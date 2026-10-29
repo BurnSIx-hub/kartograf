@@ -14,10 +14,23 @@ const LEVEL_ID: &str = "defaultLevel0000";
 pub struct Layout {
     /// Сплошные стены — ломаные в клетках.
     pub walls: Vec<Vec<[f32; 2]>>,
-    /// Двери и окна — отрезок в клетках.
-    pub portals: Vec<(Segment, PortalKind)>,
+    /// Двери и окна — отрезок в клетках; пустые проёмы сюда не попадают.
+    pub portals: Vec<PortalOut>,
     /// Свет: середина в клетках, радиус яркого и тусклого в клетках, цвет.
     pub lights: Vec<Light>,
+}
+
+pub struct PortalOut {
+    pub seg: Segment,
+    pub kind: PortalKind,
+    /// Картинка створки — у дверей; без своей — встроенная деревянная.
+    pub leaf: Option<String>,
+}
+
+/// Картинка створки, уже лежащая рядом со сценой: путь для Foundry и ширина в точках.
+pub struct LeafFile {
+    pub src: String,
+    pub width: u32,
 }
 
 pub struct Light {
@@ -56,7 +69,16 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         })
         .filter(|l| l.len() >= 2)
         .collect();
-    let portals = map.portals.iter().map(|p| ((p.a, p.b), p.kind)).collect();
+    let portals = map
+        .portals
+        .iter()
+        .filter(|p| p.kind != PortalKind::Opening)
+        .map(|p| PortalOut {
+            seg: (p.a, p.b),
+            kind: p.kind,
+            leaf: p.kind.is_door().then(|| p.asset.clone().unwrap_or_else(|| crate::library::DEFAULT_DOOR.into())),
+        })
+        .collect();
     let lights = map
         .props
         .iter()
@@ -127,7 +149,9 @@ fn doc_id(kind: char, n: usize) -> String {
 
 /// Сцена Foundry 14: картинка в уровне по умолчанию, клетка = `px` пикселей,
 /// без полей (padding 0), чтобы координаты стен совпадали с картинкой.
-pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &Layout) -> Value {
+/// Двери подвижные: створка — картинка анимации стены (`leaves` по ключу ассета),
+/// двойная дверь — `animation.double`, Foundry сам делит проём на две створки.
+pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &Layout, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
     let p = px as f32;
     let at = |v: [f32; 2]| [(v[0] * p).round() as i64, (v[1] * p).round() as i64];
     let mut walls = Vec::new();
@@ -139,12 +163,26 @@ pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &L
             }
         }
     }
-    for ((a, b), kind) in &layout.portals {
-        let (a, b) = (at(*a), at(*b));
+    for po in &layout.portals {
+        let (a0, b0) = po.seg;
+        let (a, b) = (at(a0), at(b0));
         let mut w = json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]]});
-        match kind {
+        match po.kind {
+            PortalKind::Opening => continue,
             // Дверь закрыта и непрозрачна, пока её не откроют.
-            PortalKind::Door => w["door"] = json!(1),
+            PortalKind::Door | PortalKind::DoubleDoor => {
+                w["door"] = json!(1);
+                let double = po.kind == PortalKind::DoubleDoor;
+                if let Some(leaf) = po.leaf.as_ref().and_then(|k| leaves.get(k)) {
+                    // Foundry растягивает створку на длину, а по толщине масштабирует
+                    // как `сетка / textureGridSize`: столько точек картинки на клетку
+                    // её длины — тогда створка той же толщины, что в Картографе.
+                    let len = ((b0[0] - a0[0]).powi(2) + (b0[1] - a0[1]).powi(2)).sqrt() / if double { 2.0 } else { 1.0 };
+                    let tgs = (leaf.width as f32 / len.max(0.1)).round().max(1.0);
+                    w["animation"] = json!({"type": "swing", "texture": leaf.src, "double": double, "duration": 750, "direction": 1, "flip": false, "strength": 1.0});
+                    w["flags"] = json!({"core": {"textureGridSize": tgs}});
+                }
+            }
             // Окно: сквозь него видно и светит, но не пройти.
             PortalKind::Window => {
                 w["sight"] = json!(0);
@@ -193,12 +231,13 @@ pub fn dd2vtt(map: &Map, px: u32, image_b64: &str, layout: &Layout) -> Value {
     let portals: Vec<Value> = layout
         .portals
         .iter()
-        .map(|((a, b), kind)| {
+        .map(|po| {
+            let ((a, b), kind) = (&po.seg, &po.kind);
             let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
             json!({
                 "position": pt(mid), "bounds": [pt(*a), pt(*b)],
                 "rotation": (b[1] - a[1]).atan2(b[0] - a[0]),
-                "closed": *kind == PortalKind::Door, "freestanding": false
+                "closed": kind.is_door(), "freestanding": false
             })
         })
         .collect();
@@ -263,20 +302,32 @@ mod tests {
         let mut m = Map::new(8, 6);
         m.paint_rect(Layer::Rooms, (1, 1), (4, 3), Some(0));
         m.walls.push(Wall { points: vec![[6.0, 0.0], [6.0, 6.0]], closed: false, bends: Vec::new() });
-        m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Door, asset: None });
-        m.portals.push(Portal { a: [6.0, 2.0], b: [6.0, 3.0], kind: PortalKind::Window, asset: None });
+        m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Door, asset: None, frame: None });
+        m.portals.push(Portal { a: [6.0, 2.0], b: [6.0, 3.0], kind: PortalKind::Window, asset: None, frame: None });
+        // Двойная дверь в нижней стене и пустой проём в левой.
+        m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
+        m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
         m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0 });
         let lay = layout(&m, &m.room_edges());
-        let scene = foundry_scene(&m, "Проба", "kartograf/proba.jpg", 100, &lay);
+        let mut leaves = std::collections::HashMap::new();
+        leaves.insert(crate::library::DEFAULT_DOOR.to_owned(), LeafFile { src: "kartograf/door.webp".into(), width: 512 });
+        let scene = foundry_scene(&m, "Проба", "kartograf/proba.jpg", 100, &lay, &leaves);
         assert_eq!((scene["width"].as_u64(), scene["height"].as_u64()), (Some(800), Some(600)));
         assert_eq!(scene["levels"][0]["background"]["src"], "kartograf/proba.jpg");
         assert_eq!(scene["background"]["src"], "kartograf/proba.jpg");
         let walls = scene["walls"].as_array().unwrap();
-        // Комната 4×3 с дверью: ломаная от двери вокруг до двери — 5 отрезков;
-        // ручная стена окном разрезана надвое; плюс дверь и окно.
-        assert_eq!(walls.len(), 5 + 2 + 2, "{walls:#?}");
-        let door = walls.iter().find(|w| w["door"] == 1).expect("дверь");
+        // Комната 4×3: дверь сверху, двойная дверь снизу, пустой проём слева режут
+        // её на три ломаные — 2 + 2 + 3 отрезка; ручная стена окном разрезана
+        // надвое; плюс дверь, двойная и окно. Пустой проём стеной не стал.
+        assert_eq!(walls.len(), 7 + 2 + 3, "{walls:#?}");
+        let door = walls.iter().find(|w| w["door"] == 1 && w["animation"]["double"] == false).expect("дверь");
         assert_eq!(door["c"], json!([200, 100, 300, 100]));
+        assert_eq!(door["animation"]["texture"], "kartograf/door.webp");
+        assert_eq!(door["flags"]["core"]["textureGridSize"], 512.0);
+        let double = walls.iter().find(|w| w["animation"]["double"] == true).expect("двойная дверь");
+        assert_eq!(double["c"], json!([200, 400, 400, 400]));
+        // Каждая створка — клетка: картинка в 512 точек на клетку её длины.
+        assert_eq!(double["flags"]["core"]["textureGridSize"], 512.0);
         let window = walls.iter().find(|w| w["sight"] == 0).expect("окно");
         assert_eq!(window["c"], json!([600, 200, 600, 300]));
         let ids: std::collections::HashSet<_> = walls.iter().map(|w| w["_id"].as_str().unwrap().to_owned()).collect();
@@ -284,7 +335,7 @@ mod tests {
         let light = &scene["lights"][0];
         assert_eq!((light["x"].as_i64(), light["y"].as_i64(), light["config"]["dim"].as_f64()), (Some(300), Some(200), Some(30.0)));
         let uv = dd2vtt(&m, 100, "", &lay);
-        assert_eq!(uv["portals"].as_array().unwrap().len(), 2);
+        assert_eq!(uv["portals"].as_array().unwrap().len(), 3);
         assert_eq!(uv["resolution"]["pixels_per_grid"], 100);
     }
 

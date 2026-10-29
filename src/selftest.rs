@@ -285,8 +285,8 @@ impl SelfTest {
                 let brick = image::RgbaImage::from_fn(64, 32, |x, y| if y % 16 == 0 || (x + (y / 16) * 16) % 32 == 0 { image::Rgba([60, 50, 44, 255]) } else { image::Rgba([150, 70, 50, 255]) });
                 let wrote = tile.save(&floor).is_ok() && brick.save(&wall).is_ok();
                 app.set_textures_dir(dir.clone());
-                // Две картинки папки, встроенные текстуры, объекты и стены.
-                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len();
+                // Две картинки папки, встроенные текстуры, объекты, стены и двери.
+                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len();
                 self.check("папка текстур прочиталась", wrote && app.library.assets.len() == 2 + builtin, &format!("ассетов {}", app.library.assets.len()));
                 app.use_floor_texture(&floor.to_string_lossy());
                 app.use_wall_paint(Paint::Texture(wall.to_string_lossy().into_owned()));
@@ -368,7 +368,7 @@ impl SelfTest {
                 let objects = app.library.filter(Kind::Object, "").len();
                 let doors = app.library.filter(Kind::Door, "").len();
                 let builtin = crate::library::BUILTIN_OBJECTS.len();
-                self.check("пак прочитан: 2 объекта и дверь", objects == 2 + builtin && doors == 1, &format!("объектов {objects}, дверей {doors}, паки {:?}", app.library.packs));
+                self.check("пак прочитан: 2 объекта и дверь", objects == 2 + builtin && doors == 1 + crate::library::BUILTIN_PORTALS.len(), &format!("объектов {objects}, дверей {doors}, паки {:?}", app.library.packs));
                 let found = app.library.filter(Kind::Object, "barrel").len();
                 self.check("поиск по имени нашёл бочку", found == 1, &format!("найдено {found}"));
                 // Дверь из пака — в верхнюю стену комнаты 12..18 × 10..15.
@@ -623,7 +623,57 @@ impl SelfTest {
             52 => {
                 let s = app.map.props[0].scale;
                 self.check("Alt с колесом уменьшил бочку, карта на месте", (s - 2.0 / 1.21).abs() < 1e-3 && app.cam.scale == self.area, &format!("размер {s}"));
+                // Двойная дверь с косяком: встроенный косяк подбирается под ширину.
+                app.new_map(20, 12);
+                app.set_tool(Tool::Dungeon);
+                app.brush.shape = Tip::Cells;
+                app.paint((2, 2), (9, 7));
+                app.door_kind = PortalKind::DoubleDoor;
+                app.door_width = 2.0;
+                app.door_asset = Some(format!("{}door_wood_iron", crate::library::BUILTIN));
+                app.door_frame = Some(format!("{}frame_stone_1", crate::library::BUILTIN));
+                app.place_portal([5.0, 2.0]);
+                app.door_kind = PortalKind::Opening;
+                app.door_width = 1.0;
+                app.place_portal([2.0, 4.5]);
+                let d = app.map.portals.first().cloned();
+                let ok = d.as_ref().is_some_and(|d| d.kind == PortalKind::DoubleDoor && d.a == [4.0, 2.0] && d.b == [6.0, 2.0] && d.frame.as_deref() == Some("builtin:frame_stone_2"));
+                self.check("двойная дверь в две клетки с каменным косяком на две", ok, &format!("{d:?}"));
+                let o = app.map.portals.get(1).cloned();
+                self.check("пустой проём без створки, косяк на клетку", o.as_ref().is_some_and(|o| o.kind == PortalKind::Opening && o.asset.is_none() && o.frame.as_deref() == Some("builtin:frame_stone_1")), &format!("{o:?}"));
+                // Объединение: бочка и ящик — в один объект.
+                let key = |name: &str| format!("{}{name}", crate::library::BUILTIN);
+                app.object_rot = 0.0;
+                app.object_scale = 1.0;
+                app.object_asset = Some(key("barrel"));
+                app.place_prop([4.0, 4.0], false);
+                app.object_asset = Some(key("crate"));
+                app.place_prop([5.0, 4.0], false);
+                app.picked = vec![0, 1];
+                app.bake_picked();
+                let p = app.map.props.first().cloned();
+                let ok = app.map.props.len() == 1 && p.as_ref().is_some_and(|p| std::path::Path::new(&p.asset).is_file() && (p.size[0] - 2.0).abs() < 0.05 && p.pos == [4.5, 4.0]);
+                self.check("бочка и ящик объединились в один объект 2×1", ok, &format!("{p:?}, {:?}", app.error));
+                // Разброс: мазок по полу насыпает мешки и бочки, не вплотную.
+                app.set_tool(Tool::Scatter);
+                app.scatter.set = vec![key("sacks"), key("barrel")];
+                app.scatter.radius = 1.5;
+                app.scatter.density = 1.5;
+                app.scatter.spacing = 0.9;
+                let (a, b) = (at(app, [12.0, 9.0]), at(app, [18.0, 9.0]));
+                self.drag(a, b, PointerButton::Primary);
             }
+            53 => {
+                let n = app.map.props.len() - 1;
+                let set = &app.scatter.set;
+                let pts: Vec<&map::Prop> = app.map.props.iter().filter(|p| set.contains(&p.asset)).collect();
+                let tight = pts.iter().enumerate().any(|(i, p)| pts[i + 1..].iter().any(|q| ((p.pos[0] - q.pos[0]).powi(2) + (p.pos[1] - q.pos[1]).powi(2)).sqrt() < 0.3));
+                self.check("разброс насыпал объекты из набора, не друг на друга", n >= 4 && pts.len() == n && !tight, &format!("насыпано {n}, вплотную {tight}"));
+                let c = app.canvas;
+                app.cam.fit(c, 20, 12);
+                self.resume_at = now + 0.3;
+            }
+            54 => self.snap(ctx, "двери, объединение, разброс"),
             _ => return false,
         }
         true

@@ -115,6 +115,35 @@ pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 13] = [
     ("wall_cave", "Скала", 0.6, include_bytes!("../assets/builtin/walls/cave.webp")),
 ];
 
+/// Встроенные двери, косяки и окна (`tools/portals.py`): ключ, подпись, размер холста
+/// в клетках, байты. Створка — доска поперёк холста 1×1 с петлёй справа; косяк
+/// `frame_*_N` — столбы для проёма в N клеток на холсте N+1; окно — подоконник 2×1.
+pub const BUILTIN_PORTALS: [(&str, &str, [f32; 2], &[u8]); 11] = [
+    ("door_wood", "Дверь деревянная", [1.0, 1.0], include_bytes!("../assets/builtin/portals/door_wood.webp")),
+    ("door_wood_iron", "Дверь окованная", [1.0, 1.0], include_bytes!("../assets/builtin/portals/door_wood_iron.webp")),
+    ("door_metal", "Дверь железная", [1.0, 1.0], include_bytes!("../assets/builtin/portals/door_metal.webp")),
+    ("frame_wood_1", "Косяк деревянный", [2.0, 1.0], include_bytes!("../assets/builtin/portals/frame_wood_1.webp")),
+    ("frame_wood_2", "Косяк деревянный, 2 клетки", [3.0, 1.0], include_bytes!("../assets/builtin/portals/frame_wood_2.webp")),
+    ("frame_wood_3", "Косяк деревянный, 3 клетки", [4.0, 1.0], include_bytes!("../assets/builtin/portals/frame_wood_3.webp")),
+    ("frame_stone_1", "Косяк каменный", [2.0, 1.0], include_bytes!("../assets/builtin/portals/frame_stone_1.webp")),
+    ("frame_stone_2", "Косяк каменный, 2 клетки", [3.0, 1.0], include_bytes!("../assets/builtin/portals/frame_stone_2.webp")),
+    ("frame_stone_3", "Косяк каменный, 3 клетки", [4.0, 1.0], include_bytes!("../assets/builtin/portals/frame_stone_3.webp")),
+    ("window_stone", "Окно, каменный подоконник", [2.0, 1.0], include_bytes!("../assets/builtin/portals/window_stone.webp")),
+    ("window_wood", "Окно, деревянный подоконник", [2.0, 1.0], include_bytes!("../assets/builtin/portals/window_wood.webp")),
+];
+
+/// Створка по умолчанию — для дверей без своей картинки, в том числе в выгрузке.
+pub const DEFAULT_DOOR: &str = "builtin:door_wood";
+
+/// Встроенный косяк под ширину проёма: у них варианты на 1, 2 и 3 клетки.
+/// Чужой косяк остаётся как есть.
+pub fn frame_for_width(key: &str, width: f32) -> String {
+    match key.strip_prefix(BUILTIN).and_then(|id| id.rsplit_once('_')) {
+        Some((style, _)) if style.starts_with("frame_") => format!("{BUILTIN}{style}_{}", (width.round() as i32).clamp(1, 3)),
+        _ => key.to_owned(),
+    }
+}
+
 /// Подпись и байты встроенной картинки — текстуры, объекта или стены.
 fn builtin(key: &str) -> Option<(&'static str, &'static [u8])> {
     let id = key.strip_prefix(BUILTIN)?;
@@ -124,6 +153,7 @@ fn builtin(key: &str) -> Option<(&'static str, &'static [u8])> {
         .map(|t| (t.1, t.3))
         .or_else(|| BUILTIN_OBJECTS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
         .or_else(|| BUILTIN_WALLS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
+        .or_else(|| BUILTIN_PORTALS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
 }
 
 /// Толщина встроенной стены в клетках — под неё нарисована полоса.
@@ -144,7 +174,7 @@ pub fn builtin_wall_stamps(key: &str) -> Option<u32> {
 /// Размер встроенного объекта в клетках — известен и до загрузки картинки.
 pub fn builtin_size(key: &str) -> Option<[f32; 2]> {
     let id = key.strip_prefix(BUILTIN)?;
-    BUILTIN_OBJECTS.iter().find(|t| t.0 == id).map(|t| t.2)
+    BUILTIN_OBJECTS.iter().find(|t| t.0 == id).or_else(|| BUILTIN_PORTALS.iter().find(|t| t.0 == id)).map(|t| t.2)
 }
 
 /// Ключ с этой приставкой — та же картинка, но с «разнообразием» (см. [`vary`]).
@@ -313,6 +343,11 @@ pub struct Textures {
 }
 
 impl Textures {
+    /// Байты картинки как есть — для выгрузки, где файл нужен целиком.
+    pub fn bytes(&self, key: &str) -> Result<Vec<u8>, String> {
+        read_source(key, &self.sources)
+    }
+
     pub fn new(ctx: &egui::Context) -> Self {
         let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel::<Done>();
@@ -485,12 +520,14 @@ pub struct Library {
     /// Ассеты из папки — отдельно, чтобы смена папки не трогала паки.
     folder: Vec<Asset>,
     from_packs: Vec<Asset>,
+    /// Объединённые из нескольких объектов (`App::bake`) — папка в данных программы.
+    baked: Vec<Asset>,
 }
 
 impl Default for Library {
     fn default() -> Self {
         let (tx, rx) = channel();
-        let mut library = Self { assets: Vec::new(), packs: Vec::new(), pending: 0, tx, rx, folder: Vec::new(), from_packs: Vec::new() };
+        let mut library = Self { assets: Vec::new(), packs: Vec::new(), pending: 0, tx, rx, folder: Vec::new(), from_packs: Vec::new(), baked: Vec::new() };
         library.rebuild();
         library
     }
@@ -504,6 +541,18 @@ impl Library {
                 let inner = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().into_owned();
                 let kind = kind_of(&inner, false)?;
                 Some(Asset::new(p.to_string_lossy().into_owned(), &inner, kind))
+            })
+            .collect();
+        self.rebuild();
+    }
+
+    /// Папка объединённых объектов: всё в ней — объекты, под папкой «Запечённые».
+    pub fn set_baked(&mut self, dir: &Path) {
+        self.baked = scan(dir)
+            .into_iter()
+            .map(|p| {
+                let inner = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().into_owned();
+                Asset::new(p.to_string_lossy().into_owned(), &format!("Запечённые/{inner}"), Kind::Object)
             })
             .collect();
         self.rebuild();
@@ -562,8 +611,9 @@ impl Library {
         let textures = BUILTIN_TEXTURES.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Floor));
         let objects = BUILTIN_OBJECTS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Object));
         let walls = BUILTIN_WALLS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Wall));
-        let builtin = textures.chain(objects).chain(walls);
-        self.assets = builtin.chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
+        let portals = BUILTIN_PORTALS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Door));
+        let builtin = textures.chain(objects).chain(walls).chain(portals);
+        self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
     }
 
     /// Номера ассетов нужного вида, подходящих под строку поиска.
@@ -586,6 +636,21 @@ mod tests {
             assert_eq!(img.get_pixel(0, 0)[3], 0, "{id}: угол должен быть прозрачным");
             assert_eq!(super::builtin_size(&format!("{}{id}", super::BUILTIN)), Some(size));
         }
+    }
+
+    #[test]
+    fn builtin_portals_match_their_size_and_frames_follow_width() {
+        for (id, _, size, bytes) in super::BUILTIN_PORTALS {
+            let img = image::load_from_memory(bytes).unwrap_or_else(|e| panic!("{id}: {e}")).to_rgba8();
+            assert_eq!([img.width() as f32 / 512.0, img.height() as f32 / 512.0], size, "{id}");
+            assert_eq!(img.get_pixel(0, 0)[3], 0, "{id}: угол прозрачен");
+        }
+        let b = super::BUILTIN;
+        assert_eq!(super::frame_for_width(&format!("{b}frame_stone_1"), 2.0), format!("{b}frame_stone_2"));
+        assert_eq!(super::frame_for_width(&format!("{b}frame_wood_3"), 1.0), format!("{b}frame_wood_1"));
+        assert_eq!(super::frame_for_width(&format!("{b}frame_wood_1"), 6.0), format!("{b}frame_wood_3"));
+        assert_eq!(super::frame_for_width("pack:x|Door_Frame_Wood_2x1.webp", 2.0), "pack:x|Door_Frame_Wood_2x1.webp");
+        assert_eq!(super::builtin_size(&format!("{b}frame_wood_2")), Some([3.0, 1.0]));
     }
 
     #[test]

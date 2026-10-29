@@ -179,8 +179,30 @@ pub fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortalKind {
+    /// Пустой проём: стены нет, двери тоже.
+    Opening,
     Door,
+    /// Две створки на петлях по краям проёма.
+    DoubleDoor,
     Window,
+}
+
+impl PortalKind {
+    pub const ALL: [PortalKind; 4] = [PortalKind::Opening, PortalKind::Door, PortalKind::DoubleDoor, PortalKind::Window];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PortalKind::Opening => "Проём",
+            PortalKind::Door => "Дверь",
+            PortalKind::DoubleDoor => "Двойная",
+            PortalKind::Window => "Окно",
+        }
+    }
+
+    /// Есть ли створка, которая открывается.
+    pub fn is_door(self) -> bool {
+        matches!(self, PortalKind::Door | PortalKind::DoubleDoor)
+    }
 }
 
 /// Дверь или окно: кусок стены от `a` до `b`, где стена прервана.
@@ -189,9 +211,12 @@ pub struct Portal {
     pub a: [f32; 2],
     pub b: [f32; 2],
     pub kind: PortalKind,
-    /// Картинка двери; без неё дверь рисуется простой плашкой.
+    /// Картинка створки или подоконника; без неё — простая плашка.
     #[serde(default)]
     pub asset: Option<String>,
+    /// Косяк: картинка в свой размер, посередине проёма.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
 }
 
 impl Portal {
@@ -646,8 +671,8 @@ mod tests {
     #[test]
     fn portals_cut_only_their_own_wall() {
         let segs = vec![([0.0, 2.0], [6.0, 2.0]), ([6.0, 2.0], [6.0, 5.0])];
-        let door = Portal { a: [2.0, 2.0], b: [3.0, 2.0], kind: PortalKind::Door, asset: None };
-        let window = Portal { a: [4.5, 2.0], b: [5.5, 2.0], kind: PortalKind::Window, asset: None };
+        let door = Portal { a: [2.0, 2.0], b: [3.0, 2.0], kind: PortalKind::Door, asset: None, frame: None };
+        let window = Portal { a: [4.5, 2.0], b: [5.5, 2.0], kind: PortalKind::Window, asset: None, frame: None };
         let cut = cut_portals(&segs, &[door, window]);
         assert_eq!(cut, vec![([0.0, 2.0], [2.0, 2.0]), ([3.0, 2.0], [4.5, 2.0]), ([5.5, 2.0], [6.0, 2.0]), ([6.0, 2.0], [6.0, 5.0])]);
     }

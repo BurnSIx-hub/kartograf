@@ -31,10 +31,11 @@ pub enum Tool {
     Wall,
     Door,
     Object,
+    Scatter,
 }
 
 impl Tool {
-    const ALL: [Tool; 7] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object];
+    const ALL: [Tool; 8] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter];
 
     fn label(self) -> &'static str {
         match self {
@@ -45,6 +46,7 @@ impl Tool {
             Tool::Wall => "Стена",
             Tool::Door => "Дверь и окно",
             Tool::Object => "Объект",
+            Tool::Scatter => "Разброс",
         }
     }
 
@@ -57,7 +59,43 @@ impl Tool {
             Tool::Wall => Key::W,
             Tool::Door => Key::O,
             Tool::Object => Key::P,
+            Tool::Scatter => Key::S,
         }
+    }
+}
+
+/// Разброс: кисть, которая сыплет объекты из набора вразнобой (как Scatter
+/// в Dungeondraft) — случайный объект, поворот и размер, не ближе заданного шага.
+pub struct Scatter {
+    pub set: Vec<String>,
+    /// Радиус кисти в клетках.
+    pub radius: f32,
+    /// Сколько объектов на клетку площади кисти за один отпечаток.
+    pub density: f32,
+    /// Не ближе этой доли от суммы радиусов двух объектов.
+    pub spacing: f32,
+    pub scale: [f32; 2],
+    /// Случайный поворот; без него — поворот из инструмента «Объект».
+    pub spin: bool,
+    last: Option<[f32; 2]>,
+    rng: u64,
+}
+
+impl Default for Scatter {
+    fn default() -> Self {
+        Self { set: Vec::new(), radius: 1.5, density: 0.6, spacing: 0.8, scale: [0.8, 1.2], spin: true, last: None, rng: 0x9E37_79B9_7F4A_7C15 }
+    }
+}
+
+impl Scatter {
+    /// Случайное число 0..1 (xorshift): своё зерно, без внешних библиотек.
+    pub fn rand(&mut self) -> f32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        (x >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
@@ -183,11 +221,18 @@ pub struct App {
     /// Объект, который тащат, и за что взяли.
     moving: Option<(usize, Grip)>,
     pub bending: Option<Bend>,
+    pub scatter: Scatter,
     /// Alt с колесом уже меняет размер объекта: правка в истории сделана.
     alt_wheel: bool,
     /// Стена, которую сейчас ставят по точкам.
     pub draft: Vec<[f32; 2]>,
     pub sel: Option<Sel>,
+    /// Несколько объектов разом (Shift, рамка): двигаются вместе, объединяются в один.
+    pub picked: Vec<usize>,
+    /// Рамка выбора: откуда тянут, в клетках.
+    band_from: Option<[f32; 2]>,
+    /// Группа, которую тащат: где взяли и где каждый был.
+    moving_group: Option<([f32; 2], Vec<(usize, [f32; 2])>)>,
     pub canvas: Rect,
     /// Пикселей экрана в точке egui — для выгрузки по плиткам.
     canvas_ppp: f32,
@@ -210,6 +255,8 @@ pub struct App {
     pub door_asset: Option<String>,
     pub door_kind: PortalKind,
     pub door_width: f32,
+    /// Косяк для новых проёмов; встроенный подгоняется под ширину.
+    pub door_frame: Option<String>,
     pub object_asset: Option<String>,
     pub object_rot: f32,
     pub object_scale: f32,
@@ -267,6 +314,7 @@ impl App {
         let recovery = Recovery::new(&data_dir);
         let orphans = if args.selftest.is_some() { Vec::new() } else { recovery.orphans() };
         let mut library = Library::default();
+        library.set_baked(&data_dir.join("baked"));
         if let Some(dir) = &settings.textures_dir {
             library.set_folder(dir);
         }
@@ -293,8 +341,12 @@ impl App {
             edges: Vec::new(),
             edges_dirty: true,
             moving: None,
+            picked: Vec::new(),
+            band_from: None,
+            moving_group: None,
             canvas_ppp: 1.0,
             bending: None,
+            scatter: Scatter::default(),
             alt_wheel: false,
             draft: Vec::new(),
             sel: None,
@@ -314,9 +366,10 @@ impl App {
             query: String::new(),
             filtered: Vec::new(),
             filter_key: (Kind::Floor, String::from("\u{0}"), 0),
-            door_asset: None,
+            door_asset: Some(library::DEFAULT_DOOR.into()),
             door_kind: PortalKind::Door,
             door_width: 1.0,
+            door_frame: Some(format!("{}frame_wood_1", library::BUILTIN)),
             object_asset: None,
             object_rot: 0.0,
             object_scale: 1.0,
@@ -486,6 +539,16 @@ impl App {
     }
 
     pub fn delete_selected(&mut self) {
+        if !self.picked.is_empty() {
+            self.checkpoint();
+            let mut idx = std::mem::take(&mut self.picked);
+            idx.sort_unstable();
+            for i in idx.into_iter().rev() {
+                self.map.props.remove(i);
+            }
+            self.sel = None;
+            return;
+        }
         let Some(s) = self.sel.take() else { return };
         self.checkpoint();
         match s {
@@ -531,7 +594,9 @@ impl App {
         if (b[0], b[1]) < (a[0], a[1]) {
             std::mem::swap(&mut a, &mut b);
         }
-        let portal = Portal { a, b, kind: self.door_kind, asset: self.door_asset.clone() };
+        let asset = if self.door_kind == PortalKind::Opening { None } else { self.door_asset.clone() };
+        let frame = self.door_frame.as_deref().map(|f| library::frame_for_width(f, w));
+        let portal = Portal { a, b, kind: self.door_kind, asset, frame };
         // На том же месте уже есть проём — новый его заменяет.
         let clash = self.map.portals.iter().position(|q| map::segment_distance(q.center(), portal.a, portal.b) < 0.01);
         self.checkpoint();
@@ -555,6 +620,14 @@ impl App {
             return size;
         }
         if let Some((_, px)) = self.textures.get(key, false) {
+            // Картинка вдвое крупнее обычной (512 точек на клетку, как объединённые)
+            // узнаётся по размеру в имени: `…_2.5x1.25`.
+            if let Some(s) = library::size_from_name(&library::label(key))
+                && s[0] > 0.0
+                && (px[0] as f32 / s[0] - 2.0 * PX_PER_CELL).abs() < 3.0
+            {
+                return s;
+            }
             return [px[0] as f32 / PX_PER_CELL, px[1] as f32 / PX_PER_CELL];
         }
         library::size_from_name(&library::label(key)).unwrap_or([1.0, 1.0])
@@ -586,6 +659,106 @@ impl App {
             return Some(Sel::Portal(i));
         }
         self.map.walls.iter().enumerate().map(|(i, wall)| (i, wall.distance(w))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| Sel::Wall(i))
+    }
+
+    /// Один отпечаток разброса в точке `c`: насыпать объекты из набора или, с Alt,
+    /// убрать их из круга. Правку в историю кладёт начало мазка.
+    pub fn scatter_dab(&mut self, c: [f32; 2], erase: bool) {
+        let r = self.scatter.radius;
+        let inside = |p: [f32; 2]| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) <= r * r;
+        if erase {
+            let set = self.scatter.set.clone();
+            self.map.props.retain(|p| !(inside(p.pos) && (set.is_empty() || set.contains(&p.asset))));
+            self.sel = None;
+            self.picked.clear();
+            return;
+        }
+        if self.scatter.set.is_empty() {
+            self.browse = Kind::Object;
+            return;
+        }
+        let area = std::f32::consts::PI * r * r;
+        let tries = ((self.scatter.density * area * 0.5).round() as usize).max(1);
+        let reach = |p: &Prop| p.size[0].max(p.size[1]) * p.scale / 2.0;
+        for _ in 0..tries {
+            let (a, d) = (self.scatter.rand() * std::f32::consts::TAU, self.scatter.rand().sqrt() * r);
+            let pos = [c[0] + a.cos() * d, c[1] + a.sin() * d];
+            if pos[0] < 0.0 || pos[1] < 0.0 || pos[0] > self.map.width as f32 || pos[1] > self.map.height as f32 {
+                continue;
+            }
+            let k = ((self.scatter.rand() * self.scatter.set.len() as f32) as usize).min(self.scatter.set.len() - 1);
+            let asset = self.scatter.set[k].clone();
+            let size = self.asset_size(&asset);
+            let t = self.scatter.rand();
+            let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
+            let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
+            let prop = Prop { asset, pos, size, rot, scale };
+            let me = reach(&prop) * self.scatter.spacing;
+            // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
+            let crowded = self.map.props.iter().any(|q| {
+                self.scatter.set.contains(&q.asset) && ((q.pos[0] - pos[0]).powi(2) + (q.pos[1] - pos[1]).powi(2)).sqrt() < me + reach(q) * self.scatter.spacing
+            });
+            if !crowded {
+                self.map.props.push(prop);
+            }
+        }
+    }
+
+    /// Объединить выбранные объекты в один: картинка 512 точек на клетку с
+    /// прозрачным фоном, как их видно на карте, в папку «Запечённые»; на карте
+    /// группа заменяется этим объектом там же, где была самая нижняя из группы.
+    pub fn bake_picked(&mut self) {
+        let mut idx: Vec<usize> = self.picked.iter().copied().filter(|&i| i < self.map.props.len()).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        if idx.len() < 2 {
+            return;
+        }
+        match self.bake(&idx) {
+            Ok(n) => self.notice = Some(format!("Объединено в один объект: {n} шт.")),
+            Err(e) => self.error = Some(format!("Не объединилось: {e}")),
+        }
+    }
+
+    fn bake(&mut self, idx: &[usize]) -> Result<usize, String> {
+        const PPC: f32 = 2.0 * PX_PER_CELL;
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for &i in idx {
+            for c in self.map.props[i].corners() {
+                lo = [lo[0].min(c[0]), lo[1].min(c[1])];
+                hi = [hi[0].max(c[0]), hi[1].max(c[1])];
+            }
+        }
+        let (w, h) = (((hi[0] - lo[0]) * PPC).ceil() as u32, ((hi[1] - lo[1]) * PPC).ceil() as u32);
+        if w == 0 || h == 0 || w > 16384 || h > 16384 {
+            return Err(format!("размер {w}×{h} точек"));
+        }
+        let mut out = image::RgbaImage::new(w, h);
+        for &i in idx {
+            let p = self.map.props[i].clone();
+            let bytes = self.textures.bytes(&p.asset)?;
+            let img = image::load_from_memory(&bytes).map_err(|e| format!("{}: {e}", library::label(&p.asset)))?.to_rgba8();
+            bake_prop(&mut out, &img, &p, lo, PPC);
+        }
+        let dir = self.data_dir.join("baked");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let (cw, ch) = (w as f32 / PPC, h as f32 / PPC);
+        let num = |v: f32| format!("{v:.2}").trim_end_matches('0').trim_end_matches('.').to_owned();
+        let n = (1..).find(|n| !std::fs::read_dir(&dir).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&format!("Объединённый {n}_")))).unwrap_or(false)).unwrap_or(1);
+        let file = dir.join(format!("Объединённый {n}_{}x{}.png", num(cw), num(ch)));
+        out.save(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        self.library.set_baked(&dir);
+        self.checkpoint();
+        let at = idx[0];
+        for &i in idx.iter().rev() {
+            self.map.props.remove(i);
+        }
+        let key = file.to_string_lossy().into_owned();
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0 };
+        self.map.props.insert(at, prop);
+        self.picked.clear();
+        self.sel = Some(Sel::Prop(at));
+        Ok(idx.len())
     }
 
     /// Поворот на четверть: выбранного объекта или того, что сейчас ставится.
@@ -1010,6 +1183,9 @@ impl App {
         if cmd(Key::O) {
             self.open();
         }
+        if cmd(Key::G) {
+            self.bake_picked();
+        }
         if cmd(Key::N) {
             self.new_map = Some(NewMap { width: self.map.width, height: self.map.height });
         }
@@ -1183,6 +1359,7 @@ impl App {
             Tool::Erase => "Стирает и комнаты, и местность.",
             Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
             Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите во вкладке «Двери»; без картинки — простая плашка.",
+            Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком в библиотеке.",
             Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Alt — на время наоборот с привязкой, Alt с колесом — размер, R — поворот.",
         });
 
@@ -1205,24 +1382,82 @@ impl App {
             }
             Tool::Door => {
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.door_kind, PortalKind::Door, "Дверь");
-                    ui.selectable_value(&mut self.door_kind, PortalKind::Window, "Окно");
-                });
-                ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
-                ui.horizontal(|ui| {
-                    match self.door_asset.clone() {
-                        Some(key) => {
-                            ui.label(library::label(&key));
-                            if ui.small_button("без картинки").clicked() {
-                                self.door_asset = None;
+                ui.horizontal_wrapped(|ui| {
+                    for kind in PortalKind::ALL {
+                        if ui.selectable_label(self.door_kind == kind, kind.label()).clicked() && self.door_kind != kind {
+                            self.door_kind = kind;
+                            // Окну — подоконник, двери — створка, если выбрано не то.
+                            let is_window = self.door_asset.as_deref().is_some_and(|k| k.contains("window") || k.to_lowercase().contains("sill"));
+                            if kind == PortalKind::Window && !is_window {
+                                self.door_asset = Some(format!("{}window_stone", library::BUILTIN));
+                            } else if kind.is_door() && (is_window || self.door_asset.is_none()) {
+                                self.door_asset = Some(library::DEFAULT_DOOR.into());
                             }
-                        }
-                        None => {
-                            ui.weak("без картинки");
+                            if kind == PortalKind::DoubleDoor && self.door_width < 2.0 {
+                                self.door_width = 2.0;
+                            }
                         }
                     }
                 });
+                ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
+                if self.door_kind != PortalKind::Opening {
+                    ui.horizontal(|ui| {
+                        ui.label(if self.door_kind == PortalKind::Window { "Окно:" } else { "Створка:" });
+                        match self.door_asset.clone() {
+                            Some(key) => {
+                                ui.label(library::label(&key));
+                            }
+                            None => {
+                                ui.weak("простая плашка");
+                            }
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Косяк:");
+                    let b = library::BUILTIN;
+                    let style = |f: &Option<String>| f.as_deref().map(|k| k.trim_end_matches(char::is_numeric).to_owned());
+                    let now = style(&self.door_frame);
+                    for (label, key) in [("нет", None), ("дерево", Some(format!("{b}frame_wood_1"))), ("камень", Some(format!("{b}frame_stone_1")))] {
+                        if ui.selectable_label(now == style(&key), label).clicked() {
+                            self.door_frame = key;
+                        }
+                    }
+                    if let Some(k) = &self.door_frame
+                        && !k.starts_with(b)
+                    {
+                        ui.label(library::label(k));
+                    }
+                });
+                ui.weak("Створку, окно или косяк можно взять во вкладке «Двери». Створка уходит в Foundry отдельной картинкой и там открывается.");
+            }
+            Tool::Scatter => {
+                ui.add_space(6.0);
+                ui.strong("Набор");
+                if self.scatter.set.is_empty() {
+                    ui.weak("пусто — щёлкните объекты во вкладке «Объекты»");
+                }
+                let mut drop = None;
+                for (k, key) in self.scatter.set.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("×").on_hover_text("Убрать из набора").clicked() {
+                            drop = Some(k);
+                        }
+                        ui.label(library::label(key));
+                    });
+                }
+                if let Some(k) = drop {
+                    self.scatter.set.remove(k);
+                }
+                ui.add(egui::Slider::new(&mut self.scatter.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
+                ui.add(egui::Slider::new(&mut self.scatter.density, 0.05..=4.0).logarithmic(true).text("плотность"));
+                ui.add(egui::Slider::new(&mut self.scatter.spacing, 0.0..=2.0).text("просвет"));
+                ui.add(egui::Slider::new(&mut self.scatter.scale[0], 0.2..=3.0).text("размер от"));
+                ui.add(egui::Slider::new(&mut self.scatter.scale[1], 0.2..=3.0).text("размер до"));
+                if self.scatter.scale[1] < self.scatter.scale[0] {
+                    self.scatter.scale[1] = self.scatter.scale[0];
+                }
+                ui.checkbox(&mut self.scatter.spin, "Случайный поворот");
             }
             Tool::Object => {
                 ui.add_space(6.0);
@@ -1233,6 +1468,20 @@ impl App {
         }
         if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
             self.save_settings();
+        }
+        self.picked.retain(|&k| k < self.map.props.len());
+        if !self.picked.is_empty() {
+            ui.add_space(6.0);
+            ui.strong(format!("Выбрано объектов: {}", self.picked.len()));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.picked.len() >= 2, egui::Button::new("Объединить в один   Ctrl+G")).clicked() {
+                    self.bake_picked();
+                }
+                if ui.small_button("снять выбор").clicked() {
+                    self.picked.clear();
+                }
+            });
+            ui.weak("Объединённый объект ляжет в библиотеку, во вкладку «Объекты», папка «Запечённые».");
         }
         if let Some(Sel::Prop(i)) = self.sel {
             ui.add_space(6.0);
@@ -1400,14 +1649,40 @@ impl App {
                     self.use_wall_paint(Paint::Texture(key));
                 }
                 Kind::Door => {
-                    // Окна в паках FA лежат среди проёмов: вид проёма — по имени.
+                    // В паках FA косяки, окна и створки лежат вместе: что это — по имени.
                     let lower = key.to_lowercase();
-                    self.door_kind = if ["window", "arrowslit", "окно"].iter().any(|w| lower.contains(w)) { PortalKind::Window } else { PortalKind::Door };
-                    if let Some(size) = library::size_from_name(&library::label(&key)) {
-                        self.door_width = size[0].clamp(1.0, 4.0);
+                    let name = library::label(&key).to_lowercase();
+                    if lower.contains("frame") || name.contains("косяк") {
+                        self.door_frame = Some(key);
+                    } else {
+                        let window = ["window", "arrowslit", "sill", "окно"].iter().any(|w| lower.contains(w) || name.contains(w));
+                        self.door_kind = if window {
+                            PortalKind::Window
+                        } else if lower.contains("double") {
+                            PortalKind::DoubleDoor
+                        } else if self.door_kind == PortalKind::DoubleDoor {
+                            PortalKind::DoubleDoor
+                        } else {
+                            PortalKind::Door
+                        };
+                        // Ширина — из имени у FA (Door_Large_…_2x1); встроенные не меняют её.
+                        if !key.starts_with(library::BUILTIN)
+                            && let Some(size) = library::size_from_name(&library::label(&key))
+                        {
+                            self.door_width = size[0].clamp(1.0, 4.0);
+                        }
+                        self.door_asset = Some(key);
                     }
-                    self.door_asset = Some(key);
                     self.set_tool(Tool::Door);
+                }
+                Kind::Object if self.tool == Tool::Scatter => {
+                    // В разбросе щелчок кладёт объект в набор или убирает из него.
+                    match self.scatter.set.iter().position(|k| *k == key) {
+                        Some(at) => {
+                            self.scatter.set.remove(at);
+                        }
+                        None => self.scatter.set.push(key),
+                    }
                 }
                 Kind::Object => {
                     self.object_asset = Some(key);
@@ -1484,7 +1759,9 @@ impl App {
             if !alt {
                 self.alt_wheel = false;
             }
-            if notches != 0.0 && brush && ctrl {
+            if notches != 0.0 && self.tool == Tool::Scatter && ctrl {
+                self.scatter.radius = (self.scatter.radius * 1.25f32.powf(notches)).clamp(0.25, 10.0);
+            } else if notches != 0.0 && brush && ctrl {
                 self.brush.radius = (self.brush.radius * 1.25f32.powf(notches)).clamp(0.25, 10.0);
             } else if notches != 0.0 && prop && alt {
                 // Alt с колесом — размер выбранного объекта, а без выбора — того, что ставится.
@@ -1699,6 +1976,27 @@ impl App {
                     self.place_portal(self.cam.to_world(rect, p));
                 }
             }
+            Tool::Scatter => {
+                let (pressed, down, at) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
+                if pressed
+                    && resp.contains_pointer()
+                    && let Some(p) = at
+                {
+                    self.checkpoint();
+                    let w = self.cam.to_world(rect, p);
+                    self.scatter_dab(w, alt);
+                    self.scatter.last = Some(w);
+                } else if let (true, Some(last), Some(p)) = (down, self.scatter.last, at) {
+                    let w = self.cam.to_world(rect, p);
+                    // Новый отпечаток — когда кисть ушла на половину радиуса.
+                    if ((w[0] - last[0]).powi(2) + (w[1] - last[1]).powi(2)).sqrt() >= self.scatter.radius * 0.5 {
+                        self.scatter_dab(w, alt);
+                        self.scatter.last = Some(w);
+                    }
+                } else if !down {
+                    self.scatter.last = None;
+                }
+            }
             Tool::Object => {
                 self.drag_prop(ui, resp, pointer, alt);
                 if resp.clicked()
@@ -1711,11 +2009,82 @@ impl App {
                 }
             }
             Tool::Select => {
-                self.drag_prop(ui, resp, pointer, alt);
+                let shift = ui.input(|i| i.modifiers.shift);
+                if resp.drag_started_by(PointerButton::Primary)
+                    && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+                {
+                    let w = self.cam.to_world(rect, o);
+                    match self.pick(w) {
+                        // Взяли объект из группы — едет вся группа.
+                        Some(Sel::Prop(i)) if self.picked.contains(&i) && self.grip_at(o).is_none() => {
+                            self.checkpoint();
+                            self.moving_group = Some((w, self.picked.iter().map(|&k| (k, self.map.props[k].pos)).collect()));
+                        }
+                        Some(_) => {}
+                        // Мимо всего — рамка выбора.
+                        None if self.grip_at(o).is_none() => self.band_from = Some(w),
+                        None => {}
+                    }
+                }
+                if let (Some((from, start)), Some(p)) = (self.moving_group.clone(), pointer)
+                    && resp.dragged_by(PointerButton::Primary)
+                {
+                    let w = self.cam.to_world(rect, p);
+                    let mut d = [w[0] - from[0], w[1] - from[1]];
+                    if self.settings.snap != alt {
+                        d = [snap_half(d[0]), snap_half(d[1])];
+                    }
+                    for (k, pos) in start {
+                        self.map.props[k].pos = [pos[0] + d[0], pos[1] + d[1]];
+                    }
+                } else if self.band_from.is_none() {
+                    self.drag_prop(ui, resp, pointer, alt);
+                }
+                if resp.drag_stopped_by(PointerButton::Primary) {
+                    self.moving_group = None;
+                    if let (Some(a), Some(p)) = (self.band_from.take(), pointer) {
+                        let b = self.cam.to_world(rect, p);
+                        let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
+                        let inside: Vec<usize> = (0..self.map.props.len())
+                            .filter(|&k| {
+                                let c = self.map.props[k].pos;
+                                c[0] >= lo[0] && c[0] <= hi[0] && c[1] >= lo[1] && c[1] <= hi[1]
+                            })
+                            .collect();
+                        if !shift {
+                            self.picked.clear();
+                        }
+                        for k in inside {
+                            if !self.picked.contains(&k) {
+                                self.picked.push(k);
+                            }
+                        }
+                        self.sel = None;
+                    }
+                }
                 if resp.clicked()
                     && let Some(p) = pointer
                 {
-                    self.sel = self.pick(self.cam.to_world(rect, p));
+                    let hit = self.pick(self.cam.to_world(rect, p));
+                    if shift {
+                        // Shift — добавить к группе или убрать из неё.
+                        if let Some(Sel::Prop(k)) = self.sel.take() {
+                            if !self.picked.contains(&k) {
+                                self.picked.push(k);
+                            }
+                        }
+                        if let Some(Sel::Prop(k)) = hit {
+                            match self.picked.iter().position(|&x| x == k) {
+                                Some(at) => {
+                                    self.picked.remove(at);
+                                }
+                                None => self.picked.push(k),
+                            }
+                        }
+                    } else {
+                        self.picked.clear();
+                        self.sel = hit;
+                    }
                 }
             }
         }
@@ -1906,6 +2275,21 @@ impl App {
             }
         }
 
+        // Группа выбранных и рамка выбора.
+        if !exporting {
+            let green = Color32::from_rgb(140, 220, 160);
+            for &k in &self.picked {
+                if let Some(p) = self.map.props.get(k) {
+                    let q: Vec<Pos2> = p.corners().iter().map(|&c| cam.to_screen(canvas, c)).collect();
+                    painter.add(Shape::closed_line(q, Stroke::new(1.5, green)));
+                }
+            }
+            if let (Some(a), Some(h)) = (self.band_from, self.hover) {
+                let r = Rect::from_two_pos(cam.to_screen(canvas, a), h);
+                painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(140, 220, 160, 25), Stroke::new(1.0, green), egui::StrokeKind::Middle);
+            }
+        }
+
         // Ручки выбранного объекта — поверх стен и всего остального.
         if let Some(Sel::Prop(i)) = self.sel
             && matches!(self.tool, Tool::Select | Tool::Object)
@@ -1933,6 +2317,11 @@ impl App {
                     let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
+            }
+            (Tool::Scatter, Some(h)) => {
+                let alt = painter.ctx().input(|i| i.modifiers.alt);
+                let color = if alt { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(140, 220, 160) };
+                painter.circle_stroke(h, self.scatter.radius * s, Stroke::new(1.5, color));
             }
             (Tool::Dungeon | Tool::Floor | Tool::Erase, Some(h)) if self.brush.shape != Tip::Cells => {
                 // Контур кисти: куда ляжет мазок.
@@ -1997,6 +2386,22 @@ impl App {
     }
 
     /// Дверь — картинкой вдоль проёма или простой плашкой; окно — светлой полосой.
+    /// Картинка вдоль отрезка `s`→`e`: длина — отрезок, толщина — по пропорциям
+    /// картинки (у FA холст створки 1×1 с доской посередине). Правый край картинки
+    /// (петля створки) — у `e`. `false` — картинка ещё не готова.
+    fn draw_along(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2]) -> bool {
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        let Some((_, px)) = self.textures.get(key, false) else { return false };
+        let half = len * px[1] as f32 / px[0].max(1) as f32 / 2.0;
+        let (nx, ny) = (-dy / len * half, dx / len * half);
+        let c = [[s[0] + nx, s[1] + ny], [e[0] + nx, e[1] + ny], [e[0] - nx, e[1] - ny], [s[0] - nx, s[1] - ny]];
+        let full = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
+        self.quad(painter, canvas, key, c, full, Color32::WHITE)
+    }
+
+    /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
+    /// В выгрузке створок нет — они уходят в Foundry отдельной картинкой.
     fn draw_portal(&mut self, painter: &egui::Painter, canvas: Rect, p: &Portal, wall_width: f32) {
         let (dx, dy) = (p.b[0] - p.a[0], p.b[1] - p.a[1]);
         let len = (dx * dx + dy * dy).sqrt();
@@ -2004,29 +2409,43 @@ impl App {
             return;
         }
         let (ux, uy) = (dx / len, dy / len);
+        let mid = p.center();
+        if let Some(f) = p.frame.clone() {
+            let size = self.asset_size(&f);
+            let (hx, hy) = (ux * size[0] / 2.0, uy * size[0] / 2.0);
+            self.draw_along(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy]);
+        }
         let rect_around = |half: f32| {
             let (nx, ny) = (-uy * half, ux * half);
             [[p.a[0] + nx, p.a[1] + ny], [p.b[0] + nx, p.b[1] + ny], [p.b[0] - nx, p.b[1] - ny], [p.a[0] - nx, p.a[1] - ny]]
         };
         let edge = Stroke::new(1.5, Color32::from_rgb(20, 16, 13));
         let to_screen = |c: [[f32; 2]; 4], cam: &Camera| c.iter().map(|&w| cam.to_screen(canvas, w)).collect::<Vec<_>>();
-        match (p.kind, &p.asset) {
-            (_, Some(key)) => {
-                // Толщина — по пропорциям картинки: дверь 3×1 в проёме в клетку — треть клетки.
-                let half = match self.textures.get(key, false) {
-                    Some((_, px)) => len * px[1] as f32 / px[0].max(1) as f32 / 2.0,
-                    None => wall_width / 2.0,
-                };
-                let full = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
-                if !self.quad(painter, canvas, key, rect_around(half), full, Color32::WHITE) {
-                    painter.add(Shape::convex_polygon(to_screen(rect_around(half), &self.cam), Color32::from_black_alpha(60), Stroke::new(1.0, Color32::from_gray(140))));
+        let plain = |painter: &egui::Painter, cam: &Camera, half: f32, color: Color32| {
+            painter.add(Shape::convex_polygon(to_screen(rect_around(half), cam), color, edge));
+        };
+        let exporting = self.export.is_some();
+        match p.kind {
+            PortalKind::Opening => {}
+            PortalKind::Door | PortalKind::DoubleDoor if exporting => {}
+            PortalKind::Door => {
+                // Петля (правый край картинки) — у начала проёма: там её повесит и Foundry.
+                let key = p.asset.clone();
+                if !key.is_some_and(|k| self.draw_along(painter, canvas, &k, p.b, p.a)) {
+                    plain(painter, &self.cam, wall_width * 0.35, Color32::from_rgb(132, 92, 54));
                 }
             }
-            (PortalKind::Door, None) => {
-                painter.add(Shape::convex_polygon(to_screen(rect_around(wall_width * 0.35), &self.cam), Color32::from_rgb(132, 92, 54), edge));
+            PortalKind::DoubleDoor => {
+                // Створки на петлях у краёв проёма, сходятся посередине.
+                let key = p.asset.clone().unwrap_or_else(|| library::DEFAULT_DOOR.into());
+                self.draw_along(painter, canvas, &key, mid, p.a);
+                self.draw_along(painter, canvas, &key, mid, p.b);
             }
-            (PortalKind::Window, None) => {
-                painter.add(Shape::convex_polygon(to_screen(rect_around(wall_width * 0.3), &self.cam), Color32::from_rgb(150, 196, 220), edge));
+            PortalKind::Window => {
+                let key = p.asset.clone();
+                if !key.is_some_and(|k| self.draw_along(painter, canvas, &k, p.a, p.b)) {
+                    plain(painter, &self.cam, wall_width * 0.3, Color32::from_rgb(150, 196, 220));
+                }
             }
         }
     }
@@ -2403,7 +2822,22 @@ impl App {
         let edges = self.room_edges().to_vec();
         let layout = export::layout(&self.map, &edges);
         let src = export::foundry_src(&img_path);
-        let scene = export::foundry_scene(&self.map, &e.name, &src, e.px, &layout);
+        // Створки — отдельными картинками рядом со сценой: Foundry их двигает.
+        let mut leaves = std::collections::HashMap::new();
+        for key in layout.portals.iter().filter_map(|p| p.leaf.clone()) {
+            if leaves.contains_key(&key) {
+                continue;
+            }
+            let bytes = self.textures.bytes(&key)?;
+            // Foundry вращает створку вокруг левого конца картинки, а петля у FA
+            // и у встроенных нарисована справа: створка уходит отражённой.
+            let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&key)))?.fliph();
+            let width = img.width();
+            let file = e.dir.join(format!("{}_створка_{}.png", e.name, leaves.len() + 1));
+            img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
+            leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
+        }
+        let scene = export::foundry_scene(&self.map, &e.name, &src, e.px, &layout, &leaves);
         let scene_path = e.dir.join(format!("{}.json", e.name));
         std::fs::write(&scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default()).map_err(|x| x.to_string())?;
         use base64::Engine;
@@ -2473,6 +2907,60 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let Some(test) = &mut self.test {
             test.feed(raw);
+        }
+    }
+}
+
+/// Наложить объект на картинку объединения: `ppc` точек на клетку, `origin` —
+/// левый верхний угол картинки в клетках. Поворот и размер — как на карте,
+/// выборка билинейная, наложение «поверх» по прозрачности.
+pub fn bake_prop(out: &mut image::RgbaImage, img: &image::RgbaImage, p: &Prop, origin: [f32; 2], ppc: f32) {
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let (sw, sh) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let (s, c) = p.rot.to_radians().sin_cos();
+    let cs = p.corners();
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for q in cs {
+        lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+        hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+    }
+    let px = |v: f32, o: f32, m: u32| (((v - o) * ppc).floor().max(0.0) as u32).min(m);
+    let (x0, x1) = (px(lo[0], origin[0], out.width()), px(hi[0], origin[0], out.width()).saturating_add(1).min(out.width()));
+    let (y0, y1) = (px(lo[1], origin[1], out.height()), px(hi[1], origin[1], out.height()).saturating_add(1).min(out.height()));
+    let sample = |u: f32, v: f32| -> [f32; 4] {
+        let (x, y) = (u * iw - 0.5, v * ih - 0.5);
+        let (fx, fy) = (x.floor(), y.floor());
+        let (tx, ty) = (x - fx, y - fy);
+        let at = |xx: f32, yy: f32| {
+            let (xx, yy) = (xx.clamp(0.0, iw - 1.0) as u32, yy.clamp(0.0, ih - 1.0) as u32);
+            let q = img.get_pixel(xx, yy).0;
+            // Предумноженные цвета: на прозрачном крае нет тёмной каймы.
+            let a = q[3] as f32 / 255.0;
+            [q[0] as f32 * a, q[1] as f32 * a, q[2] as f32 * a, q[3] as f32]
+        };
+        let (a, b, cc, d) = (at(fx, fy), at(fx + 1.0, fy), at(fx, fy + 1.0), at(fx + 1.0, fy + 1.0));
+        std::array::from_fn(|k| (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (cc[k] * (1.0 - tx) + d[k] * tx) * ty)
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let w = [origin[0] + (x as f32 + 0.5) / ppc, origin[1] + (y as f32 + 0.5) / ppc];
+            let (dx, dy) = (w[0] - p.pos[0], w[1] - p.pos[1]);
+            // В систему объекта: поворот назад.
+            let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
+            let (u, v) = (lx / sw + 0.5, ly / sh + 0.5);
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let src = sample(u, v);
+            let sa = src[3] / 255.0;
+            if sa <= 0.0 {
+                continue;
+            }
+            let dst = out.get_pixel(x, y).0;
+            let da = dst[3] as f32 / 255.0;
+            let oa = sa + da * (1.0 - sa);
+            let ch = |k: usize| ((src[k] + dst[k] as f32 * da * (1.0 - sa)) / oa).round().clamp(0.0, 255.0) as u8;
+            out.put_pixel(x, y, image::Rgba([ch(0), ch(1), ch(2), (oa * 255.0).round() as u8]));
         }
     }
 }
@@ -2655,4 +3143,31 @@ fn ribbon(line: &[[f32; 2]], closed: bool, hw: f32) -> Vec<([f32; 2], [f32; 2], 
         rows.push(([p[0] + off[0], p[1] + off[1]], [p[0] - off[0], p[1] - off[1]], dist));
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baked_prop_lands_rotated_where_the_map_shows_it() {
+        // Картинка 2×1 клетки: левая половина красная, правая синяя.
+        let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0 };
+        let mut out = image::RgbaImage::new(64, 64);
+        bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
+        // Поворот по часовой на 90°: левый (красный) конец уходит вверх.
+        assert_eq!(out.get_pixel(32, 8).0, [255, 0, 0, 255]);
+        assert_eq!(out.get_pixel(32, 56).0, [0, 0, 255, 255]);
+        assert_eq!(out.get_pixel(4, 32)[3], 0, "сбоку от повёрнутого объекта пусто");
+    }
+
+    #[test]
+    fn scatter_random_numbers_stay_in_range_and_vary() {
+        let mut s = Scatter::default();
+        let v: Vec<f32> = (0..1000).map(|_| s.rand()).collect();
+        assert!(v.iter().all(|x| (0.0..1.0).contains(x)));
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        assert!((mean - 0.5).abs() < 0.05, "среднее {mean}");
+    }
 }
