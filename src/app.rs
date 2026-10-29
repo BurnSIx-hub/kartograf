@@ -1,5 +1,6 @@
 //! Окно редактора: меню, панель инструментов с библиотекой, холст и строка состояния.
 
+use crate::export;
 use crate::generate::{self, Options};
 use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
@@ -74,6 +75,10 @@ pub struct Args {
     pub shot: Option<PathBuf>,
     pub size: Option<[f32; 2]>,
     pub data: Option<PathBuf>,
+    /// `--export папка`: выгрузить карту для Foundry и выйти.
+    pub export: Option<PathBuf>,
+    /// `--px N`: пикселей на клетку в выгрузке.
+    pub px: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +119,33 @@ pub enum Grip {
     Scale(f32, f32),
     /// Ручка над объектом: поворот вслед за курсором.
     Turn,
+}
+
+/// Выгрузка для VTT идёт по кадрам: камера встаёт на плитку карты, окно снимает
+/// себя, плитка переносится в большую картинку. Так картинка выходит тем же
+/// отрисовщиком, что на экране, а не второй копией его кода.
+struct Export {
+    dir: PathBuf,
+    name: String,
+    px: u32,
+    /// Размер плитки в пикселях экрана.
+    tile: [u32; 2],
+    tiles: Vec<[u32; 2]>,
+    next: usize,
+    image: image::RgbImage,
+    /// Камера и выбор до выгрузки — вернуть после.
+    cam: Camera,
+    sel: Option<Sel>,
+    /// Кадров после сдвига камеры: дать догрузиться картинкам.
+    settle: u32,
+    asked: bool,
+    /// Выгрузка из командной строки: по окончании выйти.
+    quit: bool,
+}
+
+/// Окно выгрузки: сколько пикселей на клетку.
+struct ExportDialog {
+    px: u32,
 }
 
 /// Окно «Новая карта».
@@ -157,6 +189,8 @@ pub struct App {
     pub draft: Vec<[f32; 2]>,
     pub sel: Option<Sel>,
     pub canvas: Rect,
+    /// Пикселей экрана в точке egui — для выгрузки по плиткам.
+    canvas_ppp: f32,
     pub hover: Option<Pos2>,
     pub error: Option<String>,
     pub test: Option<SelfTest>,
@@ -184,6 +218,12 @@ pub struct App {
     pub orphans: Vec<Orphan>,
     pub generator: Option<Options>,
     new_map: Option<NewMap>,
+    export: Option<Export>,
+    export_dialog: Option<ExportDialog>,
+    /// Выгрузка из командной строки: куда и с каким разрешением.
+    export_args: Option<(PathBuf, u32)>,
+    /// Сообщение в строке состояния: что сделано.
+    pub notice: Option<String>,
     confirm_close: bool,
     allow_close: bool,
 }
@@ -191,6 +231,11 @@ pub struct App {
 pub fn default_data_dir() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Kartograf")
 }
+
+/// Пикселей на клетку в выгрузке по умолчанию: столько у Foundry по умолчанию
+/// не бывает (там 100), но карта с мелкими предметами при 100 мылится.
+const EXPORT_PX: u32 = 140;
+const EXPORT_PX_CHOICES: [u32; 4] = [100, 140, 200, 256];
 
 fn snap_half(v: f32) -> f32 {
     (v * 2.0).round() / 2.0
@@ -248,6 +293,7 @@ impl App {
             edges: Vec::new(),
             edges_dirty: true,
             moving: None,
+            canvas_ppp: 1.0,
             bending: None,
             alt_wheel: false,
             draft: Vec::new(),
@@ -278,6 +324,10 @@ impl App {
             orphans,
             generator: None,
             new_map: None,
+            export: None,
+            export_dialog: None,
+            export_args: args.export.map(|d| (d, args.px.unwrap_or(EXPORT_PX))),
+            notice: None,
             confirm_close: false,
             allow_close: false,
         };
@@ -740,7 +790,10 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.confirm_close = true;
         }
-        self.shortcuts(&ctx);
+        if self.export.is_none() {
+            self.shortcuts(&ctx);
+        }
+        self.export_step(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));
@@ -803,6 +856,42 @@ impl App {
             } else if let Some(i) = drop {
                 let o = self.orphans.remove(i);
                 self.recovery.discard(&o);
+            }
+        }
+
+        if let Some(mut dlg) = self.export_dialog.take() {
+            let mut open = true;
+            let mut go = false;
+            egui::Window::new("Выгрузка для Foundry").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("Пикселей на клетку:");
+                ui.horizontal(|ui| {
+                    for px in EXPORT_PX_CHOICES {
+                        ui.selectable_value(&mut dlg.px, px, px.to_string());
+                    }
+                });
+                let (w, h) = (self.map.width * dlg.px, self.map.height * dlg.px);
+                ui.weak(format!("Картинка {w}×{h}."));
+                ui.add_space(4.0);
+                ui.weak("Рядом лягут три файла: картинка, сцена для Foundry (.json) и Universal VTT (.dd2vtt). В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
+                ui.add_space(6.0);
+                go = ui.button("Выбрать место и выгрузить").clicked();
+            });
+            if go {
+                let dir = export::foundry_data_dir().map(|d| d.join("kartograf"));
+                if let Some(d) = &dir {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let mut dialog = rfd::FileDialog::new().add_filter("Сцена Foundry", &["json"]).set_file_name(format!("{}.json", self.name()));
+                if let Some(d) = dir {
+                    dialog = dialog.set_directory(d);
+                }
+                if let Some(file) = dialog.save_file() {
+                    let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| self.name());
+                    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+                    self.start_export(dir, name, dlg.px, false);
+                }
+            } else if open {
+                self.export_dialog = Some(dlg);
             }
         }
 
@@ -1009,6 +1098,10 @@ impl App {
                 }
                 if item(ui, "Сохранить как…", "Ctrl+Shift+S") {
                     self.save_as();
+                }
+                ui.separator();
+                if item(ui, "Выгрузить для Foundry…", "") {
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX });
                 }
                 ui.separator();
                 if item(ui, "Папка с картинками…", "")
@@ -1341,6 +1434,13 @@ impl App {
                 ui.separator();
                 ui.weak("копия на случай сбоя сделана");
             }
+            if let Some(e) = &self.export {
+                ui.separator();
+                ui.strong(format!("Выгрузка: плитка {} из {}…", (e.next + 1).min(e.tiles.len()), e.tiles.len()));
+            } else if let Some(n) = &self.notice {
+                ui.separator();
+                ui.label(n);
+            }
         });
     }
 
@@ -1348,11 +1448,19 @@ impl App {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         self.canvas = rect;
+        self.canvas_ppp = ui.ctx().pixels_per_point();
         if !self.fitted && rect.width() > 50.0 {
             self.cam.fit(rect, self.map.width, self.map.height);
             self.fitted = true;
         }
         self.hover = resp.hover_pos().or(self.hover.filter(|_| resp.dragged()));
+
+        if self.export.is_some() {
+            // Выгрузка двигает камеру сама; курсор и инструменты молчат.
+            self.hover = None;
+            self.draw(&painter, rect);
+            return;
+        }
 
         // Колесо — масштаб вокруг курсора.
         if let Some(p) = resp.hover_pos() {
@@ -1708,8 +1816,9 @@ impl App {
         self.map.room_floor = room_floor;
         self.map.rooms = rooms;
 
+        let exporting = self.export.is_some();
         // Протянутая заливка — рамкой, пока кнопку не отпустили.
-        if let (Some(a), Some(p)) = (self.drag_from, self.hover) {
+        if let (Some(a), Some(p)) = (self.drag_from, self.hover.filter(|_| !exporting)) {
             let b = cam.cell(canvas, p);
             let r = Rect::from_min_max(
                 cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
@@ -1720,7 +1829,8 @@ impl App {
         }
 
         // Сетка. На мелком масштабе она сливается в сплошной фон — тогда её нет.
-        if s >= 10.0 {
+        // В выгрузке сетки нет: её рисует сам VTT.
+        if s >= 10.0 && !exporting {
             let grid = Stroke::new(1.0, Color32::from_black_alpha(60));
             for x in x0..=x1 {
                 painter.line_segment([cam.to_screen(canvas, [x as f32, y0 as f32]), cam.to_screen(canvas, [x as f32, y1 as f32])], grid);
@@ -1729,7 +1839,9 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, [x0 as f32, y as f32]), cam.to_screen(canvas, [x1 as f32, y as f32])], grid);
             }
         }
-        painter.rect_stroke(map_rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
+        if !exporting {
+            painter.rect_stroke(map_rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
+        }
 
         // Объекты — под стенами, как мебель у стены.
         let props = self.map.props.clone();
@@ -2173,6 +2285,141 @@ impl App {
         painter.add(Shape::mesh(logs));
     }
 
+    /// Начать выгрузку: плитки по размеру холста, камера и выбор запоминаются.
+    pub fn start_export(&mut self, dir: PathBuf, name: String, px: u32, quit: bool) {
+        let ppp = self.canvas_ppp;
+        let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
+        let (w, h) = (self.map.width * px, self.map.height * px);
+        let mut tiles = Vec::new();
+        for ty in 0..h.div_ceil(tile[1]) {
+            for tx in 0..w.div_ceil(tile[0]) {
+                tiles.push([tx, ty]);
+            }
+        }
+        self.notice = None;
+        self.export = Some(Export {
+            dir,
+            name,
+            px,
+            tile,
+            tiles,
+            next: 0,
+            image: image::RgbImage::new(w, h),
+            cam: self.cam,
+            sel: self.sel.take(),
+            settle: 0,
+            asked: false,
+            quit,
+        });
+    }
+
+    /// Шаг выгрузки до отрисовки кадра: поставить камеру на плитку и, когда
+    /// картинки догрузились, попросить снимок.
+    fn export_step(&mut self, ctx: &egui::Context) {
+        if self.export.is_none()
+            && let Some((dir, px)) = self.export_args.clone()
+            && self.frame >= 10
+            && !self.library.loading()
+            && self.textures.idle()
+            && self.canvas.width() > 100.0
+        {
+            self.export_args = None;
+            let name = self.name();
+            self.start_export(dir, name, px, true);
+        }
+        let ppp = ctx.pixels_per_point();
+        let canvas = self.canvas;
+        let idle = self.textures.idle() && !self.library.loading();
+        let Some(e) = &mut self.export else { return };
+        ctx.request_repaint();
+        if e.asked {
+            return;
+        }
+        let [tx, ty] = e.tiles[e.next];
+        // Начало плитки ложится на целый пиксель экрана: плитки стыкуются без шва.
+        let origin = [(canvas.min.x * ppp).ceil(), (canvas.min.y * ppp).ceil()];
+        let scale = e.px as f32 / ppp;
+        let world = [(tx * e.tile[0]) as f32 / e.px as f32, (ty * e.tile[1]) as f32 / e.px as f32];
+        self.cam.scale = scale;
+        self.cam.pan = vec2(origin[0] / ppp - canvas.min.x - world[0] * scale, origin[1] / ppp - canvas.min.y - world[1] * scale);
+        e.settle += 1;
+        if e.settle >= 3 && idle {
+            e.asked = true;
+            ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+    }
+
+    /// Снимок пришёл: вырезать плитку в большую картинку; последняя — записать файлы.
+    fn export_tile(&mut self, ctx: &egui::Context, shot: &egui::ColorImage) {
+        let ppp = ctx.pixels_per_point();
+        let canvas = self.canvas;
+        let Some(e) = &mut self.export else { return };
+        let [tx, ty] = e.tiles[e.next];
+        let (ox, oy) = ((canvas.min.x * ppp).ceil() as usize, (canvas.min.y * ppp).ceil() as usize);
+        let (x0, y0) = (tx * e.tile[0], ty * e.tile[1]);
+        let w = e.tile[0].min(e.image.width() - x0);
+        let h = e.tile[1].min(e.image.height() - y0);
+        let [sw, sh] = shot.size;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let (sx, sy) = (ox + x, oy + y);
+                if sx < sw && sy < sh {
+                    let c = shot.pixels[sy * sw + sx];
+                    e.image.put_pixel(x0 + x as u32, y0 + y as u32, image::Rgb([c.r(), c.g(), c.b()]));
+                }
+            }
+        }
+        e.next += 1;
+        e.asked = false;
+        e.settle = 0;
+        if e.next < e.tiles.len() {
+            return;
+        }
+        let Some(e) = self.export.take() else { return };
+        self.cam = e.cam;
+        self.sel = e.sel;
+        let result = self.write_export(&e);
+        match &result {
+            Ok(msg) => self.notice = Some(msg.clone()),
+            Err(err) => self.error = Some(format!("Выгрузка не удалась: {err}")),
+        }
+        if e.quit {
+            match result {
+                Ok(msg) => println!("{msg}"),
+                Err(err) => eprintln!("{err}"),
+            }
+            self.recovery.close();
+            std::process::exit(0);
+        }
+    }
+
+    /// Картинка, сцена Foundry и Universal VTT рядом друг с другом.
+    fn write_export(&mut self, e: &Export) -> Result<String, String> {
+        std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
+        let img_path = e.dir.join(format!("{}.jpg", e.name));
+        let mut jpg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&e.image).map_err(|x| x.to_string())?;
+        std::fs::write(&img_path, &jpg).map_err(|x| format!("{}: {x}", img_path.display()))?;
+        let edges = self.room_edges().to_vec();
+        let layout = export::layout(&self.map, &edges);
+        let src = export::foundry_src(&img_path);
+        let scene = export::foundry_scene(&self.map, &e.name, &src, e.px, &layout);
+        let scene_path = e.dir.join(format!("{}.json", e.name));
+        std::fs::write(&scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default()).map_err(|x| x.to_string())?;
+        use base64::Engine;
+        let uv = export::dd2vtt(&self.map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpg), &layout);
+        std::fs::write(e.dir.join(format!("{}.dd2vtt", e.name)), uv.to_string()).map_err(|x| x.to_string())?;
+        let walls: usize = layout.walls.iter().map(|l| l.len().saturating_sub(1)).sum();
+        Ok(format!(
+            "Выгружено в {}: картинка {}×{}, стен {walls}, проёмов {}, огней {}",
+            e.dir.display(),
+            e.image.width(),
+            e.image.height(),
+            layout.portals.len(),
+            layout.lights.len()
+        ))
+    }
+
     /// `--shot файл.png`: снять окно, когда оно устоялось, и выйти.
     fn screenshots(&mut self, ctx: &egui::Context) {
         let images: Vec<_> = ctx.input(|i| {
@@ -2184,6 +2431,13 @@ impl App {
                 })
                 .collect()
         });
+        if self.export.as_ref().is_some_and(|e| e.asked) {
+            if let Some(image) = images.first() {
+                self.export_tile(ctx, image);
+            }
+            ctx.request_repaint();
+            return;
+        }
         if let Some(test) = &mut self.test {
             for image in &images {
                 test.screenshot(image);

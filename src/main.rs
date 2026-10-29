@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod export;
 mod generate;
 mod library;
 mod map;
@@ -16,13 +17,15 @@ use eframe::egui;
 use std::path::PathBuf;
 
 fn parse_args() -> app::Args {
-    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None };
+    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--selftest" => args.selftest = it.next().map(PathBuf::from),
             "--shot" => args.shot = it.next().map(PathBuf::from),
             "--data-dir" => args.data = it.next().map(PathBuf::from),
+            "--export" => args.export = it.next().map(PathBuf::from),
+            "--px" => args.px = it.next().and_then(|s| s.parse().ok()),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             _ => args.file = Some(PathBuf::from(a)),
