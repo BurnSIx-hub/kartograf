@@ -1,0 +1,481 @@
+<title>Живая карта Картографа</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Alegreya+SC:wght@500;700&family=Alegreya+Sans:wght@400;500;700&display=swap">
+<style>
+/* Ночной стол картографа: карта во всю ширину, под ней пульт с ползунками по эффектам. */
+:root {
+  --bg: #15171a;
+  --panel: #1d2024;
+  --line: #31363c;
+  --ink: #e6e1d6;
+  --muted: #9a958b;
+  --ember: #e8894a;
+  --water: #63c3cf;
+  --display: "Alegreya SC", Georgia, serif;
+  --body: "Alegreya Sans", "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+html, body { background: var(--bg); color: var(--ink); }
+body {
+  font: 16px/1.5 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 32px;
+}
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 18px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 20px; }
+h1 { font: 700 clamp(26px, 4vw, 38px)/1.1 var(--display); letter-spacing: 0.02em; margin: 0; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); max-width: 60ch; }
+.stage { position: relative; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #0d0f11; }
+canvas { display: block; width: 100%; height: auto; aspect-ratio: 16 / 10; max-width: 100%; }
+.scale { position: absolute; left: 12px; bottom: 10px; font: 500 13px var(--body); color: #f1ead9; text-shadow: 0 1px 2px #000; display: flex; align-items: center; gap: 8px; }
+.scale i { display: block; height: 6px; border: 2px solid #f1ead9; border-top: 0; box-shadow: 0 1px 2px #000; }
+.fail { padding: 40px 20px; text-align: center; color: var(--muted); }
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 18px 20px; }
+.group { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.group h2 { font: 700 15px/1 var(--display); letter-spacing: 0.08em; margin: 0 0 2px; color: var(--muted); }
+.group h2 b { color: var(--water); font-weight: 700; }
+.group.fire h2 b { color: var(--ember); }
+label { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; font-size: 15px; }
+label output { font-variant-numeric: tabular-nums; color: var(--muted); }
+input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--ember); }
+.group.water input[type=range] { accent-color: var(--water); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; }
+button { font: 500 15px var(--body); color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 6px 14px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 28px; color: var(--muted); font-size: 15px; }
+.notes p { margin: 0; }
+.notes strong { color: var(--ink); font-weight: 500; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Живая карта</h1>
+    <p>Текстуры — те же, что встроены в Картограф. Движение не нарисовано кадрами: его считает видеокарта по формулам, поэтому любой эффект настраивается ползунком.</p>
+  </header>
+
+  <div class="stage">
+    <canvas id="map" width="1600" height="1000" aria-label="Карта: пруд с песчаным берегом, костёр на траве, каменный зал с лавой и жаровней"></canvas>
+    <div class="scale"><i style="width:var(--cell,70px)"></i>5 футов</div>
+  </div>
+
+  <div class="controls">
+    <div class="group water">
+      <h2><b>Вода</b></h2>
+      <label>Скорость течения <output id="o-speed"></output><input id="speed" type="range" min="0" max="2" step="0.05" value="1"></label>
+      <label>Рябь <output id="o-ripple"></output><input id="ripple" type="range" min="0" max="2" step="0.05" value="1"></label>
+      <label>Пена у берега <output id="o-foam"></output><input id="foam" type="range" min="0" max="1.5" step="0.05" value="1"></label>
+      <label>Блики на дне <output id="o-caustic"></output><input id="caustic" type="range" min="0" max="2" step="0.05" value="1"></label>
+      <label>Рыбки <output id="o-fish"></output><input id="fish" type="range" min="0" max="1" step="0.05" value="1"></label>
+    </div>
+    <div class="group fire">
+      <h2><b>Огонь и дым</b></h2>
+      <label>Дым <output id="o-smoke"></output><input id="smoke" type="range" min="0" max="1.5" step="0.05" value="1"></label>
+      <label>Ветер, направление <output id="o-wind"></output><input id="wind" type="range" min="0" max="360" step="5" value="210"></label>
+      <label>Свет от огня <output id="o-light"></output><input id="light" type="range" min="0" max="2" step="0.05" value="1"></label>
+      <label>Свечение лавы <output id="o-lava"></output><input id="lava" type="range" min="0" max="2" step="0.05" value="1"></label>
+    </div>
+    <div class="group">
+      <h2>Сцена</h2>
+      <label>Сумерки <output id="o-dusk"></output><input id="dusk" type="range" min="0" max="1" step="0.05" value="0.35"></label>
+      <label>Туман <output id="o-fog"></output><input id="fog" type="range" min="0" max="1" step="0.05" value="0"></label>
+      <div class="row">
+        <button id="pause" type="button">Пауза</button>
+        <button id="reset" type="button">Как было</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <p><strong>Вода.</strong> Текстура мелководья и глубины сдвигается по плавному шуму, сверху ложатся блики на дне. Пена бежит волнами вдоль берега, мокрый песок темнее сухого. Белые искры — солнце на ряби. Изредка из глубины всплывают рыбки: кои и тёмный карп. Где берег, шейдер знает по маске — в Картографе она уже есть.</p>
+    <p><strong>Лава.</strong> Текстуру лавы медленно мнёт шум, трещины пульсируют, а пол вокруг подсвечен рыжим.</p>
+    <p><strong>Огонь и дым.</strong> Вид сверху: языки пламени расходятся от середины костра, искры и дым уносит ветер. Сумерки затемняют карту, чтобы был виден свет костра.</p>
+  </div>
+</div>
+
+<script>
+const TEX = __TEXTURES__;
+
+const FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D tGrass, tSand, tShallow, tDeep, tLava, tFlag, tWall, tFire, tBrazier;
+uniform float uTime, uSpeed, uRipple, uFoam, uCaustic, uFish, uSmoke, uLight, uLava, uDusk, uFog;
+uniform vec2 uWind;
+const vec2 WORLD = vec2(16.0, 10.0);
+const vec2 CAMP = vec2(7.35, 2.35);
+const vec2 BRAZ = vec2(10.7, 2.0);
+const vec4 ROOM = vec4(9.7, 1.0, 15.3, 9.0);
+
+float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { v += a * noise(p); p = p * 2.03 + vec2(17.1, 9.2); a *= 0.5; }
+  return v;
+}
+float blob(vec2 p, vec2 c, float r, float seed) {
+  vec2 d = p - c;
+  float a = atan(d.y, d.x);
+  return length(d) - r * (1.0 + 0.12 * sin(a * 3.0 + seed) + 0.07 * sin(a * 5.0 + seed * 2.3));
+}
+float box(vec2 p, vec4 b) {
+  vec2 c = (b.xy + b.zw) * 0.5, h = (b.zw - b.xy) * 0.5;
+  vec2 q = abs(p - c) - h;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+}
+// Блики на дне: известная формула преломления ряби, повторённая несколько раз.
+float caustic(vec2 p, float t) {
+  vec2 i = p;
+  float c = 1.0;
+  for (int n = 0; n < 4; n++) {
+    float tt = t * (1.0 - 3.5 / float(n + 1));
+    i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+    c += 1.0 / length(vec2(p.x / (sin(i.x + tt) / 0.005), p.y / (cos(i.y + tt) / 0.005)));
+  }
+  c /= 4.0;
+  c = 1.17 - pow(c, 1.4);
+  return clamp(pow(abs(c), 8.0), 0.0, 1.0);
+}
+// Рыбка сверху: тело-овал, хвост веером, плавники; хвост виляет.
+// Плавает по петле вокруг середины пруда, изредка всплывая из глубины.
+vec4 fish(vec2 p, float t, float i) {
+  float ph = i * 2.39 + 0.7;
+  float dir = mod(i, 2.0) < 1.0 ? 1.0 : -1.0;
+  float a = dir * (t * (0.13 + 0.05 * fract(i * 0.37)) + ph);
+  float R = 1.65 + 0.35 * sin(t * 0.09 + ph * 1.7);
+  vec2 c = vec2(4.3, 5.7) + vec2(0.35 * sin(ph), 0.25 * cos(ph));
+  vec2 pos = c + vec2(cos(a), sin(a) * 0.72) * R;
+  vec2 fw = normalize(dir * vec2(-sin(a), cos(a) * 0.72));
+  vec2 side = vec2(-fw.y, fw.x);
+  float len = 0.75 + 0.15 * fract(i * 0.61);
+  vec2 d = p - pos;
+  float x = dot(d, fw) / len;
+  float y = dot(d, side) / len;
+  float tail = clamp(0.35 - x, 0.0, 1.2);
+  y -= sin(x * 6.0 - t * 8.0 - i) * 0.07 * tail * tail;
+  float taper = mix(0.45, 1.0, smoothstep(-0.45, 0.15, x));
+  float body = 1.0 - smoothstep(0.8, 1.0, length(vec2(x / 0.42, y / (0.115 * taper))));
+  // Хвост — две мягкие лопасти, разведённые назад; плавники — маленькие, тоже назад.
+  vec2 tq = vec2(x + 0.47, abs(y) - 0.035);
+  tq = mat2(0.80, 0.60, -0.60, 0.80) * tq;
+  float fan = 1.0 - smoothstep(0.75, 1.0, length(vec2(tq.x / 0.19, tq.y / 0.06)));
+  vec2 fq = vec2(x - 0.1, abs(y) - 0.1);
+  fq = mat2(0.7, 0.71, -0.71, 0.7) * fq;
+  float fins = 1.0 - smoothstep(0.7, 1.0, length(vec2(fq.x / 0.1, fq.y / 0.035)));
+  float m = max(body, max(fan * 0.85, fins * 0.75));
+  // Окраска: кои — рыжие с белыми пятнами, каждая третья — тёмный карп.
+  vec3 koi = mix(vec3(1.0, 0.42, 0.08), vec3(0.97, 0.94, 0.9), smoothstep(0.45, 0.6, noise(vec2(x, y) * 7.0 + i * 13.0)));
+  vec3 col = mod(i, 3.0) > 1.5 ? vec3(0.22, 0.24, 0.2) : koi;
+  col = mix(col, col * 0.75, (1.0 - body) * 0.6);
+  // Показывается изредка: всплывает, плывёт, уходит в глубину.
+  float s = fract(t / 26.0 + i * 0.29) / 0.5;
+  float vis = s < 1.0 ? smoothstep(0.0, 0.18, s) * smoothstep(1.0, 0.82, s) : 0.0;
+  return vec4(col, m * vis);
+}
+
+vec3 tex(sampler2D s, vec2 uv) { return texture(s, uv).rgb; }
+vec4 sprite(sampler2D s, vec2 p, vec2 c, float size) {
+  vec2 uv = (p - c) / size + 0.5;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec4(0);
+  return texture(s, uv);
+}
+// Пламя сверху: языки расходятся от середины, рваный край бежит наружу.
+vec4 flame(vec2 p, vec2 c, float size, float t) {
+  vec2 d = (p - c) / size;
+  float r = length(d);
+  float a = atan(d.y, d.x);
+  float tongues = fbm(vec2(a * 2.2 + 3.0, r * 5.0 - t * 3.2)) * 0.9 + fbm(vec2(-a * 3.1, r * 9.0 - t * 4.7)) * 0.4;
+  float edge = 0.18 + 0.30 * tongues;
+  float i = smoothstep(edge, edge * 0.25, r);
+  float flick = 0.85 + 0.15 * noise(vec2(t * 9.0, c.x));
+  i *= flick;
+  vec3 col = mix(vec3(0.75, 0.12, 0.02), vec3(1.0, 0.55, 0.12), smoothstep(0.0, 0.5, i));
+  col = mix(col, vec3(1.0, 0.93, 0.7), smoothstep(0.55, 1.0, i));
+  return vec4(col, smoothstep(0.0, 0.25, i));
+}
+// Дым по ветру: шлейф ширится и тает, клочья бегут вдоль него.
+float smoke(vec2 p, vec2 src, float t, float spread) {
+  vec2 w = uWind;
+  vec2 q = p - src;
+  float along = dot(q, w);
+  float across = dot(q, vec2(-w.y, w.x));
+  if (along < -0.4) return 0.0;
+  float width = 0.3 + along * spread;
+  float body = exp(-across * across / (width * width)) * smoothstep(-0.3, 0.35, along) * exp(-along * 0.22);
+  float puffs = fbm(vec2(along * 1.4 - t * 1.1, across * 1.8 / (0.6 + along * 0.4)) + src * 3.1);
+  return body * smoothstep(0.22, 0.62, puffs);
+}
+float sparks(vec2 p, vec2 src, float t) {
+  float s = 0.0;
+  vec2 w = uWind, n = vec2(-w.y, w.x);
+  for (int i = 0; i < 12; i++) {
+    float h = hash(vec2(float(i), 3.7));
+    float ph = fract(t * (0.35 + 0.25 * h) + h * 7.0);
+    vec2 pos = src + w * ph * (1.8 + 1.4 * h) + n * ((hash(vec2(h, 1.3)) - 0.5) * 0.9 * ph + 0.12 * sin(t * 3.0 + h * 20.0) * ph);
+    float d = length(p - pos);
+    s += smoothstep(0.05, 0.0, d) * (1.0 - ph) * step(0.3, hash(vec2(floor(t * (0.35 + 0.25 * h) + h * 7.0), h)));
+  }
+  return s;
+}
+
+void main() {
+  vec2 p = vec2(vUv.x, 1.0 - vUv.y) * WORLD;
+  float t = uTime;
+  float tw = t * uSpeed;
+
+  // Земля: трава, песок вокруг пруда.
+  vec3 col = tex(tGrass, p / 3.0);
+  float pond = blob(p, vec2(4.4, 5.6), 3.0, 1.0) + (fbm(p * 1.3) - 0.5) * 0.35;
+  float sandAmt = 1.0 - smoothstep(0.15, 1.0, pond + (fbm(p * 2.1 + 4.0) - 0.5) * 0.6);
+  col = mix(col, tex(tSand, p / 2.5), sandAmt);
+  col *= mix(0.7, 1.0, smoothstep(0.0, 0.32, pond));
+
+  // Вода.
+  if (pond < 0.06) {
+    float depth = smoothstep(0.1, 1.9, -pond);
+    vec2 warp = vec2(fbm(p * 0.7 + vec2(tw * 0.35, tw * 0.22)), fbm(p * 0.7 + vec2(-tw * 0.27, tw * 0.33) + 5.2)) - 0.5;
+    vec2 uv = p / 3.0 + warp * 0.07 * uRipple + vec2(tw * 0.012, tw * 0.007);
+    vec3 shallow = tex(tShallow, uv);
+    vec3 deep = tex(tDeep, uv * 1.15 - warp * 0.03 * uRipple);
+    vec3 water = mix(shallow, deep, depth);
+    water += vec3(0.85, 1.0, 1.0) * caustic(p * 1.25 + warp * 0.6, tw * 0.6 + 23.0) * 0.32 * uCaustic * (1.0 - depth * 0.85);
+    // Рыбки — под водой: их размывает рябь, глубже — бледнее и синее, на дне тень.
+    if (uFish > 0.0) {
+      vec2 fp = p + warp * 0.12 * uRipple;
+      for (int k = 0; k < 4; k++) {
+        float i = float(k);
+        vec4 sh = fish(fp - vec2(0.09, 0.12), t, i);
+        water *= 1.0 - sh.a * 0.4 * uFish * (1.0 - depth * 0.4);
+        vec4 f = fish(fp, t, i);
+        vec3 fc = mix(f.rgb, deep * 1.3, 0.12 + depth * 0.25);
+        water = mix(water, fc, f.a * uFish * (0.95 - depth * 0.25));
+      }
+    }
+    float glint = pow(noise(p * 9.0 + vec2(tw * 1.5, -tw)) * noise(p * 14.0 - vec2(tw, tw * 1.3)), 5.0);
+    water += vec3(1.0) * smoothstep(0.25, 0.5, glint) * 0.3 * uRipple;
+    // У самого берега вода прозрачнее: сквозь неё виден песок.
+    water = mix(water, col * 1.05 + vec3(0.0, 0.05, 0.06), smoothstep(-0.35, 0.02, pond) * 0.55);
+    float waves = sin(pond * 26.0 + tw * 2.6 + fbm(p * 1.6) * 7.0) * 0.5 + 0.5;
+    float band = smoothstep(-0.32, -0.03, pond) * (1.0 - smoothstep(-0.02, 0.05, pond));
+    float foam = band * smoothstep(0.5, 0.95, waves * 0.65 + fbm(p * 5.0 + vec2(tw * 0.6, 0.0)) * 0.55);
+    foam += smoothstep(-0.06, 0.0, pond) * (1.0 - smoothstep(0.0, 0.05, pond)) * 0.7;
+    water = mix(water, vec3(0.93, 0.97, 1.0), clamp(foam * uFoam, 0.0, 1.0));
+    col = mix(col, water, 1.0 - smoothstep(-0.02, 0.05, pond));
+  }
+
+  // Каменный зал с лавой.
+  float room = box(p, ROOM);
+  float lava = blob(p, vec2(12.7, 6.5), 1.45, 4.0) + (fbm(p * 1.7 + 2.0) - 0.5) * 0.3;
+  float pulse = 0.72 + 0.28 * sin(t * 1.4 + fbm(p * 1.3) * 6.0);
+  if (room < 0.0) {
+    vec3 floorCol = tex(tFlag, p / 2.0);
+    floorCol += vec3(1.0, 0.36, 0.06) * 0.42 * uLava * pulse * exp(-max(lava, 0.0) * 2.4) * step(0.0, lava);
+    if (lava < 0.12) {
+      vec2 lwarp = vec2(fbm(p * 0.6 + t * 0.05), fbm(p * 0.6 - t * 0.04 + 3.0)) - 0.5;
+      vec3 lv = tex(tLava, p / 2.4 + lwarp * 0.14);
+      float crack = clamp(lv.r - lv.b * 1.6, 0.0, 1.0);
+      lv += vec3(1.0, 0.5, 0.12) * crack * pulse * 0.9 * uLava;
+      lv = mix(lv, lv * 0.35, smoothstep(-0.25, 0.08, lava));
+      floorCol = mix(floorCol, lv, 1.0 - smoothstep(0.0, 0.12, lava));
+    }
+    col = floorCol;
+  }
+  // Стена зала — та же полоса «Каменные блоки», что во встроенных стенах.
+  float hw = 0.24;
+  if (abs(room) < hw) {
+    vec2 c = (ROOM.xy + ROOM.zw) * 0.5, h = (ROOM.zw - ROOM.xy) * 0.5;
+    vec2 q = abs(p - c) - h;
+    bool vert = q.x > q.y;
+    float along = vert ? p.y : p.x;
+    float across = (vert ? q.x : q.y) + hw;
+    vec4 w = texture(tWall, vec2(along / (2.0 * hw * 8.9), across / (2.0 * hw)));
+    col = mix(col, w.rgb, w.a);
+  }
+  // Тень стены на полу зала.
+  if (room < 0.0) col *= mix(0.7, 1.0, smoothstep(0.0, 0.3, -room - hw));
+
+  // Предметы: костёр и жаровня.
+  vec4 camp = sprite(tFire, p, CAMP, 1.7);
+  col = mix(col, camp.rgb, camp.a);
+  vec4 braz = sprite(tBrazier, p, BRAZ, 1.25);
+  col = mix(col, braz.rgb, braz.a);
+
+  // Сумерки и свет огня.
+  float flickA = 0.82 + 0.18 * noise(vec2(t * 7.0, 1.0));
+  float flickB = 0.85 + 0.15 * noise(vec2(t * 8.0, 5.0));
+  float lit = uLight * (flickA * exp(-dot(p - CAMP, p - CAMP) / 9.0) + 0.7 * flickB * exp(-dot(p - BRAZ, p - BRAZ) / 3.0) * step(room, 0.3));
+  lit += uLava * 0.6 * pulse * exp(-max(lava, 0.0) * 1.1) * step(room, 0.3);
+  vec3 ambient = mix(vec3(1.0), vec3(0.32, 0.36, 0.48), uDusk);
+  col = col * ambient + col * vec3(1.0, 0.62, 0.32) * lit * (0.25 + uDusk);
+
+  // Огонь — поверх, светится сам.
+  vec4 f1 = flame(p, CAMP + vec2(0.0, 0.03), 1.0, t);
+  col = mix(col, f1.rgb, f1.a);
+  vec4 f2 = flame(p, BRAZ, 0.55, t * 1.1 + 4.0);
+  col = mix(col, f2.rgb, f2.a);
+  col += vec3(1.0, 0.7, 0.3) * sparks(p, CAMP, t) * 1.4;
+
+  // Дым над огнём.
+  float sm = (smoke(p, CAMP, t, 0.42) + 0.7 * smoke(p, BRAZ, t * 1.1, 0.34)) * uSmoke;
+  col = mix(col, mix(vec3(0.42, 0.42, 0.45), vec3(0.6, 0.6, 0.63), 1.0 - uDusk) * (ambient * 0.6 + 0.4), clamp(sm * 0.95, 0.0, 0.88));
+
+  // Туман.
+  float fog = smoothstep(0.38, 0.85, fbm(p * 0.32 + vec2(t * 0.05, t * 0.022)) + fbm(p * 0.9 - vec2(t * 0.03, 0.0)) * 0.25) * uFog;
+  col = mix(col, mix(vec3(0.82, 0.85, 0.88), vec3(0.42, 0.46, 0.55), uDusk), fog * 0.75);
+
+  outColor = vec4(col, 1.0);
+}`;
+
+const VERT = `#version 300 es
+in vec2 a; out vec2 vUv;
+void main() { vUv = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }`;
+
+const canvas = document.getElementById("map");
+const gl = canvas.getContext("webgl2", { antialias: false, preserveDrawingBuffer: true });
+const stage = document.querySelector(".stage");
+
+function fail(msg) {
+  stage.innerHTML = `<p class="fail">${msg}</p>`;
+}
+
+if (!gl) {
+  fail("Браузер не дал WebGL 2 — без него живую карту не нарисовать.");
+} else {
+  start();
+}
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function loadTexture(unit, src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const t = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      const wrap = src.clamp ? gl.CLAMP_TO_EDGE : gl.REPEAT;
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, src.clampS ? gl.CLAMP_TO_EDGE : gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+      resolve();
+    };
+    img.onerror = reject;
+    img.src = src.data;
+  });
+}
+
+async function start() {
+  let prog;
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  } catch (e) {
+    console.error(e);
+    fail("Видеокарта не приняла шейдер. Подробности — в консоли браузера.");
+    return;
+  }
+  gl.useProgram(prog);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "a");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const names = ["tGrass", "tSand", "tShallow", "tDeep", "tLava", "tFlag", "tWall", "tFire", "tBrazier"];
+  await Promise.all(names.map((n, i) => {
+    gl.uniform1i(gl.getUniformLocation(prog, n), i);
+    return loadTexture(i, TEX[n]);
+  }));
+
+  const u = {};
+  for (const n of ["uTime", "uSpeed", "uRipple", "uFoam", "uCaustic", "uFish", "uSmoke", "uLight", "uLava", "uDusk", "uFog", "uWind"]) {
+    u[n] = gl.getUniformLocation(prog, n);
+  }
+
+  const ids = ["speed", "ripple", "foam", "caustic", "fish", "smoke", "wind", "light", "lava", "dusk", "fog"];
+  const defaults = Object.fromEntries(ids.map((id) => [id, document.getElementById(id).value]));
+  const fmt = (id, v) => id === "wind" ? `${Math.round(v)}°` : id === "dusk" || id === "fog" || id === "fish" ? `${Math.round(v * 100)}%` : `×${(+v).toFixed(2)}`;
+  const val = {};
+  function read() {
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      val[id] = parseFloat(el.value);
+      document.getElementById("o-" + id).textContent = fmt(id, val[id]);
+    }
+  }
+  for (const id of ids) document.getElementById(id).addEventListener("input", read);
+  read();
+
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let running = !reduce;
+  const pauseBtn = document.getElementById("pause");
+  pauseBtn.textContent = running ? "Пауза" : "Пустить";
+  pauseBtn.addEventListener("click", () => {
+    running = !running;
+    pauseBtn.textContent = running ? "Пауза" : "Пустить";
+    last = performance.now();
+  });
+  document.getElementById("reset").addEventListener("click", () => {
+    for (const id of ids) document.getElementById(id).value = defaults[id];
+    read();
+  });
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const w = Math.round(canvas.clientWidth * dpr);
+    const h = Math.round(w * 10 / 16);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    stage.style.setProperty("--cell", `${canvas.clientWidth / 16}px`);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  let time = 12.0;
+  let last = performance.now();
+  function frame(now) {
+    if (running) time += Math.min((now - last) / 1000, 0.1);
+    last = now;
+    resize();
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    const a = val.wind * Math.PI / 180;
+    gl.uniform1f(u.uTime, time);
+    gl.uniform1f(u.uSpeed, val.speed);
+    gl.uniform1f(u.uRipple, val.ripple);
+    gl.uniform1f(u.uFoam, val.foam);
+    gl.uniform1f(u.uCaustic, val.caustic);
+    gl.uniform1f(u.uFish, val.fish);
+    gl.uniform1f(u.uSmoke, val.smoke);
+    gl.uniform1f(u.uLight, val.light);
+    gl.uniform1f(u.uLava, val.lava);
+    gl.uniform1f(u.uDusk, val.dusk);
+    gl.uniform1f(u.uFog, val.fog);
+    gl.uniform2f(u.uWind, Math.cos(a), Math.sin(a));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+</script>

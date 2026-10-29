@@ -1,0 +1,720 @@
+//! Карта как данные. Всё в единицах клетки, без пикселей: масштаб — забота холста,
+//! а файл не меняется от того, как близко его рассматривали.
+//!
+//! Пол лежит масками (см. `mask.rs`), а не целыми клетками, — так работают круглые
+//! и мягкие кисти:
+//! - `terrain` — местность: слои материалов без стен (трава, камень двора);
+//! - `rooms` — где подземелье: по краю этой маски стены встают сами, как у кисти
+//!   подземелья в Dungeondraft; `room_floor` — чем выложен пол комнат. Стены комнат
+//!   не хранятся, а выводятся из маски, поэтому стереть кусок комнаты — значит
+//!   и стену подвинуть.
+//!
+//! Первый формат файла хранил материал целыми клетками; такие карты открываются
+//! и переводятся в маски.
+
+use crate::mask::{self, Mask};
+use serde::{Deserialize, Serialize};
+
+pub const EXT: &str = "karta";
+pub const FORMAT: u32 = 2;
+
+/// Чем закрашено: цветом или картинкой с диска.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Paint {
+    Color([u8; 3]),
+    /// Путь к картинке. Картинка повторяется плиткой.
+    Texture(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Material {
+    pub name: String,
+    pub paint: Paint,
+    /// Плитка перемешивается против заметного повтора (`library::vary`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vary: bool,
+}
+
+/// Вид стен: и нарисованных вручную, и тех, что встают вокруг комнат.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WallStyle {
+    pub paint: Paint,
+    /// Толщина в клетках.
+    pub width: f32,
+}
+
+impl Default for WallStyle {
+    fn default() -> Self {
+        Self { paint: Paint::Color([74, 64, 56]), width: 0.25 }
+    }
+}
+
+/// Палитра новой карты — встроенные текстуры. Первые четыре стоят на местах
+/// прежних цветов (камень, дерево, земля, трава): карты формата 1 без своей
+/// палитры открываются с ними.
+pub fn builtin_materials() -> Vec<Material> {
+    crate::library::BUILTIN_TEXTURES
+        .iter()
+        .map(|t| Material { name: t.1.into(), paint: Paint::Texture(format!("{}{}", crate::library::BUILTIN, t.0)), vary: t.2 })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layer {
+    Floor,
+    Rooms,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Wall {
+    /// Вершины на узлах сетки.
+    pub points: Vec<[f32; 2]>,
+    /// Замкнутая стена соединяет последнюю вершину с первой.
+    pub closed: bool,
+    /// Прогиб каждого отрезка в клетках: насколько середина дуги отошла от прямой,
+    /// плюс — влево по ходу стены. Пусто или 0 — прямой отрезок.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bends: Vec<f32>,
+}
+
+pub type Segment = ([f32; 2], [f32; 2]);
+
+impl Wall {
+    /// Отрезки между вершинами, без изгиба.
+    pub fn chords(&self) -> impl Iterator<Item = Segment> + '_ {
+        let n = self.points.len();
+        let count = if self.closed && n > 2 { n } else { n.saturating_sub(1) };
+        (0..count).map(move |i| (self.points[i], self.points[(i + 1) % n]))
+    }
+
+    pub fn bend(&self, i: usize) -> f32 {
+        self.bends.get(i).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_bend(&mut self, i: usize, h: f32) {
+        if self.bends.len() <= i {
+            self.bends.resize(i + 1, 0.0);
+        }
+        self.bends[i] = h;
+        while self.bends.last() == Some(&0.0) {
+            self.bends.pop();
+        }
+    }
+
+    /// Отрезки стены; изогнутые — мелкими кусками дуги.
+    pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
+        self.chords().enumerate().flat_map(move |(i, (a, b))| {
+            let pts = arc_points(a, b, self.bend(i));
+            (0..pts.len() - 1).map(move |k| (pts[k], pts[k + 1])).collect::<Vec<_>>()
+        })
+    }
+
+    /// Расстояние от точки до ближайшего отрезка стены.
+    pub fn distance(&self, p: [f32; 2]) -> f32 {
+        self.segments().map(|(a, b)| segment_distance(p, a, b)).fold(f32::INFINITY, f32::min)
+    }
+}
+
+/// Окружность дуги через `a` и `b` с прогибом `h` (плюс — влево от `a`→`b`):
+/// центр, радиус и левая нормаль хорды. `None` — дуги нет, отрезок прямой.
+fn arc_circle(a: [f32; 2], b: [f32; 2], h: f32) -> Option<([f32; 2], f32, [f32; 2])> {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-6 || h.abs() < 1e-4 {
+        return None;
+    }
+    let n = [dy / len, -dx / len];
+    let c = len / 2.0;
+    let r = (c * c + h * h) / (2.0 * h.abs());
+    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let k = -h.signum() * (r - h.abs());
+    Some(([mid[0] + n[0] * k, mid[1] + n[1] * k], r, n))
+}
+
+/// Наибольший прогиб — полукруг: дальше дуга загибается назад за концы.
+pub fn max_bend(a: [f32; 2], b: [f32; 2]) -> f32 {
+    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() / 2.0
+}
+
+/// Точки дуги от `a` до `b`; прямой отрезок — две точки.
+pub fn arc_points(a: [f32; 2], b: [f32; 2], h: f32) -> Vec<[f32; 2]> {
+    let Some((c, r, _)) = arc_circle(a, b, h) else { return vec![a, b] };
+    let a0 = (a[1] - c[1]).atan2(a[0] - c[0]);
+    let a1 = (b[1] - c[1]).atan2(b[0] - c[0]);
+    // Идём через вершину дуги: она слева от хорды при h > 0.
+    let mut sweep = a1 - a0;
+    let apex_side = h.signum();
+    let tau = std::f32::consts::TAU;
+    sweep = sweep.rem_euclid(tau);
+    // Проверим середину: не та сторона — берём дугу в другую сторону.
+    let mid_ang = a0 + sweep / 2.0;
+    let m = [c[0] + r * mid_ang.cos(), c[1] + r * mid_ang.sin()];
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let side = (m[0] - a[0]) * dy - (m[1] - a[1]) * dx;
+    if side.signum() != apex_side {
+        sweep -= tau;
+    }
+    let n = ((sweep.abs() * r / 0.12).ceil() as usize).clamp(4, 96);
+    (0..=n)
+        .map(|k| {
+            if k == 0 {
+                return a;
+            }
+            if k == n {
+                return b;
+            }
+            let t = a0 + sweep * k as f32 / n as f32;
+            [c[0] + r * t.cos(), c[1] + r * t.sin()]
+        })
+        .collect()
+}
+
+pub fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    let (cx, cy) = (a[0] + t * dx, a[1] + t * dy);
+    ((p[0] - cx).powi(2) + (p[1] - cy).powi(2)).sqrt()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PortalKind {
+    Door,
+    Window,
+}
+
+/// Дверь или окно: кусок стены от `a` до `b`, где стена прервана.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Portal {
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub kind: PortalKind,
+    /// Картинка двери; без неё дверь рисуется простой плашкой.
+    #[serde(default)]
+    pub asset: Option<String>,
+}
+
+impl Portal {
+    pub fn center(&self) -> [f32; 2] {
+        [(self.a[0] + self.b[0]) / 2.0, (self.a[1] + self.b[1]) / 2.0]
+    }
+}
+
+/// Объект на карте: картинка с центром, размером в клетках и поворотом.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Prop {
+    pub asset: String,
+    pub pos: [f32; 2],
+    /// Размер в клетках без учёта `scale`.
+    pub size: [f32; 2],
+    /// Поворот в градусах по часовой стрелке.
+    pub rot: f32,
+    pub scale: f32,
+}
+
+impl Prop {
+    /// Углы на карте: левый верхний, правый верхний, правый нижний, левый нижний.
+    pub fn corners(&self) -> [[f32; 2]; 4] {
+        let (hw, hh) = (self.size[0] * self.scale / 2.0, self.size[1] * self.scale / 2.0);
+        let (s, c) = self.rot.to_radians().sin_cos();
+        [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [self.pos[0] + x * c - y * s, self.pos[1] + x * s + y * c])
+    }
+
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        let (s, c) = (-self.rot).to_radians().sin_cos();
+        let (dx, dy) = (p[0] - self.pos[0], p[1] - self.pos[1]);
+        let (x, y) = (dx * c - dy * s, dx * s + dy * c);
+        x.abs() <= self.size[0] * self.scale / 2.0 && y.abs() <= self.size[1] * self.scale / 2.0
+    }
+}
+
+/// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них.
+pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    for &(a, b) in segs {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len == 0.0 {
+            continue;
+        }
+        let t = |p: [f32; 2]| ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len;
+        let mut holes: Vec<(f32, f32)> = portals
+            .iter()
+            .filter(|p| segment_line_distance(p.a, a, b) < 0.02 && segment_line_distance(p.b, a, b) < 0.02)
+            .map(|p| {
+                let (t0, t1) = (t(p.a), t(p.b));
+                (t0.min(t1).max(0.0), t0.max(t1).min(len))
+            })
+            .filter(|(s, e)| e > s)
+            .collect();
+        holes.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let at = |t: f32| [a[0] + dx * t / len, a[1] + dy * t / len];
+        let mut from = 0.0;
+        for (s, e) in holes {
+            if s > from {
+                out.push((at(from), at(s)));
+            }
+            from = from.max(e);
+        }
+        if from < len {
+            out.push((at(from), b));
+        }
+    }
+    out
+}
+
+/// Расстояние от точки до прямой через отрезок (не до самого отрезка).
+fn segment_line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len == 0.0 {
+        return f32::INFINITY;
+    }
+    ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / len
+}
+
+
+fn default_materials() -> Vec<Material> {
+    builtin_materials()
+}
+
+/// Слой материала: где и с какой силой он лежит.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Coat {
+    /// Номер в `Map::materials`.
+    pub material: u8,
+    pub mask: Mask,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Map {
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub materials: Vec<Material>,
+    /// Местность: слои снизу вверх.
+    pub terrain: Vec<Coat>,
+    /// Где комнаты: по краю этой маски встают стены.
+    pub rooms: Mask,
+    /// Пол комнат: слои снизу вверх, видны только внутри `rooms`.
+    pub room_floor: Vec<Coat>,
+    pub walls: Vec<Wall>,
+    #[serde(default)]
+    pub wall_style: WallStyle,
+    #[serde(default)]
+    pub portals: Vec<Portal>,
+    #[serde(default)]
+    pub props: Vec<Prop>,
+}
+
+/// Первый формат: материал целыми клетками.
+#[derive(Deserialize)]
+struct MapV1 {
+    width: u32,
+    height: u32,
+    #[serde(default = "default_materials")]
+    materials: Vec<Material>,
+    floor: Vec<u8>,
+    #[serde(default)]
+    rooms: Vec<u8>,
+    walls: Vec<Wall>,
+    #[serde(default)]
+    wall_style: WallStyle,
+    #[serde(default)]
+    portals: Vec<Portal>,
+    #[serde(default)]
+    props: Vec<Prop>,
+}
+
+/// Наложить силу `v` (0..1) на точку: материал растёт, остальные слои уступают.
+fn lay(coats: &mut Vec<Coat>, material: u8, template: &Mask, weights: &[(usize, f32)]) {
+    let k = match coats.iter().position(|c| c.material == material) {
+        Some(k) => k,
+        None => {
+            coats.push(Coat { material, mask: Mask { data: vec![0; template.data.len()], ..template.clone() } });
+            coats.len() - 1
+        }
+    };
+    for &(i, v) in weights {
+        for (n, c) in coats.iter_mut().enumerate() {
+            let x = c.mask.data[i] as f32;
+            c.mask.data[i] = if n == k { (x + v * (255.0 - x)).round() as u8 } else { (x * (1.0 - v)).round() as u8 };
+        }
+    }
+}
+
+fn fade(mask: &mut Mask, weights: &[(usize, f32)]) {
+    for &(i, v) in weights {
+        mask.data[i] = (mask.data[i] as f32 * (1.0 - v)).round() as u8;
+    }
+}
+
+/// Прозрачность слоя при рисовании. В маске — доля слоя в точке: кисть, прибавляя
+/// одному, убавляет остальным, и вместе их не больше 255. Рисуются же слои поверх
+/// друг друга, и с долей вместо прозрачности на мягком крае просвечивал фон (тень
+/// между двумя слоями по 50% — четверть фона). Слою достаётся доля от того, что
+/// оставят верхние: `share / (255 − above)`, где `above` — сумма долей выше.
+pub fn coat_alpha(share: u8, above: u32) -> u8 {
+    let rest = 255u32.saturating_sub(above);
+    if share as u32 >= rest {
+        return 255;
+    }
+    ((share as u32 * 255 + rest / 2) / rest) as u8
+}
+
+fn dominant(coats: &[Coat], i: isize, j: isize) -> u8 {
+    coats.iter().rev().map(|c| (c.material, c.mask.get(i, j))).filter(|(_, v)| *v >= 128).map(|(m, _)| m + 1).next().unwrap_or(0)
+}
+
+impl Map {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            format: FORMAT,
+            width,
+            height,
+            materials: builtin_materials(),
+            terrain: Vec::new(),
+            rooms: Mask::for_cells(width, height),
+            room_floor: Vec::new(),
+            walls: Vec::new(),
+            wall_style: WallStyle::default(),
+            portals: Vec::new(),
+            props: Vec::new(),
+        }
+    }
+
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height
+    }
+
+    /// Мазок: материал `material` кладётся по весам; для комнат растёт и сама комната.
+    pub fn paint(&mut self, layer: Layer, material: usize, weights: &[(usize, f32)]) {
+        let m = material as u8;
+        let template = self.rooms.clone();
+        match layer {
+            Layer::Floor => lay(&mut self.terrain, m, &template, weights),
+            Layer::Rooms => {
+                lay(&mut self.room_floor, m, &template, weights);
+                for &(i, v) in weights {
+                    let x = self.rooms.data[i] as f32;
+                    self.rooms.data[i] = (x + v * (255.0 - x)).round() as u8;
+                }
+            }
+        }
+    }
+
+    /// Стирание: слабеет всё — и местность, и комнаты.
+    pub fn erase(&mut self, weights: &[(usize, f32)]) {
+        for c in self.terrain.iter_mut().chain(self.room_floor.iter_mut()) {
+            fade(&mut c.mask, weights);
+        }
+        fade(&mut self.rooms, weights);
+    }
+
+    /// Выбросить опустевшие слои — после мазка.
+    pub fn prune(&mut self) {
+        self.terrain.retain(|c| !c.mask.is_empty());
+        self.room_floor.retain(|c| !c.mask.is_empty());
+    }
+
+    /// Целые клетки прямоугольника. `true` — что-то поменялось.
+    pub fn paint_rect(&mut self, layer: Layer, a: (i32, i32), b: (i32, i32), material: Option<usize>) -> bool {
+        let weights = mask::cells(self.rooms.w, self.rooms.h, a, b);
+        let before = self.clone();
+        match material {
+            Some(m) => self.paint(layer, m, &weights),
+            None => self.erase(&weights),
+        }
+        self.prune();
+        *self != before
+    }
+
+    /// Материал (номер + 1) в середине клетки; 0 — пусто.
+    pub fn at(&self, layer: Layer, x: i32, y: i32) -> u8 {
+        if !self.contains(x, y) {
+            return 0;
+        }
+        let c = (mask::RES / 2) as isize;
+        let (i, j) = (x as isize * mask::RES as isize + c, y as isize * mask::RES as isize + c);
+        match layer {
+            Layer::Floor => dominant(&self.terrain, i, j),
+            Layer::Rooms if self.rooms.get(i, j) >= 128 => dominant(&self.room_floor, i, j),
+            Layer::Rooms => 0,
+        }
+    }
+
+    pub fn floor_at(&self, x: i32, y: i32) -> u8 {
+        self.at(Layer::Floor, x, y)
+    }
+
+    pub fn room_at(&self, x: i32, y: i32) -> u8 {
+        self.at(Layer::Rooms, x, y)
+    }
+
+    /// Сколько клеток закрашено (по середине клетки).
+    pub fn count(&self, layer: Layer) -> usize {
+        (0..self.height as i32).flat_map(|y| (0..self.width as i32).map(move |x| (x, y))).filter(|&(x, y)| self.at(layer, x, y) != 0).count()
+    }
+
+    pub fn floor_count(&self) -> usize {
+        self.count(Layer::Floor)
+    }
+
+    /// Номер материала в палитре карты; новый дописывается в конец.
+    pub fn material_index(&mut self, m: Material) -> Option<usize> {
+        if let Some(i) = self.materials.iter().position(|x| x.paint == m.paint) {
+            return Some(i);
+        }
+        if self.materials.len() >= 255 {
+            return None;
+        }
+        self.materials.push(m);
+        Some(self.materials.len() - 1)
+    }
+
+    /// Выгнуть стену комнаты: край `a`–`b` становится дугой с прогибом `h`
+    /// (плюс — влево от `a`→`b`). Наружу комната прирастает полом `material`,
+    /// внутрь — теряет кусок; местность за стеной не трогается.
+    pub fn bend_room(&mut self, a: [f32; 2], b: [f32; 2], h: f32, material: usize) {
+        let Some((c, r, n)) = arc_circle(a, b, h) else { return };
+        let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let s = h.signum();
+        let res = mask::RES as f32;
+        let half = max_bend(a, b);
+        let probe = [mid[0] + n[0] * s * 0.6 / res, mid[1] + n[1] * s * 0.6 / res];
+        let (pi, pj) = ((probe[0] * res).floor() as isize, (probe[1] * res).floor() as isize);
+        let grow = self.rooms.get(pi, pj) < 128;
+        let pts = arc_points(a, b, h);
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in &pts {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        let (w, hgt) = (self.rooms.w as isize, self.rooms.h as isize);
+        let cl = |v: f32, m: isize| (v.floor() as isize).clamp(0, m);
+        let mut weights = Vec::new();
+        for j in cl((lo[1] - 0.5) * res, hgt)..cl((hi[1] + 0.5) * res + 1.0, hgt) {
+            for i in cl((lo[0] - 0.5) * res, w)..cl((hi[0] + 0.5) * res + 1.0, w) {
+                let p = mask::sample_pos(i, j);
+                // Внутри круга и по ту сторону хорды, куда выгнули; у хорды — с запасом,
+                // чтобы шов с прежней комнатой не остался полупрозрачным.
+                let side = ((p[0] - mid[0]) * n[0] + (p[1] - mid[1]) * n[1]) * s;
+                let round = r - ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
+                // Запас за хордой — только между её концами, иначе у концов по
+                // соседним стенам расплываются пятна.
+                let along = (p[0] - mid[0]) * -n[1] + (p[1] - mid[1]) * n[0];
+                let ends = if side < 0.0 { half - along.abs() } else { f32::MAX };
+                let v = (0.5 + round.min(side + 0.3).min(ends) * res).clamp(0.0, 1.0);
+                if v > 0.0 {
+                    weights.push(((j * w + i) as usize, v));
+                }
+            }
+        }
+        if grow {
+            self.paint(Layer::Rooms, material, &weights);
+        } else {
+            for c in self.room_floor.iter_mut() {
+                fade(&mut c.mask, &weights);
+            }
+            fade(&mut self.rooms, &weights);
+        }
+        self.prune();
+    }
+
+    /// Стены вокруг комнат: контур маски комнат.
+    pub fn room_edges(&self) -> Vec<Segment> {
+        mask::contour(&self.rooms)
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        // Блокнот и PowerShell пишут UTF-8 с меткой в начале.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("файл не читается как карта: {e}"))?;
+        let format = value.get("format").and_then(|f| f.as_u64()).unwrap_or(1) as u32;
+        if format > FORMAT {
+            return Err(format!("карта записана более новой версией (формат {format})"));
+        }
+        let map = if format == 1 { Self::from_v1(serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))?)? } else { serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))? };
+        let (w, h) = (map.width as usize * mask::RES, map.height as usize * mask::RES);
+        let fits = |m: &Mask| m.w == w && m.h == h;
+        if map.width == 0 || map.height == 0 || !fits(&map.rooms) || !map.terrain.iter().chain(&map.room_floor).all(|c| fits(&c.mask)) {
+            return Err("размер карты не сходится с размером слоёв".into());
+        }
+        if map.terrain.iter().chain(&map.room_floor).any(|c| c.material as usize >= map.materials.len()) {
+            return Err("в карте неизвестный материал пола".into());
+        }
+        Ok(map)
+    }
+
+    /// Карта первого формата: каждая закрашенная клетка становится квадратом маски.
+    fn from_v1(old: MapV1) -> Result<Self, String> {
+        let n = (old.width * old.height) as usize;
+        let rooms = if old.rooms.is_empty() { vec![0; n] } else { old.rooms };
+        if old.width == 0 || old.height == 0 || old.floor.len() != n || rooms.len() != n {
+            return Err("размер карты не сходится с числом клеток".into());
+        }
+        if old.floor.iter().chain(&rooms).any(|&c| c as usize > old.materials.len()) {
+            return Err("в карте неизвестный материал пола".into());
+        }
+        let mut map = Map::new(old.width, old.height);
+        map.materials = old.materials;
+        for (layer, cells) in [(Layer::Floor, &old.floor), (Layer::Rooms, &rooms)] {
+            for (k, &v) in cells.iter().enumerate() {
+                if v != 0 {
+                    let (x, y) = ((k as u32 % old.width) as i32, (k as u32 / old.width) as i32);
+                    let weights = mask::cells(map.rooms.w, map.rooms.h, (x, y), (x, y));
+                    map.paint(layer, v as usize - 1, &weights);
+                }
+            }
+        }
+        map.walls = old.walls;
+        map.wall_style = old.wall_style;
+        map.portals = old.portals;
+        map.props = old.props;
+        Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paint_is_clipped_to_the_map() {
+        let mut m = Map::new(10, 5);
+        assert!(m.paint_rect(Layer::Floor, (8, 3), (14, -2), Some(0)));
+        assert_eq!(m.floor_count(), 2 * 4, "столбцы 8–9, строки 0–3");
+        assert!(!m.paint_rect(Layer::Floor, (8, 0), (9, 3), Some(0)), "повторная заливка тем же ничего не меняет");
+        assert_eq!(m.floor_at(-1, 0), 0);
+        assert_eq!(m.count(Layer::Rooms), 0, "слои не мешаются");
+    }
+
+    #[test]
+    fn new_material_covers_the_old_one() {
+        let mut m = Map::new(6, 4);
+        m.paint_rect(Layer::Floor, (0, 0), (5, 3), Some(0));
+        m.paint_rect(Layer::Floor, (1, 1), (2, 2), Some(2));
+        assert_eq!((m.floor_at(1, 1), m.floor_at(4, 1)), (3, 1));
+        // Стирание и вычистка пустых слоёв.
+        m.paint_rect(Layer::Floor, (0, 0), (5, 3), None);
+        assert!(m.terrain.is_empty());
+    }
+
+    #[test]
+    fn soft_edge_between_coats_shows_no_background() {
+        // Мягкий мазок вторым материалом поверх залитого первым.
+        let mut m = Map::new(4, 1);
+        m.paint_rect(Layer::Floor, (0, 0), (3, 0), Some(0));
+        let w = mask::RES as usize * 4;
+        let weights: Vec<(usize, f32)> = (0..w).map(|i| (i, i as f32 / (w - 1) as f32)).collect();
+        m.paint(Layer::Floor, 1, &weights);
+        for i in 0..w {
+            // Рисование поверх: остаток фона — произведение (1 − прозрачность).
+            let mut background = 1.0;
+            for (k, c) in m.terrain.iter().enumerate() {
+                let above = m.terrain[k + 1..].iter().map(|c| c.mask.data[i] as u32).sum();
+                background *= 1.0 - coat_alpha(c.mask.data[i], above) as f32 / 255.0;
+            }
+            assert!(background < 0.02, "в точке {i} просвечивает фон: {background:.2}");
+        }
+    }
+
+    #[test]
+    fn closed_wall_has_a_segment_back_to_the_start() {
+        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: true, bends: Vec::new() };
+        assert_eq!(w.segments().count(), 3);
+        assert!((w.distance([1.0, 2.0]) - 1.0).abs() < 0.01, "ближе всего обратный отрезок");
+        let open = Wall { closed: false, ..w };
+        assert_eq!(open.segments().count(), 2);
+    }
+
+    #[test]
+    fn room_walls_follow_the_outline() {
+        let mut m = Map::new(20, 12);
+        m.paint_rect(Layer::Rooms, (2, 2), (7, 6), Some(0));
+        assert_eq!(m.room_edges().len(), 4, "прямоугольник — четыре стены");
+        m.paint_rect(Layer::Rooms, (5, 5), (10, 8), Some(1));
+        let total: f32 = m.room_edges().iter().map(|(a, b)| (b[0] - a[0]).abs() + (b[1] - a[1]).abs()).sum();
+        assert!((total - 32.0).abs() < 1e-3, "{total}");
+        assert_eq!((m.room_at(3, 3), m.room_at(9, 7)), (1, 2));
+    }
+
+    #[test]
+    fn portals_cut_only_their_own_wall() {
+        let segs = vec![([0.0, 2.0], [6.0, 2.0]), ([6.0, 2.0], [6.0, 5.0])];
+        let door = Portal { a: [2.0, 2.0], b: [3.0, 2.0], kind: PortalKind::Door, asset: None };
+        let window = Portal { a: [4.5, 2.0], b: [5.5, 2.0], kind: PortalKind::Window, asset: None };
+        let cut = cut_portals(&segs, &[door, window]);
+        assert_eq!(cut, vec![([0.0, 2.0], [2.0, 2.0]), ([3.0, 2.0], [4.5, 2.0]), ([5.5, 2.0], [6.0, 2.0]), ([6.0, 2.0], [6.0, 5.0])]);
+    }
+
+    #[test]
+    fn rotated_prop_hit_test() {
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0 };
+        assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
+        assert!(!p.contains([6.8, 5.0]));
+        let c = p.corners();
+        assert!((c[0][0] - 5.5).abs() < 1e-4 && (c[0][1] - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn json_round_trip_and_damage() {
+        let mut m = Map::new(6, 4);
+        m.paint_rect(Layer::Floor, (1, 1), (2, 2), Some(2));
+        m.paint_rect(Layer::Rooms, (3, 0), (4, 1), Some(0));
+        let i = m.material_index(Material { name: "Плитка".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false }).unwrap();
+        let n = builtin_materials().len();
+        assert_eq!(i, n);
+        assert_eq!(m.material_index(Material { name: "другое имя".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false }), Some(n));
+        m.walls.push(Wall { points: vec![[1.0, 1.0], [3.0, 1.0]], closed: false, bends: Vec::new() });
+        assert_eq!(Map::from_json(&m.to_json()).unwrap(), m);
+        let broken = m.to_json().replace("\"width\": 6", "\"width\": 7");
+        assert!(Map::from_json(&broken).is_err());
+    }
+
+    #[test]
+    fn first_format_files_still_open() {
+        let old = r#"{"format":1,"width":3,"height":1,"floor":[2,0,0],"rooms":[0,1,1],"walls":[]}"#;
+        let m = Map::from_json(old).unwrap();
+        assert_eq!(Map::from_json(&format!("\u{feff}{old}")).unwrap(), m, "метка BOM в начале не мешает");
+        assert_eq!(m.materials, builtin_materials());
+        assert_eq!((m.floor_at(0, 0), m.room_at(1, 0), m.room_at(0, 0)), (2, 1, 0));
+        assert_eq!(m.room_edges().len(), 4);
+        assert_eq!(m.format, FORMAT);
+    }
+    #[test]
+    fn arc_passes_through_its_apex_and_ends() {
+        let pts = arc_points([0.0, 0.0], [4.0, 0.0], 1.0);
+        assert_eq!((pts[0], *pts.last().unwrap()), ([0.0, 0.0], [4.0, 0.0]));
+        // Плюс — влево по ходу: при ходе вправо это вверх, к меньшим y.
+        let apex = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+        assert!((apex + 1.0).abs() < 0.01, "вершина дуги {apex}");
+        assert!(pts.iter().all(|p| p[1] <= 1e-4), "дуга вся по одну сторону");
+        assert_eq!(arc_points([0.0, 0.0], [4.0, 0.0], 0.0).len(), 2);
+        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: false, bends: vec![1.0] };
+        assert!(w.segments().count() > 4 && w.distance([2.0, -1.0]) < 0.02);
+    }
+
+    #[test]
+    fn bending_a_room_wall_grows_or_cuts_the_room() {
+        let mut m = Map::new(10, 10);
+        m.paint_rect(Layer::Rooms, (2, 2), (7, 7), Some(0));
+        let before = m.rooms.area();
+        // Верхняя стена от (2,2) до (8,2), прогиб наружу — вверх, влево по ходу вправо.
+        m.bend_room([2.0, 2.0], [8.0, 2.0], 2.0, 0);
+        let grown = m.rooms.area();
+        // Сегмент круга: хорда 6, прогиб 2 — площадь около 8,5 клетки.
+        assert!((grown - before - 8.5).abs() < 1.0, "приросло {}", grown - before);
+        assert_eq!(m.room_at(4, 0), 1, "пол под дугой того же материала");
+        // Снаружи у конца дуги, вдоль боковой стены, комната не расплылась.
+        assert!(m.rooms.get(7, 8) == 0 && m.rooms.get(32, 8) == 0, "пятна у концов: {} {}", m.rooms.get(7, 8), m.rooms.get(32, 8));
+        // Левая стена внутрь: от (2,8) до (2,2) влево по ходу — наружу, значит минус.
+        m.bend_room([2.0, 8.0], [2.0, 2.0], -1.5, 0);
+        assert!(m.rooms.area() < grown - 4.0);
+        assert_eq!(m.room_at(2, 4), 0, "вогнутая стена вырезала пол");
+    }
+}
