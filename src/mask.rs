@@ -86,6 +86,8 @@ impl<'de> Deserialize<'de> for Mask {
 pub enum Shape {
     /// Целые клетки протяжкой прямоугольника.
     Cells,
+    /// Овал, вписанный в протянутый прямоугольник клеток: круглая комната одним жестом.
+    Oval,
     Square,
     Circle,
     /// Россыпь мелких мягких пятен.
@@ -93,11 +95,17 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub const ALL: [Shape; 4] = [Shape::Cells, Shape::Square, Shape::Circle, Shape::Spray];
+    pub const ALL: [Shape; 5] = [Shape::Cells, Shape::Oval, Shape::Square, Shape::Circle, Shape::Spray];
+
+    /// Ставится протяжкой рамки, а не мазком.
+    pub fn drags(self) -> bool {
+        matches!(self, Shape::Cells | Shape::Oval)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Shape::Cells => "Клетки",
+            Shape::Oval => "Овал",
             Shape::Square => "Квадрат",
             Shape::Circle => "Круг",
             Shape::Spray => "Спрей",
@@ -153,7 +161,7 @@ pub fn dab(w: usize, h: usize, brush: &Brush, c: [f32; 2], seed: u32) -> Vec<(us
     let (j0, j1) = (((c[1] - r) * res - 1.0).floor().max(0.0) as usize, (((c[1] + r) * res + 1.0).ceil().max(0.0) as usize).min(h));
     let mut out = Vec::new();
     match brush.shape {
-        Shape::Cells | Shape::Square | Shape::Circle => {
+        Shape::Cells | Shape::Oval | Shape::Square | Shape::Circle => {
             for j in j0..j1 {
                 for i in i0..i1 {
                     let p = sample_pos(i as isize, j as isize);
@@ -199,6 +207,34 @@ pub fn cells(w: usize, h: usize, a: (i32, i32), b: (i32, i32)) -> Vec<(usize, f3
     for j in y0 as usize * RES..(y1 as usize + 1) * RES {
         for i in x0 as usize * RES..(x1 as usize + 1) * RES {
             out.push((j * w + i, 1.0));
+        }
+    }
+    out
+}
+
+/// Овал, вписанный в прямоугольник клеток между двумя углами (включительно),
+/// с краем, размытым на шаг маски, — как у круглой кисти.
+pub fn oval(w: usize, h: usize, a: (i32, i32), b: (i32, i32)) -> Vec<(usize, f32)> {
+    let cw = (w / RES) as i32;
+    let ch = (h / RES) as i32;
+    let (x0, x1) = (a.0.min(b.0), a.0.max(b.0) + 1);
+    let (y0, y1) = (a.1.min(b.1), a.1.max(b.1) + 1);
+    let c = [(x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0];
+    let (rx, ry) = ((x1 - x0) as f32 / 2.0, (y1 - y0) as f32 / 2.0);
+    let aa = 0.5 / RES as f32;
+    let mut out = Vec::new();
+    for j in (y0.max(0) as usize * RES)..(y1.min(ch).max(0) as usize * RES) {
+        for i in (x0.max(0) as usize * RES)..(x1.min(cw).max(0) as usize * RES) {
+            let p = sample_pos(i as isize, j as isize);
+            let (dx, dy) = ((p[0] - c[0]) / rx, (p[1] - c[1]) / ry);
+            // Расстояние до края по нормали — приближённо, через градиент.
+            let f = (dx * dx + dy * dy).sqrt();
+            let g = ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt() / f.max(1e-6);
+            let d = (f - 1.0) / g.max(1e-6);
+            let v = (0.5 - d / (2.0 * aa)).clamp(0.0, 1.0);
+            if v > 0.0 {
+                out.push((j * w + i, v));
+            }
         }
     }
     out
@@ -557,6 +593,20 @@ mod tests {
     fn fill_cells(m: &mut Mask, a: (i32, i32), b: (i32, i32)) {
         let w = cells(m.w, m.h, a, b);
         fill(m, &w);
+    }
+
+    #[test]
+    fn oval_fills_inscribed_circle() {
+        let mut m = Mask::for_cells(12, 12);
+        let w = oval(m.w, m.h, (1, 1), (10, 10));
+        fill(&mut m, &w);
+        // Круг радиусом 5 клеток: площадь ≈ 25π, середина залита, углы рамки пусты.
+        assert!((m.area() - 25.0 * std::f32::consts::PI).abs() < 0.5, "{}", m.area());
+        let r = RES as isize;
+        assert_eq!(m.get(6 * r, 6 * r), 255);
+        assert_eq!(m.get(r + 1, r + 1), 0);
+        // Контур — одна замкнутая линия.
+        assert_eq!(join(contour(&m)).len(), 1);
     }
 
     fn fill_dab(m: &mut Mask, brush: &Brush, c: [f32; 2], seed: u32) {

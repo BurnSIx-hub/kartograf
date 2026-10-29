@@ -18,6 +18,54 @@ pub struct Layout {
     pub portals: Vec<PortalOut>,
     /// Свет: середина в клетках, радиус яркого и тусклого в клетках, цвет.
     pub lights: Vec<Light>,
+    /// Живые области: эффект и контуры в клетках; `true` — дыра (остров).
+    pub zones: Vec<Zone>,
+}
+
+pub struct Zone {
+    pub effect: &'static str,
+    pub loops: Vec<(Vec<[f32; 2]>, bool)>,
+}
+
+/// Модуль Foundry, который оживляет области.
+pub const LIVE_MODULE: &str = "burn-living-map";
+
+/// Контуры живых материалов: по эффекту — все залитые им места, острова — дырами.
+fn zones(map: &Map) -> Vec<Zone> {
+    let mut out: Vec<Zone> = Vec::new();
+    for (m, mat) in map.materials.iter().enumerate() {
+        let Some(effect) = mat.live().effect() else { continue };
+        let mask = map.material_mask(m);
+        if mask.is_empty() {
+            continue;
+        }
+        let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&mask)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
+        let tagged = loops
+            .iter()
+            .map(|l| {
+                // Дыра — контур внутри нечётного числа других.
+                let depth = loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count();
+                (l.clone(), depth % 2 == 1)
+            })
+            .collect::<Vec<_>>();
+        match out.iter_mut().find(|z| z.effect == effect) {
+            Some(z) => z.loops.extend(tagged),
+            None => out.push(Zone { effect, loops: tagged }),
+        }
+    }
+    out
+}
+
+/// Точка внутри замкнутой ломаной (чётность пересечений).
+fn inside(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut c = false;
+    for w in poly.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+            c = !c;
+        }
+    }
+    c
 }
 
 pub struct PortalOut {
@@ -87,7 +135,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
-    Layout { walls, portals, lights }
+    Layout { walls, portals, lights, zones: zones(map) }
 }
 
 /// Упрощение ломаной (Дуглас — Пекер): точки, отступающие от прямой меньше `tol`, уходят.
@@ -151,10 +199,99 @@ fn doc_id(kind: char, n: usize) -> String {
 /// без полей (padding 0), чтобы координаты стен совпадали с картинкой.
 /// Двери подвижные: створка — картинка анимации стены (`leaves` по ключу ассета),
 /// двойная дверь — `animation.double`, Foundry сам делит проём на две створки.
+#[cfg(test)]
 pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &Layout, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
+    foundry_levels(map, name, &[SceneLevel { name: name.to_owned(), image_src: image_src.to_owned(), layout }], px, leaves)
+}
+
+/// Этаж сцены: имя, картинка и что на нём.
+pub struct SceneLevel<'a> {
+    pub name: String,
+    pub image_src: String,
+    pub layout: &'a Layout,
+}
+
+/// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
+pub fn level_id(k: usize) -> String {
+    if k == 0 { LEVEL_ID.to_owned() } else { format!("kartografLevel{k:02}") }
+}
+
+/// Сцена с этажами: каждый — уровень Foundry 14 со своей картинкой, высота этажа
+/// 10 футов; стены и огни этажа видны только на нём. Один этаж — как раньше,
+/// без высот и привязки к уровню.
+pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
+    let multi = levels.len() > 1;
+    let mut walls = Vec::new();
+    let mut lights = Vec::new();
+    let mut regions = Vec::new();
+    let mut docs = Vec::new();
+    for (k, lv) in levels.iter().enumerate() {
+        let tag = |mut v: Value| {
+            if multi {
+                v["levels"] = json!([level_id(k)]);
+            }
+            v
+        };
+        let (w0, l0) = (walls.len(), lights.len());
+        level_docs(lv.layout, px, leaves, &mut walls, &mut lights);
+        for w in &mut walls[w0..] {
+            *w = tag(w.take());
+        }
+        for l in &mut lights[l0..] {
+            *l = tag(l.take());
+        }
+        let p = px as f32;
+        for z in &lv.layout.zones {
+            let shapes: Vec<Value> = z
+                .loops
+                .iter()
+                .map(|(l, hole)| {
+                    let pts: Vec<i64> = l[..l.len() - 1].iter().flat_map(|v| [(v[0] * p).round() as i64, (v[1] * p).round() as i64]).collect();
+                    json!({"type": "polygon", "points": pts, "hole": hole})
+                })
+                .collect();
+            let (title, color) = match z.effect {
+                "lava" => ("Лава", "#ff6a1a"),
+                "swamp" => ("Болото", "#6a8f3a"),
+                _ => ("Вода", "#2a8fd6"),
+            };
+            let region = json!({
+                "_id": doc_id('r', regions.len()), "name": title, "color": color, "shapes": shapes,
+                "elevation": {"bottom": null, "top": null},
+                "flags": {LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}
+            });
+            regions.push(tag(region));
+        }
+        let mut doc = json!({"_id": level_id(k), "name": lv.name, "background": {"src": lv.image_src, "color": "#999999"}});
+        if multi {
+            doc["elevation"] = json!({"bottom": k as i64 * 10, "top": (k as i64 + 1) * 10});
+            doc["sort"] = json!(k as i64 * 100);
+        }
+        docs.push(doc);
+    }
+    json!({
+        "name": name,
+        "width": map.width * px,
+        "height": map.height * px,
+        "padding": 0,
+        "grid": {"type": 1, "size": px, "distance": 5, "units": "ft"},
+        // Фон и в уровне (формат 14), и по-старому: JSON без версии Foundry при
+        // импорте проходит миграцию со старого формата, и та берёт фон отсюда.
+        "background": {"src": levels[0].image_src},
+        "levels": docs,
+        "initialLevel": LEVEL_ID,
+        "tokenVision": true,
+        "walls": walls,
+        "lights": lights,
+        "regions": regions,
+        "flags": {"kartograf": {"format": 1}}
+    })
+}
+
+/// Стены, двери, окна и огни одного этажа — в общие списки сцены.
+fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<String, LeafFile>, walls: &mut Vec<Value>, lights_out: &mut Vec<Value>) {
     let p = px as f32;
     let at = |v: [f32; 2]| [(v[0] * p).round() as i64, (v[1] * p).round() as i64];
-    let mut walls = Vec::new();
     for line in &layout.walls {
         for w in line.windows(2) {
             let (a, b) = (at(w[0]), at(w[1]));
@@ -192,36 +329,15 @@ pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &L
         }
         walls.push(w);
     }
-    let lights: Vec<Value> = layout
-        .lights
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let [x, y] = at(l.at);
-            // Радиус в единицах сетки сцены: футы, 5 на клетку.
-            json!({
-                "_id": doc_id('l', i), "x": x, "y": y,
-                "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color, "alpha": 0.35,
-                           "animation": {"type": l.animation, "speed": 3, "intensity": 3}}
-            })
-        })
-        .collect();
-    json!({
-        "name": name,
-        "width": map.width * px,
-        "height": map.height * px,
-        "padding": 0,
-        "grid": {"type": 1, "size": px, "distance": 5, "units": "ft"},
-        // Фон и в уровне (формат 14), и по-старому: JSON без версии Foundry при
-        // импорте проходит миграцию со старого формата, и та берёт фон отсюда.
-        "background": {"src": image_src},
-        "levels": [{"_id": LEVEL_ID, "name": name, "background": {"src": image_src, "color": "#999999"}}],
-        "initialLevel": LEVEL_ID,
-        "tokenVision": true,
-        "walls": walls,
-        "lights": lights,
-        "flags": {"kartograf": {"format": 1}}
-    })
+    for l in &layout.lights {
+        let [x, y] = at(l.at);
+        // Радиус в единицах сетки сцены: футы, 5 на клетку.
+        lights_out.push(json!({
+            "_id": doc_id('l', lights_out.len()), "x": x, "y": y,
+            "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color, "alpha": 0.35,
+                       "animation": {"type": l.animation, "speed": 3, "intensity": 3}}
+        }));
+    }
 }
 
 /// Universal VTT (`.dd2vtt`): картинка внутри файла, всё в клетках.
@@ -286,6 +402,55 @@ pub fn foundry_data_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn water_becomes_living_region_with_island_hole() {
+        let mut m = Map::new(12, 12);
+        let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        assert_eq!(m.materials[water].live(), crate::map::Live::Water);
+        let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (9, 9));
+        m.paint(crate::map::Layer::Floor, water, &all);
+        let grass = crate::mask::cells(m.rooms.w, m.rooms.h, (4, 4), (6, 6));
+        m.paint(crate::map::Layer::Floor, 3, &grass);
+        m.prune();
+        let lay = layout(&m, &[]);
+        assert_eq!(lay.zones.len(), 1);
+        let z = &lay.zones[0];
+        assert_eq!((z.effect, z.loops.len()), ("water", 2));
+        assert_eq!(z.loops.iter().filter(|l| l.1).count(), 1);
+        let scene = foundry_levels(&m, "Пруд", &[SceneLevel { name: "Пруд".into(), image_src: "p.jpg".into(), layout: &lay }], 100, &Default::default());
+        let r = &scene["regions"][0];
+        assert_eq!(r["flags"][LIVE_MODULE]["effect"], "water");
+        assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
+        assert_eq!(r["shapes"][0]["type"], "polygon");
+    }
+
+    #[test]
+    fn levels_become_foundry_levels() {
+        let mut a = Map::new(6, 4);
+        let w = crate::mask::cells(a.rooms.w, a.rooms.h, (1, 1), (3, 2));
+        a.paint(crate::map::Layer::Rooms, 0, &w);
+        let b = a.new_level();
+        let mut b2 = b.clone();
+        b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
+        let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
+        let levels = [
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb },
+        ];
+        let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
+        let lv = scene["levels"].as_array().unwrap();
+        assert_eq!(lv.len(), 2);
+        assert_eq!(lv[1]["_id"].as_str().unwrap().len(), 16);
+        assert_eq!(lv[1]["elevation"]["bottom"], 10);
+        assert_eq!(lv[1]["background"]["src"], "k/b.jpg");
+        let walls = scene["walls"].as_array().unwrap();
+        // Стена второго этажа видна только на нём; id не повторяются.
+        assert_eq!(walls.last().unwrap()["levels"][0], lv[1]["_id"]);
+        assert!(walls.iter().filter(|w| w["levels"][0] == lv[0]["_id"]).count() >= 4);
+        let ids: std::collections::HashSet<_> = walls.iter().map(|w| w["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), walls.len());
+    }
     use crate::map::{Layer, Portal, Prop, Wall};
 
     #[test]
@@ -301,13 +466,13 @@ mod tests {
     fn scene_has_walls_doors_windows_and_fire_light() {
         let mut m = Map::new(8, 6);
         m.paint_rect(Layer::Rooms, (1, 1), (4, 3), Some(0));
-        m.walls.push(Wall { points: vec![[6.0, 0.0], [6.0, 6.0]], closed: false, bends: Vec::new() });
+        m.walls.push(Wall { points: vec![[6.0, 0.0], [6.0, 6.0]], closed: false, bends: Vec::new(), style: None });
         m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Door, asset: None, frame: None });
         m.portals.push(Portal { a: [6.0, 2.0], b: [6.0, 3.0], kind: PortalKind::Window, asset: None, frame: None });
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0 });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None });
         let lay = layout(&m, &m.room_edges());
         let mut leaves = std::collections::HashMap::new();
         leaves.insert(crate::library::DEFAULT_DOOR.to_owned(), LeafFile { src: "kartograf/door.webp".into(), width: 512 });

@@ -289,6 +289,8 @@ impl SelfTest {
                 let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len();
                 self.check("папка текстур прочиталась", wrote && app.library.assets.len() == 2 + builtin, &format!("ассетов {}", app.library.assets.len()));
                 app.use_floor_texture(&floor.to_string_lossy());
+                // Вид всех стен: с выбранной стеной текстура легла бы только на неё.
+                app.sel = None;
                 app.use_wall_paint(Paint::Texture(wall.to_string_lossy().into_owned()));
                 let (a, b) = (cell(app, 3.0, 10.0), cell(app, 8.0, 16.0));
                 self.drag(a, b, PointerButton::Primary);
@@ -557,7 +559,7 @@ impl SelfTest {
                 app.brush.shape = Tip::Cells;
                 app.material = 0;
                 app.paint((2, 2), (8, 6));
-                app.map.walls.push(map::Wall { points: vec![[12.0, 3.0], [18.0, 3.0]], closed: false, bends: Vec::new() });
+                app.map.walls.push(map::Wall { points: vec![[12.0, 3.0], [18.0, 3.0]], closed: false, bends: Vec::new(), style: None });
                 let c = app.canvas;
                 app.cam.fit(c, 20, 12);
                 self.area = app.map.rooms.area();
@@ -674,6 +676,70 @@ impl SelfTest {
                 self.resume_at = now + 0.3;
             }
             54 => self.snap(ctx, "двери, объединение, разброс"),
+            55 => {
+                // Дорога от руки и круглая комната протяжкой рамки.
+                app.new_map(20, 12);
+                app.set_tool(Tool::Dungeon);
+                app.brush.shape = Tip::Oval;
+                app.paint((2, 2), (8, 8));
+                app.set_tool(Tool::Path);
+                app.material = 2;
+                let pts = [[1.0, 10.5], [6.0, 9.0], [12.0, 10.0], [19.0, 4.0]].map(|w| at(app, w));
+                self.frames.push_back((Modifiers::NONE, vec![Event::PointerMoved(pts[0])]));
+                self.frames.push_back((Modifiers::NONE, vec![Self::button(pts[0], PointerButton::Primary, true)]));
+                for k in 0..3 {
+                    for i in 1..=6 {
+                        let p = pts[k] + (pts[k + 1] - pts[k]) * (i as f32 / 6.0);
+                        self.frames.push_back((Modifiers::NONE, vec![Event::PointerMoved(p)]));
+                    }
+                }
+                self.frames.push_back((Modifiers::NONE, vec![Self::button(pts[3], PointerButton::Primary, false)]));
+                self.frames.push_back((Modifiers::NONE, vec![]));
+            }
+            56 => {
+                let round = app.map.room_at(5, 5) != 0 && app.map.room_at(2, 2) == 0 && app.map.room_at(5, 2) != 0;
+                self.check("овал протяжкой — круглая комната 7×7", round, &format!("углы {} середина {}", app.map.room_at(2, 2), app.map.room_at(5, 5)));
+                let p = app.map.paths.first().cloned();
+                let ok = app.map.paths.len() == 1 && p.as_ref().is_some_and(|p| p.points.len() >= 8 && p.material == 2 && p.distance([12.0, 10.0]) < 0.6);
+                self.check("протяжка «Дорогой» положила плавную дорогу", ok, &format!("{:?}", p.map(|p| (p.points.len(), p.material))));
+                app.sel = None;
+                self.resume_at = now + 0.3;
+            }
+            57 => self.snap(ctx, "круглая комната и дорога"),
+            58 => {
+                // Тень кистью, подпись, второй этаж.
+                app.set_tool(Tool::Shade);
+                app.brush.shape = Tip::Cells;
+                app.shade_level = 0.6;
+                app.paint((10, 1), (13, 3));
+                let dark = app.map.shade.as_ref().map_or(0, |m| m.get(11 * mask::RES as isize, 2 * mask::RES as isize));
+                self.check("тень 60% легла прямоугольником", dark == 153, &format!("{dark}"));
+                app.set_tool(Tool::Text);
+                app.label_style.text = "Колодец".into();
+                let p = at(app, [15.0, 7.0]);
+                self.click(p);
+                self.resume_at = now + CLICK_GAP;
+            }
+            59 => {
+                let l = app.map.labels.first().cloned();
+                self.check("щелчок «Подписью» поставил подпись", l.as_ref().is_some_and(|l| l.text == "Колодец" && (l.pos[0] - 15.0).abs() < 0.6), &format!("{l:?}"));
+                app.add_level(true);
+                let up = app.level == 1 && app.levels.len() == 2 && app.map.labels.is_empty();
+                app.set_tool(Tool::Dungeon);
+                app.brush.shape = Tip::Cells;
+                app.paint((3, 3), (6, 6));
+                app.switch_level(0);
+                let below = app.map.labels.len() == 1 && app.levels[1].room_at(4, 4) != 0;
+                // Отмена правки второго этажа сама переводит на него.
+                app.undo();
+                let undone = app.level == 1 && app.map.room_at(4, 4) == 0;
+                app.redo();
+                let proj = app.project();
+                self.check("второй этаж: свой пол, отмена переходит на этаж, в файле два этажа", up && below && undone && proj.levels.len() == 1 && proj.levels[0].room_at(4, 4) != 0, &format!("up {up} below {below} undone {undone}"));
+                app.sel = None;
+                self.resume_at = now + 0.3;
+            }
+            60 => self.snap(ctx, "второй этаж поверх первого"),
             _ => return false,
         }
         true

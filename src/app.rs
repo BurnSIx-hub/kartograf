@@ -32,10 +32,13 @@ pub enum Tool {
     Door,
     Object,
     Scatter,
+    Path,
+    Shade,
+    Text,
 }
 
 impl Tool {
-    const ALL: [Tool; 8] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter];
+    const ALL: [Tool; 11] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Text];
 
     fn label(self) -> &'static str {
         match self {
@@ -47,6 +50,9 @@ impl Tool {
             Tool::Door => "Дверь и окно",
             Tool::Object => "Объект",
             Tool::Scatter => "Разброс",
+            Tool::Path => "Дорога",
+            Tool::Shade => "Тень",
+            Tool::Text => "Подпись",
         }
     }
 
@@ -60,6 +66,9 @@ impl Tool {
             Tool::Door => Key::O,
             Tool::Object => Key::P,
             Tool::Scatter => Key::S,
+            Tool::Path => Key::L,
+            Tool::Shade => Key::H,
+            Tool::Text => Key::T,
         }
     }
 }
@@ -105,6 +114,8 @@ pub enum Sel {
     Wall(usize),
     Portal(usize),
     Prop(usize),
+    Path(usize),
+    Label(usize),
 }
 
 pub struct Args {
@@ -171,6 +182,11 @@ struct Export {
     tiles: Vec<[u32; 2]>,
     next: usize,
     image: image::RgbImage,
+    /// Снятые этажи (кроме того, что снимается сейчас) и какой снимается.
+    done: Vec<image::RgbImage>,
+    doing: usize,
+    /// С какого этажа начали — на него вернуться.
+    start_level: usize,
     /// Камера и выбор до выгрузки — вернуть после.
     cam: Camera,
     sel: Option<Sel>,
@@ -203,8 +219,14 @@ pub struct App {
     pub material: usize,
     pub cam: Camera,
     fitted: bool,
-    undo: Vec<Map>,
-    redo: Vec<Map>,
+    /// История: этаж и карта этого этажа до правки.
+    undo: Vec<(usize, Map)>,
+    redo: Vec<(usize, Map)>,
+    /// Все этажи снизу вверх; на месте текущего — устаревшая копия, живой — `map`.
+    pub levels: Vec<Map>,
+    pub level: usize,
+    /// Стены этажа ниже — тонкими линиями, чтобы попасть в них наверху.
+    below: Vec<Segment>,
     /// Клетка, с которой начали тянуть заливку.
     drag_from: Option<(i32, i32)>,
     pub brush: Brush,
@@ -222,6 +244,17 @@ pub struct App {
     moving: Option<(usize, Grip)>,
     pub bending: Option<Bend>,
     pub scatter: Scatter,
+    /// Начатая дорога: точки в клетках; `path_free` — рисуется протяжкой.
+    pub path_draft: Vec<[f32; 2]>,
+    path_free: bool,
+    /// Ширина и край новых дорог.
+    pub path_style: map::Path,
+    /// Кисть «Тень»: до какой темноты, и стирает ли (Alt в начале мазка).
+    pub shade_level: f32,
+    shade_erase: bool,
+    /// Образец новой подписи; тащат подпись — откуда взяли.
+    pub label_style: map::Label,
+    label_grab: Option<(usize, [f32; 2])>,
     /// Alt с колесом уже меняет размер объекта: правка в истории сделана.
     alt_wheel: bool,
     /// Стена, которую сейчас ставят по точкам.
@@ -332,6 +365,9 @@ impl App {
             fitted: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            levels: vec![Map::new(1, 1)],
+            level: 0,
+            below: Vec::new(),
             drag_from: None,
             brush: Brush::default(),
             stroke_last: None,
@@ -347,6 +383,13 @@ impl App {
             canvas_ppp: 1.0,
             bending: None,
             scatter: Scatter::default(),
+            path_draft: Vec::new(),
+            path_free: false,
+            path_style: map::Path::template(0),
+            shade_level: 0.4,
+            shade_erase: false,
+            label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
+            label_grab: None,
             alt_wheel: false,
             draft: Vec::new(),
             sel: None,
@@ -394,7 +437,7 @@ impl App {
 
     /// Запомнить карту перед правкой.
     pub fn checkpoint(&mut self) {
-        self.undo.push(self.map.clone());
+        self.undo.push((self.level, self.map.clone()));
         if self.undo.len() > HISTORY {
             self.undo.remove(0);
         }
@@ -409,23 +452,91 @@ impl App {
     }
 
     pub fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.map, prev));
+        if let Some((level, prev)) = self.undo.pop() {
+            // Правка была на другом этаже — сначала туда.
+            self.switch_level(level);
+            self.redo.push((level, std::mem::replace(&mut self.map, prev)));
             self.after_history();
         }
     }
 
     pub fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.map, next));
+        if let Some((level, next)) = self.redo.pop() {
+            self.switch_level(level);
+            self.undo.push((level, std::mem::replace(&mut self.map, next)));
             self.after_history();
         }
+    }
+
+    /// Перейти на этаж `k`: живая карта уходит на своё место в списке.
+    pub fn switch_level(&mut self, k: usize) {
+        if k == self.level || k >= self.levels.len() {
+            return;
+        }
+        std::mem::swap(&mut self.map, &mut self.levels[self.level]);
+        std::mem::swap(&mut self.map, &mut self.levels[k]);
+        self.level = k;
+        self.sel = None;
+        self.picked.clear();
+        self.draft.clear();
+        self.path_draft.clear();
+        self.moving = None;
+        self.edges_dirty = true;
+        self.material = self.material.min(self.map.materials.len().saturating_sub(1));
+        self.refresh_below();
+    }
+
+    /// Карта для файла: первый этаж, остальные — в его `levels`.
+    pub fn project(&self) -> Map {
+        let mut all: Vec<Map> = self.levels.iter().enumerate().map(|(k, m)| if k == self.level { self.map.clone() } else { m.clone() }).collect();
+        let mut root = all.remove(0);
+        root.levels = all;
+        root
+    }
+
+    /// Новый этаж выше текущего (`above`) или ниже; история правок сбрасывается.
+    pub fn add_level(&mut self, above: bool) {
+        let fresh = self.map.new_level();
+        let at = if above { self.level + 1 } else { self.level };
+        self.levels[self.level] = self.map.clone();
+        self.levels.insert(at, fresh);
+        self.level = if above { self.level } else { self.level + 1 };
+        self.undo.clear();
+        self.redo.clear();
+        self.switch_level(at);
+        self.touch();
+    }
+
+    pub fn remove_level(&mut self) {
+        if self.levels.len() < 2 {
+            return;
+        }
+        self.levels.remove(self.level);
+        self.level = self.level.min(self.levels.len() - 1);
+        self.map = self.levels[self.level].clone();
+        self.undo.clear();
+        self.redo.clear();
+        self.sel = None;
+        self.edges_dirty = true;
+        self.refresh_below();
+        self.touch();
+    }
+
+    fn refresh_below(&mut self) {
+        let k = self.level;
+        self.below = if k > 0 { self.levels[k - 1].room_edges().into_iter().chain(self.levels[k - 1].walls.iter().flat_map(|w| w.segments().collect::<Vec<_>>())).collect() } else { Vec::new() };
+    }
+
+    pub fn level_name(&self, k: usize) -> String {
+        let m = if k == self.level { &self.map } else { &self.levels[k] };
+        if m.name.trim().is_empty() { format!("Этаж {}", k + 1) } else { m.name.clone() }
     }
 
     fn after_history(&mut self) {
         self.sel = self.sel.filter(|s| self.sel_exists(*s));
         self.material = self.material.min(self.map.materials.len().saturating_sub(1));
         self.draft.clear();
+        self.path_draft.clear();
         self.moving = None;
         self.touch();
     }
@@ -435,21 +546,52 @@ impl App {
             Sel::Wall(i) => i < self.map.walls.len(),
             Sel::Portal(i) => i < self.map.portals.len(),
             Sel::Prop(i) => i < self.map.props.len(),
+            Sel::Path(i) => i < self.map.paths.len(),
+            Sel::Label(i) => i < self.map.labels.len(),
         }
     }
 
-    /// Кисть «Клетки»: целые клетки прямоугольника.
+    /// Кисти «Клетки» и «Овал»: прямоугольник клеток или овал в нём.
     pub fn paint(&mut self, a: (i32, i32), b: (i32, i32)) {
         let mut probe = self.map.clone();
-        let changed = match self.tool {
-            Tool::Erase => probe.paint_rect(Layer::Floor, a, b, None),
-            Tool::Dungeon => probe.paint_rect(Layer::Rooms, a, b, Some(self.material)),
-            _ => probe.paint_rect(Layer::Floor, a, b, Some(self.material)),
+        if self.tool == Tool::Shade {
+            let (w, h) = (probe.rooms.w, probe.rooms.h);
+            let weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
+            if self.shade_erase {
+                probe.shade_fade(&weights);
+            } else {
+                probe.shade_paint(&weights, self.shade_level);
+            }
+            probe.prune();
+            if probe != self.map {
+                self.checkpoint();
+                self.map = probe;
+            }
+            return;
+        }
+        let (layer, material) = match self.tool {
+            Tool::Erase => (Layer::Floor, None),
+            Tool::Dungeon => (Layer::Rooms, Some(self.material)),
+            _ => (Layer::Floor, Some(self.material)),
+        };
+        let changed = if self.brush.shape == Tip::Oval {
+            probe.paint_oval(layer, a, b, material)
+        } else {
+            probe.paint_rect(layer, a, b, material)
         };
         if changed {
             self.checkpoint();
             self.map = probe;
         }
+    }
+
+    /// Второй угол рамки; с Shift у овала — квадрат, чтобы вышел круг.
+    fn drag_corner(&self, a: (i32, i32), b: (i32, i32), shift: bool) -> (i32, i32) {
+        if !(shift && self.brush.shape == Tip::Oval) {
+            return b;
+        }
+        let n = (b.0 - a.0).abs().max((b.1 - a.1).abs());
+        (a.0 + n * if b.0 < a.0 { -1 } else { 1 }, a.1 + n * if b.1 < a.1 { -1 } else { 1 })
     }
 
     /// Один отпечаток кисти в точке карты. В пределах мазка точка получает самую
@@ -470,6 +612,12 @@ impl App {
             *v > 0.0
         });
         match self.tool {
+            Tool::Shade if self.shade_erase => self.map.shade_fade(&weights),
+            Tool::Shade => {
+                // Темнеет до уровня по полной силе отпечатка, а не по прибавке.
+                let raw: Vec<(usize, f32)> = weights.iter().map(|&(i, _)| (i, self.stroke_max.get(&i).copied().unwrap_or(0.0))).collect();
+                self.map.shade_paint(&raw, self.shade_level);
+            }
             Tool::Erase => self.map.erase(&weights),
             Tool::Dungeon => self.map.paint(Layer::Rooms, self.material, &weights),
             _ => self.map.paint(Layer::Floor, self.material, &weights),
@@ -533,7 +681,7 @@ impl App {
         let points = std::mem::take(&mut self.draft);
         if points.len() >= 2 {
             self.checkpoint();
-            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new() });
+            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), style: None });
             self.sel = Some(Sel::Wall(self.map.walls.len() - 1));
         }
     }
@@ -561,6 +709,23 @@ impl App {
             Sel::Prop(i) => {
                 self.map.props.remove(i);
             }
+            Sel::Path(i) => {
+                self.map.paths.remove(i);
+            }
+            Sel::Label(i) => {
+                self.map.labels.remove(i);
+            }
+        }
+    }
+
+    /// Поставить начатую дорогу. Из одной точки дороги не бывает.
+    pub fn finish_path(&mut self) {
+        let points = std::mem::take(&mut self.path_draft);
+        if points.len() >= 2 {
+            self.checkpoint();
+            let material = self.material.min(self.map.materials.len().saturating_sub(1));
+            self.map.paths.push(map::Path { points, material, ..self.path_style.clone() });
+            self.sel = Some(Sel::Path(self.map.paths.len() - 1));
         }
     }
 
@@ -643,7 +808,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -651,6 +816,9 @@ impl App {
 
     /// Что лежит под точкой: сначала объекты (верхний — последний), потом проёмы, потом стены.
     pub fn pick(&self, w: [f32; 2]) -> Option<Sel> {
+        if let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
+            return Some(Sel::Label(i));
+        }
         if let Some(i) = self.map.props.iter().rposition(|p| p.contains(w)) {
             return Some(Sel::Prop(i));
         }
@@ -658,7 +826,11 @@ impl App {
         if let Some((i, _)) = self.map.portals.iter().enumerate().map(|(i, p)| (i, map::segment_distance(w, p.a, p.b))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)) {
             return Some(Sel::Portal(i));
         }
-        self.map.walls.iter().enumerate().map(|(i, wall)| (i, wall.distance(w))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| Sel::Wall(i))
+        if let Some(s) = self.map.walls.iter().enumerate().map(|(i, wall)| (i, wall.distance(w))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| Sel::Wall(i)) {
+            return Some(s);
+        }
+        // Дорога — по всей ширине; верхняя — последняя.
+        self.map.paths.iter().rposition(|p| p.distance(w) <= p.width / 2.0).map(Sel::Path)
     }
 
     /// Один отпечаток разброса в точке `c`: насыпать объекты из набора или, с Alt,
@@ -692,7 +864,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -754,7 +926,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0 };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -774,7 +946,7 @@ impl App {
 
     /// Картинка из библиотеки становится материалом пола и выбирается.
     pub fn use_floor_texture(&mut self, key: &str) {
-        let m = Material { name: library::label(key), paint: Paint::Texture(key.to_owned()), vary: false };
+        let m = Material { name: library::label(key), paint: Paint::Texture(key.to_owned()), vary: false, live: map::Live::Auto };
         if !self.map.materials.iter().any(|x| x.paint == m.paint) {
             self.checkpoint();
         }
@@ -782,15 +954,50 @@ impl App {
             Some(i) => self.material = i,
             None => self.error = Some("В карте уже 255 материалов — больше не помещается.".into()),
         }
-        if !matches!(self.tool, Tool::Dungeon | Tool::Floor) {
+        if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
             self.tool = Tool::Dungeon;
+        }
+        self.recolor_path();
+    }
+
+    /// Выбранная дорога перекрашивается в выбранный материал.
+    fn recolor_path(&mut self) {
+        if let Some(Sel::Path(i)) = self.sel
+            && self.tool == Tool::Path
+            && self.map.paths[i].material != self.material
+        {
+            self.checkpoint();
+            self.map.paths[i].material = self.material;
         }
     }
 
     pub fn use_wall_paint(&mut self, paint: Paint) {
-        if self.map.wall_style.paint != paint {
+        let mut st = self.wall_style();
+        st.paint = paint;
+        self.set_wall_style(st);
+    }
+
+    /// Вид, который правят панель и библиотека: у выбранной стены — её
+    /// (свой появится с первой правкой), без выбора — всей карты.
+    pub fn wall_style(&self) -> map::WallStyle {
+        match self.sel {
+            Some(Sel::Wall(i)) => self.map.walls[i].style.clone().unwrap_or_else(|| self.map.wall_style.clone()),
+            _ => self.map.wall_style.clone(),
+        }
+    }
+
+    pub fn set_wall_style(&mut self, st: map::WallStyle) {
+        if st != self.wall_style() || matches!(self.sel, Some(Sel::Wall(i)) if self.map.walls[i].style.is_none()) {
             self.checkpoint();
-            self.map.wall_style.paint = paint;
+            self.put_wall_style(st);
+        }
+    }
+
+    /// Без записи в историю — для протяжки ползунка.
+    fn put_wall_style(&mut self, st: map::WallStyle) {
+        match self.sel {
+            Some(Sel::Wall(i)) => self.map.walls[i].style = Some(st),
+            _ => self.map.wall_style = st,
         }
     }
 
@@ -817,7 +1024,11 @@ impl App {
 
     // ----- файлы -----
 
-    fn reset_doc(&mut self, map: Map, path: Option<PathBuf>) {
+    fn reset_doc(&mut self, mut map: Map, path: Option<PathBuf>) {
+        let rest = std::mem::take(&mut map.levels);
+        self.levels = std::iter::once(map.clone()).chain(rest).collect();
+        self.level = 0;
+        self.below.clear();
         self.map = map;
         self.path = path;
         self.dirty = false;
@@ -840,7 +1051,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: &Path) -> bool {
-        match std::fs::write(path, self.map.to_json()) {
+        match std::fs::write(path, self.project().to_json()) {
             Ok(()) => {
                 self.path = Some(path.to_owned());
                 self.dirty = false;
@@ -915,7 +1126,7 @@ impl App {
     pub fn autosave(&mut self, now: f64, force: bool) {
         if force || self.recovery.due(now, self.dirty, self.rev) {
             let meta = recovery::Meta { name: self.name(), path: self.path.clone(), saved: recovery::now_unix() };
-            self.recovery.snapshot(now, self.rev, &self.map, &meta);
+            self.recovery.snapshot(now, self.rev, &self.project(), &meta);
         }
     }
 
@@ -1229,13 +1440,17 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
             self.finish_wall(false);
+            self.finish_path();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.draft.clear();
+            self.path_draft.clear();
             self.sel = None;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace)) {
-            if !self.draft.is_empty() {
+            if !self.path_draft.is_empty() {
+                self.path_draft.pop();
+            } else if !self.draft.is_empty() {
                 self.draft.pop();
             } else {
                 self.delete_selected();
@@ -1250,12 +1465,15 @@ impl App {
         if tool != Tool::Wall {
             self.finish_wall(false);
         }
+        if tool != Tool::Path {
+            self.finish_path();
+        }
         self.tool = tool;
         // Инструмент сам открывает нужную вкладку библиотеки.
         match tool {
             Tool::Door => self.browse = Kind::Door,
             Tool::Object => self.browse = Kind::Object,
-            Tool::Dungeon | Tool::Floor if matches!(self.browse, Kind::Door | Kind::Object) => self.browse = Kind::Floor,
+            Tool::Dungeon | Tool::Floor | Tool::Path if matches!(self.browse, Kind::Door | Kind::Object) => self.browse = Kind::Floor,
             _ => {}
         }
     }
@@ -1342,8 +1560,44 @@ impl App {
         }
     }
 
+    /// Этажи сверху вниз, как в доме; текущий можно переименовать.
+    fn levels_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Этажи");
+            if ui.small_button("+ выше").clicked() {
+                self.add_level(true);
+            }
+            if ui.small_button("+ ниже").clicked() {
+                self.add_level(false);
+            }
+        });
+        if self.levels.len() < 2 {
+            ui.weak("Один этаж. Новый — того же размера; в Foundry этажи станут уровнями сцены.");
+            return;
+        }
+        for k in (0..self.levels.len()).rev() {
+            if ui.selectable_label(self.level == k, self.level_name(k)).clicked() {
+                self.switch_level(k);
+            }
+        }
+        ui.horizontal(|ui| {
+            let mut name = self.map.name.clone();
+            let hint = format!("Этаж {}", self.level + 1);
+            let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint).desired_width(120.0));
+            if r.gained_focus() {
+                self.checkpoint();
+            }
+            self.map.name = name;
+            if ui.small_button("удалить").on_hover_text("Удалить этот этаж; отменить нельзя").clicked() {
+                self.remove_level();
+            }
+        });
+    }
+
     fn tools(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
+        self.levels_ui(ui);
+        ui.add_space(8.0);
         ui.strong("Инструменты");
         for tool in Tool::ALL {
             let text = format!("{}   {}", tool.label(), tool.key().name());
@@ -1359,13 +1613,24 @@ impl App {
             Tool::Erase => "Стирает и комнаты, и местность.",
             Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
             Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите во вкладке «Двери»; без картинки — простая плашка.",
+            Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — ниже.",
+            Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
+            Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — из «Пол»: земля — тропа, вода — ручей, ткань — ковёр.",
             Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком в библиотеке.",
             Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Alt — на время наоборот с привязкой, Alt с колесом — размер, R — поворот.",
         });
 
         match self.tool {
-            Tool::Dungeon | Tool::Floor | Tool::Erase => {
+            Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade => {
                 ui.add_space(6.0);
+                if self.tool == Tool::Shade {
+                    ui.horizontal(|ui| {
+                        for level in [0.2, 0.4, 0.6, 0.8] {
+                            ui.selectable_value(&mut self.shade_level, level, format!("{}%", (level * 100.0) as u32));
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut self.shade_level, 0.05..=1.0).text("темнота"));
+                }
                 ui.horizontal_wrapped(|ui| {
                     for shape in Tip::ALL {
                         ui.selectable_value(&mut self.brush.shape, shape, shape.label());
@@ -1373,6 +1638,8 @@ impl App {
                 });
                 if self.brush.shape == Tip::Cells {
                     ui.weak("Щелчок — клетка, протяжка — прямоугольник клеток.");
+                } else if self.brush.shape == Tip::Oval {
+                    ui.weak("Протяжка — овал во весь прямоугольник; квадрат даёт круг. Shift держит круг.");
                 } else {
                     ui.add(egui::Slider::new(&mut self.brush.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
                     ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("жёсткость"));
@@ -1430,6 +1697,68 @@ impl App {
                     }
                 });
                 ui.weak("Створку, окно или косяк можно взять во вкладке «Двери». Створка уходит в Foundry отдельной картинкой и там открывается.");
+            }
+            Tool::Text => {
+                ui.add_space(6.0);
+                let chosen = match self.sel {
+                    Some(Sel::Label(i)) => Some(i),
+                    _ => None,
+                };
+                let mut st = chosen.map_or_else(|| self.label_style.clone(), |i| self.map.labels[i].clone());
+                if chosen.is_some() {
+                    ui.weak("Выбранная подпись:");
+                }
+                let text = ui.add(egui::TextEdit::multiline(&mut st.text).desired_rows(2).desired_width(f32::INFINITY));
+                let rs = [
+                    ui.add(egui::Slider::new(&mut st.size, 0.2..=4.0).logarithmic(true).text("высота, кл.")),
+                    ui.add(egui::Slider::new(&mut st.rot, -180.0..=180.0).step_by(5.0).text("поворот")),
+                ];
+                let mut color = Color32::from_rgb(st.color[0], st.color[1], st.color[2]);
+                let picked = ui.horizontal(|ui| {
+                    let r = ui.color_edit_button_srgba(&mut color);
+                    ui.label("цвет");
+                    r
+                });
+                st.color = [color.r(), color.g(), color.b()];
+                match chosen {
+                    Some(i) => {
+                        if text.gained_focus() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) || picked.inner.changed() {
+                            self.checkpoint();
+                        }
+                        self.map.labels[i] = st;
+                    }
+                    None => self.label_style = st,
+                }
+            }
+            Tool::Path => {
+                ui.add_space(6.0);
+                // Ползунки правят выбранную дорогу, а без неё — образец для новых.
+                let chosen = match self.sel {
+                    Some(Sel::Path(i)) => Some(i),
+                    _ => None,
+                };
+                let mut st = chosen.map_or_else(|| self.path_style.clone(), |i| self.map.paths[i].clone());
+                if chosen.is_some() {
+                    ui.weak("Выбранная дорога:");
+                }
+                let rs = [
+                    ui.add(egui::Slider::new(&mut st.width, 0.25..=12.0).logarithmic(true).text("ширина, кл.")),
+                    ui.add(egui::Slider::new(&mut st.soft, 0.0..=1.0).text("мягкость края")),
+                    ui.add(egui::Slider::new(&mut st.rough, 0.0..=1.0).text("неровность")),
+                ];
+                let along = ui.checkbox(&mut st.along, "Текстура вдоль линии").on_hover_text("Для ковра и мостовой. Без галочки текстура лежит по сетке, как пол, — для земли и воды.");
+                match chosen {
+                    Some(i) => {
+                        if rs.iter().any(|r| r.drag_started()) || along.changed() || rs.iter().any(|r| r.changed() && !r.dragged()) {
+                            self.checkpoint();
+                        }
+                        self.map.paths[i] = st;
+                    }
+                    None => {
+                        st.points.clear();
+                        self.path_style = st;
+                    }
+                }
             }
             Tool::Scatter => {
                 ui.add_space(6.0);
@@ -1494,6 +1823,11 @@ impl App {
             }
             self.map.props[i].rot = rot;
             self.map.props[i].scale = scale;
+            let mut casts = self.map.props[i].casts_shadow();
+            if ui.checkbox(&mut casts, "Отбрасывает тень").changed() {
+                self.checkpoint();
+                self.map.props[i].shadow = Some(casts);
+            }
         }
 
         ui.add_space(10.0);
@@ -1505,13 +1839,27 @@ impl App {
                 let label = ui.selectable_label(self.material == i, &m.name);
                 if resp.clicked() || label.clicked() {
                     self.material = i;
-                    if !matches!(self.tool, Tool::Dungeon | Tool::Floor) {
+                    if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
                         self.set_tool(Tool::Dungeon);
                     }
+                    self.recolor_path();
                 }
             });
         }
         if let Some(m) = materials.get(self.material).filter(|m| matches!(m.paint, Paint::Texture(_))) {
+            ui.horizontal(|ui| {
+                ui.label("Живой в Foundry:").on_hover_text("Залитое этим материалом в выгрузке станет областью сцены, и модуль «Живая карта» её оживит: рябь и рыбки, течение лавы, пузыри болота.");
+                let now = m.live;
+                let shown = if now == map::Live::Auto { format!("{} ({})", now.label(), m.live().label()) } else { now.label().to_owned() };
+                egui::ComboBox::from_id_salt("live").selected_text(shown).show_ui(ui, |ui| {
+                    for c in map::Live::CHOICES {
+                        if ui.selectable_label(now == c, c.label()).clicked() && now != c {
+                            self.checkpoint();
+                            self.map.materials[self.material].live = c;
+                        }
+                    }
+                });
+            });
             let mut vary = m.vary;
             if ui
                 .checkbox(&mut vary, "Разнообразие")
@@ -1524,25 +1872,57 @@ impl App {
         }
 
         ui.add_space(10.0);
-        ui.strong("Стены");
+        let own = match self.sel {
+            Some(Sel::Wall(i)) => Some(self.map.walls[i].style.is_some()),
+            _ => None,
+        };
         ui.horizontal(|ui| {
-            let paint = self.map.wall_style.paint.clone();
-            self.swatch(ui, &paint, 18.0);
-            ui.label(match &paint {
+            ui.strong(if own.is_some() { "Выбранная стена" } else { "Стены" });
+            if own == Some(true) && ui.small_button("как у всех").on_hover_text("Убрать свой вид — стена станет как остальные").clicked()
+                && let Some(Sel::Wall(i)) = self.sel
+            {
+                self.checkpoint();
+                self.map.walls[i].style = None;
+            }
+        });
+        if own == Some(false) {
+            ui.weak("Как у всех. Текстура из библиотеки ляжет только на неё.");
+        }
+        let current = self.wall_style();
+        ui.horizontal(|ui| {
+            self.swatch(ui, &current.paint, 18.0);
+            ui.label(match &current.paint {
                 Paint::Color(_) => "цвет".to_owned(),
                 Paint::Texture(k) => library::label(k),
             });
-            if matches!(paint, Paint::Texture(_)) && ui.small_button("цвет").clicked() {
+            if matches!(current.paint, Paint::Texture(_)) && ui.small_button("цвет").clicked() {
                 self.use_wall_paint(map::WallStyle::default().paint);
             }
         });
-        let mut width = self.map.wall_style.width;
+        let mut width = current.width;
         let slider = ui.add(egui::Slider::new(&mut width, 0.1..=1.0).text("толщина"));
         // Протяжка ползунка — одна правка в истории, а не по одной на кадр.
         if slider.drag_started() || (slider.changed() && !slider.dragged()) {
             self.checkpoint();
         }
-        self.map.wall_style.width = width;
+        if width != current.width {
+            self.put_wall_style(map::WallStyle { width, ..current });
+        }
+
+        ui.add_space(10.0);
+        let mut sh = self.map.shadows.clone();
+        let on = ui.checkbox(&mut sh.on, "Тени от стен и объектов");
+        let mut rs = Vec::new();
+        if sh.on {
+            rs.push(ui.add(egui::Slider::new(&mut sh.angle, 0.0..=345.0).step_by(15.0).text("куда падают, °")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.dist, 0.0..=1.0).text("длина, кл.")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.blur, 0.1..=1.0).text("размытие, кл.")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.opacity, 0.05..=1.0).text("темнота")));
+        }
+        if on.changed() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) {
+            self.checkpoint();
+        }
+        self.map.shadows = sh;
 
         ui.add_space(10.0);
         self.browser(ui);
@@ -1640,13 +2020,12 @@ impl App {
                 Kind::Floor => self.use_floor_texture(&key),
                 Kind::Wall => {
                     // Встроенная полоса нарисована под свою толщину — её и ставим.
+                    let mut st = self.wall_style();
                     if let Some(width) = library::builtin_wall_width(&key) {
-                        if self.map.wall_style.width != width {
-                            self.checkpoint();
-                            self.map.wall_style.width = width;
-                        }
+                        st.width = width;
                     }
-                    self.use_wall_paint(Paint::Texture(key));
+                    st.paint = Paint::Texture(key);
+                    self.set_wall_style(st);
                 }
                 Kind::Door => {
                     // В паках FA косяки, окна и створки лежат вместе: что это — по имени.
@@ -1753,7 +2132,7 @@ impl App {
                     .sum::<f32>()
             });
             // Ctrl с колесом у кисти — её размер, а не масштаб карты.
-            let brush = matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Erase) && self.brush.shape != Tip::Cells;
+            let brush = matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade) && !self.brush.shape.drags();
             let (ctrl, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.alt));
             let prop = matches!(self.tool, Tool::Select | Tool::Object);
             if !alt {
@@ -1922,13 +2301,14 @@ impl App {
             return;
         }
         match self.tool {
-            Tool::Floor | Tool::Erase | Tool::Dungeon if self.brush.shape != Tip::Cells => {
+            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade if !self.brush.shape.drags() => {
                 // Мазок начинается сразу по нажатию, а не после порога протяжки.
                 let (pressed, down, at) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
                 if pressed
                     && resp.contains_pointer()
                     && let Some(p) = at
                 {
+                    self.shade_erase = alt;
                     self.begin_stroke(self.cam.to_world(rect, p));
                 } else if self.stroke_last.is_some() {
                     match (down, at) {
@@ -1937,14 +2317,15 @@ impl App {
                     }
                 }
             }
-            Tool::Floor | Tool::Erase | Tool::Dungeon => {
+            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade => {
+                self.shade_erase = alt;
                 if resp.drag_started_by(PointerButton::Primary) {
                     let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
                     self.drag_from = origin.map(|p| self.cam.cell(rect, p));
                 }
                 if resp.drag_stopped_by(PointerButton::Primary) {
                     if let (Some(a), Some(p)) = (self.drag_from.take(), pointer) {
-                        let b = self.cam.cell(rect, p);
+                        let b = self.drag_corner(a, self.cam.cell(rect, p), ui.input(|i| i.modifiers.shift));
                         self.paint(a, b);
                     }
                 } else if resp.clicked()
@@ -1974,6 +2355,76 @@ impl App {
                     && let Some(p) = pointer
                 {
                     self.place_portal(self.cam.to_world(rect, p));
+                }
+            }
+            Tool::Text => {
+                if resp.drag_started_by(PointerButton::Primary)
+                    && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+                {
+                    let w = self.cam.to_world(rect, o);
+                    if let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
+                        self.checkpoint();
+                        let p = self.map.labels[i].pos;
+                        self.label_grab = Some((i, [w[0] - p[0], w[1] - p[1]]));
+                        self.sel = Some(Sel::Label(i));
+                    }
+                }
+                if let (Some((i, g)), Some(p)) = (self.label_grab, pointer)
+                    && resp.dragged_by(PointerButton::Primary)
+                {
+                    let w = self.cam.to_world(rect, p);
+                    self.map.labels[i].pos = self.snap_pos([w[0] - g[0], w[1] - g[1]], alt);
+                }
+                if resp.drag_stopped_by(PointerButton::Primary) {
+                    self.label_grab = None;
+                } else if resp.clicked()
+                    && let Some(p) = pointer
+                {
+                    let w = self.cam.to_world(rect, p);
+                    match self.map.labels.iter().rposition(|l| l.contains(w)) {
+                        Some(i) => self.sel = Some(Sel::Label(i)),
+                        None if !self.label_style.text.trim().is_empty() => {
+                            self.checkpoint();
+                            let pos = self.snap_pos(w, alt);
+                            self.map.labels.push(map::Label { pos, ..self.label_style.clone() });
+                            self.sel = Some(Sel::Label(self.map.labels.len() - 1));
+                        }
+                        None => self.sel = None,
+                    }
+                }
+            }
+            Tool::Path => {
+                if resp.drag_started_by(PointerButton::Primary)
+                    && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+                {
+                    // Протяжка — от руки: точки через полклетки, на отпускании дорога готова.
+                    self.path_draft.push(self.cam.to_world(rect, o));
+                    self.path_free = true;
+                }
+                if self.path_free
+                    && resp.dragged_by(PointerButton::Primary)
+                    && let (Some(p), Some(last)) = (pointer, self.path_draft.last().copied())
+                {
+                    let w = self.cam.to_world(rect, p);
+                    if ((w[0] - last[0]).powi(2) + (w[1] - last[1]).powi(2)).sqrt() >= 0.5 {
+                        self.path_draft.push(w);
+                    }
+                }
+                if self.path_free && resp.drag_stopped_by(PointerButton::Primary) {
+                    if let Some(p) = pointer {
+                        self.path_draft.push(self.cam.to_world(rect, p));
+                    }
+                    self.path_free = false;
+                    self.finish_path();
+                } else if resp.double_clicked() || resp.secondary_clicked() {
+                    self.finish_path();
+                } else if resp.clicked()
+                    && let Some(p) = pointer
+                {
+                    let w = self.snap_pos(self.cam.to_world(rect, p), alt);
+                    if self.path_draft.last() != Some(&w) {
+                        self.path_draft.push(w);
+                    }
                 }
             }
             Tool::Scatter => {
@@ -2185,16 +2636,44 @@ impl App {
         self.map.room_floor = room_floor;
         self.map.rooms = rooms;
 
+        // Дороги и реки — поверх пола.
+        let paths = std::mem::take(&mut self.map.paths);
+        for (i, path) in paths.iter().enumerate() {
+            self.draw_path(painter, canvas, path, i as u32);
+        }
+        self.map.paths = paths;
+
+        // Нарисованная тень — поверх пола и дорог.
+        if let Some(shade) = self.map.shade.take() {
+            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto };
+            self.draw_mask(painter, canvas, &black, &shade, &[], None, view);
+            self.map.shade = Some(shade);
+        }
+
         let exporting = self.export.is_some();
         // Протянутая заливка — рамкой, пока кнопку не отпустили.
         if let (Some(a), Some(p)) = (self.drag_from, self.hover.filter(|_| !exporting)) {
-            let b = cam.cell(canvas, p);
+            let b = self.drag_corner(a, cam.cell(canvas, p), painter.ctx().input(|i| i.modifiers.shift));
             let r = Rect::from_min_max(
                 cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
                 cam.to_screen(canvas, [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0]),
-            )
-            .intersect(map_rect);
-            painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(120, 180, 255)), egui::StrokeKind::Inside);
+            );
+            let blue = Color32::from_rgb(120, 180, 255);
+            if self.brush.shape == Tip::Oval {
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, blue.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+                let n = 72;
+                let pts: Vec<Pos2> = (0..n)
+                    .map(|k| {
+                        let t = k as f32 / n as f32 * std::f32::consts::TAU;
+                        r.center() + vec2(t.cos() * r.width() / 2.0, t.sin() * r.height() / 2.0)
+                    })
+                    .collect();
+                painter.add(Shape::closed_line(pts, Stroke::new(2.0, blue)));
+            } else {
+                painter.rect_stroke(r.intersect(map_rect), 0.0, Stroke::new(2.0, blue), egui::StrokeKind::Inside);
+            }
+            let (w, h) = ((a.0 - b.0).abs() + 1, (a.1 - b.1).abs() + 1);
+            painter.text(r.right_bottom() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, format!("{w}×{h}"), egui::FontId::proportional(13.0), blue);
         }
 
         // Сетка. На мелком масштабе она сливается в сплошной фон — тогда её нет.
@@ -2212,8 +2691,26 @@ impl App {
             painter.rect_stroke(map_rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
         }
 
-        // Объекты — под стенами, как мебель у стены.
+        // Стены этажа ниже — пунктиром, чтобы верхний лёг на них.
+        if !self.below.is_empty() && !exporting {
+            let ghost = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 220, 140, 120));
+            for (a, b) in &self.below {
+                painter.add(Shape::dashed_line(&[cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], ghost, 6.0, 4.0));
+            }
+        }
+
+        // Объекты — под стенами, как мебель у стены. Сначала их тени.
         let props = self.map.props.clone();
+        let shadows = self.map.shadows.clone();
+        if shadows.on {
+            for prop in props.iter().filter(|p| p.casts_shadow()) {
+                let c = prop.corners();
+                let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
+                if bounds.intersects(view) {
+                    self.draw_prop_shadow(painter, canvas, prop, &shadows);
+                }
+            }
+        }
         for (i, prop) in props.iter().enumerate() {
             let c = prop.corners();
             let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1])));
@@ -2227,19 +2724,28 @@ impl App {
             }
         }
 
-        // Стены комнат и нарисованные вручную — за вычетом проёмов.
+        // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
+        // ложатся и на объекты у стены.
         let style = self.map.wall_style.clone();
         let edges = map::cut_portals(&self.room_edges().to_vec(), &self.map.portals);
+        if shadows.on {
+            self.draw_wall_shadow(painter, canvas, &edges, style.width, &shadows);
+            for w in self.map.walls.clone() {
+                let width = w.style.as_ref().map_or(style.width, |s| s.width);
+                self.draw_wall_shadow(painter, canvas, &map::cut_portals(&w.segments().collect::<Vec<_>>(), &self.map.portals), width, &shadows);
+            }
+        }
         self.draw_walls(painter, canvas, &style, &edges);
         let walls = self.map.walls.clone();
         for (i, wall) in walls.iter().enumerate() {
             let segs: Vec<Segment> = wall.segments().collect();
+            let own = wall.style.as_ref().unwrap_or(&style);
             if self.sel == Some(Sel::Wall(i)) {
                 for (a, b) in &segs {
-                    painter.line_segment([cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], Stroke::new(style.width * s + 6.0, Color32::from_rgb(120, 180, 255)));
+                    painter.line_segment([cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], Stroke::new(own.width * s + 6.0, Color32::from_rgb(120, 180, 255)));
                 }
             }
-            self.draw_walls(painter, canvas, &style, &map::cut_portals(&segs, &self.map.portals));
+            self.draw_walls(painter, canvas, own, &map::cut_portals(&segs, &self.map.portals));
         }
 
         let portals = self.map.portals.clone();
@@ -2314,7 +2820,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -2323,10 +2829,11 @@ impl App {
                 let color = if alt { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(140, 220, 160) };
                 painter.circle_stroke(h, self.scatter.radius * s, Stroke::new(1.5, color));
             }
-            (Tool::Dungeon | Tool::Floor | Tool::Erase, Some(h)) if self.brush.shape != Tip::Cells => {
+            (Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade, Some(h)) if !self.brush.shape.drags() => {
                 // Контур кисти: куда ляжет мазок.
                 let r = self.brush.radius * s;
-                let color = if self.tool == Tool::Erase { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(120, 180, 255) };
+                let erase = self.tool == Tool::Erase || (self.tool == Tool::Shade && painter.ctx().input(|i| i.modifiers.alt));
+                let color = if erase { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(120, 180, 255) };
                 let stroke = Stroke::new(1.5, color);
                 match self.brush.shape {
                     Tip::Square => {
@@ -2345,6 +2852,46 @@ impl App {
                 painter.circle_stroke(cam.to_screen(canvas, cam.node(canvas, h)), 6.0, Stroke::new(1.5, Color32::from_rgb(255, 200, 90)));
             }
             _ => {}
+        }
+
+        // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
+        for (i, label) in self.map.labels.clone().iter().enumerate() {
+            self.draw_label(painter, canvas, label);
+            if self.sel == Some(Sel::Label(i)) && !exporting {
+                let [hw, hh] = label.half_extent();
+                let (sn, cs) = label.rot.to_radians().sin_cos();
+                let q: Vec<Pos2> = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]]
+                    .iter()
+                    .map(|[x, y]| cam.to_screen(canvas, [label.pos[0] + x * cs - y * sn, label.pos[1] + x * sn + y * cs]))
+                    .collect();
+                painter.add(Shape::closed_line(q, Stroke::new(1.5, Color32::from_rgb(120, 180, 255))));
+            }
+        }
+
+        // Выбранная дорога — осевой линией; начатая — линией до курсора.
+        if let Some(Sel::Path(i)) = self.sel
+            && !exporting
+            && let Some(p) = self.map.paths.get(i)
+        {
+            let line: Vec<Pos2> = p.curve().iter().map(|&q| cam.to_screen(canvas, q)).collect();
+            painter.add(Shape::line(line, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
+            for q in &p.points {
+                painter.circle_stroke(cam.to_screen(canvas, *q), 4.0, Stroke::new(1.5, Color32::from_rgb(120, 180, 255)));
+            }
+        }
+        if !self.path_draft.is_empty() {
+            let mut pts = self.path_draft.clone();
+            if let (Some(h), false) = (hover, self.path_free) {
+                pts.push(self.snap_pos(cam.to_world(canvas, h), painter.ctx().input(|i| i.modifiers.alt)));
+            }
+            let line: Vec<Pos2> = map::smooth_line(&pts).iter().map(|&q| cam.to_screen(canvas, q)).collect();
+            let gold = Color32::from_rgb(255, 200, 90);
+            painter.add(Shape::line(line, Stroke::new((self.path_style.width * s).max(3.0), gold.gamma_multiply(0.35))));
+            if !self.path_free {
+                for q in &self.path_draft {
+                    painter.circle_filled(cam.to_screen(canvas, *q), 4.0, gold);
+                }
+            }
         }
 
         // Начатая стена и отрезок до курсора.
@@ -2456,8 +3003,13 @@ impl App {
     /// которые лягут поверх: сила в маске — доля слоя в точке, а рисуются слои
     /// друг на друга, поэтому прозрачность пересчитывается (см. [`map::coat_alpha`]).
     fn draw_coat(&mut self, painter: &egui::Painter, canvas: Rect, coat: &Coat, above: &[Coat], clip: Option<&Mask>, view: Rect) {
-        let Some(material) = self.map.materials.get(coat.material as usize) else { return };
-        let m = &coat.mask;
+        let Some(material) = self.map.materials.get(coat.material as usize).cloned() else { return };
+        self.draw_mask(painter, canvas, &material, &coat.mask, above, clip, view);
+    }
+
+    /// Маска, залитая материалом: сила точки — прозрачность.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_mask(&mut self, painter: &egui::Painter, canvas: Rect, material: &Material, m: &Mask, above: &[Coat], clip: Option<&Mask>, view: Rect) {
         let res = RES as f32;
         // Мельче четырёх точек экрана четырёхугольник не дробится: дальше глаз не различит,
         // а на большой карте издалека это сотни тысяч лишних вершин.
@@ -2580,6 +3132,157 @@ impl App {
         if !mesh.is_empty() {
             painter.add(Shape::mesh(mesh));
         }
+    }
+
+    /// Подпись: текст по центру своей точки, повёрнутый, с каймой из восьми
+    /// тёмных копий вокруг.
+    fn draw_label(&self, painter: &egui::Painter, canvas: Rect, label: &map::Label) {
+        let px = label.size * self.cam.scale;
+        if px < 3.0 || label.text.is_empty() {
+            return;
+        }
+        let font = egui::FontId::proportional(px);
+        let color = Color32::from_rgb(label.color[0], label.color[1], label.color[2]);
+        let galley = painter.layout(label.text.clone(), font.clone(), color, f32::INFINITY);
+        let dark = painter.layout(label.text.clone(), font, Color32::from_black_alpha(200), f32::INFINITY);
+        let c = self.cam.to_screen(canvas, label.pos);
+        let angle = label.rot.to_radians();
+        let half = galley.size() / 2.0;
+        // Угол текста — левый верхний; поворот — вокруг него, так что середину
+        // сдвигаем повёрнутой половиной размера.
+        let rot = egui::emath::Rot2::from_angle(angle);
+        let origin = c - rot * half;
+        let ring = (px * 0.07).max(1.0);
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let o = vec2(a.cos(), a.sin()) * ring;
+            painter.add(egui::epaint::TextShape::new(origin + o, dark.clone(), Color32::BLACK).with_angle(angle));
+        }
+        painter.add(egui::epaint::TextShape::new(origin, galley, color).with_angle(angle));
+    }
+
+    /// Тень объекта: размытый силуэт той же картинки, сдвинутый от света.
+    fn draw_prop_shadow(&mut self, painter: &egui::Painter, canvas: Rect, prop: &Prop, sh: &map::Shadows) {
+        let blur = ((sh.blur * 10.0).round() as u32).clamp(1, 10);
+        let key = format!("{}{blur}:{}", library::SHADOW, prop.asset);
+        let Some((tex, info)) = self.textures.get(&key, false) else { return };
+        let (id, [tw, th]) = (tex.id(), tex.size());
+        let (pad, sw) = (info[0] as f32, info[1].max(1) as f32);
+        let sh_h = (th as f32 - 2.0 * pad).max(1.0);
+        let _ = tw;
+        let (w, h) = (prop.size[0] * prop.scale, prop.size[1] * prop.scale);
+        let (hw, hh) = (w / 2.0 + pad / sw * w, h / 2.0 + pad / sh_h * h);
+        let (s, c) = prop.rot.to_radians().sin_cos();
+        let o = sh.offset();
+        let corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [prop.pos[0] + x * c - y * s + o[0], prop.pos[1] + x * s + y * c + o[1]]);
+        let uv = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
+        let tint = Color32::from_white_alpha((sh.opacity * 255.0).round() as u8);
+        let mut mesh = egui::Mesh::with_texture(id);
+        for (p, uv) in corners.iter().zip(uv) {
+            mesh.vertices.push(egui::epaint::Vertex { pos: self.cam.to_screen(canvas, *p), uv, color: tint });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(Shape::mesh(mesh));
+    }
+
+    /// Тень стен: лента шире стены на размытие, сдвинутая от света; края тают.
+    fn draw_wall_shadow(&mut self, painter: &egui::Painter, canvas: Rect, segs: &[Segment], width: f32, sh: &map::Shadows) {
+        let cam = self.cam;
+        let o = sh.offset();
+        let (outer_hw, inner_hw) = (width / 2.0 + sh.blur / 2.0, (width / 2.0 - sh.blur / 2.0).max(0.01));
+        let dark = Color32::from_black_alpha((sh.opacity * 255.0).round() as u8);
+        let mut mesh = egui::Mesh::default();
+        for line in mask::join(segs.to_vec()) {
+            let closed = line.len() > 3 && (line[0][0] - line[line.len() - 1][0]).abs() < 1e-3 && (line[0][1] - line[line.len() - 1][1]).abs() < 1e-3;
+            let (outer, inner) = (ribbon(&line, closed, outer_hw), ribbon(&line, closed, inner_hw));
+            if outer.len() < 2 || outer.len() != inner.len() {
+                continue;
+            }
+            let base = mesh.vertices.len() as u32;
+            for ((ol, or, _), (il, ir, _)) in outer.iter().zip(&inner) {
+                for (p, color) in [(ol, Color32::TRANSPARENT), (il, dark), (ir, dark), (or, Color32::TRANSPARENT)] {
+                    let q = [p[0] + o[0], p[1] + o[1]];
+                    mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, q), uv: egui::epaint::WHITE_UV, color });
+                }
+            }
+            for k in 0..outer.len() as u32 - 1 {
+                let (p, q) = (base + k * 4, base + (k + 1) * 4);
+                for r in 0..3 {
+                    mesh.add_triangle(p + r, p + r + 1, q + r + 1);
+                    mesh.add_triangle(p + r, q + r + 1, q + r);
+                }
+            }
+        }
+        if !mesh.is_empty() {
+            painter.add(Shape::mesh(mesh));
+        }
+    }
+
+    /// Дорога лентой вдоль плавной линии: четыре ряда вершин поперёк — внешний край
+    /// прозрачный, внутренние сплошные, между ними край тает. Ширина каждой стороны
+    /// гуляет по своему шуму, как берег. Текстура — по сетке, как пол, или вдоль.
+    fn draw_path(&mut self, painter: &egui::Painter, canvas: Rect, path: &map::Path, seed: u32) {
+        let Some(material) = self.map.materials.get(path.material) else { return };
+        let (tex, tile, tint) = match &material.paint {
+            Paint::Color(c) => (None, [1.0, 1.0], rgb(*c)),
+            Paint::Texture(key) => {
+                let key = if material.vary && !path.along { format!("{}{key}", library::VARY) } else { key.clone() };
+                match self.textures.get(&key, false) {
+                    Some((t, px)) => (Some(t.id()), [(px[0] as f32 / PX_PER_CELL).max(MIN_TILE), (px[1] as f32 / PX_PER_CELL).max(MIN_TILE)], Color32::WHITE),
+                    None => (None, [1.0, 1.0], Color32::from_gray(60)),
+                }
+            }
+        };
+        let line = path.curve();
+        if line.len() < 2 {
+            return;
+        }
+        let mut dist = vec![0.0f32; line.len()];
+        for k in 1..line.len() {
+            dist[k] = dist[k - 1] + ((line[k][0] - line[k - 1][0]).powi(2) + (line[k][1] - line[k - 1][1]).powi(2)).sqrt();
+        }
+        let total = dist[line.len() - 1].max(1e-4);
+        let hw = path.width / 2.0;
+        // Край не тоньше полутора точек экрана, иначе он лесенкой.
+        let fade = (hw * path.soft).max(1.5 / self.cam.scale).min(hw);
+        let cam = self.cam;
+        let mut mesh = match tex {
+            Some(id) => egui::Mesh::with_texture(id),
+            None => egui::Mesh::default(),
+        };
+        for k in 0..line.len() {
+            let (a, b) = (line[k.saturating_sub(1)], line[(k + 1).min(line.len() - 1)]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let n = [-dy / len, dx / len];
+            let d = dist[k];
+            let side = |salt: u32| hw * (1.0 + path.rough * 0.8 * (value_noise(d / (0.9 + hw * 0.5), seed.wrapping_mul(2).wrapping_add(salt)) - 0.5));
+            let (wl, wr) = (side(0), side(1));
+            // На концах дорога тает так же, как по краю.
+            let end = ((d.min(total - d)) / fade).clamp(0.0, 1.0);
+            let c = line[k];
+            let rows = [(wl, 0.0), (wl - fade, 1.0), (-(wr - fade), 1.0), (-wr, 0.0)];
+            for (off, a) in rows {
+                let p = [c[0] + n[0] * off, c[1] + n[1] * off];
+                let uv = match tex {
+                    None => egui::epaint::WHITE_UV,
+                    Some(_) if path.along => pos2(d / tile[0], (hw - off) / tile[1]),
+                    Some(_) => pos2(p[0] / tile[0], p[1] / tile[1]),
+                };
+                let alpha = (a * end * 255.0).round() as u8;
+                let color = if tex.is_some() { Color32::from_white_alpha(alpha) } else { Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), alpha) };
+                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv, color });
+            }
+            if k > 0 {
+                let (p, q) = (((k - 1) * 4) as u32, (k * 4) as u32);
+                for r in 0..3 {
+                    mesh.add_triangle(p + r, p + r + 1, q + r + 1);
+                    mesh.add_triangle(p + r, q + r + 1, q + r);
+                }
+            }
+        }
+        painter.add(Shape::mesh(mesh));
     }
 
     /// Стены лентой: отрезки склеиваются в ломаные, у каждой вершины лента
@@ -2716,6 +3419,9 @@ impl App {
             }
         }
         self.notice = None;
+        let start_level = self.level;
+        let sel = self.sel.take();
+        self.switch_level(0);
         self.export = Some(Export {
             dir,
             name,
@@ -2724,8 +3430,11 @@ impl App {
             tiles,
             next: 0,
             image: image::RgbImage::new(w, h),
+            done: Vec::new(),
+            doing: 0,
+            start_level,
             cam: self.cam,
-            sel: self.sel.take(),
+            sel,
             settle: 0,
             asked: false,
             quit,
@@ -2794,7 +3503,20 @@ impl App {
         if e.next < e.tiles.len() {
             return;
         }
-        let Some(e) = self.export.take() else { return };
+        // Этаж снят — следующий, пока не кончатся.
+        if e.doing + 1 < self.levels.len() {
+            let fresh = image::RgbImage::new(e.image.width(), e.image.height());
+            e.done.push(std::mem::replace(&mut e.image, fresh));
+            e.doing += 1;
+            e.next = 0;
+            let k = e.doing;
+            self.switch_level(k);
+            return;
+        }
+        let Some(mut e) = self.export.take() else { return };
+        let last = std::mem::replace(&mut e.image, image::RgbImage::new(1, 1));
+        e.done.push(last);
+        self.switch_level(e.start_level);
         self.cam = e.cam;
         self.sel = e.sel;
         let result = self.write_export(&e);
@@ -2812,19 +3534,28 @@ impl App {
         }
     }
 
-    /// Картинка, сцена Foundry и Universal VTT рядом друг с другом.
+    /// Картинка, сцена Foundry и Universal VTT рядом друг с другом; у нескольких
+    /// этажей — картинка и `.dd2vtt` на каждый, сцена одна, этажи в ней — уровни.
     fn write_export(&mut self, e: &Export) -> Result<String, String> {
         std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
-        let img_path = e.dir.join(format!("{}.jpg", e.name));
-        let mut jpg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&e.image).map_err(|x| x.to_string())?;
-        std::fs::write(&img_path, &jpg).map_err(|x| format!("{}: {x}", img_path.display()))?;
-        let edges = self.room_edges().to_vec();
-        let layout = export::layout(&self.map, &edges);
-        let src = export::foundry_src(&img_path);
+        let n = e.done.len();
+        let stem = |k: usize| if n == 1 { e.name.clone() } else { format!("{}_{}", e.name, k + 1) };
+        let mut jpgs = Vec::new();
+        let mut srcs = Vec::new();
+        let mut layouts = Vec::new();
+        for (k, img) in e.done.iter().enumerate() {
+            let img_path = e.dir.join(format!("{}.jpg", stem(k)));
+            let mut jpg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
+            std::fs::write(&img_path, &jpg).map_err(|x| format!("{}: {x}", img_path.display()))?;
+            let map = if k == self.level { &self.map } else { &self.levels[k] };
+            layouts.push(export::layout(map, &map.room_edges()));
+            srcs.push(export::foundry_src(&img_path));
+            jpgs.push(jpg);
+        }
         // Створки — отдельными картинками рядом со сценой: Foundry их двигает.
         let mut leaves = std::collections::HashMap::new();
-        for key in layout.portals.iter().filter_map(|p| p.leaf.clone()) {
+        for key in layouts.iter().flat_map(|l| l.portals.iter()).filter_map(|p| p.leaf.clone()) {
             if leaves.contains_key(&key) {
                 continue;
             }
@@ -2837,20 +3568,26 @@ impl App {
             img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
             leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
         }
-        let scene = export::foundry_scene(&self.map, &e.name, &src, e.px, &layout, &leaves);
+        let levels: Vec<export::SceneLevel> = (0..n)
+            .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k] })
+            .collect();
+        let scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
         let scene_path = e.dir.join(format!("{}.json", e.name));
         std::fs::write(&scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default()).map_err(|x| x.to_string())?;
         use base64::Engine;
-        let uv = export::dd2vtt(&self.map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpg), &layout);
-        std::fs::write(e.dir.join(format!("{}.dd2vtt", e.name)), uv.to_string()).map_err(|x| x.to_string())?;
-        let walls: usize = layout.walls.iter().map(|l| l.len().saturating_sub(1)).sum();
+        for k in 0..n {
+            let map = if k == self.level { &self.map } else { &self.levels[k] };
+            let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpgs[k]), &layouts[k]);
+            std::fs::write(e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string()).map_err(|x| x.to_string())?;
+        }
+        let walls: usize = layouts.iter().flat_map(|l| l.walls.iter()).map(|l| l.len().saturating_sub(1)).sum();
+        let (w, h) = (e.done[0].width(), e.done[0].height());
         Ok(format!(
-            "Выгружено в {}: картинка {}×{}, стен {walls}, проёмов {}, огней {}",
+            "Выгружено в {}: {}картинка {w}×{h}, стен {walls}, проёмов {}, огней {}",
             e.dir.display(),
-            e.image.width(),
-            e.image.height(),
-            layout.portals.len(),
-            layout.lights.len()
+            if n > 1 { format!("этажей {n}, ") } else { String::new() },
+            layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
+            layouts.iter().map(|l| l.lights.len()).sum::<usize>()
         ))
     }
 
@@ -2963,6 +3700,22 @@ pub fn bake_prop(out: &mut image::RgbaImage, img: &image::RgbaImage, p: &Prop, o
             out.put_pixel(x, y, image::Rgba([ch(0), ch(1), ch(2), (oa * 255.0).round() as u8]));
         }
     }
+}
+
+/// Плавный шум 0..1 вдоль одной оси: случайные значения в целых точках,
+/// между ними — сглаженная середина.
+fn value_noise(x: f32, seed: u32) -> f32 {
+    let h = |i: i32| {
+        let mut v = (i as u32).wrapping_mul(0x9E37_79B1) ^ seed.wrapping_mul(0x85EB_CA77);
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x2C1B_3C6D);
+        v ^= v >> 12;
+        (v & 0xFFFF) as f32 / 65535.0
+    };
+    let i = x.floor();
+    let t = x - i;
+    let t = t * t * (3.0 - 2.0 * t);
+    h(i as i32) * (1.0 - t) + h(i as i32 + 1) * t
 }
 
 fn rgb(c: [u8; 3]) -> Color32 {
@@ -3153,7 +3906,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0 };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

@@ -99,7 +99,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 34] = [
 /// Стены, зашитые в программу: имя, подпись, толщина в клетках, байты. Картинка —
 /// полоса гребня стены, бесшовная по длине, высотой «толщина × 256» с обводкой
 /// по краям, как в паках FA (`tools/walls.py`).
-pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 13] = [
+pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 15] = [
     ("wall_stone_blocks", "Каменные блоки", 0.45, include_bytes!("../assets/builtin/walls/stone_blocks.webp")),
     ("wall_sandstone", "Песчаник", 0.45, include_bytes!("../assets/builtin/walls/sandstone.webp")),
     ("wall_brick", "Кирпич", 0.35, include_bytes!("../assets/builtin/walls/brick.webp")),
@@ -113,6 +113,9 @@ pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 13] = [
     ("wall_timber", "Фахверк", 0.35, include_bytes!("../assets/builtin/walls/timber.webp")),
     ("wall_hedge", "Живая изгородь", 0.5, include_bytes!("../assets/builtin/walls/hedge.webp")),
     ("wall_cave", "Скала", 0.6, include_bytes!("../assets/builtin/walls/cave.webp")),
+    // Из каменных блоков, `tools/races.py`.
+    ("wall_dwarven", "Гномья кладка", 0.45, include_bytes!("../assets/builtin/walls/dwarven.webp")),
+    ("wall_drow", "Обсидиан дроу", 0.45, include_bytes!("../assets/builtin/walls/drow.webp")),
 ];
 
 /// Встроенные двери, косяки и окна (`tools/portals.py`): ключ, подпись, размер холста
@@ -179,6 +182,11 @@ pub fn builtin_size(key: &str) -> Option<[f32; 2]> {
 
 /// Ключ с этой приставкой — та же картинка, но с «разнообразием» (см. [`vary`]).
 pub const VARY: &str = "vary:";
+/// Ключ тени объекта: `shadow:<размытие в десятых клетки>:<ключ картинки>`.
+/// Вместо размера картинки слот тени отдаёт [поле, ширина силуэта] в точках —
+/// по ним видно, сколько поля под размытие в долях объекта.
+pub const SHADOW: &str = "shadow:";
+const SHADOW_SIDE: u32 = 256;
 /// Во сколько раз плитка с разнообразием больше исходной по каждой стороне.
 pub const VARY_TIMES: u32 = 3;
 /// Исходник для разнообразия не крупнее этого: большая плитка — втрое больше.
@@ -364,12 +372,18 @@ impl Textures {
                         },
                         Err(_) => return,
                     };
-                    let result = match job.key.strip_prefix(VARY) {
+                    let shadow = job.key.strip_prefix(SHADOW).and_then(|rest| rest.split_once(':'));
+                    let result = if let Some((blur, inner)) = shadow {
+                        let blur = blur.parse::<f32>().unwrap_or(3.0) / 10.0;
+                        read_source(inner, &sources).and_then(|bytes| shadow_image(&bytes, blur))
+                    } else {
+                        match job.key.strip_prefix(VARY) {
                         Some(inner) => read_source(inner, &sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
                             let big = vary(&rgba, inner);
                             (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])
                         }),
                         None => read_source(&job.key, &sources).and_then(|bytes| decode(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })),
+                        }
                     };
                     if tx.send(Done { key: job.key, thumb: job.thumb, result }).is_err() {
                         return;
@@ -435,6 +449,51 @@ fn decode_rgba(bytes: &[u8], max_side: u32) -> Result<(image::RgbaImage, [u32; 2
     let size = [picture.width(), picture.height()];
     let picture = if size[0].max(size[1]) > max_side { picture.thumbnail(max_side, max_side) } else { picture };
     Ok((picture.to_rgba8(), size))
+}
+
+/// Тень объекта: силуэт по прозрачности, размытый тремя проходами ящика
+/// (почти по Гауссу), с полями под размытие. Картинка мелкая — тень мягкая,
+/// подробности ей ни к чему.
+pub fn shadow_image(bytes: &[u8], blur_cells: f32) -> Result<(ColorImage, [u32; 2]), String> {
+    let (small, orig) = decode_rgba(bytes, SHADOW_SIDE)?;
+    let (w, h) = (small.width() as usize, small.height() as usize);
+    let ppc = w as f32 / (orig[0] as f32 / PX_PER_CELL).max(1e-3);
+    let r = ((blur_cells * ppc / 2.0).round() as usize).clamp(1, 64);
+    let pad = 3 * r + 1;
+    let (pw, ph) = (w + 2 * pad, h + 2 * pad);
+    let mut a = vec![0f32; pw * ph];
+    for (x, y, p) in small.enumerate_pixels() {
+        a[(y as usize + pad) * pw + x as usize + pad] = p.0[3] as f32;
+    }
+    let mut tmp = vec![0f32; pw * ph];
+    for _ in 0..3 {
+        box_pass(&a, &mut tmp, pw, ph, r, true);
+        box_pass(&tmp, &mut a, pw, ph, r, false);
+    }
+    let rgba: Vec<u8> = a.iter().flat_map(|&v| [0, 0, 0, v.round().clamp(0.0, 255.0) as u8]).collect();
+    Ok((ColorImage::from_rgba_unmultiplied([pw, ph], &rgba), [pad as u32, w as u32]))
+}
+
+/// Скользящее среднее по строкам или столбцам, окно 2r+1, за краем — пусто.
+fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, rows: bool) {
+    let (n, lines) = if rows { (w, h) } else { (h, w) };
+    let at = |line: usize, k: usize| if rows { line * w + k } else { k * w + line };
+    let norm = 1.0 / (2 * r + 1) as f32;
+    for line in 0..lines {
+        let mut sum = 0.0;
+        for k in 0..=r.min(n - 1) {
+            sum += src[at(line, k)];
+        }
+        for k in 0..n {
+            dst[at(line, k)] = sum * norm;
+            if k + r + 1 < n {
+                sum += src[at(line, k + r + 1)];
+            }
+            if k >= r {
+                sum -= src[at(line, k - r)];
+            }
+        }
+    }
 }
 
 fn to_color_image(rgba: &image::RgbaImage) -> ColorImage {
@@ -693,6 +752,28 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn shadow_is_blurred_silhouette_with_margin() {
+        // Квадрат 2×2 клетки: непрозрачная середина, прозрачные края.
+        let mut img = image::RgbaImage::new(512, 512);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let inside = (128..384).contains(&x) && (128..384).contains(&y);
+            *p = image::Rgba([200, 30, 30, if inside { 255 } else { 0 }]);
+        }
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        let (shadow, [pad, w]) = shadow_image(&bytes, 0.3).unwrap();
+        assert_eq!(w, 256);
+        assert_eq!(shadow.size, [256 + 2 * pad as usize, 256 + 2 * pad as usize]);
+        let at = |x: usize, y: usize| shadow.pixels[y * shadow.size[0] + x];
+        let c = shadow.size[0] / 2;
+        // Середина тёмная и чёрная, угол поля пустой, край силуэта — полутень.
+        assert!(at(c, c).a() > 250 && at(c, c).r() == 0);
+        assert_eq!(at(0, 0).a(), 0);
+        let edge = at(pad as usize + 64, c).a();
+        assert!((90..170).contains(&edge), "{edge}");
+    }
 
     #[test]
     fn size_and_kind_from_names() {
