@@ -77,10 +77,10 @@ pub fn tile_cells(px: [u32; 2]) -> [f32; 2] {
     [(px[0] as f32 / crate::library::PX_PER_CELL).max(0.5), (px[1] as f32 / crate::library::PX_PER_CELL).max(0.5)]
 }
 
-/// Тень крыши на землю: контур, сдвинутый дальше, чем тени стен, — крыша выше.
-pub fn shadow_outline(roof: &Roof, sh: &map::Shadows) -> Vec<[f32; 2]> {
+/// Тень крыши длиннее тени стены: крыша выше.
+pub fn shadow_offset(sh: &map::Shadows) -> [f32; 2] {
     let o = sh.offset();
-    roof.outline().into_iter().map(|p| [p[0] + o[0] * 2.5, p[1] + o[1] * 2.5]).collect()
+    [o[0] * 2.5, o[1] * 2.5]
 }
 
 #[cfg(test)]

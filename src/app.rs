@@ -3352,13 +3352,19 @@ impl App {
             l.1 = map::cut_portals_wide(&l.1, &self.map.portals, l.0.width / 2.0);
         }
         if shadows.on {
+            // Стена под крышей своей тени не даёт: её накрывает тень крыши, а вдвоём они
+            // чернили двери и всё у стены на теневой стороне дома.
+            let roofs = if self.roof_view == RoofView::Hidden { Vec::new() } else { self.map.roofs.clone() };
+            let open = |segs: &[Segment]| -> Vec<Segment> {
+                segs.iter().copied().filter(|s| !roofs.iter().any(|r| r.contains([(s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0]))).collect()
+            };
             for sh in shadows.layers() {
                 for (st, edges) in &looks {
-                    self.draw_wall_shadow(painter, canvas, edges, st.width, &sh);
+                    self.draw_wall_shadow(painter, canvas, &open(edges), st.width, &sh);
                 }
                 for w in self.map.walls.clone() {
                     let width = w.style.as_ref().map_or(style.width, |s| s.width);
-                    self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &sh);
+                    self.draw_wall_shadow(painter, canvas, &open(&map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0)), width, &sh);
                 }
             }
         }
@@ -3495,10 +3501,8 @@ impl App {
         if self.roof_view != RoofView::Hidden {
             let roofs = self.map.roofs.clone();
             if shadows.on {
-                for sh in shadows.layers() {
-                    for r in &roofs {
-                        self.draw_roof_shadow(painter, canvas, r, &sh);
-                    }
+                for r in &roofs {
+                    self.draw_roof_shadow(painter, canvas, r, &shadows);
                 }
             }
             if roof_alpha > 0.0 {
@@ -3877,23 +3881,51 @@ impl App {
     /// Тень крыши на земле: сдвинутый контур, залитый, с мягким краем.
     fn draw_roof_shadow(&self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, sh: &map::Shadows) {
         let cam = self.cam;
-        let pts = roofs::shadow_outline(roof, sh);
+        // От стен, а не от края свеса: без крыши на земле не остаётся резкой полосы.
+        let (lo, hi) = ([roof.a[0].min(roof.b[0]), roof.a[1].min(roof.b[1])], [roof.a[0].max(roof.b[0]), roof.a[1].max(roof.b[1])]);
+        let pts: Vec<[f32; 2]> = roof.outline().into_iter().map(|p| [p[0].clamp(lo[0], hi[0]), p[1].clamp(lo[1], hi[1])]).collect();
         let n = pts.len();
         let c = [pts.iter().map(|p| p[0]).sum::<f32>() / n as f32, pts.iter().map(|p| p[1]).sum::<f32>() / n as f32];
+        let o = roofs::shadow_offset(sh);
+        let len = (o[0] * o[0] + o[1] * o[1]).sqrt();
+        if len < 1e-4 {
+            return;
+        }
+        let along = [o[0] / len * sh.blur, o[1] / len * sh.blur];
+        let shift = |p: [f32; 2], d: [f32; 2]| [p[0] + d[0], p[1] + d[1]];
         let dark = Color32::from_black_alpha((sh.opacity * 255.0).round() as u8);
+        let far = Color32::from_black_alpha((sh.opacity * (1.0 - sh.fade) * 255.0).round() as u8);
         let mut mesh = egui::Mesh::default();
-        let v = |p: [f32; 2], color| egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: egui::epaint::WHITE_UV, color };
-        mesh.vertices.push(v(c, dark));
-        for (k, &p) in pts.iter().enumerate() {
-            let d = [p[0] - c[0], p[1] - c[1]];
-            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
-            let half = sh.blur / 2.0;
-            mesh.vertices.push(v([p[0] - d[0] / l * half, p[1] - d[1] / l * half], dark));
-            mesh.vertices.push(v([p[0] + d[0] / l * half, p[1] + d[1] / l * half], Color32::TRANSPARENT));
-            let (i, j) = (1 + 2 * k as u32, 1 + 2 * ((k + 1) % n) as u32);
-            mesh.add_triangle(0, i, j);
-            mesh.add_triangle(i, i + 1, j + 1);
-            mesh.add_triangle(i, j + 1, j);
+        let mut quad = |a: [([f32; 2], Color32); 4]| {
+            let base = mesh.vertices.len() as u32;
+            for (p, color) in a {
+                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: egui::epaint::WHITE_UV, color });
+            }
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+        };
+        // Сторона в тени: тень идёт полосой от края крыши; на границе с освещённой
+        // стороной тает вбок.
+        let shaded = |k: usize| {
+            let (p, q) = (pts[k], pts[(k + 1) % n]);
+            let m = [(p[0] + q[0]) / 2.0 - c[0], (p[1] + q[1]) / 2.0 - c[1]];
+            let (nx, ny) = (q[1] - p[1], p[0] - q[0]);
+            let side = if nx * m[0] + ny * m[1] >= 0.0 { 1.0 } else { -1.0 };
+            (nx * o[0] + ny * o[1]) * side > 0.0
+        };
+        for k in 0..n {
+            let (p, q) = (pts[k], pts[(k + 1) % n]);
+            if shaded(k) {
+                quad([(p, dark), (q, dark), (shift(q, o), far), (shift(p, o), far)]);
+                quad([(shift(p, o), far), (shift(q, o), far), (shift(shift(q, o), along), Color32::TRANSPARENT), (shift(shift(p, o), along), Color32::TRANSPARENT)]);
+            }
+            if shaded(k) != shaded((k + 1) % n) {
+                let mut s = [-along[1], along[0]];
+                if s[0] * (q[0] - c[0]) + s[1] * (q[1] - c[1]) < 0.0 {
+                    s = [-s[0], -s[1]];
+                }
+                quad([(q, dark), (shift(q, o), far), (shift(shift(q, o), s), Color32::TRANSPARENT), (shift(q, s), Color32::TRANSPARENT)]);
+            }
         }
         painter.add(Shape::mesh(mesh));
     }
