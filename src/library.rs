@@ -59,7 +59,7 @@ pub const BUILTIN_TEXTURES: [(&str, &str, bool, &[u8]); 27] = [
 
 /// Объекты, зашитые в программу: имя, подпись, размер в клетках, байты. Картинка —
 /// 256 точек на клетку с прозрачным полем и тенью (`tools/cutout.py`).
-pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 40] = [
+pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 49] = [
     ("chair", "Стул", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chair.webp")),
     ("stool", "Табурет", [1.0, 1.0], include_bytes!("../assets/builtin/objects/stool.webp")),
     ("table", "Стол", [2.0, 1.0], include_bytes!("../assets/builtin/objects/table.webp")),
@@ -100,6 +100,15 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 40] = [
     ("plant_pot", "Растение в горшке", [1.0, 1.0], include_bytes!("../assets/builtin/objects/plant_pot.webp")),
     ("bush", "Куст", [1.0, 1.0], include_bytes!("../assets/builtin/objects/bush.webp")),
     ("tree", "Дерево", [3.0, 3.0], include_bytes!("../assets/builtin/objects/tree.webp")),
+    ("fountain", "Фонтан", [4.0, 4.0], include_bytes!("../assets/builtin/objects/fountain.webp")),
+    ("market_stall", "Лавка с красным навесом", [3.0, 3.0], include_bytes!("../assets/builtin/objects/market_stall.webp")),
+    ("market_stall_blue", "Лавка с синим навесом", [3.0, 3.0], include_bytes!("../assets/builtin/objects/market_stall_blue.webp")),
+    ("market_stall_ochre", "Лавка с жёлтым навесом", [3.0, 3.0], include_bytes!("../assets/builtin/objects/market_stall_ochre.webp")),
+    ("cart", "Телега", [2.0, 3.0], include_bytes!("../assets/builtin/objects/cart.webp")),
+    ("street_lamp", "Фонарь", [1.0, 1.0], include_bytes!("../assets/builtin/objects/street_lamp.webp")),
+    ("notice_board", "Доска объявлений", [3.0, 2.0], include_bytes!("../assets/builtin/objects/notice_board.webp")),
+    ("stocks", "Колодки", [2.0, 2.0], include_bytes!("../assets/builtin/objects/stocks.webp")),
+    ("planter", "Ящик с цветами", [1.0, 1.0], include_bytes!("../assets/builtin/objects/planter.webp")),
 ];
 
 /// Стены, зашитые в программу: имя, подпись, толщина в клетках, байты. Картинка —
@@ -271,7 +280,7 @@ impl Asset {
 }
 
 /// Встроенные предметы с вариантами: всё, что начинается с этих имён, — одна семья.
-const BUILTIN_FAMILIES: [&str; 11] = ["chest", "weapon_rack", "door", "window", "rug", "bed", "table", "roof_clay", "roof_slate", "frame_wood", "frame_stone"];
+const BUILTIN_FAMILIES: [&str; 12] = ["market_stall", "chest", "weapon_rack", "door", "window", "rug", "bed", "table", "roof_clay", "roof_slate", "frame_wood", "frame_stone"];
 
 /// Семья ассета. У встроенных — по таблице. У паков и папок — имя без хвоста, который
 /// отличает варианты: размера, номера, буквы (`Barrel_Wood_A2_1x1` → `barrel_wood`).

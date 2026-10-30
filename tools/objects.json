@@ -37,5 +37,14 @@
   ["well", "Колодец", "round stone well with a wooden roof frame", 1.6, 1.6, "g", 1],
   ["plant_pot", "Растение в горшке", "potted green plant in a clay pot", 0.5, 0.5, "m", 1],
   ["bush", "Куст", "round leafy green bush", 0.9, 0.9, "m", 1],
-  ["tree", "Дерево", "large leafy green oak tree crown", 2.6, 2.6, "m", 1]
+  ["tree", "Дерево", "large leafy green oak tree crown", 2.6, 2.6, "m", 1],
+  ["fountain", "Фонтан", "round stone town fountain", 3.8, 3.8, "g", 1],
+  ["market_stall", "Лавка с красным навесом", "market stall, flat plan view, red and cream striped canvas roof", 2.8, 2.9, "g", 1],
+  ["market_stall_blue", "Лавка с синим навесом", "market stall, flat plan view, blue and cream striped canvas roof", 2.8, 2.9, "g", 1],
+  ["market_stall_ochre", "Лавка с жёлтым навесом", "market stall, flat plan view, patched ochre canvas roof", 2.8, 2.9, "m", 1],
+  ["cart", "Телега", "hand cart with hay and sacks, flat plan view, wheels as thin strips", 1.75, 2.9, "m", 1],
+  ["street_lamp", "Фонарь", "street lantern, flat plan view, round iron cap and glowing glass", 0.7, 0.7, "g", 1],
+  ["notice_board", "Доска объявлений", "notice board, flat plan view, small gabled shingle roof", 2.6, 1.4, "g", 1],
+  ["stocks", "Колодки", "wooden stocks on a plank platform", 1.4, 1.4, "g", 1],
+  ["planter", "Ящик с цветами", "wooden planter box with flowers", 0.9, 0.9, "m", 1]
 ]

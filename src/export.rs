@@ -97,6 +97,7 @@ fn light_of(asset: &str) -> Option<(f32, f32, &'static str, &'static str)> {
         "campfire" => Some((3.0, 6.0, "#ff9a3c", "flame")),
         "fireplace" => Some((2.0, 5.0, "#ff8a2c", "flame")),
         "brazier" => Some((2.0, 4.0, "#ffa040", "torch")),
+        "street_lamp" => Some((3.0, 6.0, "#ffc870", "torch")),
         _ => None,
     }
 }
