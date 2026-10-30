@@ -286,7 +286,7 @@ impl SelfTest {
                 let wrote = tile.save(&floor).is_ok() && brick.save(&wall).is_ok();
                 app.set_textures_dir(dir.clone());
                 // Две картинки папки, встроенные текстуры, объекты, стены и двери.
-                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len();
+                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len() + crate::library::BUILTIN_ROOFS.len();
                 self.check("папка текстур прочиталась", wrote && app.library.assets.len() == 2 + builtin, &format!("ассетов {}", app.library.assets.len()));
                 app.use_floor_texture(&floor.to_string_lossy());
                 // Вид всех стен: с выбранной стеной текстура легла бы только на неё.
@@ -740,6 +740,37 @@ impl SelfTest {
                 self.resume_at = now + 0.3;
             }
             60 => self.snap(ctx, "второй этаж поверх первого"),
+            61 => {
+                // Крыши: протяжка рамкой ставит двускатную над домом, вторая — шатёр.
+                app.switch_level(0);
+                app.set_tool(Tool::Dungeon);
+                app.brush.shape = Tip::Cells;
+                app.paint((10, 5), (16, 9));
+                app.set_tool(Tool::Roof);
+                let (a, b) = (at(app, [10.5, 5.5]), at(app, [16.5, 9.5]));
+                self.drag(a, b, PointerButton::Primary);
+            }
+            62 => {
+                let r = app.map.roofs.first().cloned();
+                let ok = r.as_ref().is_some_and(|r| r.a == [10.0, 5.0] && r.b == [17.0, 10.0] && r.shape == map::RoofShape::Gable);
+                self.check("протяжка «Крышей» поставила двускатную над домом", ok, &format!("{r:?}"));
+                // Шатёр рядом, слуховое разнообразие покрытий — черепица и сланец.
+                app.roof_style.shape = map::RoofShape::Tent;
+                app.roof_style.paint = format!("{}roof_slate_blue", crate::library::BUILTIN);
+                app.place_roof((2, 2), (5, 5));
+                app.roof_style.shape = map::RoofShape::Hip;
+                app.roof_style.paint = format!("{}roof_thatch", crate::library::BUILTIN);
+                app.place_roof((7, 1), (16, 3));
+                // С инструментом стен крыши полупрозрачны и не мешают выбрать стену.
+                app.set_tool(Tool::Wall);
+                let ghost = app.roof_alpha() < 1.0 && !matches!(app.pick([12.0, 7.0]), Some(Sel::Roof(_)));
+                app.set_tool(Tool::Select);
+                let solid = matches!(app.pick([12.0, 7.0]), Some(Sel::Roof(0)));
+                self.check("крыша видна в «Выборе» и прозрачна для стен", ghost && solid, &format!("ghost {ghost} solid {solid}"));
+                app.sel = None;
+                self.resume_at = now + 0.4;
+            }
+            63 => self.snap(ctx, "крыши"),
             _ => return false,
         }
         true

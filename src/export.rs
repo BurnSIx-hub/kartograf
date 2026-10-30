@@ -201,7 +201,7 @@ fn doc_id(kind: char, n: usize) -> String {
 /// двойная дверь — `animation.double`, Foundry сам делит проём на две створки.
 #[cfg(test)]
 pub fn foundry_scene(map: &Map, name: &str, image_src: &str, px: u32, layout: &Layout, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
-    foundry_levels(map, name, &[SceneLevel { name: name.to_owned(), image_src: image_src.to_owned(), layout }], px, leaves)
+    foundry_levels(map, name, &[SceneLevel { name: name.to_owned(), image_src: image_src.to_owned(), layout, roofs: Vec::new() }], px, leaves)
 }
 
 /// Этаж сцены: имя, картинка и что на нём.
@@ -209,6 +209,14 @@ pub struct SceneLevel<'a> {
     pub name: String,
     pub image_src: String,
     pub layout: &'a Layout,
+    /// Крыши этажа — тайлами над токенами.
+    pub roofs: Vec<RoofTile>,
+}
+
+/// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
+pub struct RoofTile {
+    pub src: String,
+    pub rect: [i64; 4],
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -224,6 +232,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
     let mut walls = Vec::new();
     let mut lights = Vec::new();
     let mut regions = Vec::new();
+    let mut tiles = Vec::new();
     let mut docs = Vec::new();
     for (k, lv) in levels.iter().enumerate() {
         let tag = |mut v: Value| {
@@ -239,6 +248,18 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         }
         for l in &mut lights[l0..] {
             *l = tag(l.take());
+        }
+        // Крыша — тайл выше токенов этажа: гаснет, когда под ней токен,
+        // и не пускает свет и дождь. `x`, `y` тайла — точка привязки картинки
+        // (по умолчанию её середина), поэтому привязка — в левый верхний угол.
+        for r in &lv.roofs {
+            let [x, y, w, h] = r.rect;
+            tiles.push(tag(json!({
+                "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0, "anchorY": 0}, "x": x, "y": y, "width": w, "height": h,
+                "elevation": k as i64 * 10 + 9, "sort": tiles.len(),
+                "occlusion": {"modes": [1], "alpha": 0},
+                "restrictions": {"light": true, "weather": true}
+            })));
         }
         let p = px as f32;
         for z in &lv.layout.zones {
@@ -284,6 +305,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         "walls": walls,
         "lights": lights,
         "regions": regions,
+        "tiles": tiles,
         "flags": {"kartograf": {"format": 1}}
     })
 }
@@ -418,7 +440,7 @@ mod tests {
         let z = &lay.zones[0];
         assert_eq!((z.effect, z.loops.len()), ("water", 2));
         assert_eq!(z.loops.iter().filter(|l| l.1).count(), 1);
-        let scene = foundry_levels(&m, "Пруд", &[SceneLevel { name: "Пруд".into(), image_src: "p.jpg".into(), layout: &lay }], 100, &Default::default());
+        let scene = foundry_levels(&m, "Пруд", &[SceneLevel { name: "Пруд".into(), image_src: "p.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
         let r = &scene["regions"][0];
         assert_eq!(r["flags"][LIVE_MODULE]["effect"], "water");
         assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
@@ -435,8 +457,8 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la },
-            SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200] }] },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: Vec::new() },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
         let lv = scene["levels"].as_array().unwrap();
@@ -450,6 +472,12 @@ mod tests {
         assert!(walls.iter().filter(|w| w["levels"][0] == lv[0]["_id"]).count() >= 4);
         let ids: std::collections::HashSet<_> = walls.iter().map(|w| w["_id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), walls.len());
+        // Крыша — тайл над токенами первого этажа, гаснет над токеном.
+        let t = &scene["tiles"][0];
+        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(50), Some(300), Some(9)));
+        assert_eq!(t["occlusion"]["modes"][0], 1);
+        assert_eq!((t["texture"]["anchorX"].as_i64(), t["texture"]["anchorY"].as_i64()), (Some(0), Some(0)));
+        assert_eq!(t["levels"][0], lv[0]["_id"]);
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 

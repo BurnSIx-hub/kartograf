@@ -138,6 +138,21 @@ pub const BUILTIN_PORTALS: [(&str, &str, [f32; 2], &[u8]); 11] = [
 /// Створка по умолчанию — для дверей без своей картинки, в том числе в выгрузке.
 pub const DEFAULT_DOOR: &str = "builtin:door_wood";
 
+/// Покрытия крыш (`tools/roofs.py`): бесшовные, 512 px — две клетки; ряды
+/// поперёк, низ картинки — к свесу, как у узоров крыш FA.
+pub const BUILTIN_ROOFS: [(&str, &str, &[u8]); 9] = [
+    ("roof_clay_red", "Черепица красная", include_bytes!("../assets/builtin/roofs/roof_clay_red.webp")),
+    ("roof_clay_brown", "Черепица коричневая", include_bytes!("../assets/builtin/roofs/roof_clay_brown.webp")),
+    ("roof_clay_green", "Черепица зелёная", include_bytes!("../assets/builtin/roofs/roof_clay_green.webp")),
+    ("roof_slate_blue", "Сланец синий", include_bytes!("../assets/builtin/roofs/roof_slate_blue.webp")),
+    ("roof_slate_gray", "Сланец серый", include_bytes!("../assets/builtin/roofs/roof_slate_gray.webp")),
+    ("roof_shingle", "Дранка", include_bytes!("../assets/builtin/roofs/roof_shingle.webp")),
+    ("roof_thatch", "Солома", include_bytes!("../assets/builtin/roofs/roof_thatch.webp")),
+    ("roof_metal", "Профнастил", include_bytes!("../assets/builtin/roofs/roof_metal.webp")),
+    ("roof_copper", "Медь", include_bytes!("../assets/builtin/roofs/roof_copper.webp")),
+];
+pub const DEFAULT_ROOF: &str = "builtin:roof_clay_red";
+
 /// Встроенный косяк под ширину проёма: у них варианты на 1, 2 и 3 клетки.
 /// Чужой косяк остаётся как есть.
 pub fn frame_for_width(key: &str, width: f32) -> String {
@@ -157,6 +172,7 @@ fn builtin(key: &str) -> Option<(&'static str, &'static [u8])> {
         .or_else(|| BUILTIN_OBJECTS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
         .or_else(|| BUILTIN_WALLS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
         .or_else(|| BUILTIN_PORTALS.iter().find(|t| t.0 == id).map(|t| (t.1, t.3)))
+        .or_else(|| BUILTIN_ROOFS.iter().find(|t| t.0 == id).map(|t| (t.1, t.2)))
 }
 
 /// Толщина встроенной стены в клетках — под неё нарисована полоса.
@@ -201,10 +217,11 @@ pub enum Kind {
     Wall,
     Door,
     Object,
+    Roof,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Floor, Kind::Wall, Kind::Door, Kind::Object];
+    pub const ALL: [Kind; 5] = [Kind::Floor, Kind::Wall, Kind::Door, Kind::Object, Kind::Roof];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -212,6 +229,7 @@ impl Kind {
             Kind::Wall => "Стены",
             Kind::Door => "Двери",
             Kind::Object => "Объекты",
+            Kind::Roof => "Крыши",
         }
     }
 }
@@ -253,6 +271,10 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
     let lower = inner.to_lowercase();
     if from_pack {
         let section = lower.strip_prefix("textures/")?.split('/').next()?;
+        // Узоры крыш FA: черепица, сланец, дранка, солома, профнастил.
+        if section == "patterns" && (lower.contains("roof") || lower.contains("corrugated")) {
+            return Some(Kind::Roof);
+        }
         return match section {
             "terrain" | "patterns" => Some(Kind::Floor),
             "walls" => Some(Kind::Wall),
@@ -263,7 +285,9 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
     }
     let parts: Vec<&str> = lower.split(['/', '\\']).collect();
     let has = |names: &[&str]| parts.iter().any(|p| names.contains(p));
-    Some(if has(&["objects", "props", "объекты", "предметы"]) {
+    Some(if has(&["roofs", "крыши"]) {
+        Kind::Roof
+    } else if has(&["objects", "props", "объекты", "предметы"]) {
         Kind::Object
     } else if has(&["walls", "стены"]) {
         Kind::Wall
@@ -671,7 +695,8 @@ impl Library {
         let objects = BUILTIN_OBJECTS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Object));
         let walls = BUILTIN_WALLS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Wall));
         let portals = BUILTIN_PORTALS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Door));
-        let builtin = textures.chain(objects).chain(walls).chain(portals);
+        let roofs = BUILTIN_ROOFS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Roof));
+        let builtin = textures.chain(objects).chain(walls).chain(portals).chain(roofs);
         self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
     }
 

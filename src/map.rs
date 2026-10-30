@@ -329,6 +329,192 @@ impl Prop {
     }
 }
 
+/// Форма крыши. Как в Dungeondraft, крыша ставится прямоугольником поверх
+/// дома; сложный дом — несколько крыш внахлёст.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoofShape {
+    /// Два ската, конёк вдоль.
+    Gable,
+    /// Четыре ската: торцы тоже скатами.
+    Hip,
+    /// Один скат.
+    Shed,
+    Flat,
+    /// Восьмигранный шатёр — для башен.
+    Tent,
+}
+
+impl RoofShape {
+    pub const ALL: [RoofShape; 5] = [RoofShape::Gable, RoofShape::Hip, RoofShape::Shed, RoofShape::Flat, RoofShape::Tent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoofShape::Gable => "Двускатная",
+            RoofShape::Hip => "Вальмовая",
+            RoofShape::Shed => "Односкатная",
+            RoofShape::Flat => "Плоская",
+            RoofShape::Tent => "Шатёр",
+        }
+    }
+}
+
+/// Крыша над прямоугольником клеток.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Roof {
+    /// Углы по стенам, в клетках: левый верхний и правый нижний.
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub shape: RoofShape,
+    /// Картинка покрытия: ряды поперёк, низ картинки — к свесу.
+    pub paint: String,
+    /// Четверти поворота: конёк поперёк, у односкатной — куда скат.
+    #[serde(default)]
+    pub turn: u8,
+    /// Насколько крыша выходит за стены, в клетках.
+    pub overhang: f32,
+}
+
+/// Скат крыши: выпуклый многоугольник и как на нём лежит покрытие —
+/// `along` вдоль рядов (x картинки), `down` вниз по скату (y картинки).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoofPlane {
+    pub poly: Vec<[f32; 2]>,
+    pub origin: [f32; 2],
+    pub along: [f32; 2],
+    pub down: [f32; 2],
+}
+
+impl RoofPlane {
+    fn new(poly: Vec<[f32; 2]>, origin: [f32; 2], down: [f32; 2]) -> Self {
+        // Поворот на четверть: при `down` вниз ряды идут слева направо.
+        Self { poly, origin, along: [down[1], -down[0]], down }
+    }
+
+    /// Насколько точка внутри (плюс) или снаружи (минус), в клетках.
+    pub fn inside(&self, p: [f32; 2]) -> f32 {
+        convex_depth(&self.poly, p)
+    }
+}
+
+/// Глубина точки в выпуклом многоугольнике: до ближайшей стороны, снаружи — с минусом.
+pub fn convex_depth(poly: &[[f32; 2]], p: [f32; 2]) -> f32 {
+    let n = poly.len();
+    let area: f32 = (0..n).map(|i| poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1]).sum();
+    let s = area.signum();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            s * ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / -len
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+impl Roof {
+    pub fn new(a: [f32; 2], b: [f32; 2], shape: RoofShape, paint: String) -> Self {
+        let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
+        Self { a: lo, b: hi, shape, paint, turn: 0, overhang: 0.25 }
+    }
+
+    /// Прямоугольник со свесом.
+    fn outer(&self) -> ([f32; 2], [f32; 2]) {
+        let o = self.overhang;
+        ([self.a[0] - o, self.a[1] - o], [self.b[0] + o, self.b[1] + o])
+    }
+
+    /// Восемь углов шатра — вписаны в прямоугольник, стороны по осям.
+    fn octagon(&self) -> Vec<[f32; 2]> {
+        let (lo, hi) = self.outer();
+        let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+        let (rx, ry) = ((hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0);
+        // Восьмиугольник, а не окружность: стороны касаются рамки.
+        let k = 1.0 / (std::f32::consts::PI / 8.0).cos();
+        (0..8)
+            .map(|i| {
+                let t = (i as f32 + 0.5) * std::f32::consts::FRAC_PI_4;
+                [c[0] + t.cos() * rx * k.min(1.08), c[1] + t.sin() * ry * k.min(1.08)]
+            })
+            .collect()
+    }
+
+    /// Контур крыши сверху.
+    pub fn outline(&self) -> Vec<[f32; 2]> {
+        if self.shape == RoofShape::Tent {
+            return self.octagon();
+        }
+        let (lo, hi) = self.outer();
+        vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]
+    }
+
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        convex_depth(&self.outline(), p) >= 0.0
+    }
+
+    /// Конёк вдоль x: по длинной стороне, `turn` — поперёк.
+    fn along_x(&self) -> bool {
+        let (w, h) = (self.b[0] - self.a[0], self.b[1] - self.a[1]);
+        (w >= h) != (self.turn % 2 == 1)
+    }
+
+    /// Скаты и линии коньков и рёбер (на них ложатся гребни).
+    pub fn geometry(&self) -> (Vec<RoofPlane>, Vec<Segment>) {
+        let (lo, hi) = self.outer();
+        match self.shape {
+            RoofShape::Flat => (vec![RoofPlane::new(self.outline(), lo, [0.0, 1.0])], Vec::new()),
+            RoofShape::Shed => {
+                let down = [[0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [1.0, 0.0]][(self.turn % 4) as usize];
+                // Начало — у верхнего края ската.
+                let origin = [if down[0] < 0.0 { hi[0] } else { lo[0] }, if down[1] < 0.0 { hi[1] } else { lo[1] }];
+                (vec![RoofPlane::new(self.outline(), origin, down)], Vec::new())
+            }
+            RoofShape::Tent => {
+                let pts = self.octagon();
+                let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+                let planes = (0..8)
+                    .map(|i| {
+                        let (p, q) = (pts[i], pts[(i + 1) % 8]);
+                        let m = [(p[0] + q[0]) / 2.0 - c[0], (p[1] + q[1]) / 2.0 - c[1]];
+                        let l = (m[0] * m[0] + m[1] * m[1]).sqrt().max(1e-6);
+                        RoofPlane::new(vec![c, p, q], c, [m[0] / l, m[1] / l])
+                    })
+                    .collect();
+                (planes, pts.iter().map(|&p| (c, p)).collect())
+            }
+            RoofShape::Gable | RoofShape::Hip => {
+                // Считаем как будто конёк вдоль x; иначе меняем оси местами.
+                let swap = !self.along_x();
+                let f = |p: [f32; 2]| if swap { [p[1], p[0]] } else { p };
+                let (lo, hi) = (f(lo), f(hi));
+                let m = (lo[1] + hi[1]) / 2.0;
+                let half = (hi[1] - lo[1]) / 2.0;
+                let r = if self.shape == RoofShape::Hip { half.min((hi[0] - lo[0]) / 2.0) } else { 0.0 };
+                let (r0, r1) = ([lo[0] + r, m], [hi[0] - r, m]);
+                let mut planes = vec![
+                    (vec![lo, [hi[0], lo[1]], r1, r0], r0, [0.0, -1.0]),
+                    (vec![r0, r1, hi, [lo[0], hi[1]]], r0, [0.0, 1.0]),
+                ];
+                let mut lines = vec![(r0, r1)];
+                if r > 0.0 {
+                    planes.push((vec![lo, r0, [lo[0], hi[1]]], r0, [-1.0, 0.0]));
+                    planes.push((vec![[hi[0], lo[1]], hi, r1], r1, [1.0, 0.0]));
+                    lines.extend([(lo, r0), ([lo[0], hi[1]], r0), ([hi[0], lo[1]], r1), (hi, r1)]);
+                }
+                let planes = planes.into_iter().map(|(poly, o, d)| RoofPlane::new(poly.into_iter().map(f).collect(), f(o), f(d))).collect();
+                (planes, lines.into_iter().map(|(a, b)| (f(a), f(b))).filter(|(a, b)| a != b).collect())
+            }
+        }
+    }
+}
+
+/// Освещённость ската: обращённый к свету светлее. `light` — откуда свет.
+pub fn roof_shade(down: [f32; 2], light: [f32; 2], flat: bool) -> f32 {
+    if flat {
+        return 0.92;
+    }
+    0.8 + 0.2 * (down[0] * light[0] + down[1] * light[1])
+}
+
 /// Подпись на карте: название комнаты, улицы, метка.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Label {
@@ -395,6 +581,12 @@ impl Shadows {
     pub fn offset(&self) -> [f32; 2] {
         let (s, c) = self.angle.to_radians().sin_cos();
         [c * self.dist, s * self.dist]
+    }
+
+    /// Откуда свет: против направления тени.
+    pub fn light(&self) -> [f32; 2] {
+        let (s, c) = self.angle.to_radians().sin_cos();
+        [-c, -s]
     }
 }
 
@@ -540,6 +732,8 @@ pub struct Map {
     pub shadows: Shadows,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<Label>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roofs: Vec<Roof>,
     /// Имя этажа; пусто — «Этаж N».
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -629,6 +823,7 @@ impl Map {
             shadows: Shadows { on: true, ..Shadows::default() },
             shade: None,
             labels: Vec::new(),
+            roofs: Vec::new(),
             name: String::new(),
             levels: Vec::new(),
         }
@@ -913,6 +1108,48 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roof_planes_cover_outline_and_face_out() {
+        for shape in RoofShape::ALL {
+            let mut r = Roof::new([2.0, 1.0], [8.0, 5.0], shape, "x".into());
+            for turn in 0..4 {
+                r.turn = turn;
+                let (planes, lines) = r.geometry();
+                let out = r.outline();
+                // Каждая точка внутри контура — ровно на одном скате (кроме рёбер).
+                let c = [5.0, 3.0];
+                for p in [[0.0f32, 0.0], [1.0, 0.3], [-0.6, 0.9], [2.5, -1.8], [-2.7, 1.9]] {
+                    let q = [c[0] + p[0], c[1] + p[1]];
+                    if convex_depth(&out, q) <= 0.05 {
+                        continue;
+                    }
+                    let hits = planes.iter().filter(|pl| pl.inside(q) > 1e-3).count();
+                    assert!(hits <= 1 && planes.iter().any(|pl| pl.inside(q) > -1e-3), "{shape:?} {turn} {q:?}");
+                }
+                // Скаты смотрят от конька наружу: середина ската дальше по `down`, чем начало.
+                for pl in &planes {
+                    let n = pl.poly.len() as f32;
+                    let m = [pl.poly.iter().map(|p| p[0]).sum::<f32>() / n, pl.poly.iter().map(|p| p[1]).sum::<f32>() / n];
+                    assert!((m[0] - pl.origin[0]) * pl.down[0] + (m[1] - pl.origin[1]) * pl.down[1] > 0.0, "{shape:?}");
+                }
+                match shape {
+                    RoofShape::Gable => assert_eq!((planes.len(), lines.len()), (2, 1)),
+                    // Поперёк длинной стороны вальма сходится в пирамиду — без конька.
+                    RoofShape::Hip => assert!(planes.len() == 4 && (lines.len() == 5 || (turn % 2 == 1 && lines.len() == 4))),
+                    RoofShape::Tent => assert_eq!((planes.len(), lines.len()), (8, 8)),
+                    _ => assert_eq!(planes.len(), 1),
+                }
+            }
+        }
+        // Конёк по длинной стороне, поворот кладёт его поперёк.
+        let r = Roof::new([0.0, 0.0], [6.0, 2.0], RoofShape::Gable, "x".into());
+        let ridge = r.geometry().1[0];
+        assert_eq!(ridge.0[1], ridge.1[1]);
+        let t = Roof { turn: 1, ..r };
+        let ridge = t.geometry().1[0];
+        assert_eq!(ridge.0[0], ridge.1[0]);
+    }
 
     #[test]
     fn levels_round_trip_and_size_is_checked() {

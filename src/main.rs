@@ -10,6 +10,7 @@ mod map;
 mod mask;
 mod pck;
 mod recovery;
+mod roofs;
 mod selftest;
 mod view;
 

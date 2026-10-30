@@ -6,6 +6,7 @@ use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
 use crate::mask::{self, Brush, Mask, RES, Shape as Tip};
 use crate::recovery::{self, Orphan, Recovery};
+use crate::roofs;
 use crate::selftest::SelfTest;
 use crate::view::{Camera, WHEEL_STEP};
 use eframe::egui::{self, Color32, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Shape, Stroke, ViewportCommand, pos2, vec2};
@@ -35,10 +36,11 @@ pub enum Tool {
     Path,
     Shade,
     Text,
+    Roof,
 }
 
 impl Tool {
-    const ALL: [Tool; 11] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Text];
+    const ALL: [Tool; 12] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text];
 
     fn label(self) -> &'static str {
         match self {
@@ -53,6 +55,7 @@ impl Tool {
             Tool::Path => "Дорога",
             Tool::Shade => "Тень",
             Tool::Text => "Подпись",
+            Tool::Roof => "Крыша",
         }
     }
 
@@ -69,6 +72,7 @@ impl Tool {
             Tool::Path => Key::L,
             Tool::Shade => Key::H,
             Tool::Text => Key::T,
+            Tool::Roof => Key::K,
         }
     }
 }
@@ -116,6 +120,16 @@ pub enum Sel {
     Prop(usize),
     Path(usize),
     Label(usize),
+    Roof(usize),
+}
+
+/// Как видны крыши в редакторе.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoofView {
+    /// Видны; с инструментами для внутренностей дома — полупрозрачны.
+    Auto,
+    Ghost,
+    Hidden,
 }
 
 pub struct Args {
@@ -255,6 +269,11 @@ pub struct App {
     /// Образец новой подписи; тащат подпись — откуда взяли.
     pub label_style: map::Label,
     label_grab: Option<(usize, [f32; 2])>,
+    /// Образец новой крыши, вид крыш, протяжка новой и перенос стоящей.
+    pub roof_style: map::Roof,
+    pub roof_view: RoofView,
+    roof_from: Option<(i32, i32)>,
+    roof_grab: Option<(usize, [f32; 2], [f32; 2], [f32; 2])>,
     /// Alt с колесом уже меняет размер объекта: правка в истории сделана.
     alt_wheel: bool,
     /// Стена, которую сейчас ставят по точкам.
@@ -390,6 +409,10 @@ impl App {
             shade_erase: false,
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
+            roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
+            roof_view: RoofView::Auto,
+            roof_from: None,
+            roof_grab: None,
             alt_wheel: false,
             draft: Vec::new(),
             sel: None,
@@ -548,6 +571,7 @@ impl App {
             Sel::Prop(i) => i < self.map.props.len(),
             Sel::Path(i) => i < self.map.paths.len(),
             Sel::Label(i) => i < self.map.labels.len(),
+            Sel::Roof(i) => i < self.map.roofs.len(),
         }
     }
 
@@ -715,7 +739,40 @@ impl App {
             Sel::Label(i) => {
                 self.map.labels.remove(i);
             }
+            Sel::Roof(i) => {
+                self.map.roofs.remove(i);
+            }
         }
+    }
+
+    /// Насколько видны крыши сейчас: 1 — целиком, 0 — нет.
+    pub fn roof_alpha(&self) -> f32 {
+        match self.roof_view {
+            RoofView::Hidden => 0.0,
+            RoofView::Ghost => 0.35,
+            RoofView::Auto if matches!(self.tool, Tool::Select | Tool::Roof) => 1.0,
+            RoofView::Auto => 0.35,
+        }
+    }
+
+    /// Крыша под точкой, если её сейчас можно взять.
+    fn roof_at(&self, w: [f32; 2]) -> Option<usize> {
+        if self.roof_alpha() < 1.0 && self.tool != Tool::Roof {
+            return None;
+        }
+        self.map.roofs.iter().rposition(|r| r.contains(w))
+    }
+
+    /// Крыша над прямоугольником клеток `a`–`b` (включительно), по образцу.
+    pub fn place_roof(&mut self, a: (i32, i32), b: (i32, i32)) -> usize {
+        let lo = [a.0.min(b.0) as f32, a.1.min(b.1) as f32];
+        let hi = [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0];
+        let roof = map::Roof { a: lo, b: hi, ..self.roof_style.clone() };
+        self.checkpoint();
+        self.map.roofs.push(roof);
+        let i = self.map.roofs.len() - 1;
+        self.sel = Some(Sel::Roof(i));
+        i
     }
 
     /// Поставить начатую дорогу. Из одной точки дороги не бывает.
@@ -818,6 +875,10 @@ impl App {
     pub fn pick(&self, w: [f32; 2]) -> Option<Sel> {
         if let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
             return Some(Sel::Label(i));
+        }
+        // Видимая крыша закрывает всё, что под ней.
+        if let Some(i) = self.roof_at(w) {
+            return Some(Sel::Roof(i));
         }
         if let Some(i) = self.map.props.iter().rposition(|p| p.contains(w)) {
             return Some(Sel::Prop(i));
@@ -935,6 +996,16 @@ impl App {
 
     /// Поворот на четверть: выбранного объекта или того, что сейчас ставится.
     pub fn rotate(&mut self) {
+        if let Some(Sel::Roof(i)) = self.sel {
+            self.checkpoint();
+            let r = &mut self.map.roofs[i];
+            r.turn = (r.turn + 1) % 4;
+            return;
+        }
+        if self.tool == Tool::Roof {
+            self.roof_style.turn = (self.roof_style.turn + 1) % 4;
+            return;
+        }
         if let Some(Sel::Prop(i)) = self.sel {
             self.checkpoint();
             let p = &mut self.map.props[i];
@@ -1472,6 +1543,7 @@ impl App {
         // Инструмент сам открывает нужную вкладку библиотеки.
         match tool {
             Tool::Door => self.browse = Kind::Door,
+            Tool::Roof => self.browse = Kind::Roof,
             Tool::Object => self.browse = Kind::Object,
             Tool::Dungeon | Tool::Floor | Tool::Path if matches!(self.browse, Kind::Door | Kind::Object) => self.browse = Kind::Floor,
             _ => {}
@@ -1613,6 +1685,7 @@ impl App {
             Tool::Erase => "Стирает и комнаты, и местность.",
             Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
             Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите во вкладке «Двери»; без картинки — простая плашка.",
+            Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — во вкладке «Крыши». С другими инструментами крыши полупрозрачны.",
             Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — ниже.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
             Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — из «Пол»: земля — тропа, вода — ручей, ткань — ковёр.",
@@ -1697,6 +1770,45 @@ impl App {
                     }
                 });
                 ui.weak("Створку, окно или косяк можно взять во вкладке «Двери». Створка уходит в Foundry отдельной картинкой и там открывается.");
+            }
+            Tool::Roof => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Крыши:");
+                    ui.selectable_value(&mut self.roof_view, RoofView::Auto, "видно");
+                    ui.selectable_value(&mut self.roof_view, RoofView::Ghost, "сквозь");
+                    ui.selectable_value(&mut self.roof_view, RoofView::Hidden, "скрыть");
+                });
+                let chosen = match self.sel {
+                    Some(Sel::Roof(i)) => Some(i),
+                    _ => None,
+                };
+                let mut st = chosen.map_or_else(|| self.roof_style.clone(), |i| self.map.roofs[i].clone());
+                if chosen.is_some() {
+                    ui.weak("Выбранная крыша:");
+                }
+                let before = st.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for shape in map::RoofShape::ALL {
+                        ui.selectable_value(&mut st.shape, shape, shape.label());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Повернуть   R").clicked() {
+                        st.turn = (st.turn + 1) % 4;
+                    }
+                    ui.label(format!("Покрытие: {}", library::label(&st.paint)));
+                });
+                let over = ui.add(egui::Slider::new(&mut st.overhang, 0.0..=0.75).text("свес, кл."));
+                match chosen {
+                    Some(i) => {
+                        if st != before && (over.drag_started() || !over.dragged()) {
+                            self.checkpoint();
+                        }
+                        self.map.roofs[i] = st;
+                    }
+                    None => self.roof_style = st,
+                }
             }
             Tool::Text => {
                 ui.add_space(6.0);
@@ -1979,6 +2091,10 @@ impl App {
             },
             Kind::Door => self.door_asset.clone(),
             Kind::Object => self.object_asset.clone(),
+            Kind::Roof => Some(match self.sel {
+                Some(Sel::Roof(i)) => self.map.roofs[i].paint.clone(),
+                _ => self.roof_style.paint.clone(),
+            }),
         };
         let mut chosen: Option<(String, bool)> = None;
         egui::ScrollArea::vertical().id_salt("assets").max_height(BROWSER_HEIGHT).auto_shrink([false, true]).show_rows(ui, THUMB + 4.0, rows, |ui, range| {
@@ -2053,6 +2169,19 @@ impl App {
                         self.door_asset = Some(key);
                     }
                     self.set_tool(Tool::Door);
+                }
+                Kind::Roof => {
+                    // Покрытие — выбранной крыше и образцу новых.
+                    if let Some(Sel::Roof(i)) = self.sel
+                        && self.map.roofs[i].paint != key
+                    {
+                        self.checkpoint();
+                        self.map.roofs[i].paint = key.clone();
+                    }
+                    self.roof_style.paint = key;
+                    if self.tool != Tool::Roof {
+                        self.set_tool(Tool::Roof);
+                    }
                 }
                 Kind::Object if self.tool == Tool::Scatter => {
                     // В разбросе щелчок кладёт объект в набор или убирает из него.
@@ -2355,6 +2484,43 @@ impl App {
                     && let Some(p) = pointer
                 {
                     self.place_portal(self.cam.to_world(rect, p));
+                }
+            }
+            Tool::Roof => {
+                if resp.drag_started_by(PointerButton::Primary)
+                    && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+                {
+                    let w = self.cam.to_world(rect, o);
+                    match self.roof_at(w) {
+                        Some(i) => {
+                            self.checkpoint();
+                            let r = &self.map.roofs[i];
+                            self.roof_grab = Some((i, w, r.a, r.b));
+                            self.sel = Some(Sel::Roof(i));
+                        }
+                        None => self.roof_from = Some(self.cam.cell(rect, o)),
+                    }
+                }
+                if let (Some((i, w0, a, b)), Some(p)) = (self.roof_grab, pointer)
+                    && resp.dragged_by(PointerButton::Primary)
+                {
+                    // Крыша двигается целыми клетками — остаётся на стенах.
+                    let w = self.cam.to_world(rect, p);
+                    let d = [(w[0] - w0[0]).round(), (w[1] - w0[1]).round()];
+                    let r = &mut self.map.roofs[i];
+                    r.a = [a[0] + d[0], a[1] + d[1]];
+                    r.b = [b[0] + d[0], b[1] + d[1]];
+                }
+                if resp.drag_stopped_by(PointerButton::Primary) {
+                    self.roof_grab = None;
+                    if let (Some(a), Some(p)) = (self.roof_from.take(), pointer) {
+                        let b = self.cam.cell(rect, p);
+                        self.place_roof(a, b);
+                    }
+                } else if resp.clicked()
+                    && let Some(p) = pointer
+                {
+                    self.sel = self.roof_at(self.cam.to_world(rect, p)).map(Sel::Roof);
                 }
             }
             Tool::Text => {
@@ -2854,6 +3020,35 @@ impl App {
             _ => {}
         }
 
+        // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
+        // они уходят в Foundry отдельными тайлами.
+        let roof_alpha = if exporting { 0.0 } else { self.roof_alpha() };
+        if self.roof_view != RoofView::Hidden {
+            let roofs = self.map.roofs.clone();
+            if shadows.on {
+                for r in &roofs {
+                    self.draw_roof_shadow(painter, canvas, r, &shadows);
+                }
+            }
+            if roof_alpha > 0.0 {
+                for (i, r) in roofs.iter().enumerate() {
+                    self.draw_roof(painter, canvas, r, roof_alpha, shadows.light());
+                    if self.sel == Some(Sel::Roof(i)) {
+                        let q: Vec<Pos2> = r.outline().iter().map(|&p| cam.to_screen(canvas, p)).collect();
+                        painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
+                    }
+                }
+            }
+        }
+        if let (Some(a), Some(p)) = (self.roof_from, self.hover.filter(|_| !exporting)) {
+            let b = cam.cell(canvas, p);
+            let r = Rect::from_min_max(
+                cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
+                cam.to_screen(canvas, [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0]),
+            );
+            painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90)), egui::StrokeKind::Inside);
+        }
+
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {
             self.draw_label(painter, canvas, label);
@@ -3132,6 +3327,95 @@ impl App {
         if !mesh.is_empty() {
             painter.add(Shape::mesh(mesh));
         }
+    }
+
+    /// Крыша: скаты своей картинкой, каждый со своей освещённостью; гребни на
+    /// коньке и рёбрах — ряд того же покрытия вдоль линии; тёмная кромка свеса.
+    fn draw_roof(&mut self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, alpha: f32, light: [f32; 2]) {
+        let cam = self.cam;
+        let (tex, tile) = match self.textures.get(&roof.paint, false) {
+            Some((t, px)) => (Some(t.id()), roofs::tile_cells(px)),
+            None => (None, [1.0, 1.0]),
+        };
+        let (planes, lines) = roof.geometry();
+        let flat = roof.shape == map::RoofShape::Flat;
+        let tint = |s: f32| {
+            let v = (s * alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+            if tex.is_some() { Color32::from_rgba_premultiplied(v, v, v, (alpha * 255.0) as u8) } else { Color32::from_rgba_premultiplied((v as f32 * 0.6) as u8, (v as f32 * 0.35) as u8, (v as f32 * 0.3) as u8, (alpha * 255.0) as u8) }
+        };
+        let mut mesh = match tex {
+            Some(id) => egui::Mesh::with_texture(id),
+            None => egui::Mesh::default(),
+        };
+        let uv = |p: [f32; 2], o: [f32; 2], along: [f32; 2], down: [f32; 2]| {
+            if tex.is_none() {
+                return egui::epaint::WHITE_UV;
+            }
+            let d = [p[0] - o[0], p[1] - o[1]];
+            pos2((d[0] * along[0] + d[1] * along[1]) / tile[0], (d[0] * down[0] + d[1] * down[1]) / tile[1])
+        };
+        for pl in &planes {
+            let color = tint(map::roof_shade(pl.down, light, flat));
+            let base = mesh.vertices.len() as u32;
+            for &p in &pl.poly {
+                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: uv(p, pl.origin, pl.along, pl.down), color });
+            }
+            for k in 1..pl.poly.len() as u32 - 1 {
+                mesh.add_triangle(base, base + k, base + k + 1);
+            }
+        }
+        // Гребни поверх скатов.
+        let dark = Color32::from_rgba_premultiplied(0, 0, 0, (alpha * 150.0) as u8);
+        let mut edges = Vec::new();
+        for &(a, b) in &lines {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let along = [dx / len, dy / len];
+            let n = [-along[1] * roofs::CAP / 2.0, along[0] * roofs::CAP / 2.0];
+            let quad = [[a[0] + n[0], a[1] + n[1]], [b[0] + n[0], b[1] + n[1]], [b[0] - n[0], b[1] - n[1]], [a[0] - n[0], a[1] - n[1]]];
+            let down = [-along[1], along[0]];
+            let color = tint(roofs::CAP_SHADE);
+            let base = mesh.vertices.len() as u32;
+            for p in quad {
+                let mut t = uv(p, a, along, down);
+                t.x *= 2.0;
+                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: t, color });
+            }
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+            edges.push([quad[0], quad[1]]);
+            edges.push([quad[3], quad[2]]);
+        }
+        painter.add(Shape::mesh(mesh));
+        for [a, b] in edges {
+            painter.line_segment([cam.to_screen(canvas, a), cam.to_screen(canvas, b)], Stroke::new(1.0, dark));
+        }
+        let out: Vec<Pos2> = roof.outline().iter().map(|&p| cam.to_screen(canvas, p)).collect();
+        painter.add(Shape::closed_line(out, Stroke::new(roofs::RIM_PX, Color32::from_rgba_premultiplied(14, 10, 8, (alpha * 230.0) as u8))));
+    }
+
+    /// Тень крыши на земле: сдвинутый контур, залитый, с мягким краем.
+    fn draw_roof_shadow(&self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, sh: &map::Shadows) {
+        let cam = self.cam;
+        let pts = roofs::shadow_outline(roof, sh);
+        let n = pts.len();
+        let c = [pts.iter().map(|p| p[0]).sum::<f32>() / n as f32, pts.iter().map(|p| p[1]).sum::<f32>() / n as f32];
+        let dark = Color32::from_black_alpha((sh.opacity * 255.0).round() as u8);
+        let mut mesh = egui::Mesh::default();
+        let v = |p: [f32; 2], color| egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: egui::epaint::WHITE_UV, color };
+        mesh.vertices.push(v(c, dark));
+        for (k, &p) in pts.iter().enumerate() {
+            let d = [p[0] - c[0], p[1] - c[1]];
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+            let half = sh.blur / 2.0;
+            mesh.vertices.push(v([p[0] - d[0] / l * half, p[1] - d[1] / l * half], dark));
+            mesh.vertices.push(v([p[0] + d[0] / l * half, p[1] + d[1] / l * half], Color32::TRANSPARENT));
+            let (i, j) = (1 + 2 * k as u32, 1 + 2 * ((k + 1) % n) as u32);
+            mesh.add_triangle(0, i, j);
+            mesh.add_triangle(i, i + 1, j + 1);
+            mesh.add_triangle(i, j + 1, j);
+        }
+        painter.add(Shape::mesh(mesh));
     }
 
     /// Подпись: текст по центру своей точки, повёрнутый, с каймой из восьми
@@ -3568,8 +3852,33 @@ impl App {
             img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
             leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
         }
+        // Крыши — картинками по одной, рядом со сценой.
+        let mut covers: std::collections::HashMap<String, (image::RgbaImage, [f32; 2])> = std::collections::HashMap::new();
+        let mut roof_tiles: Vec<Vec<export::RoofTile>> = Vec::new();
+        let mut roof_count = 0;
+        for k in 0..n {
+            let map = if k == self.level { &self.map } else { &self.levels[k] };
+            let light = map.shadows.light();
+            let mut tiles = Vec::new();
+            for r in &map.roofs {
+                if !covers.contains_key(&r.paint) {
+                    let bytes = self.textures.bytes(&r.paint)?;
+                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&r.paint)))?.to_rgba8();
+                    let tile = roofs::tile_cells([img.width(), img.height()]);
+                    covers.insert(r.paint.clone(), (img, tile));
+                }
+                let (tex, tile) = &covers[&r.paint];
+                let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light);
+                roof_count += 1;
+                let file = e.dir.join(format!("{}_крыша_{roof_count}.png", stem(k)));
+                img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
+                let p = e.px as f32;
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64] });
+            }
+            roof_tiles.push(tiles);
+        }
         let levels: Vec<export::SceneLevel> = (0..n)
-            .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k] })
+            .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
         let scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
         let scene_path = e.dir.join(format!("{}.json", e.name));
@@ -3583,7 +3892,7 @@ impl App {
         let walls: usize = layouts.iter().flat_map(|l| l.walls.iter()).map(|l| l.len().saturating_sub(1)).sum();
         let (w, h) = (e.done[0].width(), e.done[0].height());
         Ok(format!(
-            "Выгружено в {}: {}картинка {w}×{h}, стен {walls}, проёмов {}, огней {}",
+            "Выгружено в {}: {}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
             e.dir.display(),
             if n > 1 { format!("этажей {n}, ") } else { String::new() },
             layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
