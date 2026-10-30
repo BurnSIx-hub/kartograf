@@ -771,6 +771,35 @@ impl SelfTest {
                 self.resume_at = now + 0.4;
             }
             63 => self.snap(ctx, "крыши"),
+            64 => {
+                // Стрелка ячейки «Кисть» открывает её режимы.
+                let h = (app.canvas.height() / 7.0).floor();
+                self.click(egui::pos2(88.0, app.canvas.top() + h * 1.5));
+                self.resume_at = now + CLICK_GAP;
+            }
+            65 => {
+                self.check("стрелка открыла режимы кисти", app.fly == Some(1), &format!("{:?}", app.fly));
+                self.snap(ctx, "режимы кисти");
+            }
+            66 => {
+                // Вторая строка списка — «Местность».
+                let h = (app.canvas.height() / 7.0).floor();
+                self.click(egui::pos2(130.0, app.canvas.top() + h + 36.0));
+                self.resume_at = now + CLICK_GAP;
+            }
+            67 => {
+                self.check("режим выбран, список закрылся, ячейка помнит его", app.tool == Tool::Floor && app.fly.is_none() && app.group_last[1] == Tool::Floor, &format!("{:?} {:?}", app.tool, app.fly));
+                let h = (app.canvas.height() / 7.0).floor();
+                self.click(egui::pos2(40.0, app.canvas.top() + h * 0.5));
+                self.resume_at = now + CLICK_GAP;
+            }
+            68 => {
+                self.check("щелчок по ячейке выбрал её инструмент", app.tool == Tool::Select, &format!("{:?}", app.tool));
+                let h = (app.canvas.height() / 7.0).floor();
+                self.click(egui::pos2(40.0, app.canvas.top() + h * 1.5));
+                self.resume_at = now + CLICK_GAP;
+            }
+            69 => self.check("ячейка вернула последний режим", app.tool == Tool::Floor, &format!("{:?}", app.tool)),
             _ => return false,
         }
         true

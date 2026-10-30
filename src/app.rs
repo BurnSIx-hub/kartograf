@@ -20,8 +20,16 @@ const PICK: f32 = 0.35;
 const DOOR_REACH: f32 = 0.6;
 /// Меньше этого (в клетках) плитка пола не бывает, даже у крошечной картинки.
 const MIN_TILE: f32 = 1.0;
-const THUMB: f32 = 52.0;
-const BROWSER_HEIGHT: f32 = 340.0;
+const THUMB: f32 = 84.0;
+
+const BG: Color32 = Color32::from_rgb(27, 28, 31);
+const PANEL: Color32 = Color32::from_rgb(37, 39, 43);
+const FIELD: Color32 = Color32::from_rgb(48, 50, 55);
+const LINE: Color32 = Color32::from_rgb(58, 61, 67);
+const TEXT: Color32 = Color32::from_rgb(232, 230, 225);
+const MUTED: Color32 = Color32::from_rgb(155, 156, 159);
+const ACCENT: Color32 = Color32::from_rgb(224, 160, 74);
+const ON_ACCENT: Color32 = Color32::from_rgb(36, 24, 7);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -77,6 +85,54 @@ impl Tool {
     }
 }
 
+/// Ячейка левого столбца: родственные инструменты под одной кнопкой.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Select,
+    Brush,
+    Wall,
+    Roof,
+    Object,
+    Path,
+    Text,
+}
+
+impl Group {
+    const ALL: [Group; 7] = [Group::Select, Group::Brush, Group::Wall, Group::Roof, Group::Object, Group::Path, Group::Text];
+
+    fn has(self, tool: Tool) -> bool {
+        match self {
+            Group::Select => tool == Tool::Select,
+            Group::Brush => matches!(tool, Tool::Dungeon | Tool::Floor | Tool::Shade | Tool::Erase),
+            Group::Wall => matches!(tool, Tool::Wall | Tool::Door),
+            Group::Roof => tool == Tool::Roof,
+            Group::Object => matches!(tool, Tool::Object | Tool::Scatter),
+            Group::Path => tool == Tool::Path,
+            Group::Text => tool == Tool::Text,
+        }
+    }
+
+    fn first(self) -> Tool {
+        match self {
+            Group::Select => Tool::Select,
+            Group::Brush => Tool::Dungeon,
+            Group::Wall => Tool::Wall,
+            Group::Roof => Tool::Roof,
+            Group::Object => Tool::Object,
+            Group::Path => Tool::Path,
+            Group::Text => Tool::Text,
+        }
+    }
+}
+
+/// Строка списка режимов ячейки.
+#[derive(Clone, Copy)]
+enum Mode {
+    Tool(Tool),
+    Door(PortalKind),
+    Roof(map::RoofShape),
+}
+
 /// Разброс: кисть, которая сыплет объекты из набора вразнобой (как Scatter
 /// в Dungeondraft) — случайный объект, поворот и размер, не ближе заданного шага.
 pub struct Scatter {
@@ -121,6 +177,8 @@ pub enum Sel {
     Path(usize),
     Label(usize),
     Roof(usize),
+    /// Стена комнаты: ключ отрезка и весь ли контур.
+    Edge((i32, i32), bool),
 }
 
 /// Как видны крыши в редакторе.
@@ -274,6 +332,11 @@ pub struct App {
     pub roof_view: RoofView,
     roof_from: Option<(i32, i32)>,
     tap_from: Option<Pos2>,
+    shelf_rows: u32,
+    pub fly: Option<usize>,
+    fly_rect: Rect,
+    fly_frame: u64,
+    pub group_last: [Tool; 7],
     roof_grab: Option<(usize, [f32; 2], [f32; 2], [f32; 2])>,
     /// Alt с колесом уже меняет размер объекта: правка в истории сделана.
     alt_wheel: bool,
@@ -358,6 +421,7 @@ const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=8.0;
 impl App {
     pub fn new(cc: &eframe::CreationContext, args: Args) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        apply_theme(&cc.egui_ctx);
         let data_dir = args.data.or_else(|| args.selftest.as_ref().map(|d| d.join("data"))).unwrap_or_else(default_data_dir);
         let _ = std::fs::create_dir_all(&data_dir);
         let settings: Settings = std::fs::read(data_dir.join("settings.json"))
@@ -414,6 +478,11 @@ impl App {
             roof_view: RoofView::Auto,
             roof_from: None,
             tap_from: None,
+            shelf_rows: 1,
+            fly: None,
+            fly_rect: Rect::NOTHING,
+            fly_frame: 0,
+            group_last: Group::ALL.map(Group::first),
             roof_grab: None,
             alt_wheel: false,
             draft: Vec::new(),
@@ -569,6 +638,7 @@ impl App {
     fn sel_exists(&self, s: Sel) -> bool {
         match s {
             Sel::Wall(i) => i < self.map.walls.len(),
+            Sel::Edge(..) => true,
             Sel::Portal(i) => i < self.map.portals.len(),
             Sel::Prop(i) => i < self.map.props.len(),
             Sel::Path(i) => i < self.map.paths.len(),
@@ -696,10 +766,53 @@ impl App {
     /// Стены вокруг комнат; пересчитываются, только когда комнаты менялись.
     pub fn room_edges(&mut self) -> &[Segment] {
         if self.edges_dirty {
-            self.edges = self.map.room_edges();
+            let edges = self.map.room_edges();
+            self.map.sync_edge_looks(&edges);
+            self.edges = edges;
             self.edges_dirty = false;
         }
         &self.edges
+    }
+
+    /// Отрезки выбранной стены комнаты: прямой участок или весь её контур.
+    fn edge_run(&self, key: (i32, i32), whole: bool) -> Vec<Segment> {
+        for line in mask::join(self.edges.clone()) {
+            let Some(k) = line.windows(2).position(|p| map::edge_key(&(p[0], p[1])) == key) else { continue };
+            let seg = |i: usize| (line[i], line[i + 1]);
+            if whole {
+                return (0..line.len() - 1).map(seg).collect();
+            }
+            let dir = |p: [f32; 2], q: [f32; 2]| {
+                let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+                [dx / l, dy / l]
+            };
+            let d0 = dir(line[k], line[k + 1]);
+            let same = |i: usize| {
+                let e = dir(line[i], line[i + 1]);
+                d0[0] * e[0] + d0[1] * e[1] > 0.9995
+            };
+            let (mut s, mut e) = (k, k);
+            while s > 0 && same(s - 1) {
+                s -= 1;
+            }
+            while e + 2 < line.len() && same(e + 1) {
+                e += 1;
+            }
+            return (s..=e).map(seg).collect();
+        }
+        Vec::new()
+    }
+
+    /// Все стоящие стены — в один вид.
+    fn apply_wall_style_to_all(&mut self) {
+        self.checkpoint();
+        let st = self.map.wall_style.clone();
+        let edges = self.room_edges().to_vec();
+        self.map.set_edge_look(&edges, &st);
+        for w in &mut self.map.walls {
+            w.style = None;
+        }
     }
 
     /// Поставить начатую стену на карту. Из одной точки стены не бывает.
@@ -744,6 +857,8 @@ impl App {
             Sel::Roof(i) => {
                 self.map.roofs.remove(i);
             }
+            // Стена комнаты стирается вместе с комнатой.
+            Sel::Edge(..) => {}
         }
     }
 
@@ -890,6 +1005,9 @@ impl App {
             return Some(Sel::Portal(i));
         }
         if let Some(s) = self.map.walls.iter().enumerate().map(|(i, wall)| (i, wall.distance(w))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| Sel::Wall(i)) {
+            return Some(s);
+        }
+        if let Some(s) = self.edges.iter().map(|s| (s, map::segment_distance(w, s.0, s.1))).filter(|(_, d)| near(*d)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(s, _)| Sel::Edge(map::edge_key(s), false)) {
             return Some(s);
         }
         // Дорога — по всей ширине; верхняя — последняя.
@@ -1051,10 +1169,11 @@ impl App {
     }
 
     /// Вид, который правят панель и библиотека: у выбранной стены — её
-    /// (свой появится с первой правкой), без выбора — всей карты.
+    /// (свой появится с первой правкой), без выбора — новых стен.
     pub fn wall_style(&self) -> map::WallStyle {
         match self.sel {
             Some(Sel::Wall(i)) => self.map.walls[i].style.clone().unwrap_or_else(|| self.map.wall_style.clone()),
+            Some(Sel::Edge(key, _)) => self.map.edge_look(key),
             _ => self.map.wall_style.clone(),
         }
     }
@@ -1070,7 +1189,18 @@ impl App {
     fn put_wall_style(&mut self, st: map::WallStyle) {
         match self.sel {
             Some(Sel::Wall(i)) => self.map.walls[i].style = Some(st),
-            _ => self.map.wall_style = st,
+            Some(Sel::Edge(key, whole)) => {
+                let run = self.edge_run(key, whole);
+                self.map.set_edge_look(&run, &st);
+            }
+            _ => {
+                // Стоящие стены остаются какими были.
+                let old = self.map.wall_style.clone();
+                for w in self.map.walls.iter_mut().filter(|w| w.style.is_none()) {
+                    w.style = Some(old.clone());
+                }
+                self.map.wall_style = st;
+            }
         }
     }
 
@@ -1080,6 +1210,8 @@ impl App {
         self.checkpoint();
         self.map.rooms = Mask::for_cells(self.map.width, self.map.height);
         self.map.room_floor.clear();
+        self.map.edge_looks.clear();
+        self.sel = None;
         let (w, h, cw) = (self.map.rooms.w, self.map.rooms.h, self.map.width as usize);
         let weights: Vec<(usize, f32)> = cells
             .iter()
@@ -1257,11 +1389,16 @@ impl App {
         self.export_step(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
+        egui::Panel::top("options").exact_size(38.0).resizable(false).show(ui, |ui| self.options_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));
-        egui::Panel::left("tools").default_size(270.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("tools-scroll").show(ui, |ui| self.tools(ui));
-        });
-        egui::CentralPanel::no_frame().frame(egui::Frame::new().fill(Color32::from_gray(24))).show(ui, |ui| self.canvas_ui(ui));
+        let shelf = 44.0 + self.shelf_rows as f32 * (THUMB + 4.0);
+        egui::Panel::bottom("shelf").exact_size(shelf).resizable(false).show(ui, |ui| self.shelf(ui));
+        egui::Panel::left("tools").exact_size(96.0).resizable(false).frame(egui::Frame::new().fill(PANEL)).show(ui, |ui| self.tool_cells(ui));
+        egui::CentralPanel::no_frame().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas_ui(ui));
+        if self.export.is_none() {
+            self.levels_overlay(&ctx);
+            self.tool_flyout(&ctx);
+        }
         self.windows(&ctx);
 
         let title = format!("{}{} — Картограф", if self.dirty { "• " } else { "" }, self.name());
@@ -1373,6 +1510,12 @@ impl App {
                     ui.label("Кольца");
                     ui.add(egui::Slider::new(&mut opt.loops, 0.0..=1.0));
                     ui.end_row();
+                    ui.label("Пол");
+                    ui.horizontal(|ui| self.material_combo(ui));
+                    ui.end_row();
+                    ui.label("Стены");
+                    self.wall_combo(ui);
+                    ui.end_row();
                     ui.label("Зерно");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut opt.seed).desired_width(110.0));
@@ -1382,7 +1525,7 @@ impl App {
                     });
                     ui.end_row();
                 });
-                ui.weak("Одно и то же зерно даёт ту же карту. Пол берётся из выбранного материала.");
+                ui.weak("Одно и то же зерно даёт ту же карту: поменяйте пол или стены и создайте заново.");
                 ui.add_space(4.0);
                 go = ui.button("Создать").clicked();
             });
@@ -1538,6 +1681,23 @@ impl App {
         }
     }
 
+    fn set_door_kind(&mut self, kind: PortalKind) {
+        if self.door_kind == kind {
+            return;
+        }
+        self.door_kind = kind;
+        // Окну — подоконник, двери — створка, если выбрано не то.
+        let is_window = self.door_asset.as_deref().is_some_and(|k| k.contains("window") || k.to_lowercase().contains("sill"));
+        if kind == PortalKind::Window && !is_window {
+            self.door_asset = Some(format!("{}window_stone", library::BUILTIN));
+        } else if kind.is_door() && (is_window || self.door_asset.is_none()) {
+            self.door_asset = Some(library::DEFAULT_DOOR.into());
+        }
+        if kind == PortalKind::DoubleDoor && self.door_width < 2.0 {
+            self.door_width = 2.0;
+        }
+    }
+
     pub fn set_tool(&mut self, tool: Tool) {
         if tool != Tool::Wall {
             self.finish_wall(false);
@@ -1546,12 +1706,16 @@ impl App {
             self.finish_path();
         }
         self.tool = tool;
-        // Инструмент сам открывает нужную вкладку библиотеки.
+        if let Some(k) = Group::ALL.iter().position(|g| g.has(tool)) {
+            self.group_last[k] = tool;
+        }
+        // Инструмент сам открывает нужный раздел полки.
         match tool {
             Tool::Door => self.browse = Kind::Door,
             Tool::Roof => self.browse = Kind::Roof,
-            Tool::Object => self.browse = Kind::Object,
-            Tool::Dungeon | Tool::Floor | Tool::Path if matches!(self.browse, Kind::Door | Kind::Object) => self.browse = Kind::Floor,
+            Tool::Object | Tool::Scatter => self.browse = Kind::Object,
+            Tool::Wall => self.browse = Kind::Wall,
+            Tool::Dungeon | Tool::Floor | Tool::Path if self.browse != Kind::Floor => self.browse = Kind::Floor,
             _ => {}
         }
     }
@@ -1589,6 +1753,36 @@ impl App {
                     }
                 }
             });
+            ui.menu_button("Процедурно", |ui| {
+                if item(ui, "Случайное подземелье…", "") {
+                    self.generator = Some(Options { seed: generate::new_seed(), ..Default::default() });
+                }
+            });
+            ui.menu_button("Вид", |ui| {
+                if item(ui, "Вся карта", "Home") {
+                    self.fitted = false;
+                }
+                if ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
+                    self.save_settings();
+                }
+                ui.separator();
+                ui.label("Крыши");
+                ui.selectable_value(&mut self.roof_view, RoofView::Auto, "Видно");
+                ui.selectable_value(&mut self.roof_view, RoofView::Ghost, "Сквозь");
+                ui.selectable_value(&mut self.roof_view, RoofView::Hidden, "Скрыть");
+                ui.separator();
+                self.shadows_ui(ui);
+            });
+            ui.menu_button("Сочетания клавиш", |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for tool in Tool::ALL {
+                    ui.label(format!("{} — {}", tool.key().name(), tool.label()));
+                }
+                ui.separator();
+                for line in ["Колесо — масштаб", "Средняя кнопка или пробел с левой — сдвиг", "R — поворот", "Ctrl+G — объединить выбранное", "Ctrl+Shift с протяжкой — выгнуть стену", "[ и ] или Ctrl с колесом — размер кисти", "Alt с колесом — размер объекта"] {
+                    ui.label(line);
+                }
+            });
             ui.menu_button("Правка", |ui| {
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Отменить").shortcut_text("Ctrl+Z")).clicked() {
                     self.undo();
@@ -1600,14 +1794,15 @@ impl App {
                     self.delete_selected();
                 }
             });
-            ui.menu_button("Создать", |ui| {
-                if item(ui, "Случайное подземелье…", "") {
-                    self.generator = Some(Options { seed: generate::new_seed(), ..Default::default() });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("В Foundry").clicked() {
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX });
                 }
-            });
-            ui.menu_button("Вид", |ui| {
-                if item(ui, "Вся карта", "Home") {
-                    self.fitted = false;
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Вернуть")).clicked() {
+                    self.redo();
+                }
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Отменить")).clicked() {
+                    self.undo();
                 }
             });
         });
@@ -1638,335 +1833,224 @@ impl App {
         }
     }
 
-    /// Этажи сверху вниз, как в доме; текущий можно переименовать.
-    fn levels_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Этажи");
-            if ui.small_button("+ выше").clicked() {
-                self.add_level(true);
-            }
-            if ui.small_button("+ ниже").clicked() {
-                self.add_level(false);
-            }
-        });
-        if self.levels.len() < 2 {
-            ui.weak("Один этаж. Новый — того же размера; в Foundry этажи станут уровнями сцены.");
-            return;
-        }
-        for k in (0..self.levels.len()).rev() {
-            if ui.selectable_label(self.level == k, self.level_name(k)).clicked() {
-                self.switch_level(k);
-            }
-        }
-        ui.horizontal(|ui| {
-            let mut name = self.map.name.clone();
-            let hint = format!("Этаж {}", self.level + 1);
-            let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint).desired_width(120.0));
-            if r.gained_focus() {
-                self.checkpoint();
-            }
-            self.map.name = name;
-            if ui.small_button("удалить").on_hover_text("Удалить этот этаж; отменить нельзя").clicked() {
-                self.remove_level();
-            }
-        });
-    }
-
-    fn tools(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        self.levels_ui(ui);
-        ui.add_space(8.0);
-        ui.strong("Инструменты");
-        for tool in Tool::ALL {
-            let text = format!("{}   {}", tool.label(), tool.key().name());
-            if ui.selectable_label(self.tool == tool, text).clicked() {
-                self.set_tool(tool);
-            }
-        }
-        ui.add_space(4.0);
-        ui.weak(match self.tool {
+    /// Подсказка к инструменту — в строке состояния.
+    fn hint(&self) -> &'static str {
+        match self.tool {
             Tool::Select => "Щелчок выбирает объект, дверь или стену. Объект можно тащить, за углы — менять размер, за ручку сверху — поворачивать; Alt с колесом — размер; стрелки сдвигают. Delete удаляет, R поворачивает.",
             Tool::Dungeon => "Пол комнат: стены встают по краю сами. Ctrl+Shift с протяжкой выгибает стену дугой.",
             Tool::Floor => "Пол без стен: двор, трава, площадь.",
             Tool::Erase => "Стирает и комнаты, и местность.",
             Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
-            Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите во вкладке «Двери»; без картинки — простая плашка.",
-            Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — во вкладке «Крыши». С другими инструментами крыши полупрозрачны.",
-            Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — ниже.",
+            Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите на полке; без картинки — простая плашка.",
+            Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
+            Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — в строке над картой.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
-            Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — из «Пол»: земля — тропа, вода — ручей, ткань — ковёр.",
-            Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком в библиотеке.",
+            Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
+            Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком на полке.",
             Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Alt — на время наоборот с привязкой, Alt с колесом — размер, R — поворот.",
-        });
+        }
+    }
 
+    /// Левый столбец: семь ячеек на всю высоту. Ячейка — инструмент, что был в ней
+    /// последним; стрелка или правая кнопка открывают её режимы.
+    fn tool_cells(&mut self, ui: &mut egui::Ui) {
+        let h = (ui.available_height() / Group::ALL.len() as f32).floor();
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        for (k, group) in Group::ALL.into_iter().enumerate() {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+            let on = group.has(self.tool);
+            let tool = if on { self.tool } else { self.group_last[k] };
+            let modes = self.group_modes(group);
+            let arrow = Rect::from_min_max(pos2(rect.right() - 16.0, rect.top()), rect.right_bottom());
+            let fly = !modes.is_empty() && ui.interact(arrow, resp.id.with("arrow"), Sense::click()).clicked();
+            let open = fly || (!modes.is_empty() && resp.secondary_clicked());
+            if resp.clicked() {
+                self.set_tool(tool);
+            }
+            if open {
+                self.fly = if self.fly == Some(k) { None } else { Some(k) };
+                self.fly_rect = rect;
+                self.fly_frame = self.frame;
+            }
+            let (fill, ink) = if on {
+                (ACCENT, ON_ACCENT)
+            } else if resp.hovered() {
+                (Color32::from_rgb(48, 50, 55), TEXT)
+            } else {
+                (PANEL, MUTED)
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, 0.0, fill);
+            p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, LINE));
+            let icon = Rect::from_center_size(pos2(rect.center().x, rect.center().y - 9.0), vec2(26.0, 26.0));
+            tool_icon(p, icon, group, ink);
+            let label = if on { self.mode_label() } else { tool.label().to_owned() };
+            p.text(pos2(rect.center().x, rect.center().y + 15.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.5), ink);
+            if !modes.is_empty() {
+                let c = arrow.center();
+                p.add(Shape::convex_polygon(vec![c + vec2(-3.0, -5.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 5.0)], ink, Stroke::NONE));
+            }
+            resp.on_hover_text(format!("{}   {}", tool.label(), tool.key().name()));
+        }
+    }
+
+    /// Подпись ячейки выбранного инструмента.
+    fn mode_label(&self) -> String {
         match self.tool {
-            Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade => {
-                ui.add_space(6.0);
-                if self.tool == Tool::Shade {
-                    ui.horizontal(|ui| {
-                        for level in [0.2, 0.4, 0.6, 0.8] {
-                            ui.selectable_value(&mut self.shade_level, level, format!("{}%", (level * 100.0) as u32));
-                        }
-                    });
-                    ui.add(egui::Slider::new(&mut self.shade_level, 0.05..=1.0).text("темнота"));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    for shape in Tip::ALL {
-                        ui.selectable_value(&mut self.brush.shape, shape, shape.label());
-                    }
-                });
-                if self.brush.shape == Tip::Cells {
-                    ui.weak("Щелчок — клетка, протяжка — прямоугольник клеток.");
-                } else if self.brush.shape == Tip::Oval {
-                    ui.weak("Протяжка — овал во весь прямоугольник; квадрат даёт круг. Shift держит круг.");
-                } else {
-                    ui.add(egui::Slider::new(&mut self.brush.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
-                    ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("жёсткость"));
-                    ui.add(egui::Slider::new(&mut self.brush.flow, 0.05..=1.0).text("сила"));
-                    ui.weak("[ и ] или Ctrl с колесом — меньше и больше. Мягкий край и неполная сила смешивают материалы.");
-                }
-            }
-            Tool::Door => {
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    for kind in PortalKind::ALL {
-                        if ui.selectable_label(self.door_kind == kind, kind.label()).clicked() && self.door_kind != kind {
-                            self.door_kind = kind;
-                            // Окну — подоконник, двери — створка, если выбрано не то.
-                            let is_window = self.door_asset.as_deref().is_some_and(|k| k.contains("window") || k.to_lowercase().contains("sill"));
-                            if kind == PortalKind::Window && !is_window {
-                                self.door_asset = Some(format!("{}window_stone", library::BUILTIN));
-                            } else if kind.is_door() && (is_window || self.door_asset.is_none()) {
-                                self.door_asset = Some(library::DEFAULT_DOOR.into());
-                            }
-                            if kind == PortalKind::DoubleDoor && self.door_width < 2.0 {
-                                self.door_width = 2.0;
-                            }
-                        }
-                    }
-                });
-                ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
-                if self.door_kind != PortalKind::Opening {
-                    ui.horizontal(|ui| {
-                        ui.label(if self.door_kind == PortalKind::Window { "Окно:" } else { "Створка:" });
-                        match self.door_asset.clone() {
-                            Some(key) => {
-                                ui.label(library::label(&key));
-                            }
-                            None => {
-                                ui.weak("простая плашка");
-                            }
-                        }
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Косяк:");
-                    let b = library::BUILTIN;
-                    let style = |f: &Option<String>| f.as_deref().map(|k| k.trim_end_matches(char::is_numeric).to_owned());
-                    let now = style(&self.door_frame);
-                    for (label, key) in [("нет", None), ("дерево", Some(format!("{b}frame_wood_1"))), ("камень", Some(format!("{b}frame_stone_1")))] {
-                        if ui.selectable_label(now == style(&key), label).clicked() {
-                            self.door_frame = key;
-                        }
-                    }
-                    if let Some(k) = &self.door_frame
-                        && !k.starts_with(b)
-                    {
-                        ui.label(library::label(k));
-                    }
-                });
-                ui.weak("Створку, окно или косяк можно взять во вкладке «Двери». Створка уходит в Foundry отдельной картинкой и там открывается.");
-            }
-            Tool::Roof => {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Крыши:");
-                    ui.selectable_value(&mut self.roof_view, RoofView::Auto, "видно");
-                    ui.selectable_value(&mut self.roof_view, RoofView::Ghost, "сквозь");
-                    ui.selectable_value(&mut self.roof_view, RoofView::Hidden, "скрыть");
-                });
-                let chosen = match self.sel {
-                    Some(Sel::Roof(i)) => Some(i),
-                    _ => None,
-                };
-                let mut st = chosen.map_or_else(|| self.roof_style.clone(), |i| self.map.roofs[i].clone());
-                if chosen.is_some() {
-                    ui.weak("Выбранная крыша:");
-                }
-                let before = st.clone();
-                ui.horizontal_wrapped(|ui| {
-                    for shape in map::RoofShape::ALL {
-                        ui.selectable_value(&mut st.shape, shape, shape.label());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Повернуть   R").clicked() {
-                        st.turn = (st.turn + 1) % 4;
-                    }
-                    ui.label(format!("Покрытие: {}", library::label(&st.paint)));
-                });
-                let over = ui.add(egui::Slider::new(&mut st.overhang, 0.0..=0.75).text("свес, кл."));
-                match chosen {
-                    Some(i) => {
-                        if st != before && (over.drag_started() || !over.dragged()) {
-                            self.checkpoint();
-                        }
-                        self.map.roofs[i] = st;
-                    }
-                    None => self.roof_style = st,
-                }
-            }
-            Tool::Text => {
-                ui.add_space(6.0);
-                let chosen = match self.sel {
-                    Some(Sel::Label(i)) => Some(i),
-                    _ => None,
-                };
-                let mut st = chosen.map_or_else(|| self.label_style.clone(), |i| self.map.labels[i].clone());
-                if chosen.is_some() {
-                    ui.weak("Выбранная подпись:");
-                }
-                let text = ui.add(egui::TextEdit::multiline(&mut st.text).desired_rows(2).desired_width(f32::INFINITY));
-                let rs = [
-                    ui.add(egui::Slider::new(&mut st.size, 0.2..=4.0).logarithmic(true).text("высота, кл.")),
-                    ui.add(egui::Slider::new(&mut st.rot, -180.0..=180.0).step_by(5.0).text("поворот")),
-                ];
-                let mut color = Color32::from_rgb(st.color[0], st.color[1], st.color[2]);
-                let picked = ui.horizontal(|ui| {
-                    let r = ui.color_edit_button_srgba(&mut color);
-                    ui.label("цвет");
-                    r
-                });
-                st.color = [color.r(), color.g(), color.b()];
-                match chosen {
-                    Some(i) => {
-                        if text.gained_focus() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) || picked.inner.changed() {
-                            self.checkpoint();
-                        }
-                        self.map.labels[i] = st;
-                    }
-                    None => self.label_style = st,
-                }
-            }
-            Tool::Path => {
-                ui.add_space(6.0);
-                // Ползунки правят выбранную дорогу, а без неё — образец для новых.
-                let chosen = match self.sel {
-                    Some(Sel::Path(i)) => Some(i),
-                    _ => None,
-                };
-                let mut st = chosen.map_or_else(|| self.path_style.clone(), |i| self.map.paths[i].clone());
-                if chosen.is_some() {
-                    ui.weak("Выбранная дорога:");
-                }
-                let rs = [
-                    ui.add(egui::Slider::new(&mut st.width, 0.25..=12.0).logarithmic(true).text("ширина, кл.")),
-                    ui.add(egui::Slider::new(&mut st.soft, 0.0..=1.0).text("мягкость края")),
-                    ui.add(egui::Slider::new(&mut st.rough, 0.0..=1.0).text("неровность")),
-                ];
-                let along = ui.checkbox(&mut st.along, "Текстура вдоль линии").on_hover_text("Для ковра и мостовой. Без галочки текстура лежит по сетке, как пол, — для земли и воды.");
-                match chosen {
-                    Some(i) => {
-                        if rs.iter().any(|r| r.drag_started()) || along.changed() || rs.iter().any(|r| r.changed() && !r.dragged()) {
-                            self.checkpoint();
-                        }
-                        self.map.paths[i] = st;
-                    }
-                    None => {
-                        st.points.clear();
-                        self.path_style = st;
-                    }
-                }
-            }
-            Tool::Scatter => {
-                ui.add_space(6.0);
-                ui.strong("Набор");
-                if self.scatter.set.is_empty() {
-                    ui.weak("пусто — щёлкните объекты во вкладке «Объекты»");
-                }
-                let mut drop = None;
-                for (k, key) in self.scatter.set.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("×").on_hover_text("Убрать из набора").clicked() {
-                            drop = Some(k);
-                        }
-                        ui.label(library::label(key));
-                    });
-                }
-                if let Some(k) = drop {
-                    self.scatter.set.remove(k);
-                }
-                ui.add(egui::Slider::new(&mut self.scatter.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
-                ui.add(egui::Slider::new(&mut self.scatter.density, 0.05..=4.0).logarithmic(true).text("плотность"));
-                ui.add(egui::Slider::new(&mut self.scatter.spacing, 0.0..=2.0).text("просвет"));
-                ui.add(egui::Slider::new(&mut self.scatter.scale[0], 0.2..=3.0).text("размер от"));
-                ui.add(egui::Slider::new(&mut self.scatter.scale[1], 0.2..=3.0).text("размер до"));
-                if self.scatter.scale[1] < self.scatter.scale[0] {
-                    self.scatter.scale[1] = self.scatter.scale[0];
-                }
-                ui.checkbox(&mut self.scatter.spin, "Случайный поворот");
-            }
-            Tool::Object => {
-                ui.add_space(6.0);
-                ui.add(egui::Slider::new(&mut self.object_rot, 0.0..=345.0).step_by(15.0).text("поворот"));
-                ui.add(egui::Slider::new(&mut self.object_scale, SCALE_RANGE).logarithmic(true).text("размер"));
-            }
-            _ => {}
+            Tool::Door => self.door_kind.label().to_owned(),
+            Tool::Roof => self.roof_style.shape.label().to_owned(),
+            t => t.label().to_owned(),
         }
-        if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
-            self.save_settings();
-        }
-        self.picked.retain(|&k| k < self.map.props.len());
-        if !self.picked.is_empty() {
-            ui.add_space(6.0);
-            ui.strong(format!("Выбрано объектов: {}", self.picked.len()));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(self.picked.len() >= 2, egui::Button::new("Объединить в один   Ctrl+G")).clicked() {
-                    self.bake_picked();
-                }
-                if ui.small_button("снять выбор").clicked() {
-                    self.picked.clear();
-                }
-            });
-            ui.weak("Объединённый объект ляжет в библиотеку, во вкладку «Объекты», папка «Запечённые».");
-        }
-        if let Some(Sel::Prop(i)) = self.sel {
-            ui.add_space(6.0);
-            ui.strong(format!("Объект: {}", library::label(&self.map.props[i].asset)));
-            let (mut rot, mut scale) = (self.map.props[i].rot, self.map.props[i].scale);
-            let r1 = ui.add(egui::Slider::new(&mut rot, 0.0..=359.0).text("поворот"));
-            let r2 = ui.add(egui::Slider::new(&mut scale, SCALE_RANGE).logarithmic(true).text("размер"));
-            if r1.drag_started() || r2.drag_started() || ((r1.changed() || r2.changed()) && !r1.dragged() && !r2.dragged()) {
-                self.checkpoint();
-            }
-            self.map.props[i].rot = rot;
-            self.map.props[i].scale = scale;
-            let mut casts = self.map.props[i].casts_shadow();
-            if ui.checkbox(&mut casts, "Отбрасывает тень").changed() {
-                self.checkpoint();
-                self.map.props[i].shadow = Some(casts);
-            }
-        }
+    }
 
-        ui.add_space(10.0);
-        ui.strong("Пол");
-        let materials = self.map.materials.clone();
-        for (i, m) in materials.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let resp = self.swatch(ui, &m.paint, 18.0);
-                let label = ui.selectable_label(self.material == i, &m.name);
-                if resp.clicked() || label.clicked() {
-                    self.material = i;
-                    if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
-                        self.set_tool(Tool::Dungeon);
+    fn group_modes(&self, group: Group) -> Vec<(String, Mode)> {
+        let tool = |t: Tool| (format!("{}   {}", t.label(), t.key().name()), Mode::Tool(t));
+        match group {
+            Group::Brush => [Tool::Dungeon, Tool::Floor, Tool::Shade, Tool::Erase].map(tool).to_vec(),
+            Group::Object => [Tool::Object, Tool::Scatter].map(tool).to_vec(),
+            Group::Wall => std::iter::once(tool(Tool::Wall)).chain(PortalKind::ALL.map(|k| (k.label().to_owned(), Mode::Door(k)))).collect(),
+            Group::Roof => map::RoofShape::ALL.map(|s| (s.label().to_owned(), Mode::Roof(s))).to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Всплывающий список режимов рядом с ячейкой.
+    fn tool_flyout(&mut self, ctx: &egui::Context) {
+        let Some(k) = self.fly else { return };
+        let group = Group::ALL[k];
+        let modes = self.group_modes(group);
+        let mut chosen = None;
+        let at = egui::Area::new(egui::Id::new("tool-flyout")).order(egui::Order::Foreground).fixed_pos(self.fly_rect.right_top() + vec2(2.0, 0.0)).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for (i, (label, mode)) in modes.iter().enumerate() {
+                    let on = match *mode {
+                        Mode::Tool(t) => self.tool == t,
+                        Mode::Door(d) => self.tool == Tool::Door && self.door_kind == d,
+                        Mode::Roof(s) => self.tool == Tool::Roof && self.roof_style.shape == s,
+                    };
+                    if ui.selectable_label(on, label).clicked() {
+                        chosen = Some(i);
                     }
-                    self.recolor_path();
                 }
             });
+        });
+        if let Some(i) = chosen {
+            match modes[i].1 {
+                Mode::Tool(t) => self.set_tool(t),
+                Mode::Door(d) => {
+                    self.set_door_kind(d);
+                    self.set_tool(Tool::Door);
+                }
+                Mode::Roof(s) => {
+                    self.roof_style.shape = s;
+                    self.set_tool(Tool::Roof);
+                }
+            }
+            self.fly = None;
+        } else if self.fly_frame != self.frame && at.response.clicked_elsewhere() {
+            self.fly = None;
         }
+    }
+
+    /// Этажи и этажность — плашкой в углу карты.
+    fn levels_overlay(&mut self, ctx: &egui::Context) {
+        let at = self.canvas.right_top() + vec2(-8.0, 8.0);
+        egui::Area::new(egui::Id::new("levels")).pivot(egui::Align2::RIGHT_TOP).fixed_pos(at).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for k in (0..self.levels.len()).rev() {
+                    if ui.selectable_label(self.level == k, self.level_name(k)).clicked() {
+                        self.switch_level(k);
+                    }
+                }
+                ui.menu_button("Этажи", |ui| {
+                    if ui.button("Добавить выше").clicked() {
+                        self.add_level(true);
+                        ui.close();
+                    }
+                    if ui.button("Добавить ниже").clicked() {
+                        self.add_level(false);
+                        ui.close();
+                    }
+                    let mut name = self.map.name.clone();
+                    let hint = format!("Этаж {}", self.level + 1);
+                    let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint).desired_width(120.0));
+                    if r.gained_focus() {
+                        self.checkpoint();
+                    }
+                    self.map.name = name;
+                    if self.levels.len() > 1 && ui.button("Удалить этот этаж").on_hover_text("Отменить нельзя").clicked() {
+                        self.remove_level();
+                        ui.close();
+                    }
+                });
+            });
+        });
+    }
+
+    fn material_combo(&mut self, ui: &mut egui::Ui) {
+        let materials = self.map.materials.clone();
+        if let Some(m) = materials.get(self.material) {
+            self.swatch(ui, &m.paint, 18.0);
+        }
+        let shown = materials.get(self.material).map_or_else(String::new, |m| m.name.clone());
+        egui::ComboBox::from_id_salt("material").selected_text(shown).width(120.0).show_ui(ui, |ui| {
+            for (i, m) in materials.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let resp = self.swatch(ui, &m.paint, 18.0);
+                    let label = ui.selectable_label(self.material == i, &m.name);
+                    if resp.clicked() || label.clicked() {
+                        self.material = i;
+                        self.recolor_path();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Вид новых стен списком — для окна случайного подземелья.
+    fn wall_combo(&mut self, ui: &mut egui::Ui) {
+        let keys: Vec<(String, String)> = self.library.filter(Kind::Wall, "").into_iter().map(|i| (self.library.assets[i].key.clone(), self.library.assets[i].name.clone())).collect();
+        let now = self.map.wall_style.paint.clone();
+        let shown = match &now {
+            Paint::Texture(k) => library::label(k),
+            Paint::Color(_) => "цвет".to_owned(),
+        };
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            self.swatch(ui, &now, 18.0);
+            egui::ComboBox::from_id_salt("gen-walls").selected_text(shown).width(120.0).show_ui(ui, |ui| {
+                for (key, name) in &keys {
+                    ui.horizontal(|ui| {
+                        let paint = Paint::Texture(key.clone());
+                        let resp = self.swatch(ui, &paint, 18.0);
+                        let label = ui.selectable_label(now == paint, name);
+                        if resp.clicked() || label.clicked() {
+                            picked = Some(key.clone());
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(key) = picked {
+            self.sel = None;
+            let mut st = self.map.wall_style.clone();
+            if let Some(width) = library::builtin_wall_width(&key) {
+                st.width = width;
+            }
+            st.paint = Paint::Texture(key);
+            self.set_wall_style(st);
+        }
+    }
+
+    /// Выбор пола для кисти и дороги.
+    fn material_picker(&mut self, ui: &mut egui::Ui) {
+        self.material_combo(ui);
+        let materials = self.map.materials.clone();
         if let Some(m) = materials.get(self.material).filter(|m| matches!(m.paint, Paint::Texture(_))) {
             ui.horizontal(|ui| {
-                ui.label("Живой в Foundry:").on_hover_text("Залитое этим материалом в выгрузке станет областью сцены, и модуль «Живая карта» её оживит: рябь и рыбки, течение лавы, пузыри болота.");
+                ui.label("Живой:").on_hover_text("Залитое этим материалом в выгрузке станет областью сцены, и модуль «Живая карта» её оживит: рябь и рыбки, течение лавы, пузыри болота.");
                 let now = m.live;
                 let shown = if now == map::Live::Auto { format!("{} ({})", now.label(), m.live().label()) } else { now.label().to_owned() };
                 egui::ComboBox::from_id_salt("live").selected_text(shown).show_ui(ui, |ui| {
@@ -1989,45 +2073,279 @@ impl App {
             }
         }
 
-        ui.add_space(10.0);
-        let own = match self.sel {
-            Some(Sel::Wall(i)) => Some(self.map.walls[i].style.is_some()),
-            _ => None,
-        };
-        ui.horizontal(|ui| {
-            ui.strong(if own.is_some() { "Выбранная стена" } else { "Стены" });
-            if own == Some(true) && ui.small_button("как у всех").on_hover_text("Убрать свой вид — стена станет как остальные").clicked()
-                && let Some(Sel::Wall(i)) = self.sel
-            {
-                self.checkpoint();
-                self.map.walls[i].style = None;
-            }
-        });
-        if own == Some(false) {
-            ui.weak("Как у всех. Текстура из библиотеки ляжет только на неё.");
-        }
-        let current = self.wall_style();
-        ui.horizontal(|ui| {
-            self.swatch(ui, &current.paint, 18.0);
-            ui.label(match &current.paint {
-                Paint::Color(_) => "цвет".to_owned(),
-                Paint::Texture(k) => library::label(k),
-            });
-            if matches!(current.paint, Paint::Texture(_)) && ui.small_button("цвет").clicked() {
-                self.use_wall_paint(map::WallStyle::default().paint);
-            }
-        });
-        let mut width = current.width;
-        let slider = ui.add(egui::Slider::new(&mut width, 0.1..=1.0).text("толщина"));
-        // Протяжка ползунка — одна правка в истории, а не по одной на кадр.
-        if slider.drag_started() || (slider.changed() && !slider.dragged()) {
-            self.checkpoint();
-        }
-        if width != current.width {
-            self.put_wall_style(map::WallStyle { width, ..current });
-        }
+    }
 
-        ui.add_space(10.0);
+    /// Строка над картой: настройки инструмента и выбранного. Высота постоянная:
+    /// иначе карта прыгала бы под курсором; что не влезло — прокруткой вбок.
+    fn options_bar(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::horizontal().id_salt("options").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().slider_width = 90.0;
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.strong(self.tool.label());
+                if matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
+                    self.material_picker(ui);
+                }
+                match self.tool {
+                    Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade => {
+                        if self.tool == Tool::Shade {
+                            ui.horizontal(|ui| {
+                                for level in [0.2, 0.4, 0.6, 0.8] {
+                                    ui.selectable_value(&mut self.shade_level, level, format!("{}%", (level * 100.0) as u32));
+                                }
+                            });
+                            ui.add(egui::Slider::new(&mut self.shade_level, 0.05..=1.0).text("темнота"));
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for shape in Tip::ALL {
+                                ui.selectable_value(&mut self.brush.shape, shape, shape.label());
+                            }
+                        });
+                        if !matches!(self.brush.shape, Tip::Cells | Tip::Oval) {
+                            ui.add(egui::Slider::new(&mut self.brush.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
+                            ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("жёсткость"));
+                            ui.add(egui::Slider::new(&mut self.brush.flow, 0.05..=1.0).text("сила"));
+                        }
+                    }
+                    Tool::Door => {
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in PortalKind::ALL {
+                                if ui.selectable_label(self.door_kind == kind, kind.label()).clicked() {
+                                    self.set_door_kind(kind);
+                                }
+                            }
+                        });
+                        ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
+                        if self.door_kind != PortalKind::Opening {
+                            ui.horizontal(|ui| {
+                                ui.label(if self.door_kind == PortalKind::Window { "Окно:" } else { "Створка:" });
+                                match self.door_asset.clone() {
+                                    Some(key) => {
+                                        ui.label(library::label(&key));
+                                    }
+                                    None => {
+                                        ui.weak("простая плашка");
+                                    }
+                                }
+                            });
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Косяк:");
+                            let b = library::BUILTIN;
+                            let style = |f: &Option<String>| f.as_deref().map(|k| k.trim_end_matches(char::is_numeric).to_owned());
+                            let now = style(&self.door_frame);
+                            for (label, key) in [("нет", None), ("дерево", Some(format!("{b}frame_wood_1"))), ("камень", Some(format!("{b}frame_stone_1")))] {
+                                if ui.selectable_label(now == style(&key), label).clicked() {
+                                    self.door_frame = key;
+                                }
+                            }
+                            if let Some(k) = &self.door_frame
+                                && !k.starts_with(b)
+                            {
+                                ui.label(library::label(k));
+                            }
+                        });
+                    }
+                    Tool::Roof => {
+                        let chosen = match self.sel {
+                            Some(Sel::Roof(i)) => Some(i),
+                            _ => None,
+                        };
+                        let mut st = chosen.map_or_else(|| self.roof_style.clone(), |i| self.map.roofs[i].clone());
+                        let before = st.clone();
+                        ui.horizontal_wrapped(|ui| {
+                            for shape in map::RoofShape::ALL {
+                                ui.selectable_value(&mut st.shape, shape, shape.label());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Повернуть   R").clicked() {
+                                st.turn = (st.turn + 1) % 4;
+                            }
+                            ui.label(format!("Покрытие: {}", library::label(&st.paint)));
+                        });
+                        let over = ui.add(egui::Slider::new(&mut st.overhang, 0.0..=0.75).text("свес, кл."));
+                        match chosen {
+                            Some(i) => {
+                                if st != before && (over.drag_started() || !over.dragged()) {
+                                    self.checkpoint();
+                                }
+                                self.map.roofs[i] = st;
+                            }
+                            None => self.roof_style = st,
+                        }
+                    }
+                    Tool::Text => {
+                        let chosen = match self.sel {
+                            Some(Sel::Label(i)) => Some(i),
+                            _ => None,
+                        };
+                        let mut st = chosen.map_or_else(|| self.label_style.clone(), |i| self.map.labels[i].clone());
+                        let text = ui.add(egui::TextEdit::singleline(&mut st.text).desired_width(180.0));
+                        let rs = [
+                            ui.add(egui::Slider::new(&mut st.size, 0.2..=4.0).logarithmic(true).text("высота, кл.")),
+                            ui.add(egui::Slider::new(&mut st.rot, -180.0..=180.0).step_by(5.0).text("поворот")),
+                        ];
+                        let mut color = Color32::from_rgb(st.color[0], st.color[1], st.color[2]);
+                        let picked = ui.horizontal(|ui| {
+                            let r = ui.color_edit_button_srgba(&mut color);
+                            ui.label("цвет");
+                            r
+                        });
+                        st.color = [color.r(), color.g(), color.b()];
+                        match chosen {
+                            Some(i) => {
+                                if text.gained_focus() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) || picked.inner.changed() {
+                                    self.checkpoint();
+                                }
+                                self.map.labels[i] = st;
+                            }
+                            None => self.label_style = st,
+                        }
+                    }
+                    Tool::Path => {
+                        // Ползунки правят выбранную дорогу, а без неё — образец для новых.
+                        let chosen = match self.sel {
+                            Some(Sel::Path(i)) => Some(i),
+                            _ => None,
+                        };
+                        let mut st = chosen.map_or_else(|| self.path_style.clone(), |i| self.map.paths[i].clone());
+                        let rs = [
+                            ui.add(egui::Slider::new(&mut st.width, 0.25..=12.0).logarithmic(true).text("ширина, кл.")),
+                            ui.add(egui::Slider::new(&mut st.soft, 0.0..=1.0).text("мягкость края")),
+                            ui.add(egui::Slider::new(&mut st.rough, 0.0..=1.0).text("неровность")),
+                        ];
+                        let along = ui.checkbox(&mut st.along, "Текстура вдоль линии").on_hover_text("Для ковра и мостовой. Без галочки текстура лежит по сетке, как пол, — для земли и воды.");
+                        match chosen {
+                            Some(i) => {
+                                if rs.iter().any(|r| r.drag_started()) || along.changed() || rs.iter().any(|r| r.changed() && !r.dragged()) {
+                                    self.checkpoint();
+                                }
+                                self.map.paths[i] = st;
+                            }
+                            None => {
+                                st.points.clear();
+                                self.path_style = st;
+                            }
+                        }
+                    }
+                    Tool::Scatter => {
+                        if self.scatter.set.is_empty() {
+                            ui.weak("Набор пуст: щёлкните объекты на полке");
+                        }
+                        let mut drop = None;
+                        for (k, key) in self.scatter.set.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("×").on_hover_text("Убрать из набора").clicked() {
+                                    drop = Some(k);
+                                }
+                                ui.label(library::label(key));
+                            });
+                        }
+                        if let Some(k) = drop {
+                            self.scatter.set.remove(k);
+                        }
+                        ui.add(egui::Slider::new(&mut self.scatter.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
+                        ui.add(egui::Slider::new(&mut self.scatter.density, 0.05..=4.0).logarithmic(true).text("плотность"));
+                        ui.add(egui::Slider::new(&mut self.scatter.spacing, 0.0..=2.0).text("просвет"));
+                        ui.add(egui::Slider::new(&mut self.scatter.scale[0], 0.2..=3.0).text("размер от"));
+                        ui.add(egui::Slider::new(&mut self.scatter.scale[1], 0.2..=3.0).text("размер до"));
+                        if self.scatter.scale[1] < self.scatter.scale[0] {
+                            self.scatter.scale[1] = self.scatter.scale[0];
+                        }
+                        ui.checkbox(&mut self.scatter.spin, "Случайный поворот");
+                    }
+                    Tool::Object => {
+                        ui.add(egui::Slider::new(&mut self.object_rot, 0.0..=345.0).step_by(15.0).text("поворот"));
+                        ui.add(egui::Slider::new(&mut self.object_scale, SCALE_RANGE).logarithmic(true).text("размер"));
+                    }
+                    _ => {}
+                }
+                if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
+                    self.save_settings();
+                }
+                self.picked.retain(|&k| k < self.map.props.len());
+                if !self.picked.is_empty() {
+                    ui.strong(format!("Выбрано объектов: {}", self.picked.len()));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(self.picked.len() >= 2, egui::Button::new("Объединить в один   Ctrl+G")).clicked() {
+                            self.bake_picked();
+                        }
+                        if ui.small_button("снять выбор").clicked() {
+                            self.picked.clear();
+                        }
+                    });
+                }
+                if let Some(Sel::Prop(i)) = self.sel {
+                    ui.strong(format!("Объект: {}", library::label(&self.map.props[i].asset)));
+                    let (mut rot, mut scale) = (self.map.props[i].rot, self.map.props[i].scale);
+                    let r1 = ui.add(egui::Slider::new(&mut rot, 0.0..=359.0).text("поворот"));
+                    let r2 = ui.add(egui::Slider::new(&mut scale, SCALE_RANGE).logarithmic(true).text("размер"));
+                    if r1.drag_started() || r2.drag_started() || ((r1.changed() || r2.changed()) && !r1.dragged() && !r2.dragged()) {
+                        self.checkpoint();
+                    }
+                    self.map.props[i].rot = rot;
+                    self.map.props[i].scale = scale;
+                    let mut casts = self.map.props[i].casts_shadow();
+                    if ui.checkbox(&mut casts, "Отбрасывает тень").changed() {
+                        self.checkpoint();
+                        self.map.props[i].shadow = Some(casts);
+                    }
+                }
+
+                if self.tool == Tool::Wall || matches!(self.sel, Some(Sel::Wall(_) | Sel::Edge(..))) {
+                    let own = match self.sel {
+                        Some(Sel::Wall(i)) => Some(self.map.walls[i].style.is_some()),
+                        Some(Sel::Edge(..)) => Some(false),
+                        _ => None,
+                    };
+                    ui.horizontal(|ui| {
+                        if own.is_some() {
+                            ui.strong("Выбранная стена");
+                        }
+                        if own == Some(true) && ui.small_button("как у всех").on_hover_text("Убрать свой вид — стена станет как остальные").clicked()
+                            && let Some(Sel::Wall(i)) = self.sel
+                        {
+                            self.checkpoint();
+                            self.map.walls[i].style = None;
+                        }
+                    });
+                    if let Some(Sel::Edge(key, whole)) = self.sel {
+                            let mut w = whole;
+                            ui.selectable_value(&mut w, false, "Участок");
+                            ui.selectable_value(&mut w, true, "Весь контур");
+                            self.sel = Some(Sel::Edge(key, w));
+                        } else if self.sel.is_none() && ui.button("Ко всем стенам").on_hover_text("Перекрасить уже стоящие стены в этот вид").clicked() {
+                            self.apply_wall_style_to_all();
+                        }
+                    let current = self.wall_style();
+                    ui.horizontal(|ui| {
+                        self.swatch(ui, &current.paint, 18.0);
+                        ui.label(match &current.paint {
+                            Paint::Color(_) => "цвет".to_owned(),
+                            Paint::Texture(k) => library::label(k),
+                        });
+                        if matches!(current.paint, Paint::Texture(_)) && ui.small_button("цвет").clicked() {
+                            self.use_wall_paint(map::WallStyle::default().paint);
+                        }
+                    });
+                    let mut width = current.width;
+                    let slider = ui.add(egui::Slider::new(&mut width, 0.1..=1.0).text("толщина"));
+                    // Протяжка ползунка — одна правка в истории, а не по одной на кадр.
+                    if slider.drag_started() || (slider.changed() && !slider.dragged()) {
+                        self.checkpoint();
+                    }
+                    if width != current.width {
+                        self.put_wall_style(map::WallStyle { width, ..current });
+                    }
+
+                }
+            });
+        });
+    }
+
+    /// Настройки теней карты, меню «Вид».
+    fn shadows_ui(&mut self, ui: &mut egui::Ui) {
         let mut sh = self.map.shadows.clone();
         let on = ui.checkbox(&mut sh.on, "Тени от стен и объектов");
         let mut rs = Vec::new();
@@ -2042,48 +2360,66 @@ impl App {
         }
         self.map.shadows = sh;
 
-        ui.add_space(10.0);
-        self.browser(ui);
-        ui.add_space(10.0);
-        ui.weak("Колесо — масштаб, средняя кнопка или пробел с левой — сдвиг.");
+    }
+
+    /// Полка ассетов: слева разделы, справа поиск и большие миниатюры.
+    fn shelf(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_top(|ui| {
+            if self.shelf_rows > 0 {
+                ui.vertical(|ui| {
+                    ui.set_width(84.0);
+                    for k in Kind::ALL {
+                        ui.selectable_value(&mut self.browse, k, k.label());
+                    }
+                });
+            }
+            ui.vertical(|ui| self.browser(ui));
+        });
     }
 
     fn browser(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong("Библиотека");
-            if ui.small_button("Папка…").on_hover_text("Папка с картинками").clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder()
-            {
-                self.set_textures_dir(dir);
-            }
-            if ui.small_button("Пак DD…").on_hover_text("Подключить пак Dungeondraft").clicked()
-                && let Some(files) = rfd::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
-            {
-                for f in files {
-                    self.add_pack(f);
+            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Поиск").desired_width(180.0));
+            let found = self.filtered().len();
+            ui.weak(format!("Найдено: {found}"));
+            ui.menu_button("Источники", |ui| {
+                if ui.button("Папка с картинками…").clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.set_textures_dir(dir);
+                    ui.close();
                 }
-            }
+                if ui.button("Подключить пак Dungeondraft…").clicked()
+                    && let Some(files) = rfd::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
+                {
+                    for f in files {
+                        self.add_pack(f);
+                    }
+                    ui.close();
+                }
+                for (file, status) in &self.library.packs {
+                    let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    match status {
+                        Ok(0) if self.library.loading() => ui.weak(format!("{name}: читается…")),
+                        Ok(n) => ui.weak(format!("{name}: {n}")),
+                        Err(e) => ui.colored_label(Color32::from_rgb(230, 110, 90), e),
+                    };
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (n, label) in [(2, "2 ряда"), (1, "1 ряд"), (0, "Скрыть")] {
+                    ui.selectable_value(&mut self.shelf_rows, n, label);
+                }
+            });
         });
-        for (file, status) in &self.library.packs {
-            let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            match status {
-                Ok(0) if self.library.loading() => ui.weak(format!("{name}: читается…")),
-                Ok(n) => ui.weak(format!("{name}: {n}")),
-                Err(e) => ui.colored_label(Color32::from_rgb(230, 110, 90), e),
-            };
+        if self.shelf_rows == 0 {
+            return;
         }
         if self.library.assets.is_empty() && !self.library.loading() {
-            ui.weak("Пусто. Подключите папку с картинками или пак Dungeondraft.");
+            ui.weak("Пусто. Подключите папку с картинками или пак Dungeondraft: кнопка «Источники».");
         }
-        ui.horizontal(|ui| {
-            for k in Kind::ALL {
-                ui.selectable_value(&mut self.browse, k, k.label());
-            }
-        });
-        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Поиск: слова из имени или папки").desired_width(f32::INFINITY));
 
         let list = self.filtered().to_vec();
-        ui.weak(format!("Найдено: {}", list.len()));
         let cols = ((ui.available_width() + 4.0) / (THUMB + 4.0)).floor().max(1.0) as usize;
         let rows = list.len().div_ceil(cols);
         let current = match self.browse {
@@ -2103,7 +2439,7 @@ impl App {
             }),
         };
         let mut chosen: Option<(String, bool)> = None;
-        egui::ScrollArea::vertical().id_salt("assets").max_height(BROWSER_HEIGHT).auto_shrink([false, true]).show_rows(ui, THUMB + 4.0, rows, |ui, range| {
+        egui::ScrollArea::vertical().id_salt("assets").max_height(ui.available_height()).auto_shrink([false, false]).show_rows(ui, THUMB + 4.0, rows, |ui, range| {
             for row in range {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -2113,7 +2449,7 @@ impl App {
                         let (rect, resp) = ui.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
                         self.thumb(ui.painter(), rect, &key);
                         if current.as_deref() == Some(key.as_str()) {
-                            ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, Color32::from_rgb(120, 180, 255)), egui::StrokeKind::Outside);
+                            ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
                         }
                         let resp = resp.on_hover_text(tip);
                         if resp.clicked() {
@@ -2230,6 +2566,9 @@ impl App {
                 ui.separator();
                 ui.label(n);
             }
+            ui.separator();
+            let hint = self.hint();
+            ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate()).on_hover_text(hint);
         });
     }
 
@@ -2390,8 +2729,16 @@ impl App {
             .find(|&m| m > 0)
             .map_or(self.material, |m| m as usize - 1);
         self.checkpoint();
+        // Выгнутая стена остаётся какой была, а не берёт вид новых стен.
+        let run = self.edges.iter().min_by(|x, y| map::segment_distance(mid, x.0, x.1).total_cmp(&map::segment_distance(mid, y.0, y.1))).copied();
+        let keep = run.map(|s| self.map.edge_look(map::edge_key(&s)));
+        let fresh = keep.map(|k| std::mem::replace(&mut self.map.wall_style, k));
         self.map.bend_room(a, b, h, material);
         self.edges_dirty = true;
+        self.room_edges();
+        if let Some(st) = fresh {
+            self.map.wall_style = st;
+        }
     }
 
     /// Ctrl+Shift с протяжкой гнёт стену дугой. `true` — ввод занят изгибом.
@@ -2906,15 +3253,35 @@ impl App {
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
         // ложатся и на объекты у стены.
         let style = self.map.wall_style.clone();
-        let edges = map::cut_portals(&self.room_edges().to_vec(), &self.map.portals);
-        if shadows.on {
-            self.draw_wall_shadow(painter, canvas, &edges, style.width, &shadows);
-            for w in self.map.walls.clone() {
-                let width = w.style.as_ref().map_or(style.width, |s| s.width);
-                self.draw_wall_shadow(painter, canvas, &map::cut_portals(&w.segments().collect::<Vec<_>>(), &self.map.portals), width, &shadows);
+        let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
+        for s in self.room_edges().to_vec() {
+            let st = self.map.edge_look(map::edge_key(&s));
+            match looks.iter_mut().find(|l| l.0 == st) {
+                Some(l) => l.1.push(s),
+                None => looks.push((st, vec![s])),
             }
         }
-        self.draw_walls(painter, canvas, &style, &edges);
+        for l in &mut looks {
+            l.1 = map::cut_portals_wide(&l.1, &self.map.portals, l.0.width / 2.0);
+        }
+        if shadows.on {
+            for (st, edges) in &looks {
+                self.draw_wall_shadow(painter, canvas, edges, st.width, &shadows);
+            }
+            for w in self.map.walls.clone() {
+                let width = w.style.as_ref().map_or(style.width, |s| s.width);
+                self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &shadows);
+            }
+        }
+        if let Some(Sel::Edge(key, whole)) = self.sel {
+            let width = self.map.edge_look(key).width;
+            for (a, b) in self.edge_run(key, whole) {
+                painter.line_segment([cam.to_screen(canvas, a), cam.to_screen(canvas, b)], Stroke::new(width * s + 6.0, Color32::from_rgb(120, 180, 255)));
+            }
+        }
+        for (st, edges) in &looks {
+            self.draw_walls(painter, canvas, st, edges);
+        }
         let walls = self.map.walls.clone();
         for (i, wall) in walls.iter().enumerate() {
             let segs: Vec<Segment> = wall.segments().collect();
@@ -2924,7 +3291,7 @@ impl App {
                     painter.line_segment([cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], Stroke::new(own.width * s + 6.0, Color32::from_rgb(120, 180, 255)));
                 }
             }
-            self.draw_walls(painter, canvas, own, &map::cut_portals(&segs, &self.map.portals));
+            self.draw_walls(painter, canvas, own, &map::cut_portals_wide(&segs, &self.map.portals, own.width / 2.0));
         }
 
         let portals = self.map.portals.clone();
@@ -3967,6 +4334,91 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let Some(test) = &mut self.test {
             test.feed(raw);
+        }
+    }
+}
+
+/// Оформление: графит и янтарь.
+fn apply_theme(ctx: &egui::Context) {
+    use egui::CornerRadius;
+    ctx.style_mut_of(egui::Theme::Dark, |s| {
+        let v = &mut s.visuals;
+        v.panel_fill = PANEL;
+        v.window_fill = PANEL;
+        v.window_stroke = Stroke::new(1.0, LINE);
+        v.extreme_bg_color = Color32::from_rgb(22, 23, 25);
+        v.faint_bg_color = FIELD;
+        v.override_text_color = None;
+        v.selection.bg_fill = ACCENT;
+        v.selection.stroke = Stroke::new(1.0, ON_ACCENT);
+        v.hyperlink_color = ACCENT;
+        v.window_corner_radius = CornerRadius::same(6);
+        v.menu_corner_radius = CornerRadius::same(6);
+        for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+            w.corner_radius = CornerRadius::same(4);
+        }
+        v.widgets.noninteractive.bg_fill = PANEL;
+        v.widgets.noninteractive.weak_bg_fill = PANEL;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.bg_fill = FIELD;
+        v.widgets.inactive.weak_bg_fill = FIELD;
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(62, 64, 70);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 64, 70);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+        v.widgets.active.bg_fill = ACCENT;
+        v.widgets.active.weak_bg_fill = ACCENT;
+        // Этим же цветом egui пишет `ui.strong`, поэтому он светлый.
+        v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        s.spacing.button_padding = vec2(8.0, 3.0);
+        s.spacing.item_spacing = vec2(6.0, 5.0);
+    });
+}
+
+/// Значок ячейки инструмента, чертится линиями.
+fn tool_icon(p: &egui::Painter, r: Rect, group: Group, ink: Color32) {
+    let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    let line = Stroke::new(1.8, ink);
+    let poly = |pts: &[(f32, f32)]| p.add(Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), line));
+    match group {
+        Group::Select => {
+            let pts = [(0.25, 0.08), (0.25, 0.82), (0.44, 0.64), (0.58, 0.94), (0.70, 0.88), (0.56, 0.59), (0.82, 0.57), (0.25, 0.08)];
+            poly(&pts);
+        }
+        Group::Brush => {
+            poly(&[(0.92, 0.08), (0.45, 0.55)]);
+            poly(&[(0.38, 0.50), (0.50, 0.62), (0.40, 0.86), (0.10, 0.92), (0.22, 0.62), (0.38, 0.50)]);
+        }
+        Group::Wall => {
+            for y in [0.15, 0.40, 0.65, 0.90] {
+                poly(&[(0.05, y), (0.95, y)]);
+            }
+            poly(&[(0.05, 0.15), (0.05, 0.90)]);
+            poly(&[(0.95, 0.15), (0.95, 0.90)]);
+            poly(&[(0.5, 0.15), (0.5, 0.40)]);
+            poly(&[(0.28, 0.40), (0.28, 0.65)]);
+            poly(&[(0.72, 0.40), (0.72, 0.65)]);
+            poly(&[(0.5, 0.65), (0.5, 0.90)]);
+        }
+        Group::Roof => {
+            poly(&[(0.02, 0.55), (0.5, 0.12), (0.98, 0.55)]);
+            poly(&[(0.18, 0.42), (0.18, 0.92), (0.82, 0.92), (0.82, 0.42)]);
+        }
+        Group::Object => {
+            poly(&[(0.5, 0.06), (0.92, 0.28), (0.92, 0.74), (0.5, 0.96), (0.08, 0.74), (0.08, 0.28), (0.5, 0.06)]);
+            poly(&[(0.08, 0.28), (0.5, 0.5), (0.92, 0.28)]);
+            poly(&[(0.5, 0.5), (0.5, 0.96)]);
+        }
+        Group::Path => {
+            let pts: Vec<(f32, f32)> = (0..=24).map(|k| {
+                let t = k as f32 / 24.0;
+                (0.12 + 0.76 * t, 0.5 + 0.34 * (t * std::f32::consts::TAU).sin())
+            }).collect();
+            poly(&pts);
+        }
+        Group::Text => {
+            p.text(r.center(), egui::Align2::CENTER_CENTER, "Т", egui::FontId::proportional(25.0), ink);
         }
     }
 }

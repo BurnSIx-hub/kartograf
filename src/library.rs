@@ -59,7 +59,7 @@ pub const BUILTIN_TEXTURES: [(&str, &str, bool, &[u8]); 27] = [
 
 /// Объекты, зашитые в программу: имя, подпись, размер в клетках, байты. Картинка —
 /// 256 точек на клетку с прозрачным полем и тенью (`tools/cutout.py`).
-pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 34] = [
+pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 35] = [
     ("chair", "Стул", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chair.webp")),
     ("stool", "Табурет", [1.0, 1.0], include_bytes!("../assets/builtin/objects/stool.webp")),
     ("table", "Стол", [2.0, 1.0], include_bytes!("../assets/builtin/objects/table.webp")),
@@ -74,6 +74,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 34] = [
     ("bookshelf", "Книжный шкаф", [2.0, 1.0], include_bytes!("../assets/builtin/objects/bookshelf.webp")),
     ("chest", "Сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest.webp")),
     ("chest_open", "Открытый сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest_open.webp")),
+    ("chest_empty", "Пустой сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest_empty.webp")),
     ("barrel", "Бочка", [1.0, 1.0], include_bytes!("../assets/builtin/objects/barrel.webp")),
     ("crate", "Ящик", [1.0, 1.0], include_bytes!("../assets/builtin/objects/crate.webp")),
     ("sacks", "Мешки", [1.0, 1.0], include_bytes!("../assets/builtin/objects/sacks.webp")),
@@ -84,7 +85,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 34] = [
     ("anvil", "Наковальня", [1.0, 1.0], include_bytes!("../assets/builtin/objects/anvil.webp")),
     ("campfire", "Костёр", [1.0, 1.0], include_bytes!("../assets/builtin/objects/campfire.webp")),
     ("brazier", "Жаровня", [1.0, 1.0], include_bytes!("../assets/builtin/objects/brazier.webp")),
-    ("weapon_rack", "Стойка с оружием", [1.0, 1.0], include_bytes!("../assets/builtin/objects/weapon_rack.webp")),
+    ("weapon_rack", "Стойка с оружием", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack.webp")),
     ("altar", "Алтарь", [1.0, 1.0], include_bytes!("../assets/builtin/objects/altar.webp")),
     ("statue", "Статуя", [1.0, 1.0], include_bytes!("../assets/builtin/objects/statue.webp")),
     ("pillar", "Колонна", [1.0, 1.0], include_bytes!("../assets/builtin/objects/pillar.webp")),

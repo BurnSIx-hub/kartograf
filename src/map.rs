@@ -12,6 +12,7 @@
 //! Первый формат файла хранил материал целыми клетками; такие карты открываются
 //! и переводятся в маски.
 
+use std::collections::BTreeMap;
 use crate::mask::{self, Mask};
 use serde::{Deserialize, Serialize};
 
@@ -650,6 +651,12 @@ pub fn smooth_line(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
 
 /// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них.
 pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
+    cut_portals_wide(segs, portals, 0.0)
+}
+
+/// То же для рисования: концы стены продлеваются на полтолщины, поэтому дыра шире
+/// на `grow` с каждой стороны — и стена встаёт в край проёма, а не заходит в него.
+pub fn cut_portals_wide(segs: &[Segment], portals: &[Portal], grow: f32) -> Vec<Segment> {
     let mut out = Vec::new();
     for &(a, b) in segs {
         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -663,7 +670,7 @@ pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
             .filter(|p| segment_line_distance(p.a, a, b) < 0.02 && segment_line_distance(p.b, a, b) < 0.02)
             .map(|p| {
                 let (t0, t1) = (t(p.a), t(p.b));
-                (t0.min(t1).max(0.0), t0.max(t1).min(len))
+                ((t0.min(t1) - grow).max(0.0), (t0.max(t1) + grow).min(len))
             })
             .filter(|(s, e)| e > s)
             .collect();
@@ -719,8 +726,15 @@ pub struct Map {
     /// Пол комнат: слои снизу вверх, видны только внутри `rooms`.
     pub room_floor: Vec<Coat>,
     pub walls: Vec<Wall>,
+    /// Вид новых стен. Уже стоящие его не меняют: у них свой (см. `edge_looks`).
     #[serde(default)]
     pub wall_style: WallStyle,
+    /// Виды стен комнат, которые есть на карте.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wall_looks: Vec<WallStyle>,
+    /// Вид каждого отрезка стены комнат: середина отрезка → номер в `wall_looks`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "edge_looks_text")]
+    pub edge_looks: BTreeMap<(i32, i32), u8>,
     #[serde(default)]
     pub portals: Vec<Portal>,
     #[serde(default)]
@@ -744,6 +758,33 @@ pub struct Map {
     /// Нарисованная тень: насколько темно в точке, 255 — чёрное.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shade: Option<Mask>,
+}
+
+/// Ключ отрезка стены комнаты — его середина с шагом 1/64 клетки.
+pub fn edge_key(s: &Segment) -> (i32, i32) {
+    (((s.0[0] + s.1[0]) * 32.0).round() as i32, ((s.0[1] + s.1[1]) * 32.0).round() as i32)
+}
+
+/// `edge_looks` в файле — одной строкой «x,y,вид …»: отрезков тысячи.
+mod edge_looks_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<(i32, i32), u8>, s: S) -> Result<S::Ok, S::Error> {
+        let text: Vec<String> = map.iter().map(|((x, y), v)| format!("{x},{y},{v}")).collect();
+        s.serialize_str(&text.join(" "))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<(i32, i32), u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        Ok(text
+            .split_whitespace()
+            .filter_map(|e| {
+                let mut p = e.split(',');
+                Some(((p.next()?.parse().ok()?, p.next()?.parse().ok()?), p.next()?.parse().ok()?))
+            })
+            .collect())
+    }
 }
 
 /// Первый формат: материал целыми клетками.
@@ -817,6 +858,8 @@ impl Map {
             room_floor: Vec::new(),
             walls: Vec::new(),
             wall_style: WallStyle::default(),
+            wall_looks: Vec::new(),
+            edge_looks: BTreeMap::new(),
             portals: Vec::new(),
             props: Vec::new(),
             paths: Vec::new(),
@@ -1044,6 +1087,36 @@ impl Map {
         mask::contour(&self.rooms)
     }
 
+    fn look_id(&mut self, st: &WallStyle) -> u8 {
+        match self.wall_looks.iter().position(|l| l == st) {
+            Some(i) => i as u8,
+            None if self.wall_looks.len() < 255 => {
+                self.wall_looks.push(st.clone());
+                (self.wall_looks.len() - 1) as u8
+            }
+            None => 254,
+        }
+    }
+
+    /// После правки комнат: стоявшие отрезки хранят свой вид, новые берут вид новых стен.
+    pub fn sync_edge_looks(&mut self, edges: &[Segment]) {
+        let fresh = self.wall_style.clone();
+        let id = self.look_id(&fresh);
+        let old = std::mem::take(&mut self.edge_looks);
+        self.edge_looks = edges.iter().map(|s| edge_key(s)).map(|k| (k, old.get(&k).copied().unwrap_or(id))).collect();
+    }
+
+    pub fn edge_look(&self, key: (i32, i32)) -> WallStyle {
+        self.edge_looks.get(&key).and_then(|&i| self.wall_looks.get(i as usize)).unwrap_or(&self.wall_style).clone()
+    }
+
+    pub fn set_edge_look(&mut self, edges: &[Segment], st: &WallStyle) {
+        let id = self.look_id(st);
+        for s in edges {
+            self.edge_looks.insert(edge_key(s), id);
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
@@ -1191,6 +1264,37 @@ mod tests {
         }
         assert!(c.windows(2).all(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt() < 0.2));
         assert!(p.distance([4.0, 2.0]) < 1e-3 && p.distance([4.0, 5.0]) > 2.5);
+    }
+
+    #[test]
+    fn placed_room_walls_keep_their_look() {
+        let mut m = Map::new(10, 10);
+        let stone = WallStyle { paint: Paint::Color([1, 2, 3]), width: 0.3 };
+        let brick = WallStyle { paint: Paint::Color([9, 8, 7]), width: 0.2 };
+        m.wall_style = stone.clone();
+        m.paint_rect(Layer::Rooms, (1, 1), (2, 2), Some(0));
+        let first = m.room_edges();
+        m.sync_edge_looks(&first);
+        // Вид новых стен сменили и поставили вторую комнату: первая прежняя.
+        m.wall_style = brick.clone();
+        m.paint_rect(Layer::Rooms, (6, 6), (7, 7), Some(0));
+        let all = m.room_edges();
+        m.sync_edge_looks(&all);
+        assert_eq!(m.edge_look(edge_key(&first[0])), stone);
+        let new = all.iter().find(|s| s.0[0] >= 6.0).unwrap();
+        assert_eq!(m.edge_look(edge_key(new)), brick);
+        // Участок меняется отдельно и переживает файл.
+        m.set_edge_look(&[first[0]], &brick);
+        let back = Map::from_json(&m.to_json()).unwrap();
+        assert_eq!(back.edge_look(edge_key(&first[0])), brick);
+        assert_eq!(back.edge_look(edge_key(&first[1])), stone);
+    }
+
+    #[test]
+    fn wide_cut_leaves_room_for_wall_caps() {
+        let d = Portal { a: [2.0, 0.0], b: [3.0, 0.0], kind: PortalKind::Door, asset: None, frame: None };
+        let cut = cut_portals_wide(&[([0.0, 0.0], [5.0, 0.0])], &[d], 0.1);
+        assert_eq!(cut, vec![([0.0, 0.0], [1.9, 0.0]), ([3.1, 0.0], [5.0, 0.0])]);
     }
 
     #[test]
