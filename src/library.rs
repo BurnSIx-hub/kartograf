@@ -222,9 +222,9 @@ const SHADOW_SIDE: u32 = 256;
 pub const VARY_TIMES: u32 = 3;
 /// Исходник для разнообразия не крупнее этого: большая плитка — втрое больше.
 const VARY_SIDE: u32 = 1024;
-/// Плитки, сшитые `tools/quilt.py`: уже большие и без повтора, а разнообразие только
-/// наложило бы их камни и листья друг на друга.
-const QUILTED: [&str; 3] = ["gravel", "forest_floor", "rocky_ground"];
+/// Плитки, сшитые `tools/quilt.py` и разложенные `tools/masonry.py`: уже большие и без
+/// повтора, а разнообразие только наложило бы их камни и листья друг на друга.
+const QUILTED: [&str; 12] = ["wood_planks", "gravel", "forest_floor", "rocky_ground", "flagstones", "dungeon_flagstones", "dungeon_flagstones_moss", "stone_tiles", "sandstone", "marble", "brick_floor", "cobblestone"];
 /// Больше миниатюр в памяти не держим: давно не показанные выбрасываются.
 const THUMB_BUDGET: usize = 3000;
 const WORKERS: usize = 3;

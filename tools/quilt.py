@@ -4,7 +4,7 @@
 Шов идёт там, где два лоскута совпадают и где темно, поэтому камни и листья остаются
 целыми, а не просвечивают друг сквозь друга, как при смешивании. Плитка замкнута.
 
-python quilt.py сырьё.jpg выход.webp сторона_исходника лоскут лоскутов_в_ряду
+python quilt.py сырьё.jpg выход.webp сторона_исходника лоскут лоскутов_в_ряду [flips]
 """
 import sys
 import numpy as np
@@ -12,6 +12,8 @@ from PIL import Image
 
 src, dst = sys.argv[1], sys.argv[2]
 SIDE, B, N = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+# Вытянутые ряды (брусчатка) поворачивать нельзя.
+FLIPS_ONLY = len(sys.argv) > 6 and sys.argv[6] == "flips"
 OV, TRIES = B // 4, 400
 S = B + OV
 rng = np.random.default_rng(7)
@@ -56,7 +58,8 @@ for r in range(N):
             oy, ox = rng.integers(h - S), rng.integers(w - S)
             cand = a[oy:oy + S, ox:ox + S]
             # Повороты и отражения: иначе из маленького исходника лист повторяется рядами.
-            cand = np.rot90(cand, rng.integers(4))
+            if not FLIPS_ONLY:
+                cand = np.rot90(cand, rng.integers(4))
             if rng.random() < 0.5:
                 cand = cand[:, ::-1]
             best.append(cand)
