@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod blend;
 mod export;
 mod generate;
 mod library;
@@ -27,6 +28,7 @@ fn parse_args() -> app::Args {
             "--data-dir" => args.data = it.next().map(PathBuf::from),
             "--export" => args.export = it.next().map(PathBuf::from),
             "--px" => args.px = it.next().and_then(|s| s.parse().ok()),
+            "--aside" => {}
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             _ => args.file = Some(PathBuf::from(a)),
@@ -75,9 +77,11 @@ fn main() -> eframe::Result {
     let args = parse_args();
     // Самопроверке нужен один и тот же размер окна, иначе точки щелчков поплывут.
     let size = args.size.or(args.selftest.as_ref().map(|_| [1280.0, 800.0])).unwrap_or([1400.0, 900.0]);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Картограф").with_inner_size(size).with_min_inner_size([640.0, 420.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default().with_title("Картограф").with_inner_size(size).with_min_inner_size([640.0, 420.0]);
+    // `--aside`: окно за краем экрана и без фокуса — снимок не мешает, пока впереди игра.
+    if std::env::args().any(|a| a == "--aside") {
+        viewport = viewport.with_position([-5000.0, 100.0]).with_active(false);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("kartograf", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
 }

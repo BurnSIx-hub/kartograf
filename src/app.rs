@@ -3,6 +3,7 @@
 use crate::export;
 use crate::generate::{self, Options};
 use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
+use crate::blend::Blend;
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
 use crate::mask::{self, Brush, Mask, RES, Shape as Tip};
 use crate::recovery::{self, Orphan, Recovery};
@@ -369,6 +370,7 @@ pub struct App {
     pub settings: Settings,
     pub library: Library,
     pub textures: Textures,
+    blend: Blend,
     pub browse: Kind,
     pub query: String,
     filtered: Vec<usize>,
@@ -508,6 +510,7 @@ impl App {
             settings,
             library,
             textures: Textures::new(&cc.egui_ctx),
+            blend: Blend::default(),
             browse: Kind::Floor,
             query: String::new(),
             filtered: Vec::new(),
@@ -3682,7 +3685,11 @@ impl App {
             let v = mask.get(i, j);
             clip.map_or(v, |c| v.min(c.get(i, j)))
         };
+        // За краем карты берётся крайняя точка: иначе слой тает к границе и у неё виден фон.
+        let (last_i, last_j) = (m.w as isize - 1, m.h as isize - 1);
+        let (map_w, map_h) = (m.w as f32 / res, m.h as f32 / res);
         let value = |i: isize, j: isize| {
+            let (i, j) = (i.clamp(0, last_i), j.clamp(0, last_j));
             let v = share(m, i, j);
             if v == 0 {
                 return 0;
@@ -3696,7 +3703,7 @@ impl App {
         let cam = self.cam;
         // Вершина в точке маски с дробными номерами (fx, fy) и силой `alpha`.
         let vertex = |fx: f32, fy: f32, alpha: u8| {
-            let w = [(fx + 0.5) / res, (fy + 0.5) / res];
+            let w = [((fx + 0.5) / res).clamp(0.0, map_w), ((fy + 0.5) / res).clamp(0.0, map_h)];
             let color = match tex {
                 Some(_) => Color32::from_white_alpha(alpha),
                 None => Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], alpha),
@@ -3774,7 +3781,12 @@ impl App {
             }
             j += s;
         }
-        if !mesh.is_empty() {
+        if mesh.is_empty() {
+            return;
+        }
+        if material.vary && tex.is_some() {
+            self.blend.paint(painter, mesh);
+        } else {
             painter.add(Shape::mesh(mesh));
         }
     }
@@ -3969,6 +3981,7 @@ impl App {
                 }
             }
         };
+        let organic = tex.is_some() && material.vary && !path.along;
         let line = path.curve();
         if line.len() < 2 {
             return;
@@ -4017,7 +4030,11 @@ impl App {
                 }
             }
         }
-        painter.add(Shape::mesh(mesh));
+        if organic {
+            self.blend.paint(painter, mesh);
+        } else {
+            painter.add(Shape::mesh(mesh));
+        }
     }
 
     /// Стены лентой: отрезки склеиваются в ломаные, у каждой вершины лента
