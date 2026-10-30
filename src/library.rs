@@ -213,6 +213,9 @@ const SHADOW_SIDE: u32 = 256;
 pub const VARY_TIMES: u32 = 3;
 /// Исходник для разнообразия не крупнее этого: большая плитка — втрое больше.
 const VARY_SIDE: u32 = 1024;
+/// Плитки, сшитые `tools/quilt.py`: уже большие и без повтора, а разнообразие только
+/// наложило бы их камни и листья друг на друга.
+const QUILTED: [&str; 3] = ["gravel", "forest_floor", "rocky_ground"];
 /// Больше миниатюр в памяти не держим: давно не показанные выбрасываются.
 const THUMB_BUDGET: usize = 3000;
 const WORKERS: usize = 3;
@@ -438,6 +441,7 @@ impl Textures {
                         read_source(inner, &sources).and_then(|bytes| shadow_image(&bytes, blur))
                     } else {
                         match job.key.strip_prefix(VARY) {
+                        Some(inner) if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, &sources).and_then(|bytes| decode(&bytes, FULL_SIDE)),
                         Some(inner) => read_source(inner, &sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
                             let big = vary(&rgba, inner);
                             (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])

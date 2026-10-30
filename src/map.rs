@@ -569,12 +569,15 @@ pub struct Shadows {
     /// Ширина размытия, в клетках.
     pub blur: f32,
     pub opacity: f32,
+    /// Затухание: 0 — тень ровная до края, 1 — тает от самой стены до конца.
+    #[serde(default)]
+    pub fade: f32,
 }
 
 impl Default for Shadows {
     /// Карты, нарисованные до теней, открываются без них.
     fn default() -> Self {
-        Self { on: false, angle: 45.0, dist: 0.2, blur: 0.3, opacity: 0.55 }
+        Self { on: false, angle: 45.0, dist: 0.2, blur: 0.3, opacity: 0.55, fade: 0.0 }
     }
 }
 
@@ -582,6 +585,24 @@ impl Shadows {
     pub fn offset(&self) -> [f32; 2] {
         let (s, c) = self.angle.to_radians().sin_cos();
         [c * self.dist, s * self.dist]
+    }
+
+    /// Тень слоями: каждый дальше и размытее прошлого и вложен в него, так что у стены
+    /// ложатся все, а к дальнему краю остаётся один. Слоёв с разным сдвигом хватает и
+    /// стенам, и объектам, и крышам, а в углах ничего не темнеет вдвое: слой один на контур.
+    pub fn layers(&self) -> Vec<Shadows> {
+        const LAYERS: usize = 10;
+        let s = self.fade.clamp(0.0, 1.0);
+        if s <= 0.0 {
+            return vec![self.clone()];
+        }
+        let opacity = 1.0 - (1.0 - self.opacity.min(0.99)).powf(1.0 / LAYERS as f32);
+        (1..=LAYERS)
+            .map(|k| {
+                let reach = self.dist * (1.0 - s + s * k as f32 / LAYERS as f32);
+                Shadows { dist: reach * (1.0 - s / 2.0), blur: self.blur + reach * s, opacity, ..self.clone() }
+            })
+            .collect()
     }
 
     /// Откуда свет: против направления тени.
@@ -1288,6 +1309,17 @@ mod tests {
         let back = Map::from_json(&m.to_json()).unwrap();
         assert_eq!(back.edge_look(edge_key(&first[0])), brick);
         assert_eq!(back.edge_look(edge_key(&first[1])), stone);
+    }
+
+    #[test]
+    fn shadow_layers_add_up_and_reach_the_same_edge() {
+        let sh = Shadows { on: true, dist: 1.0, blur: 0.2, opacity: 0.6, fade: 1.0, ..Shadows::default() };
+        let layers = sh.layers();
+        let left: f32 = layers.iter().map(|l| 1.0 - l.opacity).product();
+        assert!((1.0 - left - 0.6).abs() < 1e-3, "у стены темнота та же");
+        let last = layers.last().unwrap();
+        assert!((last.dist + last.blur / 2.0 - 1.1).abs() < 1e-3, "край на том же месте");
+        assert_eq!(Shadows { fade: 0.0, ..sh }.layers().len(), 1);
     }
 
     #[test]

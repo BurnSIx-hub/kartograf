@@ -2365,9 +2365,10 @@ impl App {
         let mut rs = Vec::new();
         if sh.on {
             rs.push(ui.add(egui::Slider::new(&mut sh.angle, 0.0..=345.0).step_by(15.0).text("куда падают, °")));
-            rs.push(ui.add(egui::Slider::new(&mut sh.dist, 0.0..=1.0).text("длина, кл.")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.dist, 0.0..=3.0).text("длина, кл.")));
             rs.push(ui.add(egui::Slider::new(&mut sh.blur, 0.1..=1.0).text("размытие, кл.")));
             rs.push(ui.add(egui::Slider::new(&mut sh.opacity, 0.05..=1.0).text("темнота")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.fade, 0.0..=1.0).text("затухание")));
         }
         if on.changed() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) {
             self.checkpoint();
@@ -3306,7 +3307,9 @@ impl App {
                 let c = prop.corners();
                 let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
                 if bounds.intersects(view) {
-                    self.draw_prop_shadow(painter, canvas, prop, &shadows);
+                    for sh in shadows.layers() {
+                        self.draw_prop_shadow(painter, canvas, prop, &sh);
+                    }
                 }
             }
         }
@@ -3338,12 +3341,14 @@ impl App {
             l.1 = map::cut_portals_wide(&l.1, &self.map.portals, l.0.width / 2.0);
         }
         if shadows.on {
-            for (st, edges) in &looks {
-                self.draw_wall_shadow(painter, canvas, edges, st.width, &shadows);
-            }
-            for w in self.map.walls.clone() {
-                let width = w.style.as_ref().map_or(style.width, |s| s.width);
-                self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &shadows);
+            for sh in shadows.layers() {
+                for (st, edges) in &looks {
+                    self.draw_wall_shadow(painter, canvas, edges, st.width, &sh);
+                }
+                for w in self.map.walls.clone() {
+                    let width = w.style.as_ref().map_or(style.width, |s| s.width);
+                    self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &sh);
+                }
             }
         }
         if let Some(Sel::Edge(key, whole)) = self.sel {
@@ -3479,8 +3484,10 @@ impl App {
         if self.roof_view != RoofView::Hidden {
             let roofs = self.map.roofs.clone();
             if shadows.on {
-                for r in &roofs {
-                    self.draw_roof_shadow(painter, canvas, r, &shadows);
+                for sh in shadows.layers() {
+                    for r in &roofs {
+                        self.draw_roof_shadow(painter, canvas, r, &sh);
+                    }
                 }
             }
             if roof_alpha > 0.0 {
