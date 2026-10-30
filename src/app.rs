@@ -1224,8 +1224,16 @@ impl App {
         }
     }
 
-    /// Случайное подземелье вместо нынешних комнат; местность и стены не трогаются.
+    /// Подземелье вместо нынешних комнат, местность и стены не трогаются; остальные виды
+    /// заменяют карту целиком. Отменяется как обычная правка.
     pub fn generate(&mut self, opt: &Options) -> usize {
+        if opt.kind != generate::Kind::Dungeon {
+            self.checkpoint();
+            self.sel = None;
+            let n = crate::procgen::build(&mut self.map, opt);
+            self.edges_dirty = true;
+            return n;
+        }
         let (cells, rooms) = generate::dungeon(self.map.width, self.map.height, opt);
         self.checkpoint();
         self.map.rooms = Mask::for_cells(self.map.width, self.map.height);
@@ -1243,6 +1251,9 @@ impl App {
             })
             .collect();
         self.map.paint(Layer::Rooms, self.material, &weights);
+        if opt.fill {
+            crate::procgen::furnish_dungeon(&mut self.map, &cells, &rooms, &opt.seed);
+        }
         self.edges_dirty = true;
         rooms.len()
     }
@@ -1518,8 +1529,23 @@ impl App {
         if let Some(mut opt) = self.generator.take() {
             let mut open = true;
             let mut go = false;
-            egui::Window::new("Случайное подземелье").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let dungeon = opt.kind == generate::Kind::Dungeon;
+            egui::Window::new(opt.kind.label()).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
                 egui::Grid::new("gen").num_columns(2).show(ui, |ui| {
+                    if !dungeon {
+                        ui.label("Густота");
+                        ui.add(egui::Slider::new(&mut opt.density, 0.0..=1.0));
+                        ui.end_row();
+                        ui.label("Зерно");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut opt.seed).desired_width(110.0));
+                            if ui.button("🎲").on_hover_text("Новое зерно").clicked() {
+                                opt.seed = generate::new_seed();
+                            }
+                        });
+                        ui.end_row();
+                        return;
+                    }
                     ui.label("Комнат");
                     ui.add(egui::Slider::new(&mut opt.rooms, 2..=40));
                     ui.end_row();
@@ -1547,7 +1573,12 @@ impl App {
                     });
                     ui.end_row();
                 });
-                ui.weak("Одно и то же зерно даёт ту же карту: поменяйте пол или стены и создайте заново.");
+                if dungeon {
+                    ui.checkbox(&mut opt.fill, "Двери и объекты");
+                    ui.weak("Одно и то же зерно даёт ту же карту: поменяйте пол или стены и создайте заново.");
+                } else {
+                    ui.weak(format!("Заменит всю карту ({}×{} кл.), отменяется Ctrl+Z.", self.map.width, self.map.height));
+                }
                 ui.add_space(4.0);
                 go = ui.button("Создать").clicked();
             });
@@ -1776,8 +1807,10 @@ impl App {
                 }
             });
             ui.menu_button("Процедурно", |ui| {
-                if item(ui, "Случайное подземелье…", "") {
-                    self.generator = Some(Options { seed: generate::new_seed(), ..Default::default() });
+                for kind in generate::Kind::ALL {
+                    if item(ui, &format!("{}…", kind.label()), "") {
+                        self.generator = Some(Options { kind, seed: generate::new_seed(), ..Default::default() });
+                    }
                 }
             });
             ui.menu_button("Вид", |ui| {

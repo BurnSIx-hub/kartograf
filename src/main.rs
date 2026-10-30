@@ -10,6 +10,7 @@ mod library;
 mod map;
 mod mask;
 mod pck;
+mod procgen;
 mod recovery;
 mod roofs;
 mod selftest;

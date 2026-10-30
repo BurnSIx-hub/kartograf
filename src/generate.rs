@@ -35,8 +35,39 @@ impl Rng {
     }
 }
 
+/// Что строить. Подземелье ложится поверх местности, остальное заменяет карту целиком.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Dungeon,
+    Cave,
+    Forest,
+    Town,
+    House,
+    Tavern,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 6] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Dungeon => "Случайное подземелье",
+            Kind::Cave => "Пещера",
+            Kind::Forest => "Лес",
+            Kind::Town => "Городской квартал",
+            Kind::House => "Дом",
+            Kind::Tavern => "Таверна",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
+    pub kind: Kind,
+    /// Подземелье: расставить двери и объекты по комнатам.
+    pub fill: bool,
+    /// Насколько плотно: больше деревьев, домов, комнат, камней.
+    pub density: f32,
     pub rooms: u32,
     pub min_size: u32,
     pub max_size: u32,
@@ -47,7 +78,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { rooms: 8, min_size: 3, max_size: 7, loops: 0.2, seed: String::new() }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 3, max_size: 7, loops: 0.2, seed: String::new() }
     }
 }
 
@@ -65,7 +96,7 @@ pub struct Room {
 }
 
 impl Room {
-    fn center(&self) -> (i32, i32) {
+    pub fn center(&self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
 
