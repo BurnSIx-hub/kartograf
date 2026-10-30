@@ -799,7 +799,34 @@ impl SelfTest {
                 self.click(egui::pos2(40.0, app.canvas.top() + h * 1.5));
                 self.resume_at = now + CLICK_GAP;
             }
-            69 => self.check("ячейка вернула последний режим", app.tool == Tool::Floor, &format!("{:?}", app.tool)),
+            69 => {
+                self.check("ячейка вернула последний режим", app.tool == Tool::Floor, &format!("{:?}", app.tool));
+                app.set_tool(Tool::Object);
+                app.query = "сундук".into();
+                self.resume_at = now + 0.3;
+            }
+            70 => {
+                // Три сундука лежат на полке одной миниатюрой, щелчок открывает шторку.
+                self.click(egui::pos2(145.0, app.canvas.bottom() + 70.0));
+                self.resume_at = now + CLICK_GAP;
+            }
+            71 => {
+                let n = app.drawer.as_ref().map_or(0, |d| d.0.len());
+                self.check("шторка показала варианты сундука", n == 3, &format!("{n}"));
+                self.snap(ctx, "шторка вариантов");
+            }
+            72 => {
+                if let Some((_, r)) = app.drawer.clone() {
+                    // Вторая миниатюра шторки.
+                    self.click(egui::pos2(r.left() + 150.0, r.top() - 60.0));
+                }
+                self.resume_at = now + CLICK_GAP;
+            }
+            73 => {
+                let got = app.object_asset.clone().unwrap_or_default();
+                self.check("вариант из шторки выбран, шторка закрылась", got.contains("chest") && app.drawer.is_none(), &got);
+                app.query.clear();
+            }
             _ => return false,
         }
         true

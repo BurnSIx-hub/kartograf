@@ -59,7 +59,7 @@ pub const BUILTIN_TEXTURES: [(&str, &str, bool, &[u8]); 27] = [
 
 /// Объекты, зашитые в программу: имя, подпись, размер в клетках, байты. Картинка —
 /// 256 точек на клетку с прозрачным полем и тенью (`tools/cutout.py`).
-pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 35] = [
+pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 40] = [
     ("chair", "Стул", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chair.webp")),
     ("stool", "Табурет", [1.0, 1.0], include_bytes!("../assets/builtin/objects/stool.webp")),
     ("table", "Стол", [2.0, 1.0], include_bytes!("../assets/builtin/objects/table.webp")),
@@ -85,7 +85,12 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 35] = [
     ("anvil", "Наковальня", [1.0, 1.0], include_bytes!("../assets/builtin/objects/anvil.webp")),
     ("campfire", "Костёр", [1.0, 1.0], include_bytes!("../assets/builtin/objects/campfire.webp")),
     ("brazier", "Жаровня", [1.0, 1.0], include_bytes!("../assets/builtin/objects/brazier.webp")),
-    ("weapon_rack", "Стойка с оружием", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack.webp")),
+    ("weapon_rack", "Стойка с мечами", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack.webp")),
+    ("weapon_rack_spears", "Стойка с копьями", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack_spears.webp")),
+    ("weapon_rack_axes", "Стойка с топорами", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack_axes.webp")),
+    ("weapon_rack_maces", "Стойка с булавами", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack_maces.webp")),
+    ("weapon_rack_bows", "Стойка с луками", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack_bows.webp")),
+    ("weapon_rack_mixed", "Стойка с разным оружием", [2.0, 2.0], include_bytes!("../assets/builtin/objects/weapon_rack_mixed.webp")),
     ("altar", "Алтарь", [1.0, 1.0], include_bytes!("../assets/builtin/objects/altar.webp")),
     ("statue", "Статуя", [1.0, 1.0], include_bytes!("../assets/builtin/objects/statue.webp")),
     ("pillar", "Колонна", [1.0, 1.0], include_bytes!("../assets/builtin/objects/pillar.webp")),
@@ -244,6 +249,8 @@ pub struct Asset {
     pub kind: Kind,
     /// Для поиска: имя и папка в нижнем регистре.
     search: String,
+    /// Варианты одного предмета лежат на полке одной миниатюрой.
+    pub family: String,
 }
 
 impl Asset {
@@ -251,12 +258,40 @@ impl Asset {
         let (folder, file) = inner.rsplit_once(['/', '\\']).unwrap_or(("", inner));
         let name = file.rsplit_once('.').map_or(file, |(n, _)| n).to_owned();
         let search = format!("{} {}", name, folder).to_lowercase().replace('_', " ");
-        Self { key, name, folder: folder.to_owned(), kind, search }
+        let family = family_of(&key, &name, folder);
+        Self { key, name, folder: folder.to_owned(), kind, search, family }
     }
 
     pub fn matches(&self, words: &[String]) -> bool {
         words.iter().all(|w| self.search.contains(w.as_str()))
     }
+}
+
+/// Встроенные предметы с вариантами: всё, что начинается с этих имён, — одна семья.
+const BUILTIN_FAMILIES: [&str; 11] = ["chest", "weapon_rack", "door", "window", "rug", "bed", "table", "roof_clay", "roof_slate", "frame_wood", "frame_stone"];
+
+/// Семья ассета. У встроенных — по таблице. У паков и папок — имя без хвоста, который
+/// отличает варианты: размера, номера, буквы (`Barrel_Wood_A2_1x1` → `barrel_wood`).
+/// Пусто после чистки — сам по себе.
+pub fn family_of(key: &str, name: &str, folder: &str) -> String {
+    if let Some(id) = key.strip_prefix(BUILTIN) {
+        return BUILTIN_FAMILIES.iter().find(|f| id.starts_with(**f)).map_or_else(|| id.to_owned(), |f| (*f).to_owned());
+    }
+    let lower = name.to_lowercase();
+    let mut words: Vec<&str> = lower.split(['_', '-', ' ']).filter(|w| !w.is_empty()).collect();
+    while words.last().is_some_and(|w| is_variant_word(w)) {
+        words.pop();
+    }
+    if words.is_empty() { format!("{folder}/{lower}") } else { format!("{folder}/{}", words.join("_")) }
+}
+
+/// `2`, `a`, `a2`, `v3`, `2x1` — хвост варианта, а не часть названия.
+fn is_variant_word(w: &str) -> bool {
+    let digits = w.trim_start_matches(|c: char| c.is_alphabetic());
+    let letters = w.chars().count() - digits.chars().count();
+    let number = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    let size = w.split_once('x').is_some_and(|(a, b)| !a.is_empty() && !b.is_empty() && (a.to_owned() + b).chars().all(|c| c.is_ascii_digit()));
+    size || (letters <= 1 && (number || digits.is_empty()))
 }
 
 /// Размер в клетках по имени ассета FA: `Oak_Tree_A_3x3.webp` → 3×3.
@@ -706,10 +741,41 @@ impl Library {
         let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_owned).collect();
         self.assets.iter().enumerate().filter(|(_, a)| a.kind == kind && a.matches(&words)).map(|(i, _)| i).collect()
     }
+
+    /// Найденное по семьям: порядок — по первому представителю семьи.
+    pub fn group(&self, found: &[usize]) -> Vec<Vec<usize>> {
+        let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for &i in found {
+            match at.entry(self.assets[i].family.as_str()) {
+                std::collections::hash_map::Entry::Occupied(e) => groups[*e.get()].push(i),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(groups.len());
+                    groups.push(vec![i]);
+                }
+            }
+        }
+        groups
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn variants_fall_into_one_family() {
+        let fam = |name: &str| super::family_of("pack:x", name, "objects");
+        assert_eq!(fam("Barrel_Wood_A2_1x1"), fam("Barrel_Wood_B_1x1"));
+        assert_eq!(fam("Barrel_Wood_3"), fam("Barrel_Wood_B_1x1"));
+        assert_ne!(fam("Barrel_Wood_A"), fam("Barrel_Iron_A"));
+        assert_eq!(super::family_of("builtin:chest_empty", "", ""), "chest");
+        assert_eq!(super::family_of("builtin:chest", "", ""), "chest");
+        assert_eq!(super::family_of("builtin:barrel", "", ""), "barrel");
+        let lib = super::Library::default();
+        let found = lib.filter(super::Kind::Object, "сундук");
+        assert_eq!(lib.group(&found).len(), 1);
+        assert_eq!(found.len(), 3);
+    }
+
     #[test]
     fn builtin_objects_decode_with_transparency_and_their_size() {
         for (id, _, size, bytes) in super::BUILTIN_OBJECTS {

@@ -332,6 +332,11 @@ pub struct App {
     pub roof_view: RoofView,
     roof_from: Option<(i32, i32)>,
     tap_from: Option<Pos2>,
+    groups: Vec<Vec<usize>>,
+    /// Открытая шторка: индексы вариантов и миниатюра, над которой она висит.
+    pub drawer: Option<(Vec<usize>, Rect)>,
+    drawer_frame: u64,
+    family_pick: std::collections::HashMap<String, String>,
     shelf_rows: u32,
     pub fly: Option<usize>,
     fly_rect: Rect,
@@ -478,6 +483,10 @@ impl App {
             roof_view: RoofView::Auto,
             roof_from: None,
             tap_from: None,
+            groups: Vec::new(),
+            drawer: None,
+            drawer_frame: 0,
+            family_pick: Default::default(),
             shelf_rows: 1,
             fly: None,
             fly_rect: Rect::NOTHING,
@@ -1355,6 +1364,8 @@ impl App {
         let key = (self.browse, self.query.clone(), self.library.assets.len());
         if key != self.filter_key {
             self.filtered = self.library.filter(self.browse, &self.query);
+            self.groups = self.library.group(&self.filtered);
+            self.drawer = None;
             self.filter_key = key;
         }
         &self.filtered
@@ -2377,6 +2388,41 @@ impl App {
         });
     }
 
+    /// Шторка вариантов над миниатюрой семьи — как у эмодзи с оттенками.
+    fn variant_drawer(&mut self, ctx: &egui::Context) -> Option<String> {
+        let (group, rect) = self.drawer.clone()?;
+        const SIZE: f32 = 96.0;
+        const IN_ROW: usize = 6;
+        let mut picked = None;
+        let area = egui::Area::new(egui::Id::new("variants")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(rect.left_top() - vec2(0.0, 6.0)).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                for row in group.chunks(IN_ROW) {
+                    ui.horizontal(|ui| {
+                        for &i in row {
+                            let (key, name) = (self.library.assets[i].key.clone(), self.library.assets[i].name.clone());
+                            let (r, resp) = ui.allocate_exact_size(vec2(SIZE, SIZE), Sense::click());
+                            self.thumb(ui.painter(), r, &key);
+                            if resp.hovered() {
+                                ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                            }
+                            if resp.on_hover_text(name).clicked() {
+                                picked = Some(key);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(key) = &picked {
+            let family = self.library.assets[group[0]].family.clone();
+            self.family_pick.insert(family, key.clone());
+            self.drawer = None;
+        } else if self.drawer_frame != self.frame && area.response.clicked_elsewhere() {
+            self.drawer = None;
+        }
+        picked
+    }
+
     fn browser(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Поиск").desired_width(180.0));
@@ -2419,9 +2465,10 @@ impl App {
             ui.weak("Пусто. Подключите папку с картинками или пак Dungeondraft: кнопка «Источники».");
         }
 
-        let list = self.filtered().to_vec();
+        self.filtered();
+        let groups = self.groups.clone();
         let cols = ((ui.available_width() + 4.0) / (THUMB + 4.0)).floor().max(1.0) as usize;
-        let rows = list.len().div_ceil(cols);
+        let rows = groups.len().div_ceil(cols);
         let current = match self.browse {
             Kind::Floor => match self.map.materials.get(self.material).map(|m| &m.paint) {
                 Some(Paint::Texture(k)) => Some(k.clone()),
@@ -2439,21 +2486,36 @@ impl App {
             }),
         };
         let mut chosen: Option<(String, bool)> = None;
+        let mut open_family = None;
         egui::ScrollArea::vertical().id_salt("assets").max_height(ui.available_height()).auto_shrink([false, false]).show_rows(ui, THUMB + 4.0, rows, |ui, range| {
             for row in range {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    for &i in list.iter().skip(row * cols).take(cols) {
+                    for group in groups.iter().skip(row * cols).take(cols) {
+                        // Видна та из семьи, что выбрана или бралась последней.
+                        let family = self.library.assets[group[0]].family.clone();
+                        let has = |k: &str| group.iter().copied().find(|&i| self.library.assets[i].key == k);
+                        let i = current.as_deref().and_then(has).or_else(|| self.family_pick.get(&family).and_then(|k| has(k))).unwrap_or(group[0]);
                         let asset = &self.library.assets[i];
                         let (key, tip) = (asset.key.clone(), format!("{}\n{}", asset.name, asset.folder));
                         let (rect, resp) = ui.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
                         self.thumb(ui.painter(), rect, &key);
-                        if current.as_deref() == Some(key.as_str()) {
+                        if group.iter().any(|&g| current.as_deref() == Some(self.library.assets[g].key.as_str())) {
                             ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                        }
+                        if group.len() > 1 {
+                            // Уголок с числом вариантов.
+                            let c = rect.right_bottom();
+                            ui.painter().add(Shape::convex_polygon(vec![c, c - vec2(0.0, 26.0), c - vec2(26.0, 0.0)], ACCENT, Stroke::NONE));
+                            ui.painter().text(c - vec2(7.0, 8.0), egui::Align2::CENTER_CENTER, group.len().to_string(), egui::FontId::proportional(11.0), ON_ACCENT);
                         }
                         let resp = resp.on_hover_text(tip);
                         if resp.clicked() {
-                            chosen = Some((key.clone(), false));
+                            if group.len() > 1 {
+                                open_family = Some((group.clone(), rect));
+                            } else {
+                                chosen = Some((key.clone(), false));
+                            }
                         }
                         if matches!(self.browse, Kind::Floor | Kind::Wall) {
                             resp.context_menu(|ui| {
@@ -2472,6 +2534,14 @@ impl App {
                 });
             }
         });
+        if let Some((group, rect)) = open_family {
+            let same = self.drawer.as_ref().is_some_and(|d| d.0 == group);
+            self.drawer = if same { None } else { Some((group, rect)) };
+            self.drawer_frame = self.frame;
+        }
+        if let Some(key) = self.variant_drawer(ui.ctx()) {
+            chosen = Some((key, false));
+        }
         if let Some((key, as_floor)) = chosen {
             match self.browse {
                 _ if as_floor => self.use_floor_texture(&key),
