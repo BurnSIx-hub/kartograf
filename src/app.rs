@@ -324,6 +324,8 @@ pub struct App {
     pub path_style: map::Path,
     /// Кисть «Тень»: до какой темноты, и стирает ли (Alt в начале мазка).
     pub shade_level: f32,
+    /// Затухание тени кистью: 0 — ровная до края, 1 — тает от середины мазка.
+    pub shade_soft: f32,
     shade_erase: bool,
     /// Образец новой подписи; тащат подпись — откуда взяли.
     pub label_style: map::Label,
@@ -478,6 +480,7 @@ impl App {
             path_free: false,
             path_style: map::Path::template(0),
             shade_level: 0.4,
+            shade_soft: 0.5,
             shade_erase: false,
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
@@ -664,7 +667,8 @@ impl App {
         let mut probe = self.map.clone();
         if self.tool == Tool::Shade {
             let (w, h) = (probe.rooms.w, probe.rooms.h);
-            let weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
+            let mut weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
+            mask::soften(w, h, &mut weights, self.shade_soft);
             if self.shade_erase {
                 probe.shade_fade(&weights);
             } else {
@@ -708,7 +712,11 @@ impl App {
     /// кисти проседают. Докладывается только прибавка: слои смешиваются через
     /// множитель (1 − сила), и прибавка `(new − old) / (1 − old)` даёт ровно `new`.
     fn dab(&mut self, w: [f32; 2]) {
-        let mut weights = mask::dab(self.map.rooms.w, self.map.rooms.h, &self.brush, w, self.dabs);
+        let mut brush = self.brush;
+        if self.tool == Tool::Shade {
+            brush.hardness = 1.0 - self.shade_soft;
+        }
+        let mut weights = mask::dab(self.map.rooms.w, self.map.rooms.h, &brush, w, self.dabs);
         self.dabs = self.dabs.wrapping_add(1);
         weights.retain_mut(|(i, v)| {
             let old = self.stroke_max.get(i).copied().unwrap_or(0.0);
@@ -2109,6 +2117,7 @@ impl App {
                                 }
                             });
                             ui.add(egui::Slider::new(&mut self.shade_level, 0.05..=1.0).text("темнота"));
+                            ui.add(egui::Slider::new(&mut self.shade_soft, 0.0..=1.0).text("затухание"));
                         }
                         ui.horizontal_wrapped(|ui| {
                             for shape in Tip::ALL {
@@ -2117,7 +2126,9 @@ impl App {
                         });
                         if !matches!(self.brush.shape, Tip::Cells | Tip::Oval) {
                             ui.add(egui::Slider::new(&mut self.brush.radius, 0.25..=10.0).logarithmic(true).text("радиус, кл."));
-                            ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("жёсткость"));
+                            if self.tool != Tool::Shade {
+                                ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("жёсткость"));
+                            }
                             ui.add(egui::Slider::new(&mut self.brush.flow, 0.05..=1.0).text("сила"));
                         }
                     }

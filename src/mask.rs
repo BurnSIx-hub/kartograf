@@ -6,6 +6,7 @@
 //! Здесь же кисти (что и с какой силой закрашивает мазок) и контур маски,
 //! по которому встают стены комнат.
 
+use std::f32::consts::SQRT_2;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -133,6 +134,48 @@ impl Default for Brush {
 fn smooth(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Затухание фигуры к краю: сила спадает с расстоянием от края внутрь. На `fade` = 1
+/// спад идёт от самой глубокой точки, на 0 фигура остаётся как была.
+pub fn soften(w: usize, h: usize, weights: &mut [(usize, f32)], fade: f32) {
+    if fade <= 0.0 || weights.is_empty() {
+        return;
+    }
+    let inside = |i: usize| (i % w, i / w);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for &(i, _) in weights.iter() {
+        let (x, y) = inside(i);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    // Расстояние до края по двум проходам: прямой шаг 1, косой √2. Поле шире фигуры на
+    // точку: снаружи ноль.
+    let (fw, fh) = (x1 - x0 + 3, y1 - y0 + 3);
+    let mut dist = vec![0f32; fw * fh];
+    for &(i, v) in weights.iter() {
+        if v >= 0.5 {
+            let (x, y) = inside(i);
+            dist[(y - y0 + 1) * fw + x - x0 + 1] = f32::MAX;
+        }
+    }
+    for pass in 0..2 {
+        for k in 0..fw * fh {
+            let k = if pass == 0 { k } else { fw * fh - 1 - k };
+            let (x, y) = (k % fw, k / fw);
+            if x == 0 || y == 0 || x == fw - 1 || y == fh - 1 || dist[k] == 0.0 {
+                continue;
+            }
+            let around = if pass == 0 { [(k - 1, 1.0), (k - fw, 1.0), (k - fw - 1, SQRT_2), (k - fw + 1, SQRT_2)] } else { [(k + 1, 1.0), (k + fw, 1.0), (k + fw + 1, SQRT_2), (k + fw - 1, SQRT_2)] };
+            dist[k] = around.iter().map(|&(n, cost)| dist[n] + cost).fold(dist[k], f32::min);
+        }
+    }
+    let deepest = dist.iter().copied().filter(|d| *d < f32::MAX).fold(0.0, f32::max);
+    let reach = (deepest * fade).max(1.0);
+    for (i, v) in weights.iter_mut() {
+        let (x, y) = inside(*i);
+        let d = dist[(y - y0 + 1) * fw + x - x0 + 1];
+        *v *= smooth(d / reach);
+    }
 }
 
 /// Сила по расстоянию от центра: внутри `hard` — 1, у края `r` — 0.
@@ -691,6 +734,21 @@ mod tests {
                 assert!(cos > 0.6, "излом {:.0}° в {b:?}", cos.acos().to_degrees());
             }
         }
+    }
+
+    #[test]
+    fn soften_fades_to_the_edge_and_keeps_the_middle() {
+        let (w, h) = (40, 40);
+        let mut a = cells(w, h, (2, 2), (7, 7));
+        soften(w, h, &mut a, 1.0);
+        let at = |x: usize, y: usize| a.iter().find(|(i, _)| *i == y * w + x).map_or(0.0, |p| p.1);
+        assert!(at(19, 19) > 0.95, "середина полная: {}", at(19, 19));
+        assert!(at(8, 19) < 0.05, "у края почти ноль: {}", at(8, 19));
+        assert!(at(12, 19) > at(9, 19) && at(16, 19) > at(12, 19), "спад ровный");
+        let before = cells(w, h, (2, 2), (7, 7));
+        let mut same = before.clone();
+        soften(w, h, &mut same, 0.0);
+        assert_eq!(same, before);
     }
 
     #[test]
