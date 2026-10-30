@@ -273,6 +273,7 @@ pub struct App {
     pub roof_style: map::Roof,
     pub roof_view: RoofView,
     roof_from: Option<(i32, i32)>,
+    tap_from: Option<Pos2>,
     roof_grab: Option<(usize, [f32; 2], [f32; 2], [f32; 2])>,
     /// Alt с колесом уже меняет размер объекта: правка в истории сделана.
     alt_wheel: bool,
@@ -412,6 +413,7 @@ impl App {
             roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
             roof_view: RoofView::Auto,
             roof_from: None,
+            tap_from: None,
             roof_grab: None,
             alt_wheel: false,
             draft: Vec::new(),
@@ -1231,6 +1233,10 @@ impl App {
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.frame += 1;
+        // Быстрый щелчок сдвигает мышь на 7–25 точек, при родных 6 он терялся.
+        // На карте порог ниже: от него начинаются протяжки.
+        let on_map = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| self.canvas.contains(p));
+        ctx.options_mut(|o| o.input_options.max_click_dist = if on_map { 12.0 } else { 28.0 });
         self.textures.poll(&ctx);
         self.library.poll(&self.textures);
         if self.library.loading() {
@@ -2294,6 +2300,7 @@ impl App {
         let space = ui.input(|i| i.key_down(Key::Space));
         let panning = resp.dragged_by(PointerButton::Middle) || (space && resp.dragged_by(PointerButton::Primary));
         if panning {
+            self.tap_from = None;
             self.cam.pan += resp.drag_delta();
         } else {
             self.handle_tool(ui, &resp);
@@ -2422,6 +2429,16 @@ impl App {
         true
     }
 
+    /// Нажатие для инструментов, ставящих по точке: отпустили — вот где нажимали.
+    /// Быстрый щелчок на ходу тянет мышь на десятки точек, для них это не протяжка.
+    fn tap(&mut self, ui: &egui::Ui, resp: &egui::Response) -> Option<Pos2> {
+        let (pressed, released, at) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.press_origin().or(i.pointer.interact_pos())));
+        if pressed && resp.contains_pointer() {
+            self.tap_from = at;
+        }
+        if released { self.tap_from.take() } else { None }
+    }
+
     fn handle_tool(&mut self, ui: &egui::Ui, resp: &egui::Response) {
         let rect = self.canvas;
         let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
@@ -2429,6 +2446,7 @@ impl App {
         if self.handle_bend(ui, resp, pointer) {
             return;
         }
+        let tap = self.tap(ui, resp);
         match self.tool {
             Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade if !self.brush.shape.drags() => {
                 // Мазок начинается сразу по нажатию, а не после порога протяжки.
@@ -2465,9 +2483,7 @@ impl App {
                 }
             }
             Tool::Wall => {
-                if resp.clicked()
-                    && let Some(p) = pointer
-                {
+                if let Some(p) = tap {
                     let node = self.cam.node(rect, p);
                     if self.draft.len() >= 3 && self.draft[0] == node {
                         self.finish_wall(true);
@@ -2480,9 +2496,7 @@ impl App {
                 }
             }
             Tool::Door => {
-                if resp.clicked()
-                    && let Some(p) = pointer
-                {
+                if let Some(p) = tap {
                     self.place_portal(self.cam.to_world(rect, p));
                 }
             }
@@ -2615,10 +2629,9 @@ impl App {
                 }
             }
             Tool::Object => {
+                let moved = self.moving.is_some();
                 self.drag_prop(ui, resp, pointer, alt);
-                if resp.clicked()
-                    && let Some(p) = pointer
-                {
+                if let (Some(p), false) = (tap, moved) {
                     if self.object_asset.is_none() {
                         self.browse = Kind::Object;
                     }
@@ -3479,18 +3492,19 @@ impl App {
         let mut mesh = egui::Mesh::default();
         for line in mask::join(segs.to_vec()) {
             let closed = line.len() > 3 && (line[0][0] - line[line.len() - 1][0]).abs() < 1e-3 && (line[0][1] - line[line.len() - 1][1]).abs() < 1e-3;
-            let (outer, inner) = (ribbon(&line, closed, outer_hw), ribbon(&line, closed, inner_hw));
-            if outer.len() < 2 || outer.len() != inner.len() {
+            let rows = shadow_rows(&line, closed, outer_hw, inner_hw);
+            if rows.len() < 2 {
                 continue;
             }
             let base = mesh.vertices.len() as u32;
-            for ((ol, or, _), (il, ir, _)) in outer.iter().zip(&inner) {
-                for (p, color) in [(ol, Color32::TRANSPARENT), (il, dark), (ir, dark), (or, Color32::TRANSPARENT)] {
+            for row in &rows {
+                for (p, solid) in row {
                     let q = [p[0] + o[0], p[1] + o[1]];
+                    let color = if *solid { dark } else { Color32::TRANSPARENT };
                     mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, q), uv: egui::epaint::WHITE_UV, color });
                 }
             }
-            for k in 0..outer.len() as u32 - 1 {
+            for k in 0..rows.len() as u32 - 1 {
                 let (p, q) = (base + k * 4, base + (k + 1) * 4);
                 for r in 0..3 {
                     mesh.add_triangle(p + r, p + r + 1, q + r + 1);
@@ -4146,6 +4160,36 @@ fn stamp_points(line: &[[f32; 2]], closed: bool, step: f32) -> Vec<[f32; 2]> {
 }
 
 fn ribbon(line: &[[f32; 2]], closed: bool, hw: f32) -> Vec<([f32; 2], [f32; 2], f32)> {
+    ribbon_ext(line, closed, hw, hw)
+}
+
+/// Ряды тени стены: по четыре вершины поперёк, `true` — сплошная. Края тают и
+/// вдоль, и на концах незамкнутой линии: там лишний прозрачный ряд.
+fn shadow_rows(line: &[[f32; 2]], closed: bool, outer_hw: f32, inner_hw: f32) -> Vec<[([f32; 2], bool); 4]> {
+    // Продление одно на обе ленты, иначе ряды идут наискось и на концах торчат клинья.
+    let (outer, inner) = (ribbon_ext(line, closed, outer_hw, inner_hw), ribbon_ext(line, closed, inner_hw, inner_hw));
+    if outer.len() < 2 || outer.len() != inner.len() {
+        return Vec::new();
+    }
+    let mut rows: Vec<[([f32; 2], bool); 4]> = outer.iter().zip(&inner).map(|(o, i)| [(o.0, false), (i.0, true), (i.1, true), (o.1, false)]).collect();
+    if !closed {
+        let fade = outer_hw - inner_hw;
+        let mid = |r: &[([f32; 2], bool); 4]| [(r[0].0[0] + r[3].0[0]) / 2.0, (r[0].0[1] + r[3].0[1]) / 2.0];
+        let cap = |end: &[([f32; 2], bool); 4], next: &[([f32; 2], bool); 4]| {
+            let (e, n) = (mid(end), mid(next));
+            let (dx, dy) = (e[0] - n[0], e[1] - n[1]);
+            let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+            end.map(|(p, _)| ([p[0] + dx / l * fade, p[1] + dy / l * fade], false))
+        };
+        let (first, last) = (cap(&rows[0], &rows[1]), cap(&rows[rows.len() - 1], &rows[rows.len() - 2]));
+        rows.insert(0, first);
+        rows.push(last);
+    }
+    rows
+}
+
+/// Лента с полушириной `hw`; концы незамкнутой линии продлены на `ext`.
+fn ribbon_ext(line: &[[f32; 2]], closed: bool, hw: f32, ext: f32) -> Vec<([f32; 2], [f32; 2], f32)> {
     let mut pts: Vec<[f32; 2]> = Vec::with_capacity(line.len());
     for &p in line {
         if pts.last().is_none_or(|q: &[f32; 2]| (q[0] - p[0]).abs() > 1e-5 || (q[1] - p[1]).abs() > 1e-5) {
@@ -4166,9 +4210,9 @@ fn ribbon(line: &[[f32; 2]], closed: bool, hw: f32) -> Vec<([f32; 2], [f32; 2], 
     };
     if !closed {
         let d0 = dir(pts[1], pts[0]);
-        pts[0] = [pts[0][0] + d0[0] * hw, pts[0][1] + d0[1] * hw];
+        pts[0] = [pts[0][0] + d0[0] * ext, pts[0][1] + d0[1] * ext];
         let d1 = dir(pts[n - 2], pts[n - 1]);
-        pts[n - 1] = [pts[n - 1][0] + d1[0] * hw, pts[n - 1][1] + d1[1] * hw];
+        pts[n - 1] = [pts[n - 1][0] + d1[0] * ext, pts[n - 1][1] + d1[1] * ext];
     }
     let mut rows = Vec::with_capacity(n + 1);
     let mut dist = 0.0;
@@ -4210,6 +4254,23 @@ fn ribbon(line: &[[f32; 2]], closed: bool, hw: f32) -> Vec<([f32; 2], [f32; 2], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_wall_shadow_fades_at_both_ends() {
+        let rows = shadow_rows(&[[0.0, 0.0], [0.0, 3.0]], false, 0.3, 0.1);
+        assert_eq!(rows.len(), 4);
+        // Концы прозрачны целиком и лежат прямо поперёк стены.
+        for row in [&rows[0], &rows[3]] {
+            assert!(row.iter().all(|(_, solid)| !solid));
+            assert!(row.iter().all(|(p, _)| (p[1] - row[0].0[1]).abs() < 1e-5));
+        }
+        assert!((rows[0][0].0[1] + 0.3).abs() < 1e-5 && (rows[3][0].0[1] - 3.3).abs() < 1e-5);
+        // Внутри ряды тоже поперёк: клиньев нет.
+        for row in [&rows[1], &rows[2]] {
+            assert!(row.iter().all(|(p, _)| (p[1] - row[0].0[1]).abs() < 1e-5));
+            assert!(row[1].1 && row[2].1 && !row[0].1 && !row[3].1);
+        }
+    }
 
     #[test]
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
