@@ -83,11 +83,13 @@ pub struct Options {
     /// Доля лишних коридоров, дающих кольца, а не одно дерево.
     pub loops: f32,
     pub seed: String,
+    /// Строить своими ассетами из библиотеки, а не встроенными.
+    pub library: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new() }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false }
     }
 }
 

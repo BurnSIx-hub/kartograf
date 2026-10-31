@@ -279,7 +279,7 @@ pub struct Asset {
 }
 
 impl Asset {
-    fn new(key: String, inner: &str, kind: Kind) -> Self {
+    pub fn new(key: String, inner: &str, kind: Kind) -> Self {
         let (folder, file) = inner.rsplit_once(['/', '\\']).unwrap_or(("", inner));
         let name = file.rsplit_once('.').map_or(file, |(n, _)| n).to_owned();
         let search = format!("{} {}", name, folder).to_lowercase().replace('_', " ");
@@ -290,6 +290,22 @@ impl Asset {
     pub fn matches(&self, words: &[String]) -> bool {
         words.iter().all(|w| self.search.contains(w.as_str()))
     }
+
+    pub fn is_builtin(&self) -> bool {
+        self.key.starts_with(BUILTIN)
+    }
+
+    /// Слова имени и папки по отдельности: `Barrel_Wood_A1_1x1` → barrel, wood, a1, 1x1.
+    pub fn words(&self) -> Vec<&str> {
+        self.search.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect()
+    }
+}
+
+/// Ширина и высота картинки в точках без полного раскрытия — по заголовку.
+pub fn dimensions(sources: &Sources, key: &str) -> Option<[u32; 2]> {
+    let bytes = read_source(key, sources).ok()?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+    Some([w, h])
 }
 
 /// Встроенные предметы с вариантами: всё, что начинается с этих имён, — одна семья.
@@ -396,7 +412,7 @@ pub fn label(key: &str) -> String {
 }
 
 /// Где лежат байты картинки из пака.
-type Sources = Arc<RwLock<HashMap<String, (PathBuf, u64, u64)>>>;
+pub type Sources = Arc<RwLock<HashMap<String, (PathBuf, u64, u64)>>>;
 
 fn read_source(key: &str, sources: &Sources) -> Result<Vec<u8>, String> {
     if key.starts_with(BUILTIN) {

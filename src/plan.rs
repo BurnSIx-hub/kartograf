@@ -35,6 +35,10 @@ pub struct Plan {
     pub seed: String,
     #[serde(default, skip_serializing_if = "Mood::is_default")]
     pub mood: Mood,
+    /// Чем строить: встроенными ассетами или своими из библиотеки (чего в ней
+    /// нет — встроенными).
+    #[serde(default, skip_serializing_if = "Assets::is_builtin")]
+    pub assets: Assets,
     #[serde(default, skip_serializing_if = "Style::is_empty")]
     pub style: Style,
     /// С какой стороны река; `auto` — как решит генератор, `none` — без реки.
@@ -236,6 +240,24 @@ impl LinkKind {
     }
 }
 
+/// Чем строить.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Assets {
+    #[default]
+    #[serde(alias = "встроенные", alias = "default")]
+    Builtin,
+    /// Паки и папка пользователя; слоты без замены — встроенные.
+    #[serde(alias = "свои", alias = "библиотека", alias = "user", alias = "own")]
+    Library,
+}
+
+impl Assets {
+    pub fn is_builtin(&self) -> bool {
+        *self == Assets::Builtin
+    }
+}
+
 /// Настроение: как освещено и насколько обжито.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -403,6 +425,7 @@ impl Plan {
             size: None,
             seed: String::new(),
             mood: Mood::Calm,
+            assets: Assets::Builtin,
             style: Style::default(),
             river: River::Auto,
             rooms: Vec::new(),
@@ -434,6 +457,7 @@ impl Plan {
         let mut plan = Plan::new(opt.kind);
         plan.size = Some(size);
         plan.seed = opt.seed.clone();
+        plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
         plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)] };

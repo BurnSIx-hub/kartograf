@@ -10,8 +10,41 @@ use crate::generate::{self, Corridor, Kind, Rng, Room};
 use crate::library;
 use crate::map::{Label, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
 use crate::mask::{self, Brush, Mask, Shape};
-use crate::plan::{self, LinkKind, Mood, Plan, River, Role, Size, SizeName, OUTSIDE};
+use crate::palette::{Palette, Pick};
+use crate::plan::{self, Assets, LinkKind, Mood, Plan, River, Role, Size, SizeName, OUTSIDE};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+
+thread_local! {
+    /// Подбор ассетов на время постройки: помощники просят ассет по слоту и не
+    /// таскают лишний параметр. Ставится в `build`, снимается по его концу.
+    static PALETTE: RefCell<Option<Palette>> = const { RefCell::new(None) };
+}
+
+/// Снимает подбор, когда постройка кончилась — и при ошибке тоже.
+struct PaletteGuard;
+
+impl Drop for PaletteGuard {
+    fn drop(&mut self) {
+        PALETTE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// Ассет под слот: свой из библиотеки или встроенный.
+fn asset(slot: &str) -> Pick {
+    PALETTE.with(|p| match p.borrow().as_ref() {
+        Some(pal) => pal.pick(slot),
+        None => Palette::builtin_pick(slot),
+    })
+}
+
+/// Ключ объекта — ассет этого слота (свой или встроенный).
+fn fits(slot: &str, asset: &str) -> bool {
+    PALETTE.with(|p| match p.borrow().as_ref() {
+        Some(pal) => pal.fits(slot, asset),
+        None => asset == key(slot),
+    })
+}
 
 include!("prop_bounds.rs");
 
@@ -27,29 +60,28 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
+/// Ключ встроенного ассета — для косяков, которые всегда встроенные.
 fn key(name: &str) -> String {
     format!("{}{name}", library::BUILTIN)
 }
 
 fn mat(m: &mut Map, name: &str) -> usize {
-    let k = key(name);
+    let k = asset(name).key;
     m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto }).unwrap_or(0)
 }
 
+/// Стена слота: картинка своя или встроенная, толщина — встроенной полосы.
 fn wall(name: &str) -> WallStyle {
-    let k = key(name);
-    let width = library::builtin_wall_width(&k).unwrap_or(0.35);
-    WallStyle { paint: Paint::Texture(k), width }
-}
-
-fn size(name: &str) -> [f32; 2] {
-    library::builtin_size(&key(name)).unwrap_or([1.0, 1.0])
+    let width = library::builtin_wall_width(&key(name)).unwrap_or(0.35);
+    WallStyle { paint: Paint::Texture(asset(name).key), width }
 }
 
 /// Видимый предмет от центра с учётом поворота на четверти: лево, верх, право, низ.
-fn bounds(name: &str, rot: f32, scale: f32) -> [f32; 4] {
-    let s = size(name);
-    let b = BOUNDS.iter().find(|t| t.0 == name).map_or([-s[0] / 2.0, -s[1] / 2.0, s[0] / 2.0, s[1] / 2.0], |t| t.1);
+/// У встроенных — по таблице, у своих — весь холст.
+fn bounds(p: &Pick, slot: &str, rot: f32, scale: f32) -> [f32; 4] {
+    let s = p.size;
+    let whole = [-s[0] / 2.0, -s[1] / 2.0, s[0] / 2.0, s[1] / 2.0];
+    let b = if p.own { whole } else { BOUNDS.iter().find(|t| t.0 == slot).map_or(whole, |t| t.1) };
     let [l, t, r, u] = b.map(|v| v * scale);
     match (rot / 90.0).round() as i32 % 4 {
         0 => [l, t, r, u],
@@ -91,27 +123,37 @@ impl Spots {
 
 /// Объект без проверки места: `pos` — центр холста.
 fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
-    m.props.push(Prop { asset: key(name), pos, size: size(name), rot, scale, shadow: None });
+    drop_pick(m, &asset(name), pos, rot, scale);
+}
+
+fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
+    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None });
 }
 
 /// Объект в свободные клетки, `x`, `y` — левый верхний угол занятого места.
 fn put(m: &mut Map, sp: &mut Spots, name: &str, x: i32, y: i32, rot: f32, scale: f32) -> bool {
-    let [l, t, r, u] = bounds(name, rot, scale);
+    put_pick(m, sp, &asset(name), name, x, y, rot, scale)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_pick(m: &mut Map, sp: &mut Spots, p: &Pick, slot: &str, x: i32, y: i32, rot: f32, scale: f32) -> bool {
+    let [l, t, r, u] = bounds(p, slot, rot, scale);
     let (fw, fh) = (cells_of(r - l), cells_of(u - t));
     if !sp.free(x, y, fw, fh) {
         return false;
     }
     sp.block(x, y, fw, fh);
-    drop(m, name, [x as f32 + fw as f32 / 2.0 - (l + r) / 2.0, y as f32 + fh as f32 / 2.0 - (t + u) / 2.0], rot, scale);
+    drop_pick(m, p, [x as f32 + fw as f32 / 2.0 - (l + r) / 2.0, y as f32 + fh as f32 / 2.0 - (t + u) / 2.0], rot, scale);
     true
 }
 
 /// Спиной вплотную к случайной стене комнаты; `corner` — ещё и боком к соседней.
 fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32, corner: bool) -> bool {
+    let p = asset(name);
     for _ in 0..40 {
         let side = rng.int(0, 3);
         let rot = side as f32 * 90.0;
-        let [left, top, right, low] = bounds(name, rot, scale);
+        let [left, top, right, low] = bounds(&p, name, rot, scale);
         let (fw, fh) = (cells_of(right - left), cells_of(low - top));
         if fw > r.w || fh > r.h {
             continue;
@@ -142,21 +184,22 @@ fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scal
         if y == hi_y && (side == 2 || corner) {
             pos[1] = (r.y + r.h) as f32 - WALL_GAP - low;
         }
-        drop(m, name, pos, rot, scale);
+        drop_pick(m, &p, pos, rot, scale);
         return true;
     }
     false
 }
 
 fn inside(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32) -> bool {
-    let [left, top, right, low] = bounds(name, 0.0, scale);
+    let p = asset(name);
+    let [left, top, right, low] = bounds(&p, name, 0.0, scale);
     let (fw, fh) = (cells_of(right - left), cells_of(low - top));
     if fw > r.w || fh > r.h {
         return false;
     }
     (0..16).any(|_| {
         let (x, y) = (rng.int(r.x, r.x + r.w - fw), rng.int(r.y, r.y + r.h - fh));
-        put(m, sp, name, x, y, 0.0, scale)
+        put_pick(m, sp, &p, name, x, y, 0.0, scale)
     })
 }
 
@@ -295,11 +338,11 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
 fn wanted(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, names: &[String], who: &str, warn: &mut Vec<String>) {
     for name in names {
         let Some(id) = plan::object_id(name) else { continue };
-        let here = |p: &Prop| p.asset == key(id) && p.pos[0] >= r.x as f32 && p.pos[0] <= (r.x + r.w) as f32 && p.pos[1] >= r.y as f32 && p.pos[1] <= (r.y + r.h) as f32;
+        let here = |p: &Prop| fits(id, &p.asset) && p.pos[0] >= r.x as f32 && p.pos[0] <= (r.x + r.w) as f32 && p.pos[1] >= r.y as f32 && p.pos[1] <= (r.y + r.h) as f32;
         if m.props.iter().any(here) {
             continue;
         }
-        let s = size(id);
+        let s = Palette::builtin_pick(id).size;
         let scale = if s[0].max(s[1]) >= 3.0 { 1.0 } else { FURNITURE };
         if !by_wall(m, sp, rng, r, id, scale, false) && !inside(m, sp, rng, r, id, scale) && !inside(m, sp, rng, r, id, 1.0) {
             warn.push(format!("{who}: объект «{}» не поместился", library::label(&key(id))));
@@ -313,8 +356,8 @@ fn portal(a: [f32; 2], b: [f32; 2], kind: PortalKind, wood: bool) -> Portal {
     let style = if wood { "wood" } else { "stone" };
     let len = ((b[0] - a[0]).abs() + (b[1] - a[1]).abs()).round() as i32;
     let asset = match kind {
-        PortalKind::Window => Some(key(&format!("window_{style}"))),
-        PortalKind::Door | PortalKind::DoubleDoor => Some(key("door_wood")),
+        PortalKind::Window => Some(asset(&format!("window_{style}")).key),
+        PortalKind::Door | PortalKind::DoubleDoor => Some(asset("door_wood").key),
         PortalKind::Opening | PortalKind::Secret => None,
     };
     let frame = (!matches!(kind, PortalKind::Window | PortalKind::Secret)).then(|| key(&format!("frame_{style}_{}", len.clamp(1, 3))));
@@ -607,7 +650,8 @@ fn patches(m: &mut Map, rng: &mut Rng, name: &str, count: i32, r: (f32, f32), fl
 fn around(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[String], c: [f32; 2], who: &str, avoid: &[Path], keep: f32, warn: &mut Vec<String>) {
     for name in names {
         let Some(id) = plan::object_id(name) else { continue };
-        let [l, t, r, u] = bounds(id, 0.0, 1.0);
+        let p = asset(id);
+        let [l, t, r, u] = bounds(&p, id, 0.0, 1.0);
         let (fw, fh) = (cells_of(r - l), cells_of(u - t));
         let mut done = false;
         for _ in 0..60 {
@@ -618,7 +662,7 @@ fn around(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[String], c: [f32;
             if avoid.iter().any(|p| p.distance(centre) < keep) {
                 continue;
             }
-            if put(m, sp, id, x, y, 0.0, 1.0) {
+            if put_pick(m, sp, &p, id, x, y, 0.0, 1.0) {
                 done = true;
                 break;
             }
@@ -936,7 +980,7 @@ fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32, look: O
     sp.block(r.x, r.y, r.w, r.h);
     let own: Vec<_> = m.room_edges().into_iter().filter(|s| [s.0, s.1].iter().all(|p| p[0] >= ax && p[0] <= bx && p[1] >= ay && p[1] <= by)).collect();
     m.set_edge_look(&own, &wall(st));
-    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(r.h > r.w), overhang: 0.3 });
+    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: asset(roof).key, turn: u8::from(r.h > r.w), overhang: 0.3 });
 
     let along = if door % 2 == 0 { r.w } else { r.h };
     let at = rng.int(1, (along - 2).max(1));
@@ -1103,9 +1147,10 @@ fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     if let Some(b) = middle {
         let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
         let centre = if b.w >= 9 && b.h >= 9 { "fountain" } else { "well" };
-        let s = size(centre)[0] as i32;
+        let c = asset(centre);
+        let s = c.size[0] as i32;
         let (ox, oy) = (rng.int(-1, 1), rng.int(-1, 1));
-        put(m, &mut sp, centre, cx - s / 2 + ox, cy - s / 2 + oy, 0.0, 1.0);
+        put_pick(m, &mut sp, &c, centre, cx - s / 2 + ox, cy - s / 2 + oy, 0.0, 1.0);
         for _ in 0..(b.w * b.h / 24).clamp(2, 5) {
             let n = pick(rng, &["market_stall", "market_stall_blue", "market_stall_ochre"]);
             by_wall(m, &mut sp, rng, b, n, 1.0, false);
@@ -1638,10 +1683,11 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             let main = r;
             // Стойка отгораживает угол зала: за ней бочки и полки, перед ней табуреты.
             let scale = ((main.w - 3) as f32 / 7.0).clamp(0.6, 1.0);
-            let [left, top, right, low] = bounds("bar_counter", 0.0, scale);
+            let bar = asset("bar_counter");
+            let [left, top, right, low] = bounds(&bar, "bar_counter", 0.0, scale);
             let y = main.y as f32 + 2.2 - top;
             let x = main.x as f32 + 1.6 - left;
-            drop(m, "bar_counter", [x, y], 0.0, scale);
+            drop_pick(m, &bar, [x, y], 0.0, scale);
             let width = cells_of(right - left);
             sp.block(main.x, main.y, width + 2, 5);
             for k in 0..width / 2 {
@@ -1760,7 +1806,9 @@ fn mood(m: &mut Map, p: &Plan) {
 /// Вся карта заново по плану. Ошибка — план не проходит проверку или не для этой
 /// карты; что не удалось из задуманного — в предупреждениях отчёта.
 /// `material` — пол подземелья из окна генератора; план со своим полом его перекрывает.
-pub fn build(m: &mut Map, p: &Plan, material: usize) -> Result<Report, String> {
+/// `palette` — свои ассеты из библиотеки; в деле только когда план просит
+/// `assets: library`, иначе всё встроенное.
+pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result<Report, String> {
     p.validate([m.width, m.height])?;
     if let Some(size) = p.size
         && size != [m.width, m.height]
@@ -1768,6 +1816,15 @@ pub fn build(m: &mut Map, p: &Plan, material: usize) -> Result<Report, String> {
         return Err(format!("план рассчитан на карту {}×{}, а эта {}×{}", size[0], size[1], m.width, m.height));
     }
     let mut warnings = p.unused();
+    let _guard = PaletteGuard;
+    if p.assets == Assets::Library {
+        if palette.is_empty() {
+            warnings.push("в библиотеке нет своих ассетов: построено встроенными".into());
+        } else {
+            palette.seed(&p.seed);
+            PALETTE.with(|slot| *slot.borrow_mut() = Some(palette));
+        }
+    }
     let mut rng = Rng::new(&format!("{}/{:?}", p.seed, p.kind));
     clear(m);
     let count = match p.kind {
@@ -1789,13 +1846,68 @@ mod tests {
     use crate::plan::{Link, RoomSpec};
     use std::collections::VecDeque;
 
+    /// Библиотека как у паков FA: по паре вариантов на слот, часть слотов без замены.
+    fn fake_library() -> Palette {
+        use crate::library::{Asset, Kind as K};
+        let a = |path: &str, kind: K| Asset::new(format!("pack:fa.dungeondraft_pack|textures/x/{path}"), &format!("FA/{path}"), kind);
+        let assets = vec![
+            a("Furniture/Chair_Wooden_A_1x1.webp", K::Object),
+            a("Furniture/Chair_Wooden_B_1x1.webp", K::Object),
+            a("Furniture/Table_Long_A_2x1.webp", K::Object),
+            a("Furniture/Bed_Single_A_1x2.webp", K::Object),
+            a("Furniture/Bed_Double_A_2x2.webp", K::Object),
+            a("Nature/Oak_Tree_A_3x3.webp", K::Object),
+            a("Nature/Pine_Tree_B_4x4.webp", K::Object),
+            a("Terrain/Grass_Green_A.webp", K::Floor),
+            a("Terrain/Wood_Planks_A.webp", K::Floor),
+            a("Walls/Wall_Timber_A.webp", K::Wall),
+            a("Portals/Door_Wooden_A_1x1.webp", K::Door),
+        ];
+        Palette::from_library(&assets, Box::new(|_| Some([256, 256])))
+    }
+
+    #[test]
+    fn library_assets_replace_builtin_slots_and_repeat() {
+        let mut p = tavern_plan();
+        p.assets = Assets::Library;
+        let mut m = Map::new(40, 30);
+        let r = build(&mut m, &p, 0, fake_library()).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let count = |word: &str| m.props.iter().filter(|q| q.asset.contains(word)).count();
+        assert!(count("Chair_Wooden") > 0 && count("builtin:chair") == 0, "стулья не из библиотеки");
+        assert!(count("builtin:barrel") > 0, "у бочки замены нет — встроенная");
+        assert!(m.materials.iter().any(|t| matches!(&t.paint, Paint::Texture(k) if k.contains("Wood_Planks"))));
+        assert!(matches!(&m.wall_style.paint, Paint::Texture(k) if k.contains("Wall_Timber")));
+        assert!(m.portals.iter().any(|q| q.asset.as_deref().is_some_and(|k| k.contains("Door_Wooden"))));
+        // Косяки всегда встроенные, окна без замены — тоже.
+        assert!(m.portals.iter().filter_map(|q| q.frame.as_deref()).all(|f| f.starts_with("builtin:")));
+        assert!(m.portals.iter().filter(|q| q.kind == PortalKind::Window).all(|q| q.asset.as_deref().is_some_and(|k| k.starts_with("builtin:"))));
+        // Размер своего объекта — из имени.
+        let bed = m.props.iter().find(|q| q.asset.contains("Bed_")).expect("кровать");
+        assert_eq!(bed.size, if bed.asset.contains("Double") { [2.0, 2.0] } else { [1.0, 2.0] });
+        let mut again = Map::new(40, 30);
+        build(&mut again, &p, 0, fake_library()).unwrap();
+        assert_eq!(m.to_json(), again.to_json());
+        // Лес: деревья чередуются между вариантами.
+        let mut f = Plan::random(&opt(Kind::Forest, "лес"), [40, 30]);
+        f.assets = Assets::Library;
+        let mut fm = Map::new(40, 30);
+        build(&mut fm, &f, 0, fake_library()).unwrap();
+        assert!(fm.props.iter().any(|q| q.asset.contains("Oak_Tree")) && fm.props.iter().any(|q| q.asset.contains("Pine_Tree")));
+        // Просили библиотеку, а она пуста — предупреждение и всё встроенное.
+        let mut e = Map::new(40, 30);
+        let r = build(&mut e, &p, 0, Palette::builtin()).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("нет своих ассетов")), "{:?}", r.warnings);
+        assert!(e.props.iter().all(|q| q.asset.starts_with("builtin:")));
+    }
+
     fn opt(kind: Kind, seed: &str) -> Options {
         Options { kind, seed: seed.into(), ..Default::default() }
     }
 
     fn random(m: &mut Map, kind: Kind, seed: &str) -> Report {
         let plan = Plan::random(&opt(kind, seed), [m.width, m.height]);
-        build(m, &plan, 0).unwrap()
+        build(m, &plan, 0, Palette::builtin()).unwrap()
     }
 
     /// Комнаты, в которые можно попасть из `start` через двери на общих стенах.
@@ -1885,7 +1997,7 @@ mod tests {
         let mut p = Plan::random(&opt(Kind::Forest, "сухо"), [40, 30]);
         p.river = River::None;
         let mut dry = Map::new(40, 30);
-        build(&mut dry, &p, 0).unwrap();
+        build(&mut dry, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(dry.paths.len(), 2);
         assert!(!dry.props.iter().any(|p| p.asset.ends_with("bridge")));
     }
@@ -1912,7 +2024,8 @@ mod tests {
         random(&mut m, Kind::House, "мебель");
         let segs: Vec<Segment> = m.room_edges().into_iter().chain(m.walls.iter().flat_map(|w| w.chords().collect::<Vec<_>>())).collect();
         let bed = m.props.iter().find(|p| p.asset.contains("bed")).expect("кровать");
-        let [l, t, r, u] = bounds(bed.asset.trim_start_matches(library::BUILTIN), bed.rot, bed.scale);
+        let slot = bed.asset.trim_start_matches(library::BUILTIN);
+        let [l, t, r, u] = bounds(&Palette::builtin_pick(slot), slot, bed.rot, bed.scale);
         let near = [[bed.pos[0] + l, bed.pos[1]], [bed.pos[0] + r, bed.pos[1]], [bed.pos[0], bed.pos[1] + t], [bed.pos[0], bed.pos[1] + u]];
         let gap = near.iter().flat_map(|p| segs.iter().map(move |s| map::segment_distance(*p, s.0, s.1))).fold(f32::MAX, f32::min);
         assert!(gap < 0.35, "{gap}");
@@ -1922,7 +2035,7 @@ mod tests {
     fn planned_tavern_has_its_rooms_links_and_secret_passage() {
         let p = tavern_plan();
         let mut m = Map::new(40, 30);
-        let r = build(&mut m, &p, 0).unwrap();
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(r.count, 5, "{:?}", r.warnings);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         // Комнаты восстанавливаются по перегородкам: тайный ход — между подвалом и кладовой.
@@ -1934,10 +2047,10 @@ mod tests {
         assert!(m.props.iter().any(|q| q.asset.ends_with("bar_counter")));
         // Тот же план — та же карта; другое зерно — другая.
         let mut again = Map::new(40, 30);
-        build(&mut again, &p, 0).unwrap();
+        build(&mut again, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(m.to_json(), again.to_json());
         let mut other = Map::new(40, 30);
-        build(&mut other, &Plan { seed: "дуб".into(), ..p.clone() }, 0).unwrap();
+        build(&mut other, &Plan { seed: "дуб".into(), ..p.clone() }, 0, Palette::builtin()).unwrap();
         assert_ne!(m.to_json(), other.to_json());
     }
 
@@ -1950,7 +2063,7 @@ mod tests {
                 p.links.clear();
             }
             let mut m = Map::new(40, 30);
-            let r = build(&mut m, &p, 0).unwrap();
+            let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
             assert_eq!(r.count, 5, "{seed}: {:?}", r.warnings);
             let (bw, bh) = plan::building_size(Kind::Tavern, 40, 30);
             let building = Room { x: (40 - bw) / 2, y: ((30 - bh) / 2 - 1).max(0), w: bw, h: bh };
@@ -2021,7 +2134,7 @@ mod tests {
             Link::new("temple", "stairs", LinkKind::Opening),
         ];
         let mut m = Map::new(40, 30);
-        let r = build(&mut m, &p, 0).unwrap();
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(r.count, 4, "{:?}", r.warnings);
         assert!(m.portals.iter().any(|q| q.kind == PortalKind::Secret), "{:?}", m.portals);
         assert!(m.props.iter().any(|q| q.asset.ends_with("altar")) && m.props.iter().any(|q| q.asset.ends_with("stairs")));
@@ -2038,7 +2151,7 @@ mod tests {
         p.objects = vec!["колодец".into(), "телега".into()];
         p.mood = Mood::Gloomy;
         let mut m = Map::new(36, 30);
-        let r = build(&mut m, &p, 0).unwrap();
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(m.props.iter().any(|q| q.asset.ends_with("bridge")), "нет моста");
         assert!(m.props.iter().any(|q| q.asset.ends_with("well")) && m.props.iter().any(|q| q.asset.ends_with("cart")));
@@ -2056,14 +2169,14 @@ mod tests {
         let mut p = Plan::random(&opt(Kind::Cave, "x"), [30, 20]);
         p.rooms.push(RoomSpec::new("a", Role::Auto));
         let mut m = Map::new(30, 20);
-        let r = build(&mut m, &p, 0).unwrap();
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("комнаты не используются")), "{:?}", r.warnings);
         p.size = Some([10, 10]);
-        assert!(build(&mut m, &p, 0).unwrap_err().contains("рассчитан на карту"));
+        assert!(build(&mut m, &p, 0, Palette::builtin()).unwrap_err().contains("рассчитан на карту"));
         let mut bad = Plan::new(Kind::House);
         bad.rooms = vec![RoomSpec::new("a", Role::Auto)];
         bad.links = vec![Link::new("a", "b", LinkKind::Door)];
-        assert!(build(&mut m, &bad, 0).unwrap_err().contains("«b» нет"));
+        assert!(build(&mut m, &bad, 0, Palette::builtin()).unwrap_err().contains("«b» нет"));
     }
 
     #[test]
@@ -2079,7 +2192,7 @@ mod tests {
             p.validate([w, h]).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
             let mut m = Map::new(w, h);
             let material = dungeon_look(&mut m);
-            let r = build(&mut m, &p, material).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            let r = build(&mut m, &p, material, Palette::builtin()).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
             assert!(r.warnings.is_empty(), "{}: {:?}", f.display(), r.warnings);
             assert!(r.count > 0 && !m.props.is_empty(), "{}", f.display());
             // Карта из плана сохраняется и открывается.

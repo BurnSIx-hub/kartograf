@@ -9,6 +9,7 @@ mod generate;
 mod library;
 mod map;
 mod mask;
+mod palette;
 mod pck;
 mod plan;
 mod procgen;

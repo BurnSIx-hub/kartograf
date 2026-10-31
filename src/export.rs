@@ -90,15 +90,24 @@ pub struct Light {
     pub animation: &'static str,
 }
 
-/// Огонь среди встроенных объектов: что светит и как.
+/// Огонь среди объектов: что светит и как. Встроенные — по имени, чужие — по словам
+/// в названии файла (`Campfire_A_1x1`, `Brazier_Iron`).
 fn light_of(asset: &str) -> Option<(f32, f32, &'static str, &'static str)> {
-    let id = asset.strip_prefix(crate::library::BUILTIN)?;
-    match id {
-        "campfire" => Some((3.0, 6.0, "#ff9a3c", "flame")),
-        "fireplace" => Some((2.0, 5.0, "#ff8a2c", "flame")),
-        "brazier" => Some((2.0, 4.0, "#ffa040", "torch")),
-        "street_lamp" => Some((3.0, 6.0, "#ffc870", "torch")),
-        _ => None,
+    let id = match asset.strip_prefix(crate::library::BUILTIN) {
+        Some(id) => id.to_owned(),
+        None => crate::library::label(asset).to_lowercase(),
+    };
+    let has = |ws: &[&str]| id.split(|c: char| !c.is_alphanumeric()).any(|w| ws.contains(&w));
+    if id == "campfire" || has(&["campfire", "bonfire", "костёр", "костер"]) {
+        Some((3.0, 6.0, "#ff9a3c", "flame"))
+    } else if id == "fireplace" || has(&["fireplace", "hearth", "камин"]) {
+        Some((2.0, 5.0, "#ff8a2c", "flame"))
+    } else if id == "brazier" || has(&["brazier", "torch", "жаровня", "факел"]) {
+        Some((2.0, 4.0, "#ffa040", "torch"))
+    } else if id == "street_lamp" || has(&["lamp", "lantern", "streetlight", "фонарь"]) {
+        Some((3.0, 6.0, "#ffc870", "torch"))
+    } else {
+        None
     }
 }
 

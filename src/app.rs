@@ -6,6 +6,7 @@ use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
 use crate::blend::Blend;
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
 use crate::mask::{self, Brush, Mask, RES, Shape as Tip};
+use crate::palette::Palette;
 use crate::plan::Plan;
 use crate::procgen;
 use crate::recovery::{self, Orphan, Recovery};
@@ -215,6 +216,9 @@ pub struct Settings {
     /// Объекты встают по сетке; Alt на время меняет на обратное.
     #[serde(default = "yes")]
     pub snap: bool,
+    /// Генераторы строят своими ассетами из библиотеки, а не встроенными.
+    #[serde(default)]
+    pub gen_library: bool,
 }
 
 fn yes() -> bool {
@@ -223,7 +227,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false }
     }
 }
 
@@ -1266,7 +1270,13 @@ impl App {
         if fresh_look && plan.kind == generate::Kind::Dungeon {
             self.material = procgen::dungeon_look(&mut self.map);
         }
-        match procgen::build(&mut self.map, plan, self.material) {
+        let palette = if plan.assets == crate::plan::Assets::Library {
+            let sources = self.textures.sources.clone();
+            Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key)))
+        } else {
+            Palette::builtin()
+        };
+        match procgen::build(&mut self.map, plan, self.material, palette) {
             Ok(r) => {
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
@@ -1608,8 +1618,21 @@ impl App {
             let mut open = true;
             let mut go = false;
             let dungeon = opt.kind == generate::Kind::Dungeon;
+            let own_assets = self.library.assets.iter().any(|a| !a.is_builtin());
             egui::Window::new(opt.kind.label()).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
                 egui::Grid::new("gen").num_columns(2).show(ui, |ui| {
+                    ui.label("Ассеты");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut opt.library, false, "Встроенные");
+                        ui.add_enabled_ui(own_assets, |ui| {
+                            ui.selectable_value(&mut opt.library, true, "Из библиотеки").on_hover_text("Паки и папка из «Правка»; чего там нет — встроенные");
+                        });
+                        if !own_assets {
+                            opt.library = false;
+                            ui.weak("(паков и папки нет)");
+                        }
+                    });
+                    ui.end_row();
                     if !dungeon {
                         ui.label("Густота");
                         ui.add(egui::Slider::new(&mut opt.density, 0.0..=1.0));
@@ -1663,6 +1686,10 @@ impl App {
             if go {
                 if opt.seed.trim().is_empty() {
                     opt.seed = generate::new_seed();
+                }
+                if self.settings.gen_library != opt.library {
+                    self.settings.gen_library = opt.library;
+                    self.save_settings();
                 }
                 self.generate(&opt);
             }
@@ -1895,7 +1922,7 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        self.generator = Some(Options { kind, seed: generate::new_seed(), ..Default::default() });
+                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, ..Default::default() });
                     }
                 }
                 ui.separator();
