@@ -1,0 +1,26 @@
+# Выпуск с GitHub: сборка на Windows и выкладка в kartograf-releases тем же
+# tools/release.py, что и с компьютера. Запускается руками: Actions → «Выпуск» →
+# Run workflow. Нужен секрет RELEASES_TOKEN — личный токен с правом contents:write
+# на BurnSIx-hub/kartograf-releases (Settings → Secrets and variables → Actions).
+# Версия берётся из Cargo.toml: поднять её до запуска.
+name: Выпуск
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "Что нового"
+        required: false
+        default: ""
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Собрать release и выложить
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: python tools/release.py "${{ inputs.notes }}"
