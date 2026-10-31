@@ -6,6 +6,8 @@ use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
 use crate::blend::Blend;
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
 use crate::mask::{self, Brush, Mask, RES, Shape as Tip};
+use crate::plan::Plan;
+use crate::procgen;
 use crate::recovery::{self, Orphan, Recovery};
 use crate::roofs;
 use crate::selftest::SelfTest;
@@ -201,6 +203,8 @@ pub struct Args {
     pub export: Option<PathBuf>,
     /// `--px N`: пикселей на клетку в выгрузке.
     pub px: Option<u32>,
+    /// `--plan файл.json`: построить карту по плану при запуске.
+    pub plan: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -541,6 +545,9 @@ impl App {
         };
         if let Some(file) = args.file {
             app.open_path(&file);
+        }
+        if let Some(plan) = args.plan {
+            app.build_from_file(&plan);
         }
         app
     }
@@ -1229,11 +1236,70 @@ impl App {
 
     /// Новая карта вместо нынешней, отменяется как обычная правка.
     pub fn generate(&mut self, opt: &Options) -> usize {
+        let plan = Plan::random(opt, [self.map.width, self.map.height]);
+        self.build_plan(&plan, false).map_or(0, |r| r.count)
+    }
+
+    /// Карта по плану: заменяет текущий этаж, отменяется Ctrl+Z. План другого
+    /// размера пересоздаёт карту. `fresh_look` — вид подземелья по умолчанию, как
+    /// при открытии окна генератора (из окна вид уже выбран). Ошибка плана — в окно
+    /// ошибки, что не удалось из задуманного — в строку состояния.
+    pub fn build_plan(&mut self, plan: &Plan, fresh_look: bool) -> Option<procgen::Report> {
+        let size = plan.map_size([self.map.width, self.map.height]);
+        if let Err(e) = plan.validate(size) {
+            self.error = Some(format!("План не годится:\n{e}"));
+            return None;
+        }
+        if size != [self.map.width, self.map.height] && self.levels.len() > 1 {
+            self.error = Some(format!("План рассчитан на карту {}×{}, а у этой карты несколько этажей размером {}×{}", size[0], size[1], self.map.width, self.map.height));
+            return None;
+        }
         self.checkpoint();
         self.sel = None;
-        let n = crate::procgen::build(&mut self.map, opt, self.material);
-        self.edges_dirty = true;
-        n
+        if size != [self.map.width, self.map.height] {
+            let mut fresh = Map::new(size[0], size[1]);
+            fresh.materials = self.map.materials.clone();
+            fresh.wall_style = self.map.wall_style.clone();
+            self.map = fresh;
+            self.fitted = false;
+        }
+        if fresh_look && plan.kind == generate::Kind::Dungeon {
+            self.material = procgen::dungeon_look(&mut self.map);
+        }
+        match procgen::build(&mut self.map, plan, self.material) {
+            Ok(r) => {
+                self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
+                self.edges_dirty = true;
+                Some(r)
+            }
+            Err(e) => {
+                self.undo();
+                self.error = Some(format!("План не построился:\n{e}"));
+                None
+            }
+        }
+    }
+
+    /// «Построить из плана…»: JSON-файл плана (см. `plans/README.md`).
+    pub fn build_from_file(&mut self, path: &Path) -> bool {
+        let plan = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Plan::from_json(&t)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(format!("{}: {e}", path.display()));
+                return false;
+            }
+        };
+        let Some(r) = self.build_plan(&plan, true) else { return false };
+        if self.notice.is_none() {
+            let name = if plan.name.is_empty() { path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { plan.name.clone() };
+            self.notice = Some(format!("Построено по плану «{name}»: {} {}", r.count, match plan.kind {
+                generate::Kind::Dungeon | generate::Kind::House | generate::Kind::Tavern => "комнат",
+                generate::Kind::Town => "домов",
+                generate::Kind::Forest => "деревьев",
+                generate::Kind::Cave => "клеток",
+            }));
+        }
+        true
     }
 
     // ----- файлы -----
@@ -1831,6 +1897,12 @@ impl App {
                         }
                         self.generator = Some(Options { kind, seed: generate::new_seed(), ..Default::default() });
                     }
+                }
+                ui.separator();
+                if item(ui, "Построить из плана…", "")
+                    && let Some(path) = rfd::FileDialog::new().add_filter("План карты", &["json"]).pick_file()
+                {
+                    self.build_from_file(&path);
                 }
             });
             ui.menu_button("Вид", |ui| {
