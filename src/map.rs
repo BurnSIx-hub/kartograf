@@ -511,9 +511,9 @@ impl Roof {
 /// Освещённость ската: обращённый к свету светлее. `light` — откуда свет.
 pub fn roof_shade(down: [f32; 2], light: [f32; 2], flat: bool) -> f32 {
     if flat {
-        return 0.92;
+        return 0.88;
     }
-    0.8 + 0.2 * (down[0] * light[0] + down[1] * light[1])
+    0.7 + 0.3 * (down[0] * light[0] + down[1] * light[1])
 }
 
 /// Подпись на карте: название комнаты, улицы, метка.

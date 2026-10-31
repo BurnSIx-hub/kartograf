@@ -139,6 +139,15 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     Layout { walls, portals, lights, zones: zones(map) }
 }
 
+/// Предел формата по стороне: карта больше уходит в JPEG.
+pub const WEBP_MAX_SIDE: u32 = 16383;
+
+/// WebP со сжатием: картинка карты и прозрачные слои весят в разы меньше PNG.
+/// Встроенный кодировщик `image` умеет только без потерь, поэтому libwebp.
+pub fn webp_bytes(img: &image::RgbaImage, quality: f32) -> Vec<u8> {
+    webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(quality).to_vec()
+}
+
 /// Упрощение ломаной (Дуглас — Пекер): точки, отступающие от прямой меньше `tol`, уходят.
 /// У замкнутой концы совпадают и остаются.
 pub fn simplify(line: &[[f32; 2]], closed: bool, tol: f32) -> Vec<[f32; 2]> {
@@ -251,13 +260,14 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             *l = tag(l.take());
         }
         // Крыша — тайл выше токенов этажа: гаснет, когда под ней токен,
-        // и не пускает свет и дождь. `x`, `y` тайла — точка привязки картинки
-        // (по умолчанию её середина), поэтому привязка — в левый верхний угол.
+        // и не пускает свет и дождь. Высота выше дверей: ниже 20 они просвечивают сквозь крышу.
+        // `x`, `y` — середина, режим 1 — затухание всего тайла. Без `_stats` сцены (см. ниже)
+        // миграции сдвинули бы тайл на полразмера и обнулили `occlusion.modes`.
         for r in &lv.roofs {
             let [x, y, w, h] = r.rect;
             tiles.push(tag(json!({
-                "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0, "anchorY": 0}, "x": x, "y": y, "width": w, "height": h,
-                "elevation": k as i64 * 10 + 9, "sort": tiles.len(),
+                "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
+                "elevation": k as i64 * 10 + 20, "sort": tiles.len(),
                 "occlusion": {"modes": [1], "alpha": 0},
                 "restrictions": {"light": true, "weather": true}
             })));
@@ -307,6 +317,8 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         "lights": lights,
         "regions": regions,
         "tiles": tiles,
+        // Версия новее миграций тайла (14.349, 14.355): данные уже в их формате.
+        "_stats": {"coreVersion": "14.355"},
         "flags": {"kartograf": {"format": 1}}
     })
 }
@@ -475,9 +487,10 @@ mod tests {
         assert_eq!(ids.len(), walls.len());
         // Крыша — тайл над токенами первого этажа, гаснет над токеном.
         let t = &scene["tiles"][0];
-        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(50), Some(300), Some(9)));
+        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(200), Some(300), Some(20)));
         assert_eq!(t["occlusion"]["modes"][0], 1);
-        assert_eq!((t["texture"]["anchorX"].as_i64(), t["texture"]["anchorY"].as_i64()), (Some(0), Some(0)));
+        assert_eq!(scene["_stats"]["coreVersion"], "14.355");
+        assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));
         assert_eq!(t["levels"][0], lv[0]["_id"]);
     }
     use crate::map::{Layer, Portal, Prop, Wall};

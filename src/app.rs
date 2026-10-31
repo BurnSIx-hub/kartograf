@@ -1224,38 +1224,13 @@ impl App {
         }
     }
 
-    /// Подземелье вместо нынешних комнат, местность и стены не трогаются; остальные виды
-    /// заменяют карту целиком. Отменяется как обычная правка.
+    /// Новая карта вместо нынешней, отменяется как обычная правка.
     pub fn generate(&mut self, opt: &Options) -> usize {
-        if opt.kind != generate::Kind::Dungeon {
-            self.checkpoint();
-            self.sel = None;
-            let n = crate::procgen::build(&mut self.map, opt);
-            self.edges_dirty = true;
-            return n;
-        }
-        let (cells, rooms) = generate::dungeon(self.map.width, self.map.height, opt);
         self.checkpoint();
-        self.map.rooms = Mask::for_cells(self.map.width, self.map.height);
-        self.map.room_floor.clear();
-        self.map.edge_looks.clear();
         self.sel = None;
-        let (w, h, cw) = (self.map.rooms.w, self.map.rooms.h, self.map.width as usize);
-        let weights: Vec<(usize, f32)> = cells
-            .iter()
-            .enumerate()
-            .filter(|(_, on)| **on)
-            .flat_map(|(k, _)| {
-                let c = ((k % cw) as i32, (k / cw) as i32);
-                mask::cells(w, h, c, c)
-            })
-            .collect();
-        self.map.paint(Layer::Rooms, self.material, &weights);
-        if opt.fill {
-            crate::procgen::furnish_dungeon(&mut self.map, &cells, &rooms, &opt.seed);
-        }
+        let n = crate::procgen::build(&mut self.map, opt, self.material);
         self.edges_dirty = true;
-        rooms.len()
+        n
     }
 
     // ----- файлы -----
@@ -1575,8 +1550,8 @@ impl App {
                 });
                 if dungeon {
                     ui.checkbox(&mut opt.fill, "Двери и объекты");
-                    ui.weak("Одно и то же зерно даёт ту же карту: поменяйте пол или стены и создайте заново.");
-                } else {
+                }
+                {
                     ui.weak(format!("Заменит всю карту ({}×{} кл.), отменяется Ctrl+Z.", self.map.width, self.map.height));
                 }
                 ui.add_space(4.0);
@@ -1809,6 +1784,9 @@ impl App {
             ui.menu_button("Процедурно", |ui| {
                 for kind in generate::Kind::ALL {
                     if item(ui, &format!("{}…", kind.label()), "") {
+                        if kind == generate::Kind::Dungeon {
+                            self.material = crate::procgen::dungeon_look(&mut self.map);
+                        }
                         self.generator = Some(Options { kind, seed: generate::new_seed(), ..Default::default() });
                     }
                 }
@@ -3858,7 +3836,9 @@ impl App {
         let flat = roof.shape == map::RoofShape::Flat;
         let tint = |s: f32| {
             let v = (s * alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-            if tex.is_some() { Color32::from_rgba_premultiplied(v, v, v, (alpha * 255.0) as u8) } else { Color32::from_rgba_premultiplied((v as f32 * 0.6) as u8, (v as f32 * 0.35) as u8, (v as f32 * 0.3) as u8, (alpha * 255.0) as u8) }
+            // Скат темнит и то, что видно сквозь него: у полупрозрачной крыши тень та же, что у целой.
+            let a = ((1.0 - s * (1.0 - alpha)) * 255.0).round().clamp(0.0, 255.0) as u8;
+            if tex.is_some() { Color32::from_rgba_premultiplied(v, v, v, a) } else { Color32::from_rgba_premultiplied((v as f32 * 0.6) as u8, (v as f32 * 0.35) as u8, (v as f32 * 0.3) as u8, a) }
         };
         let mut mesh = match tex {
             Some(id) => egui::Mesh::with_texture(id),
@@ -4379,10 +4359,13 @@ impl App {
         let mut srcs = Vec::new();
         let mut layouts = Vec::new();
         for (k, img) in e.done.iter().enumerate() {
-            let img_path = e.dir.join(format!("{}.jpg", stem(k)));
+            // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
             let mut jpg = Vec::new();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
-            std::fs::write(&img_path, &jpg).map_err(|x| format!("{}: {x}", img_path.display()))?;
+            let big = img.width().max(img.height()) > export::WEBP_MAX_SIDE;
+            let img_path = e.dir.join(format!("{}.{}", stem(k), if big { "jpg" } else { "webp" }));
+            let bytes = if big { jpg.clone() } else { export::webp_bytes(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0) };
+            std::fs::write(&img_path, &bytes).map_err(|x| format!("{}: {x}", img_path.display()))?;
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             layouts.push(export::layout(map, &map.room_edges()));
             srcs.push(export::foundry_src(&img_path));
@@ -4399,8 +4382,8 @@ impl App {
             // и у встроенных нарисована справа: створка уходит отражённой.
             let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&key)))?.fliph();
             let width = img.width();
-            let file = e.dir.join(format!("{}_створка_{}.png", e.name, leaves.len() + 1));
-            img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
+            let file = e.dir.join(format!("{}_створка_{}.webp", e.name, leaves.len() + 1));
+            std::fs::write(&file, export::webp_bytes(&img.to_rgba8(), 90.0)).map_err(|x| format!("{}: {x}", file.display()))?;
             leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
         }
         // Крыши — картинками по одной, рядом со сценой.
@@ -4421,8 +4404,8 @@ impl App {
                 let (tex, tile) = &covers[&r.paint];
                 let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light);
                 roof_count += 1;
-                let file = e.dir.join(format!("{}_крыша_{roof_count}.png", stem(k)));
-                img.save(&file).map_err(|x| format!("{}: {x}", file.display()))?;
+                let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
+                std::fs::write(&file, export::webp_bytes(&img, 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
                 let p = e.px as f32;
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64] });
             }

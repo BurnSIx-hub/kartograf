@@ -98,8 +98,8 @@ mod tests {
         let (n, s) = (img.get_pixel(100, 20).0, img.get_pixel(100, 80).0);
         assert_eq!((n[3], s[3]), (255, 255));
         assert!(n[0] > s[0], "{n:?} {s:?}");
-        // На коньке — гребень темнее обоих скатов.
-        assert!(img.get_pixel(100, 50).0[0] < s[0]);
+        // На коньке — гребень темнее светлого ската.
+        assert!(img.get_pixel(100, 50).0[0] < n[0]);
         // Вне крыши прозрачно.
         assert_eq!(img.get_pixel(img.width() - 1, img.height() - 1).0[3], 0);
     }

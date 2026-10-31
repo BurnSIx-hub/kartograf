@@ -59,7 +59,7 @@ pub const BUILTIN_TEXTURES: [(&str, &str, bool, &[u8]); 27] = [
 
 /// Объекты, зашитые в программу: имя, подпись, размер в клетках, байты. Картинка —
 /// 256 точек на клетку с прозрачным полем и тенью (`tools/cutout.py`).
-pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 49] = [
+pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 52] = [
     ("chair", "Стул", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chair.webp")),
     ("stool", "Табурет", [1.0, 1.0], include_bytes!("../assets/builtin/objects/stool.webp")),
     ("table", "Стол", [2.0, 1.0], include_bytes!("../assets/builtin/objects/table.webp")),
@@ -71,7 +71,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 49] = [
     ("bed", "Кровать", [1.0, 2.0], include_bytes!("../assets/builtin/objects/bed.webp")),
     ("bed_double", "Двуспальная кровать", [2.0, 2.0], include_bytes!("../assets/builtin/objects/bed_double.webp")),
     ("wardrobe", "Шкаф", [2.0, 1.0], include_bytes!("../assets/builtin/objects/wardrobe.webp")),
-    ("bookshelf", "Книжный шкаф", [2.0, 1.0], include_bytes!("../assets/builtin/objects/bookshelf.webp")),
+    ("bookshelf", "Книжный шкаф", [3.0, 1.0], include_bytes!("../assets/builtin/objects/bookshelf.webp")),
     ("chest", "Сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest.webp")),
     ("chest_open", "Открытый сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest_open.webp")),
     ("chest_empty", "Пустой сундук", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chest_empty.webp")),
@@ -80,7 +80,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 49] = [
     ("sacks", "Мешки", [1.0, 1.0], include_bytes!("../assets/builtin/objects/sacks.webp")),
     ("rug", "Ковёр", [3.0, 2.0], include_bytes!("../assets/builtin/objects/rug.webp")),
     ("rug_round", "Круглый ковёр", [2.0, 2.0], include_bytes!("../assets/builtin/objects/rug_round.webp")),
-    ("fireplace", "Камин", [2.0, 1.0], include_bytes!("../assets/builtin/objects/fireplace.webp")),
+    ("fireplace", "Камин", [3.0, 3.0], include_bytes!("../assets/builtin/objects/fireplace.webp")),
     ("cauldron", "Котёл", [1.0, 1.0], include_bytes!("../assets/builtin/objects/cauldron.webp")),
     ("anvil", "Наковальня", [1.0, 1.0], include_bytes!("../assets/builtin/objects/anvil.webp")),
     ("campfire", "Костёр", [1.0, 1.0], include_bytes!("../assets/builtin/objects/campfire.webp")),
@@ -109,6 +109,9 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 49] = [
     ("notice_board", "Доска объявлений", [3.0, 2.0], include_bytes!("../assets/builtin/objects/notice_board.webp")),
     ("stocks", "Колодки", [2.0, 2.0], include_bytes!("../assets/builtin/objects/stocks.webp")),
     ("planter", "Ящик с цветами", [1.0, 1.0], include_bytes!("../assets/builtin/objects/planter.webp")),
+    ("bar_counter", "Барная стойка", [7.0, 2.0], include_bytes!("../assets/builtin/objects/bar_counter.webp")),
+    ("bridge", "Мост", [6.0, 4.0], include_bytes!("../assets/builtin/objects/bridge.webp")),
+    ("stairs", "Лестница вниз", [3.0, 3.0], include_bytes!("../assets/builtin/objects/stairs.webp")),
 ];
 
 /// Стены, зашитые в программу: имя, подпись, толщина в клетках, байты. Картинка —
@@ -224,7 +227,7 @@ pub const VARY_TIMES: u32 = 3;
 const VARY_SIDE: u32 = 1024;
 /// Плитки, сшитые `tools/quilt.py` и разложенные `tools/masonry.py`: уже большие и без
 /// повтора, а разнообразие только наложило бы их камни и листья друг на друга.
-const QUILTED: [&str; 12] = ["wood_planks", "gravel", "forest_floor", "rocky_ground", "flagstones", "dungeon_flagstones", "dungeon_flagstones_moss", "stone_tiles", "sandstone", "marble", "brick_floor", "cobblestone"];
+const QUILTED: [&str; 13] = ["dirt", "wood_planks", "gravel", "forest_floor", "rocky_ground", "flagstones", "dungeon_flagstones", "dungeon_flagstones_moss", "stone_tiles", "sandstone", "marble", "brick_floor", "cobblestone"];
 /// Больше миниатюр в памяти не держим: давно не показанные выбрасываются.
 const THUMB_BUDGET: usize = 3000;
 const WORKERS: usize = 3;

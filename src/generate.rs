@@ -78,7 +78,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 3, max_size: 7, loops: 0.2, seed: String::new() }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new() }
     }
 }
 
