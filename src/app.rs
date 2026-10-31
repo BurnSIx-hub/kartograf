@@ -369,6 +369,7 @@ pub struct App {
     title: String,
 
     pub data_dir: PathBuf,
+    pub update: crate::update::Updater,
     pub settings: Settings,
     pub library: Library,
     pub textures: Textures,
@@ -429,6 +430,7 @@ const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=8.0;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, args: Args) -> Self {
+        let online = args.selftest.is_none() && args.shot.is_none() && args.export.is_none();
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         apply_theme(&cc.egui_ctx);
         let data_dir = args.data.or_else(|| args.selftest.as_ref().map(|d| d.join("data"))).unwrap_or_else(default_data_dir);
@@ -510,6 +512,7 @@ impl App {
             frame: 0,
             title: String::new(),
             data_dir,
+            update: crate::update::Updater::start(online.then(|| cc.egui_ctx.clone())),
             settings,
             library,
             textures: Textures::new(&cc.egui_ctx),
@@ -1428,7 +1431,41 @@ impl App {
         }
     }
 
+    fn update_window(&mut self, ctx: &egui::Context) {
+        self.update.poll();
+        if !self.update.shown {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Обновление").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(format!("Сейчас стоит {}.", env!("CARGO_PKG_VERSION")));
+            if let Some(m) = &self.update.message {
+                ui.label(m);
+            }
+            if self.update.installed {
+                ui.label("Новая версия поставлена.");
+                if ui.button("Перезапустить").clicked() {
+                    self.update.restart = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            } else if let Some((got, total)) = self.update.progress {
+                ui.add(egui::ProgressBar::new(got as f32 / total.max(1) as f32).show_percentage());
+            } else if let Some(f) = self.update.found.clone() {
+                ui.strong(format!("Вышла версия {}", f.version));
+                if !f.notes.is_empty() {
+                    ui.label(&f.notes);
+                }
+                ui.label(format!("{:.0} МБ", f.size as f64 / 1_048_576.0));
+                if ui.add_enabled(!self.update.busy(), egui::Button::new("Обновить")).clicked() {
+                    self.update.install(ctx);
+                }
+            }
+        });
+        self.update.shown = open;
+    }
+
     fn windows(&mut self, ctx: &egui::Context) {
+        self.update_window(ctx);
         if let Some(e) = self.error.clone() {
             let mut open = true;
             egui::Window::new("Ошибка").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| ui.label(e));
@@ -1779,6 +1816,11 @@ impl App {
                     for f in files {
                         self.add_pack(f);
                     }
+                }
+                ui.separator();
+                if item(ui, "Проверить обновления", "") {
+                    let ctx = ui.ctx().clone();
+                    self.update.check(&ctx, false);
                 }
             });
             ui.menu_button("Процедурно", |ui| {
@@ -3341,7 +3383,13 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            self.draw_prop(painter, canvas, prop, Color32::WHITE);
+            if exporting && library::is_canopy(&prop.asset) {
+                // Крона уйдёт в свой тайл: под ней в картинке пень.
+                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0] / 3.0, ..prop.clone() };
+                self.draw_prop(painter, canvas, &stump, Color32::WHITE);
+            } else {
+                self.draw_prop(painter, canvas, prop, Color32::WHITE);
+            }
             if self.sel == Some(Sel::Prop(i)) {
                 let q: Vec<Pos2> = c.iter().map(|&p| cam.to_screen(canvas, p)).collect();
                 painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
@@ -4390,6 +4438,7 @@ impl App {
         let mut covers: std::collections::HashMap<String, (image::RgbaImage, [f32; 2])> = std::collections::HashMap::new();
         let mut roof_tiles: Vec<Vec<export::RoofTile>> = Vec::new();
         let mut roof_count = 0;
+        let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let light = map.shadows.light();
@@ -4407,7 +4456,21 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 std::fs::write(&file, export::webp_bytes(&img, 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64] });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true });
+            }
+            // Кроны — один файл на вид дерева, выше токенов, как крыши.
+            for prop in map.props.iter().filter(|p| library::is_canopy(&p.asset)) {
+                if !canopies.contains_key(&prop.asset) {
+                    let bytes = self.textures.bytes(&prop.asset)?;
+                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
+                    let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
+                    let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
+                    let file = e.dir.join(format!("{}_дерево_{}.webp", e.name, canopies.len() + 1));
+                    std::fs::write(&file, export::webp_bytes(&img.to_rgba8(), 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
+                    canopies.insert(prop.asset.clone(), export::foundry_src(&file));
+                }
+                let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
+                tiles.push(export::canopy_tile(canopies[&prop.asset].clone(), prop.pos, size, prop.rot, e.px));
             }
             roof_tiles.push(tiles);
         }
@@ -4482,6 +4545,9 @@ impl eframe::App for App {
         // Сюда доходят, только закрыв окно по-хорошему: карта сохранена или от правок
         // отказались. Копия на случай сбоя больше не нужна.
         self.recovery.close();
+        if self.update.restart {
+            crate::update::relaunch();
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {

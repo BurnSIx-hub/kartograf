@@ -223,10 +223,21 @@ pub struct SceneLevel<'a> {
     pub roofs: Vec<RoofTile>,
 }
 
+/// Крона: крыша без ограничения света, с поворотом объекта.
+pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
+    let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
+    let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false }
+}
+
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
 pub struct RoofTile {
     pub src: String,
     pub rect: [i64; 4],
+    /// Поворот в градусах вокруг середины.
+    pub rotation: f32,
+    /// Не пускает свет и дождь: у крыши да, у кроны нет.
+    pub shelter: bool,
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -267,9 +278,9 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             let [x, y, w, h] = r.rect;
             tiles.push(tag(json!({
                 "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
-                "elevation": k as i64 * 10 + 20, "sort": tiles.len(),
+                "elevation": k as i64 * 10 + 20, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": [1], "alpha": 0},
-                "restrictions": {"light": true, "weather": true}
+                "restrictions": {"light": r.shelter, "weather": r.shelter}
             })));
         }
         let p = px as f32;
@@ -470,7 +481,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200] }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: Vec::new() },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());

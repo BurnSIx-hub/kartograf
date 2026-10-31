@@ -14,6 +14,7 @@ mod procgen;
 mod recovery;
 mod roofs;
 mod selftest;
+mod update;
 mod view;
 
 use eframe::egui;
@@ -30,6 +31,7 @@ fn parse_args() -> app::Args {
             "--export" => args.export = it.next().map(PathBuf::from),
             "--px" => args.px = it.next().and_then(|s| s.parse().ok()),
             "--aside" => {}
+            "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             _ => args.file = Some(PathBuf::from(a)),
