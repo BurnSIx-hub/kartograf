@@ -255,10 +255,13 @@ pub enum PortalKind {
     /// Две створки на петлях по краям проёма.
     DoubleDoor,
     Window,
+    /// Тайный ход: на картинке стена цельная, в редакторе — пунктирная пометка,
+    /// в Foundry — потайная дверь.
+    Secret,
 }
 
 impl PortalKind {
-    pub const ALL: [PortalKind; 4] = [PortalKind::Opening, PortalKind::Door, PortalKind::DoubleDoor, PortalKind::Window];
+    pub const ALL: [PortalKind; 5] = [PortalKind::Opening, PortalKind::Door, PortalKind::DoubleDoor, PortalKind::Window, PortalKind::Secret];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -266,7 +269,13 @@ impl PortalKind {
             PortalKind::Door => "Дверь",
             PortalKind::DoubleDoor => "Двойная",
             PortalKind::Window => "Окно",
+            PortalKind::Secret => "Тайный ход",
         }
+    }
+
+    /// Не рвёт стену на картинке: тайный ход снаружи неотличим от стены.
+    pub fn hidden(self) -> bool {
+        self == PortalKind::Secret
     }
 
     /// Есть ли створка, которая открывается.
@@ -670,14 +679,21 @@ pub fn smooth_line(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     out
 }
 
-/// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них.
+/// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них, — для выгрузки:
+/// тайный ход тоже вырезан, в VTT на его месте потайная дверь.
 pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
-    cut_portals_wide(segs, portals, 0.0)
+    cut(segs, portals.iter(), 0.0)
 }
 
 /// То же для рисования: концы стены продлеваются на полтолщины, поэтому дыра шире
 /// на `grow` с каждой стороны — и стена встаёт в край проёма, а не заходит в него.
+/// Тайные ходы стену не рвут.
 pub fn cut_portals_wide(segs: &[Segment], portals: &[Portal], grow: f32) -> Vec<Segment> {
+    cut(segs, portals.iter().filter(|p| !p.kind.hidden()), grow)
+}
+
+fn cut<'a>(segs: &[Segment], portals: impl Iterator<Item = &'a Portal>, grow: f32) -> Vec<Segment> {
+    let portals: Vec<&Portal> = portals.collect();
     let mut out = Vec::new();
     for &(a, b) in segs {
         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);

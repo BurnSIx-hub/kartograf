@@ -366,6 +366,10 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
                     w["flags"] = json!({"core": {"textureGridSize": tgs}});
                 }
             }
+            // Потайная дверь Foundry: игроки видят стену, пока ведущий не откроет.
+            PortalKind::Secret => {
+                w["door"] = json!(2);
+            }
             // Окно: сквозь него видно и светит, но не пройти.
             PortalKind::Window => {
                 w["sight"] = json!(0);
@@ -399,7 +403,7 @@ pub fn dd2vtt(map: &Map, px: u32, image_b64: &str, layout: &Layout) -> Value {
             json!({
                 "position": pt(mid), "bounds": [pt(*a), pt(*b)],
                 "rotation": (b[1] - a[1]).atan2(b[0] - a[0]),
-                "closed": kind.is_door(), "freestanding": false
+                "closed": kind.is_door() || kind.hidden(), "freestanding": false
             })
         })
         .collect();
@@ -555,6 +559,25 @@ mod tests {
         let uv = dd2vtt(&m, 100, "", &lay);
         assert_eq!(uv["portals"].as_array().unwrap().len(), 3);
         assert_eq!(uv["resolution"]["pixels_per_grid"], 100);
+    }
+
+    #[test]
+    fn secret_passage_is_a_foundry_secret_door_but_a_solid_wall_in_the_picture() {
+        let mut m = Map::new(8, 6);
+        m.paint_rect(Layer::Rooms, (1, 1), (4, 3), Some(0));
+        m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Secret, asset: None, frame: None });
+        let lay = layout(&m, &m.room_edges());
+        let scene = foundry_scene(&m, "Тайна", "t.jpg", 100, &lay, &Default::default());
+        let walls = scene["walls"].as_array().unwrap();
+        let secret = walls.iter().find(|w| w["door"] == 2).expect("потайная дверь");
+        assert_eq!(secret["c"], json!([200, 100, 300, 100]));
+        assert!(secret.get("animation").is_none());
+        // В сцене стена вокруг хода разрезана, а на холсте (ширина с запасом) — нет.
+        assert!(lay.walls.iter().all(|l| l.windows(2).all(|w| !(w[0][1] == 1.0 && w[1][1] == 1.0 && w[0][0] < 2.5 && w[1][0] > 2.5))));
+        let drawn = map::cut_portals_wide(&m.room_edges(), &m.portals, 0.1);
+        assert!(drawn.iter().any(|(a, b)| a[1] == 1.0 && b[1] == 1.0 && a[0].min(b[0]) <= 2.0 && a[0].max(b[0]) >= 3.0));
+        let uv = dd2vtt(&m, 100, "", &lay);
+        assert_eq!(uv["portals"][0]["closed"], true);
     }
 
     #[test]

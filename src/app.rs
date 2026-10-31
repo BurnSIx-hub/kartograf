@@ -956,8 +956,8 @@ impl App {
         if (b[0], b[1]) < (a[0], a[1]) {
             std::mem::swap(&mut a, &mut b);
         }
-        let asset = if self.door_kind == PortalKind::Opening { None } else { self.door_asset.clone() };
-        let frame = self.door_frame.as_deref().map(|f| library::frame_for_width(f, w));
+        let asset = if matches!(self.door_kind, PortalKind::Opening | PortalKind::Secret) { None } else { self.door_asset.clone() };
+        let frame = if self.door_kind.hidden() { None } else { self.door_frame.as_deref().map(|f| library::frame_for_width(f, w)) };
         let portal = Portal { a, b, kind: self.door_kind, asset, frame };
         // На том же месте уже есть проём — новый его заменяет.
         let clash = self.map.portals.iter().position(|q| map::segment_distance(q.center(), portal.a, portal.b) < 0.01);
@@ -2194,7 +2194,7 @@ impl App {
                             }
                         });
                         ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
-                        if self.door_kind != PortalKind::Opening {
+                        if !matches!(self.door_kind, PortalKind::Opening | PortalKind::Secret) {
                             ui.horizontal(|ui| {
                                 ui.label(if self.door_kind == PortalKind::Window { "Окно:" } else { "Створка:" });
                                 match self.door_asset.clone() {
@@ -3722,6 +3722,14 @@ impl App {
                 if !key.is_some_and(|k| self.draw_along(painter, canvas, &k, p.a, p.b)) {
                     plain(painter, &self.cam, wall_width * 0.3, Color32::from_rgb(150, 196, 220));
                 }
+            }
+            // Тайный ход виден только ведущему: пунктир по стене, в выгрузку не попадает.
+            PortalKind::Secret if exporting => {}
+            PortalKind::Secret => {
+                let pts: Vec<Pos2> = to_screen(rect_around(wall_width * 0.5 + 0.08), &self.cam);
+                let mut ring = pts.clone();
+                ring.push(pts[0]);
+                painter.extend(Shape::dashed_line(&ring, Stroke::new(1.5, ACCENT), 5.0, 4.0));
             }
         }
     }
