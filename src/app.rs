@@ -219,6 +219,9 @@ pub struct Settings {
     /// Генераторы строят своими ассетами из библиотеки, а не встроенными.
     #[serde(default)]
     pub gen_library: bool,
+    /// Выгрузка: кроны деревьев отдельными тайлами над токенами, в картинке пни.
+    #[serde(default = "yes")]
+    pub export_canopies: bool,
 }
 
 fn yes() -> bool {
@@ -227,7 +230,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false, export_canopies: true }
     }
 }
 
@@ -276,6 +279,8 @@ struct Export {
     asked: bool,
     /// Выгрузка из командной строки: по окончании выйти.
     quit: bool,
+    /// Кроны деревьев — тайлами над токенами; иначе деревья остаются в картинке как есть.
+    canopies: bool,
 }
 
 /// Окно выгрузки: сколько пикселей на клетку.
@@ -1591,7 +1596,12 @@ impl App {
                 let (w, h) = (self.map.width * dlg.px, self.map.height * dlg.px);
                 ui.weak(format!("Картинка {w}×{h}."));
                 ui.add_space(4.0);
-                ui.weak("Рядом лягут три файла: картинка, сцена для Foundry (.json) и Universal VTT (.dd2vtt). В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
+                let trees = self.map.props.iter().filter(|p| p.is_canopy()).count();
+                if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Выключите, если в Foundry кроны не видно или деревья должны остаться в картинке.").changed() {
+                    self.save_settings();
+                }
+                ui.add_space(4.0);
+                ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt) и картинки створок, крыш и крон — их надо держать рядом со сценой. В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
                 ui.add_space(6.0);
                 go = ui.button("Выбрать место и выгрузить").clicked();
             });
@@ -3505,7 +3515,7 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            if exporting && prop.is_canopy() {
+            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
                 let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0] / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
@@ -4431,6 +4441,7 @@ impl App {
             settle: 0,
             asked: false,
             quit,
+            canopies: self.settings.export_canopies,
         });
     }
 
@@ -4589,7 +4600,7 @@ impl App {
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
-            for prop in map.props.iter().filter(|p| p.is_canopy()) {
+            for prop in map.props.iter().filter(|p| e.canopies && p.is_canopy()) {
                 if !canopies.contains_key(&prop.asset) {
                     let bytes = self.textures.bytes(&prop.asset)?;
                     let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
