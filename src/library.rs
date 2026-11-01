@@ -172,7 +172,11 @@ pub const BUILTIN_ROOFS: [(&str, &str, &[u8]); 9] = [
 ];
 pub const DEFAULT_ROOF: &str = "builtin:roof_clay_red";
 
+/// Встроенное дерево — единственное, чья крона уходит в тайл сама; и пень под неё.
+pub const TREE: &str = "builtin:tree";
 pub const STUMP: &str = "builtin:stump";
+/// Пень под кроной: доля размера дерева. Ствол, а не вся крона.
+pub const STUMP_SHARE: f32 = 0.4;
 
 /// Встроенный косяк под ширину проёма: у них варианты на 1, 2 и 3 клетки.
 /// Чужой косяк остаётся как есть.

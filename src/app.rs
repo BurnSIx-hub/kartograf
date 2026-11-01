@@ -1597,7 +1597,7 @@ impl App {
                 ui.weak(format!("Картинка {w}×{h}."));
                 ui.add_space(4.0);
                 let trees = self.map.props.iter().filter(|p| p.is_canopy()).count();
-                if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Выключите, если в Foundry кроны не видно или деревья должны остаться в картинке.").changed() {
+                if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Сама так уходит только встроенная крона; чужому дереву крону включают галочкой в панели объекта.").changed() {
                     self.save_settings();
                 }
                 ui.add_space(4.0);
@@ -3517,7 +3517,8 @@ impl App {
             }
             if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
-                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0] / 3.0, ..prop.clone() };
+                // Пень размером со ствол, а не со всю крону.
+                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
             } else {
                 self.draw_prop(painter, canvas, prop, Color32::WHITE);

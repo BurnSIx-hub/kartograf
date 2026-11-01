@@ -392,13 +392,11 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
     }
 }
 
-/// Дерево с кроной по имени: крона уходит в тайл над токенами. Пни, брёвна, поваленные
-/// и сухие деревья без листвы — нет: им нечего поднимать над токенами.
+/// Крона по имени: только встроенное дерево. У чужих деревьев листва может быть любой
+/// или не быть вовсе (сухие, зимние), поэтому они остаются в картинке, пока крону не
+/// включат у объекта рукой.
 pub fn canopy_by_name(key: &str) -> bool {
-    let words = name_words(key);
-    let has = |ws: &[&str]| ws.iter().any(|w| words.iter().any(|x| x == w));
-    has(&["tree", "trees", "oak", "pine", "birch", "spruce", "fir", "willow", "maple", "elm", "palm", "cypress", "дерево", "дуб", "сосна", "ель", "берёза", "береза", "ива", "клён", "клен"])
-        && !has(&["stump", "log", "logs", "fallen", "trunk", "root", "roots", "branch", "branches", "house", "dead", "bare", "burnt", "burned", "dry", "winter", "leafless", "skeletal", "пень", "бревно", "поваленное", "сухое", "сухой", "мёртвое", "мертвое", "голое", "сгоревшее"])
+    key == crate::library::TREE
 }
 
 impl Prop {
@@ -1519,15 +1517,12 @@ mod tests {
         assert_eq!(Prop { light: Some(Glow::Off), ..prop("builtin:campfire") }.light(), None);
         assert_eq!(Prop { light: Some(Glow::Brazier), ..prop("pack:x|textures/objects/Barrel_A.webp") }.light(), Some(Glow::Brazier));
         assert!(prop("builtin:tree").is_canopy());
-        assert!(prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
-        assert!(prop("D:/паки/деревья/Сосна_большая.png").is_canopy());
-        assert!(!prop("builtin:stump").is_canopy());
-        assert!(!prop("pack:x|textures/objects/Tree_Stump_A.webp").is_canopy());
-        assert!(!prop("pack:x|textures/objects/Fallen_Tree_Log.webp").is_canopy());
+        // Чужие деревья — только рукой: листва у них любая, сухим крона ни к чему.
+        assert!(!prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
         assert!(!prop("pack:x|textures/objects/Dead_Tree_Roots_A_6x6.webp").is_canopy());
-        assert!(!prop("pack:x|textures/objects/Tree_Bare_Winter_B.webp").is_canopy());
+        assert!(!prop("builtin:stump").is_canopy());
         assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
-        assert!(Prop { canopy: Some(true), ..prop("pack:x|textures/objects/Big_Bush.webp") }.is_canopy());
+        assert!(Prop { canopy: Some(true), ..prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp") }.is_canopy());
         // В файле необязательные поля не пишутся, старые карты читаются.
         let json = serde_json::to_string(&prop("builtin:tree")).unwrap();
         assert!(!json.contains("light") && !json.contains("canopy"));
