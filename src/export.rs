@@ -90,27 +90,6 @@ pub struct Light {
     pub animation: &'static str,
 }
 
-/// Огонь среди объектов: что светит и как. Встроенные — по имени, чужие — по словам
-/// в названии файла (`Campfire_A_1x1`, `Brazier_Iron`).
-fn light_of(asset: &str) -> Option<(f32, f32, &'static str, &'static str)> {
-    let id = match asset.strip_prefix(crate::library::BUILTIN) {
-        Some(id) => id.to_owned(),
-        None => crate::library::label(asset).to_lowercase(),
-    };
-    let has = |ws: &[&str]| id.split(|c: char| !c.is_alphanumeric()).any(|w| ws.contains(&w));
-    if id == "campfire" || has(&["campfire", "bonfire", "костёр", "костер"]) {
-        Some((3.0, 6.0, "#ff9a3c", "flame"))
-    } else if id == "fireplace" || has(&["fireplace", "hearth", "камин"]) {
-        Some((2.0, 5.0, "#ff8a2c", "flame"))
-    } else if id == "brazier" || has(&["brazier", "torch", "жаровня", "факел"]) {
-        Some((2.0, 4.0, "#ffa040", "torch"))
-    } else if id == "street_lamp" || has(&["lamp", "lantern", "streetlight", "фонарь"]) {
-        Some((3.0, 6.0, "#ffc870", "torch"))
-    } else {
-        None
-    }
-}
-
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
 /// ломаные и упрощённые — Foundry медленнеет от тысяч мелких отрезков.
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
@@ -141,7 +120,8 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         .props
         .iter()
         .filter_map(|p| {
-            let (bright, dim, color, animation) = light_of(&p.asset)?;
+            // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой.
+            let (bright, dim, color, animation) = p.light()?.params()?;
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
@@ -538,7 +518,12 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None });
+        // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None };
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
         let lay = layout(&m, &m.room_edges());
         let mut leaves = std::collections::HashMap::new();
         leaves.insert(crate::library::DEFAULT_DOOR.to_owned(), LeafFile { src: "kartograf/door.webp".into(), width: 512 });
@@ -565,6 +550,9 @@ mod tests {
         assert!(ids.len() == walls.len() && ids.iter().all(|i| i.len() == 16));
         let light = &scene["lights"][0];
         assert_eq!((light["x"].as_i64(), light["y"].as_i64(), light["config"]["dim"].as_f64()), (Some(300), Some(200), Some(30.0)));
+        assert_eq!(scene["lights"].as_array().unwrap().len(), 3, "костёр, чужая жаровня и бочка по выбору");
+        assert_eq!(scene["lights"][1]["config"]["animation"]["type"], "torch");
+        assert_eq!(scene["lights"][2]["config"]["color"], "#ffc870");
         let uv = dd2vtt(&m, 100, "", &lay);
         assert_eq!(uv["portals"].as_array().unwrap().len(), 3);
         assert_eq!(uv["resolution"]["pixels_per_grid"], 100);

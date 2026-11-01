@@ -172,13 +172,6 @@ pub const BUILTIN_ROOFS: [(&str, &str, &[u8]); 9] = [
 ];
 pub const DEFAULT_ROOF: &str = "builtin:roof_clay_red";
 
-/// Дерево ли это: при выгрузке его крона уходит в отдельный тайл над токенами, а в картинке
-/// остаётся пень. Чужие деревья узнаются по имени файла.
-pub fn is_canopy(asset: &str) -> bool {
-    let file = asset.rsplit(['/', '|', ':']).next().unwrap_or(asset).to_lowercase();
-    file == "tree" || file.starts_with("tree_") || file.starts_with("tree-")
-}
-
 pub const STUMP: &str = "builtin:stump";
 
 /// Встроенный косяк под ширину проёма: у них варианты на 1, 2 и 3 клетки.

@@ -1016,7 +1016,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -1079,7 +1079,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -1141,7 +1141,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -2468,6 +2468,29 @@ impl App {
                         self.checkpoint();
                         self.map.props[i].shadow = Some(casts);
                     }
+                    // Что уйдёт в Foundry: свет и крона. «Авто» — по имени, как у встроенных.
+                    let by_name = map::glow_by_name(&self.map.props[i].asset);
+                    let mut glow = self.map.props[i].light;
+                    let shown = match glow {
+                        None => format!("авто: {}", by_name.map_or("нет", map::Glow::label)),
+                        Some(g) => g.label().to_owned(),
+                    };
+                    ui.label("Свет:");
+                    egui::ComboBox::from_id_salt("prop_light").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut glow, None, "авто по имени");
+                        for g in map::Glow::CHOICES {
+                            ui.selectable_value(&mut glow, Some(g), g.label());
+                        }
+                    });
+                    if glow != self.map.props[i].light {
+                        self.checkpoint();
+                        self.map.props[i].light = glow;
+                    }
+                    let mut canopy = self.map.props[i].is_canopy();
+                    if ui.checkbox(&mut canopy, "Крона над токенами").on_hover_text("В Foundry уходит тайлом выше токенов, в картинке карты на его месте пень. Авто — по имени: деревья.").changed() {
+                        self.checkpoint();
+                        self.map.props[i].canopy = Some(canopy);
+                    }
                 }
 
                 if self.tool == Tool::Wall || matches!(self.sel, Some(Sel::Wall(_) | Sel::Edge(..))) {
@@ -3482,7 +3505,7 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            if exporting && library::is_canopy(&prop.asset) {
+            if exporting && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
                 let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0] / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
@@ -3619,7 +3642,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -4566,7 +4589,7 @@ impl App {
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
-            for prop in map.props.iter().filter(|p| library::is_canopy(&p.asset)) {
+            for prop in map.props.iter().filter(|p| p.is_canopy()) {
                 if !canopies.contains_key(&prop.asset) {
                     let bytes = self.textures.bytes(&prop.asset)?;
                     let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
@@ -5054,7 +5077,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.
