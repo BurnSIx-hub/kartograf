@@ -1021,7 +1021,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -1036,7 +1036,8 @@ impl App {
         if let Some(i) = self.roof_at(w) {
             return Some(Sel::Roof(i));
         }
-        if let Some(i) = self.map.props.iter().rposition(|p| p.contains(w)) {
+        // Щелчок берёт видимый сверху: последний в порядке рисования.
+        if let Some(&i) = self.prop_order().iter().rev().find(|&&i| self.map.props[i].contains(w)) {
             return Some(Sel::Prop(i));
         }
         let near = |d: f32| d <= PICK;
@@ -1084,7 +1085,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -1146,7 +1147,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -2497,6 +2498,23 @@ impl App {
                         self.checkpoint();
                         self.map.props[i].light = glow;
                     }
+                    let by_name = map::layer_by_name(&self.map.props[i].asset);
+                    let mut layer = self.map.props[i].layer;
+                    let shown = match layer {
+                        None => format!("авто: {}", map::layer_label(by_name)),
+                        Some(l) => map::layer_label(l),
+                    };
+                    ui.label("Слой:").on_hover_text("Кто кого накрывает, как в Dungeondraft. Внутри слоя выше поставленный позже.");
+                    egui::ComboBox::from_id_salt("prop_layer").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut layer, None, "авто по имени");
+                        for (l, name) in map::LAYERS {
+                            ui.selectable_value(&mut layer, Some(l), name);
+                        }
+                    });
+                    if layer != self.map.props[i].layer {
+                        self.checkpoint();
+                        self.map.props[i].layer = layer;
+                    }
                     let mut canopy = self.map.props[i].is_canopy();
                     if ui.checkbox(&mut canopy, "Крона над токенами").on_hover_text("В Foundry уходит тайлом выше токенов, в картинке карты на его месте пень. Авто — по имени: деревья.").changed() {
                         self.checkpoint();
@@ -3496,39 +3514,9 @@ impl App {
             }
         }
 
-        // Объекты — под стенами, как мебель у стены. Сначала их тени.
-        let props = self.map.props.clone();
+        // Объекты — под стенами, как мебель у стены; что выше слоем — позже.
         let shadows = self.map.shadows.clone();
-        if shadows.on {
-            for prop in props.iter().filter(|p| p.casts_shadow()) {
-                let c = prop.corners();
-                let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
-                if bounds.intersects(view) {
-                    for sh in shadows.layers() {
-                        self.draw_prop_shadow(painter, canvas, prop, &sh);
-                    }
-                }
-            }
-        }
-        for (i, prop) in props.iter().enumerate() {
-            let c = prop.corners();
-            let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1])));
-            if !bounds.intersects(view) {
-                continue;
-            }
-            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
-                // Крона уйдёт в свой тайл: под ней в картинке пень.
-                // Пень размером со ствол, а не со всю крону.
-                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
-                self.draw_prop(painter, canvas, &stump, Color32::WHITE);
-            } else {
-                self.draw_prop(painter, canvas, prop, Color32::WHITE);
-            }
-            if self.sel == Some(Sel::Prop(i)) {
-                let q: Vec<Pos2> = c.iter().map(|&p| cam.to_screen(canvas, p)).collect();
-                painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
-            }
-        }
+        self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS);
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
         // ложатся и на объекты у стены.
@@ -3654,7 +3642,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -3688,6 +3676,9 @@ impl App {
             _ => {}
         }
 
+        // Слой «над стенами» — между стенами и крышами.
+        self.draw_props(painter, canvas, view, exporting, map::ABOVE_WALLS..map::ABOVE_ROOFS);
+
         // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
         // они уходят в Foundry отдельными тайлами.
         let roof_alpha = if exporting { 0.0 } else { self.roof_alpha() };
@@ -3716,6 +3707,8 @@ impl App {
             );
             painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90)), egui::StrokeKind::Inside);
         }
+
+        self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX);
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {
@@ -4297,6 +4290,55 @@ impl App {
     /// поворачивает по биссектрисе — без нахлёстов и швов. Обводка — по двум краям
     /// ленты, текстура идёт вдоль без разрывов; на замкнутой стене её шаг подогнан,
     /// чтобы целое число повторов сошлось на стыке.
+    /// Порядок рисования объектов: по слою, внутри слоя — как поставлены.
+    fn prop_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.map.props.len()).collect();
+        order.sort_by_key(|&i| self.map.props[i].layer());
+        order
+    }
+
+    /// Объекты слоёв из `layers`: сначала все их тени, потом сами.
+    fn draw_props(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, exporting: bool, layers: std::ops::Range<i16>) {
+        let cam = self.cam;
+        let order: Vec<usize> = self.prop_order().into_iter().filter(|&i| layers.contains(&self.map.props[i].layer())).collect();
+        if order.is_empty() {
+            return;
+        }
+        let props = self.map.props.clone();
+        let shadows = self.map.shadows.clone();
+        if shadows.on {
+            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow()) {
+                let c = prop.corners();
+                let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
+                if bounds.intersects(view) {
+                    for sh in shadows.layers() {
+                        self.draw_prop_shadow(painter, canvas, prop, &sh);
+                    }
+                }
+            }
+        }
+        for i in order {
+            let prop = &props[i];
+            let c = prop.corners();
+            let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1])));
+            if !bounds.intersects(view) {
+                continue;
+            }
+            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
+                // Крона уйдёт в свой тайл: под ней в картинке пень.
+                // Пень размером со ствол, а не со всю крону.
+                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
+                self.draw_prop(painter, canvas, &stump, Color32::WHITE);
+            } else {
+                self.draw_prop(painter, canvas, prop, Color32::WHITE);
+            }
+            if self.sel == Some(Sel::Prop(i)) {
+                let q: Vec<Pos2> = c.iter().map(|&p| cam.to_screen(canvas, p)).collect();
+                painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
+            }
+        }
+    }
+
     fn draw_walls(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, segs: &[Segment]) {
         let cam = self.cam;
         let hw = style.width / 2.0;
@@ -5093,7 +5135,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

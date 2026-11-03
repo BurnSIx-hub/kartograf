@@ -127,7 +127,7 @@ fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
 }
 
 fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
-    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None });
+    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None, layer: None });
 }
 
 /// Объект в свободные клетки, `x`, `y` — левый верхний угол занятого места.

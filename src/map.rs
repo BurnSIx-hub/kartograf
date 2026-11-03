@@ -323,6 +323,40 @@ pub struct Prop {
     /// Крона над токенами в Foundry (в картинке остаётся пень); `None` — по имени: деревья.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canopy: Option<bool>,
+    /// Слой высоты, как в Dungeondraft: кто кого накрывает. `None` — по имени.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<i16>,
+}
+
+/// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
+/// кто поставлен позже. Стены рисуются между 400 и 700, крыши — между 700 и 900.
+pub const LAYERS: [(i16, &str); 6] = [
+    (100, "Пол: ковры, лужи"),
+    (200, "Низкие: мелочь на полу"),
+    (300, "Обычные"),
+    (400, "Высокие: деревья, шкафы"),
+    (700, "Над стенами"),
+    (900, "Над крышами"),
+];
+pub const LAYER_DEFAULT: i16 = 300;
+/// С этого слоя объект рисуется поверх стен, с `ABOVE_ROOFS` — поверх крыш.
+pub const ABOVE_WALLS: i16 = 700;
+pub const ABOVE_ROOFS: i16 = 900;
+
+/// Слой по имени: плоское — на пол, деревья — над остальным.
+pub fn layer_by_name(key: &str) -> i16 {
+    let k = crate::library::label(key).to_lowercase();
+    if flat_by_name(key) {
+        100
+    } else if key == crate::library::TREE || ["tree", "дерев"].iter().any(|w| k.contains(w)) {
+        400
+    } else {
+        LAYER_DEFAULT
+    }
+}
+
+pub fn layer_label(layer: i16) -> String {
+    LAYERS.iter().find(|l| l.0 == layer).map_or_else(|| layer.to_string(), |l| l.1.to_owned())
 }
 
 /// Огонь или лампа: как светит в Foundry.
@@ -419,6 +453,10 @@ impl Prop {
     /// Крона: в Foundry тайлом над токенами, в картинке пень.
     pub fn is_canopy(&self) -> bool {
         self.canopy.unwrap_or_else(|| canopy_by_name(&self.asset))
+    }
+
+    pub fn layer(&self) -> i16 {
+        self.layer.unwrap_or_else(|| layer_by_name(&self.asset))
     }
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
@@ -1509,7 +1547,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -1525,6 +1563,11 @@ mod tests {
         assert!(!prop("pack:x|textures/objects/Dead_Tree_Roots_A_6x6.webp").is_canopy());
         assert!(!prop("builtin:stump").is_canopy());
         assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
+        // Слой по имени: ковёр на полу, дерево выше обычного, своё — как выбрано.
+        assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Rug_Round_A.webp").layer(), 100);
+        assert_eq!(prop("builtin:tree").layer(), 400);
+        assert_eq!(prop("builtin:chair").layer(), LAYER_DEFAULT);
+        assert_eq!(Prop { layer: Some(ABOVE_WALLS), ..prop("builtin:chair") }.layer(), ABOVE_WALLS);
         assert!(Prop { canopy: Some(true), ..prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp") }.is_canopy());
         // В файле необязательные поля не пишутся, старые карты читаются.
         let json = serde_json::to_string(&prop("builtin:tree")).unwrap();
@@ -1535,7 +1578,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();
