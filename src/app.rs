@@ -258,6 +258,8 @@ pub enum Grip {
 /// себя, плитка переносится в большую картинку. Так картинка выходит тем же
 /// отрисовщиком, что на экране, а не второй копией его кода.
 struct Export {
+    /// Пни под кронами из библиотеки (генерация из библиотеки); пусто — встроенный.
+    stumps: Vec<String>,
     dir: PathBuf,
     name: String,
     px: u32,
@@ -4381,7 +4383,12 @@ impl App {
             if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
                 // Пень размером со ствол, а не со всю крону.
-                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
+                let asset = self.export.as_ref().map(|e| &e.stumps).filter(|s| !s.is_empty()).map_or_else(
+                    || library::STUMP.to_owned(),
+                    // Вариант пня от места дерева: тот же на каждой плитке выгрузки.
+                    |s| s[(prop.pos[0] * 7.0 + prop.pos[1] * 13.0).abs() as usize % s.len()].clone(),
+                );
+                let stump = Prop { asset, size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
             } else {
                 self.draw_prop(painter, canvas, prop, Color32::WHITE);
@@ -4526,6 +4533,7 @@ impl App {
         let start_level = self.level;
         let sel = self.sel.take();
         self.switch_level(0);
+        let stumps = if self.settings.gen_library { Palette::from_library(&self.library.assets, Box::new(|_| None)).keys("stump") } else { Vec::new() };
         self.export = Some(Export {
             dir,
             name,
@@ -4543,6 +4551,7 @@ impl App {
             asked: false,
             quit,
             canopies: self.settings.export_canopies,
+            stumps,
         });
     }
 

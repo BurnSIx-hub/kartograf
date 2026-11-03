@@ -379,6 +379,11 @@ impl Palette {
         Pick { key: key.clone(), size, own: true, visible, turn: turn_of(slot, name) }
     }
 
+    /// Все свои ассеты слота, по алфавиту ключей; пусто — своих нет.
+    pub fn keys(&self, slot: &str) -> Vec<String> {
+        self.slots.get(slot).map(|v| v.iter().map(|(k, _)| k.clone()).collect()).unwrap_or_default()
+    }
+
     /// Ключ — один из ассетов слота (свой или встроенный).
     pub fn fits(&self, slot: &str, key: &str) -> bool {
         key == format!("{}{slot}", library::BUILTIN) || self.slots.get(slot).is_some_and(|v| v.iter().any(|(k, _)| k == key))
@@ -499,6 +504,15 @@ mod tests {
         // Рама — не окно, и встроенному окну своя рама не нужна.
         assert!(!p.fits("window_wood", &assets[2].key));
         assert_eq!(p.window_frame("builtin:window_wood"), None);
+    }
+
+    #[test]
+    fn stumps_for_canopies_come_from_the_library() {
+        let assets = vec![asset("Trees/Stumps/Stump_Ashen_A1_4x4.webp", Kind::Object), asset("Logs/Fir_Log_Dark_Stump_A2_3x2.webp", Kind::Object)];
+        let p = Palette::from_library(&assets, Box::new(|_| None));
+        // Бревно с пнём сбоку — не пень сверху.
+        assert_eq!(p.keys("stump"), vec![assets[0].key.clone()]);
+        assert!(Palette::builtin().keys("stump").is_empty());
     }
 
     #[test]
