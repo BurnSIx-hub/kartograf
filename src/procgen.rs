@@ -208,7 +208,8 @@ fn pick<'a>(rng: &mut Rng, of: &[&'a str]) -> &'a str {
 }
 
 /// Стол с местами вокруг. Занимает 3×4 клетки от `x`, `y`. Сиденья придвинуты
-/// вплотную и чуть задвинуты под стол: по клеткам они отъезжали на полклетки.
+/// вплотную: по клеткам они отъезжали на полклетки. Стол кладётся после них, так что
+/// чуть задвинутое сиденье уходит под столешницу, а не лежит на ней.
 fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
     if !sp.free(x, y, 3, 4) {
         return false;
@@ -218,11 +219,10 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
     let c = [x as f32 + 1.5, y as f32 + 2.0];
     let [sl, st, sr, su] = bounds(&asset(seat), seat, 0.0, FURNITURE);
     let depth = (su - st).min(sr - sl);
-    // От края стола до середины сиденья: на треть под столешницей.
-    let out = depth * 0.5 - depth * 0.3;
+    // От края стола до середины сиденья: под столешницей только самый край.
+    let out = depth * 0.5 - depth * 0.12;
     if rng.chance(0.3) {
         let [l, _, r, _] = bounds(&asset("table_round"), "table_round", 0.0, 1.1);
-        drop(m, "table_round", c, 0.0, 1.1);
         let rad = (r - l) / 2.0 + out;
         for (k, rot) in [0.0f32, 90.0, 180.0, 270.0].into_iter().enumerate() {
             if k > 0 && !rng.chance(0.85) {
@@ -231,9 +231,9 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
             let a = (rot - 90.0).to_radians();
             drop(m, seat, [c[0] + rad * a.cos(), c[1] + rad * a.sin()], rot, FURNITURE);
         }
+        drop(m, "table_round", c, 0.0, 1.1);
     } else {
         let [l, t, r, u] = bounds(&asset("table"), "table", 0.0, FURNITURE);
-        drop(m, "table", c, 0.0, FURNITURE);
         let along = (r - l) * 0.25;
         for (side, rot) in [(-1.0f32, 0.0), (1.0, 180.0)] {
             let edge = if side < 0.0 { t } else { u };
@@ -243,6 +243,7 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
                 }
             }
         }
+        drop(m, "table", c, 0.0, FURNITURE);
     }
     true
 }
