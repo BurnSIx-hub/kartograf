@@ -157,16 +157,19 @@ const NEVER: &[&str] = &["colorable", "overlay", "path"];
 const PARTS: &[&str] = &[
     "frame", "headboard", "base", "lid", "insert", "sticker", "side", "end", "corner", "branch", "brackets", "support", "decoration",
     "winch", "patch", "shadow", "piece", "pieces", "part", "top", "leg", "cloth", "runner", "cover", "door", "drawer", "broken", "fallen",
-    "arrangement", "filled", "spit", "pile", "flap",
+    "arrangement", "filled", "spit", "pile", "flap", "connector", "ending",
 ];
 
-/// Размер из имени не сильно больше встроенного: генератор раскладывает места под
-/// встроенные размеры, и стол 5×2 вместо 2×1 налезает на стулья и соседей.
+/// Размер из имени близок к встроенному — только у столов и сидений: под них место
+/// размечено заранее (стол со стульями — 3×4 клетки), и стол 5×2 налезает на соседей,
+/// а столик 1×1 оставляет стулья в воздухе. Прочее ставится по своему размеру.
 fn fits_size(slot: &str, name: &str) -> bool {
+    if !["table", "table_round", "chair", "stool", "bar_counter"].contains(&slot) {
+        return true;
+    }
     let (Some(own), Some(base)) = (library::size_from_name(name), library::builtin_size(&format!("{}{slot}", library::BUILTIN))) else { return true };
     let (big, small) = (own[0].max(own[1]), own[0].min(own[1]));
     let (bb, bs) = (base[0].max(base[1]), base[0].min(base[1]));
-    // И не мельче: столик 1×1 вместо стола 2×1 оставляет стулья висеть в воздухе.
     big <= bb + 0.5 && small <= bs + 0.5 && big >= bb * 0.75
 }
 
@@ -183,6 +186,23 @@ const NEAR: &[(&str, &str)] = &[
     ("dungeon_flagstones", "flagstones"),
     ("dungeon_flagstones_moss", "flagstones"),
     ("rug_round", "rug"),
+    ("wall_timber", "wall_wood"),
+    ("wall_thatch", "wall_wood"),
+    ("wall_palisade", "wall_wood"),
+    ("wall_fieldstone", "wall_stone_blocks"),
+    ("wall_sandstone", "wall_stone_blocks"),
+    ("wall_ruined", "wall_stone_blocks"),
+    ("wall_ruined_blocks", "wall_stone_blocks"),
+    ("wall_cave", "wall_stone_blocks"),
+    ("wall_hedge", "wall_wood"),
+    ("door_wood_iron", "door_wood"),
+    ("weapon_rack_spears", "weapon_rack"),
+    ("weapon_rack_axes", "weapon_rack"),
+    ("weapon_rack_maces", "weapon_rack"),
+    ("weapon_rack_bows", "weapon_rack"),
+    ("market_stall_blue", "market_stall"),
+    ("market_stall_ochre", "market_stall"),
+    ("sandstone", "sand"),
     ("chest_open", "chest"),
     ("chest_empty", "chest"),
 ];
@@ -377,6 +397,10 @@ mod tests {
         for table in [FLOORS, OBJECTS, WALLS, PORTALS, ROOFS] {
             for (slot, _, _) in table {
                 let n = p.slots.get(slot).map_or(0, Vec::len);
+                if n == 0 && !p.pick(slot).own {
+                    println!("{slot:24}     -  ВСТРОЕННЫЙ");
+                    continue;
+                }
                 let names: Vec<String> = (0..3).map(|_| p.pick(slot)).filter(|x| x.own).map(|x| library::label(&x.key)).collect();
                 println!("{slot:24} {n:5}  {}", names.join(" | "));
             }
