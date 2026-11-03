@@ -275,12 +275,17 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         // миграции сдвинули бы тайл на полразмера и обнулили `occlusion.modes`.
         for r in &lv.roofs {
             let [x, y, w, h] = r.rect;
-            tiles.push(tag(json!({
+            let mut tile = json!({
                 "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
                 "elevation": k as i64 * 10 + 20, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": [1], "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
-            })));
+            });
+            // Крону качает ветер «Живой карты»; крыша стоит.
+            if !r.shelter {
+                tile["flags"] = json!({LIVE_MODULE: {"wind": 1}});
+            }
+            tiles.push(tag(tile));
         }
         let p = px as f32;
         for z in &lv.layout.zones {
@@ -486,7 +491,7 @@ mod tests {
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
             SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true }] },
-            SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: Vec::new() },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
         let lv = scene["levels"].as_array().unwrap();
@@ -507,6 +512,11 @@ mod tests {
         assert_eq!(scene["_stats"]["coreVersion"], "14.355");
         assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));
         assert_eq!(t["levels"][0], lv[0]["_id"]);
+        // Крону качает ветер «Живой карты», крышу — нет.
+        assert!(t.get("flags").is_none());
+        let crown = &scene["tiles"][1];
+        assert_eq!(crown["flags"][LIVE_MODULE]["wind"], 1);
+        assert_eq!(crown["restrictions"]["light"], false);
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 
