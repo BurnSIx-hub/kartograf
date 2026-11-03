@@ -1514,11 +1514,13 @@ impl App {
         egui::Panel::left("options").default_size(250.0).size_range(200.0..=420.0).resizable(true).show(ui, |ui| self.options_bar(ui));
         egui::Panel::right("library").default_size(330.0).size_range(200.0..=700.0).resizable(true).show(ui, |ui| self.shelf(ui));
         egui::CentralPanel::no_frame().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas_ui(ui));
+        // Пока идёт выгрузка, поверх холста ничего: окно, заходящее на холст,
+        // впечатывалось краем в каждую плитку картинки.
         if self.export.is_none() {
             self.levels_overlay(&ctx);
             self.tool_flyout(&ctx);
+            self.windows(&ctx);
         }
-        self.windows(&ctx);
 
         let title = format!("{}{} — Картограф", if self.dirty { "• " } else { "" }, self.name());
         if title != self.title {
