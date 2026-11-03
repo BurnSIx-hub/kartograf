@@ -432,11 +432,11 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
     }
 }
 
-/// Крона по имени: только встроенное дерево. У чужих деревьев листва может быть любой
-/// или не быть вовсе (сухие, зимние), поэтому они остаются в картинке, пока крону не
-/// включат у объекта рукой.
+/// Крона по имени: встроенное дерево и кроны FA (`Tree_Tops`, ствол у них отдельно).
+/// У прочих чужих деревьев листва может быть любой или не быть вовсе (сухие, зимние),
+/// поэтому они остаются в картинке, пока крону не включат у объекта рукой.
 pub fn canopy_by_name(key: &str) -> bool {
-    key == crate::library::TREE
+    key == crate::library::TREE || key.contains("/Tree_Tops/")
 }
 
 impl Prop {
@@ -1588,6 +1588,7 @@ mod tests {
         assert!(!prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
         assert!(!prop("pack:x|textures/objects/Dead_Tree_Roots_A_6x6.webp").is_canopy());
         assert!(!prop("builtin:stump").is_canopy());
+        assert!(prop("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp").is_canopy());
         assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
         // Слой по имени: ковёр на полу, дерево выше обычного, своё — как выбрано.
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Rug_Round_A.webp").layer(), 100);

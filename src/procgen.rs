@@ -123,21 +123,15 @@ impl Spots {
 
 /// Объект без проверки места: `pos` — центр холста.
 fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
-    let p = asset(name);
-    let scale = scale * fit_builtin(name, &p);
-    drop_pick(m, &p, pos, rot, scale);
-}
-
-/// Слоты, где свой ассет ужимается до размера встроенного: кроны FA по 5–8 клеток,
-/// а лес и улицы расставлены под встроенное дерево в 3 — иначе кроны сливаются в кашу.
-const AS_BUILTIN: &[&str] = &["tree"];
-
-fn fit_builtin(slot: &str, p: &Pick) -> f32 {
-    if !p.own || !AS_BUILTIN.contains(&slot) {
-        return 1.0;
+    drop_pick(m, &asset(name), pos, rot, scale);
+    // Слот дерева — лиственное (сухие и пни не берутся): своё тоже уходит в Foundry
+    // кроной над токенами, как встроенное.
+    if name == "tree"
+        && let Some(p) = m.props.last_mut()
+        && !crate::map::canopy_by_name(&p.asset)
+    {
+        p.canopy = Some(true);
     }
-    let want = Palette::builtin_pick(slot).size;
-    (want[0].max(want[1]) / p.size[0].max(p.size[1])).min(1.0)
 }
 
 fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
@@ -2050,17 +2044,15 @@ mod tests {
     }
 
     #[test]
-    fn big_pack_trees_shrink_to_builtin_size() {
+    fn pack_trees_from_the_generator_are_canopies() {
         use crate::library::{Asset, Kind as K};
         let assets = vec![Asset::new("pack:fa.dungeondraft_pack|textures/x/Trees/Tree_Oak_A_6x6.webp".into(), "FA/Trees/Tree_Oak_A_6x6.webp", K::Object)];
-        let mut p = Plan::random(&opt(Kind::Forest, "крупный"), [40, 30]);
+        let mut p = Plan::random(&opt(Kind::Forest, "кроны"), [40, 30]);
         p.assets = Assets::Library;
         let mut m = Map::new(40, 30);
         build(&mut m, &p, 0, Palette::from_library(&assets, Box::new(|_| None))).unwrap();
         let trees: Vec<_> = m.props.iter().filter(|q| q.asset.contains("Tree_Oak")).collect();
-        assert!(!trees.is_empty());
-        // Как встроенное дерево в 3 клетки: 0,8…1,3 от него.
-        assert!(trees.iter().all(|q| q.size[0] * q.scale <= 3.0 * 1.3 + 0.01), "{:?}", trees.iter().map(|q| q.size[0] * q.scale).collect::<Vec<_>>());
+        assert!(!trees.is_empty() && trees.iter().all(|q| q.is_canopy()));
     }
 
     #[test]
