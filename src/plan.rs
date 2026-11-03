@@ -365,6 +365,16 @@ impl Season {
     pub fn is_summer(&self) -> bool {
         *self == Season::Summer
     }
+
+    /// Что «Живая карта» пускает от крон леса: листопад, снег, светлячков.
+    pub fn particles(self) -> &'static str {
+        match self {
+            Season::Autumn => "leaves",
+            Season::Winter => "snow",
+            Season::Magic => "fireflies",
+            Season::Summer | Season::Spring => "",
+        }
+    }
 }
 
 /// Настройки генератора; у каждого вида карты свои значимые.

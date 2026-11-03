@@ -1302,6 +1302,7 @@ impl App {
             Ok(r) => {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
+                self.map.particles = if plan.kind == generate::Kind::Forest { plan.options.season.particles().to_owned() } else { String::new() };
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
                 Some(r)
