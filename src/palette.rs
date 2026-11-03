@@ -61,7 +61,7 @@ const OBJECTS: &[Slot] = &[
     ("armchair", &[&["armchair"], &["chair", "arm"], &["кресло"]], &[]),
     ("bench", &[&["bench"], &["скамья"]], &["work", "workbench"]),
     ("bed", &[&["bed"], &["кровать"]], &["double", "large", "king", "bunk", "flower", "двуспальная"]),
-    ("bed_double", &[&["bed", "double"], &["bed", "large"], &["bed", "king"], &["кровать", "двуспальная"]], &[]),
+    ("bed_double", &[&["bed", "double"], &["bed", "large"], &["bed", "king"], &["bed", "arranged"], &["кровать", "двуспальная"]], &[]),
     ("wardrobe", &[&["wardrobe"], &["closet"], &["armoire"], &["шкаф"]], &["book"]),
     ("bookshelf", &[&["bookshelf"], &["bookcase"], &["book", "shelf"], &["shelf"], &["books"]], &[]),
     ("chest", &[&["chest"], &["сундук"]], &["open", "empty", "drawers", "открытый", "пустой"]),
@@ -72,7 +72,7 @@ const OBJECTS: &[Slot] = &[
     ("sacks", &[&["sack"], &["sacks"], &["bag"], &["мешки"], &["мешок"]], &["sleeping"]),
     ("rug", &[&["rug"], &["carpet"], &["ковёр"], &["ковер"]], &["round", "круглый"]),
     ("rug_round", &[&["rug", "round"], &["carpet", "round"], &["ковёр", "круглый"]], &[]),
-    ("fireplace", &[&["fireplace"], &["hearth"], &["камин"]], &["accessories", "holder", "tool", "tools"]),
+    ("fireplace", &[&["fireplace"], &["hearth"], &["камин"]], &["accessories", "holder", "tool", "tools", "chimneyless"]),
     ("cauldron", &[&["cauldron"], &["pot", "cooking"], &["котёл"], &["котел"]], &["plant"]),
     ("anvil", &[&["anvil"], &["наковальня"]], &[]),
     ("campfire", &[&["campfire"], &["bonfire"], &["костёр"], &["костер"]], &[]),
@@ -129,8 +129,9 @@ const PORTALS: &[Slot] = &[
     ("door_wood", &[&["door"], &["дверь"]], &["frame", "double", "window", "arch", "gate", "secret", "trap", "trapdoor", "косяк"]),
     ("door_wood_iron", &[&["door", "iron"], &["door", "reinforced"], &["дверь", "окованная"]], &["frame", "double"]),
     ("door_metal", &[&["door", "metal"], &["door", "steel"], &["дверь", "железная"]], &["frame", "double"]),
-    ("window_stone", &[&["window"], &["окно"]], &["frame", "glass", "stained", "broken"]),
-    ("window_wood", &[&["window", "wood"], &["window", "wooden"], &["window"]], &["frame", "glass", "stained", "broken"]),
+    // Малые подоконники FA нарисованы торчком, часть — на чёрном фоне.
+    ("window_stone", &[&["window"], &["окно"]], &["frame", "glass", "stained", "broken", "small"]),
+    ("window_wood", &[&["window", "wood"], &["window", "wooden"], &["window"]], &["frame", "glass", "stained", "broken", "small"]),
 ];
 
 const ROOFS: &[Slot] = &[
@@ -147,7 +148,7 @@ const ROOFS: &[Slot] = &[
 
 /// Слова в начале имени, что не говорят, что за предмет: `Fancy_Chair` — стул,
 /// `Wall_Brick` — кирпич, `Double_Bed` — кровать (двуспальность ловит исключение).
-const MODIFIERS: &[&str] = &["fancy", "single", "double", "small", "large", "big", "old", "wall", "walls", "roof", "texture", "fa"];
+const MODIFIERS: &[&str] = &["fancy", "single", "double", "small", "large", "big", "old", "wall", "walls", "roof", "texture", "fa", "arranged"];
 
 /// Чего генератор не берёт никогда: серые заготовки под перекраску и накладки.
 const NEVER: &[&str] = &["colorable", "overlay", "path"];
@@ -157,21 +158,38 @@ const NEVER: &[&str] = &["colorable", "overlay", "path"];
 const PARTS: &[&str] = &[
     "frame", "headboard", "base", "lid", "insert", "sticker", "side", "end", "corner", "branch", "brackets", "support", "decoration",
     "winch", "patch", "shadow", "piece", "pieces", "part", "top", "leg", "cloth", "runner", "cover", "door", "drawer", "broken", "fallen",
-    "arrangement", "filled", "spit", "pile", "flap", "connector", "ending",
+    "arrangement", "filled", "spit", "pile", "flap", "connector", "ending", "blanket", "blankets", "mattress", "pillow", "pillows", "ladder", "headboards", "frames",
 ];
+
+/// Куда смотрит спина своего предмета, если не вверх, как у встроенных: камины FA
+/// нарисованы задней стенкой вправо. Поворот по часовой, который ставит её наверх.
+fn turn_of(slot: &str, name: &str) -> f32 {
+    let file = name.rsplit('/').next().unwrap_or(name);
+    if slot == "fireplace" && file.starts_with("Fireplace_") {
+        270.0
+    } else {
+        0.0
+    }
+}
 
 /// Размер из имени близок к встроенному — только у столов и сидений: под них место
 /// размечено заранее (стол со стульями — 3×4 клетки), и стол 5×2 налезает на соседей,
 /// а столик 1×1 оставляет стулья в воздухе. Прочее ставится по своему размеру.
 fn fits_size(slot: &str, name: &str) -> bool {
-    if !["table", "table_round", "chair", "stool", "bar_counter"].contains(&slot) {
+    let beds = ["bed", "bed_double"].contains(&slot);
+    if !beds && !["table", "table_round", "chair", "stool", "bar_counter"].contains(&slot) {
         return true;
     }
     let (Some(own), Some(base)) = (library::size_from_name(name), library::builtin_size(&format!("{}{slot}", library::BUILTIN))) else { return true };
     let (big, small) = (own[0].max(own[1]), own[0].min(own[1]));
     let (bb, bs) = (base[0].max(base[1]), base[0].min(base[1]));
-    big <= bb + 0.5 && small <= bs + 0.5 && big >= bb * 0.75
+    // Застеленная кровать FA одна на оба слота: одиночную от двуспальной отличает ширина.
+    big <= bb + 0.5 && small <= bs + 0.5 && big >= bb * 0.75 && (!beds || small >= bs * 0.75)
 }
+
+/// Из найденного под слот брать только с этим словом, если такие есть: у FA
+/// `Single_Bed_*` — голый матрас под одеяло, застеленные — `Arranged_Bed_*`.
+const PREFER: &[(&str, &str)] = &[("bed", "arranged"), ("bed_double", "arranged")];
 
 /// Близкие слоты: чем заменить, когда своего под слот нет.
 const NEAR: &[(&str, &str)] = &[
@@ -220,6 +238,8 @@ pub struct Pick {
     pub own: bool,
     /// Видимая рамка своего объекта в клетках от середины, без масштаба.
     pub visible: Option<[f32; 4]>,
+    /// Доворот по часовой, чтобы спина предмета смотрела вверх (см. [`turn_of`]).
+    pub turn: f32,
 }
 
 /// Чем мерить картинку, когда размер не в имени: ширина и высота в точках.
@@ -278,6 +298,13 @@ impl Palette {
                 slots.entry(slot).or_insert_with(|| roofs.clone());
             }
         }
+        for (slot, word) in PREFER {
+            if let Some(v) = slots.get_mut(slot)
+                && v.iter().any(|(_, name)| file_words(name).iter().any(|w| w == word))
+            {
+                v.retain(|(_, name)| file_words(name).iter().any(|w| w == word));
+            }
+        }
         for v in slots.values_mut() {
             v.sort();
             v.dedup();
@@ -302,7 +329,7 @@ impl Palette {
     /// Встроенный ассет слота — когда библиотека не в деле.
     pub fn builtin_pick(slot: &str) -> Pick {
         let key = format!("{}{slot}", library::BUILTIN);
-        Pick { size: library::builtin_size(&key).unwrap_or([1.0, 1.0]), key, own: false, visible: None }
+        Pick { size: library::builtin_size(&key).unwrap_or([1.0, 1.0]), key, own: false, visible: None, turn: 0.0 }
     }
 
     /// Ассет под слот: свой, если нашёлся; нет — свой у близкого слота (сухая трава —
@@ -321,7 +348,7 @@ impl Palette {
         });
         let visible = *self.boxes.borrow_mut().entry(key.clone()).or_insert_with(|| self.visible.as_ref().and_then(|f| f(key)));
         let visible = visible.map(|[l, t, r, b]| [l * size[0], t * size[1], r * size[0], b * size[1]]);
-        Pick { key: key.clone(), size, own: true, visible }
+        Pick { key: key.clone(), size, own: true, visible, turn: turn_of(slot, name) }
     }
 
     /// Ключ — один из ассетов слота (свой или встроенный).
@@ -362,7 +389,7 @@ mod tests {
         assert!(p.pick("bed_double").key.contains("Bed_Double"));
         // Стул — «Fancy_Chair», а не встроенный; кофейный столик — не стол.
         assert_eq!(p.pick("chair").key, assets[6].key);
-        assert_eq!(p.pick("table"), Pick { key: "builtin:table".into(), size: [2.0, 1.0], own: false, visible: None });
+        assert_eq!(p.pick("table"), Pick { key: "builtin:table".into(), size: [2.0, 1.0], own: false, visible: None, turn: 0.0 });
         assert_eq!(p.pick("grass_green").key, assets[7].key);
         assert_eq!(p.pick("grass_dry").key, assets[8].key);
         assert_eq!(p.pick("wall_timber").key, assets[9].key);
@@ -405,6 +432,28 @@ mod tests {
                 println!("{slot:24} {n:5}  {}", names.join(" | "));
             }
         }
+    }
+
+    #[test]
+    fn fa_quirks_are_handled() {
+        let assets = vec![
+            asset("Beds/Single_Bed_Purple_Blanket_E_1x2.webp", Kind::Object),
+            asset("Beds/Arranged_Bed_Wood_Ashen_A1_1x2.webp", Kind::Object),
+            asset("Beds/Single_Bed_Ashen_A_1x2.webp", Kind::Object),
+            asset("Beds/Arranged_Bed_Wood_Ashen_A6_2x2.webp", Kind::Object),
+            asset("Fireplaces/Fireplace_Rounded_Chimney_Stone_Earthy_A_2x2.webp", Kind::Object),
+            asset("Fireplaces/Fireplace_Chimneyless_Stone_Slate_B1_1x2.webp", Kind::Object),
+            asset("Windows/Window_Sill_Small_Stone_Slate_A1_1x1.webp", Kind::Door),
+            asset("Windows/Window_Sill_Stone_Slate_A1_1x1.webp", Kind::Door),
+        ];
+        let p = Palette::from_library(&assets, Box::new(|_| None));
+        // Одеяло — накладка, голый матрас — основа: берётся застеленная кровать.
+        assert!((0..10).all(|_| p.pick("bed").key == assets[1].key));
+        assert_eq!(p.pick("bed_double").key, assets[3].key);
+        let fire = p.pick("fireplace");
+        assert_eq!((fire.key.as_str(), fire.turn), (assets[4].key.as_str(), 270.0));
+        // Малые подоконники FA стоят торчком и бывают без прозрачности.
+        assert_eq!(p.pick("window_stone").key, assets[7].key);
     }
 
     #[test]

@@ -152,7 +152,7 @@ fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scal
     let p = asset(name);
     for _ in 0..40 {
         let side = rng.int(0, 3);
-        let rot = side as f32 * 90.0;
+        let rot = (side as f32 * 90.0 + p.turn) % 360.0;
         let [left, top, right, low] = bounds(&p, name, rot, scale);
         let (fw, fh) = (cells_of(right - left), cells_of(low - top));
         if fw > r.w || fh > r.h {
