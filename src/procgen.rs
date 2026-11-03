@@ -81,7 +81,7 @@ fn wall(name: &str) -> WallStyle {
 fn bounds(p: &Pick, slot: &str, rot: f32, scale: f32) -> [f32; 4] {
     let s = p.size;
     let whole = [-s[0] / 2.0, -s[1] / 2.0, s[0] / 2.0, s[1] / 2.0];
-    let b = if p.own { whole } else { BOUNDS.iter().find(|t| t.0 == slot).map_or(whole, |t| t.1) };
+    let b = if p.own { p.visible.unwrap_or(whole) } else { BOUNDS.iter().find(|t| t.0 == slot).map_or(whole, |t| t.1) };
     let [l, t, r, u] = b.map(|v| v * scale);
     match (rot / 90.0).round() as i32 % 4 {
         0 => [l, t, r, u],
@@ -216,34 +216,39 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
     }
     sp.block(x, y, 3, 4);
     let seat = pick(rng, &["stool", "chair"]);
+    // Один выбор на весь стол: из библиотеки каждый вызов берёт новый вариант, а мерить
+    // надо то, что ставится.
+    let chair = asset(seat);
     let c = [x as f32 + 1.5, y as f32 + 2.0];
-    let [sl, st, sr, su] = bounds(&asset(seat), seat, 0.0, FURNITURE);
+    let [sl, st, sr, su] = bounds(&chair, seat, 0.0, FURNITURE);
     let depth = (su - st).min(sr - sl);
     // От края стола до середины сиденья: под столешницей только самый край.
     let out = depth * 0.5 - depth * 0.12;
     if rng.chance(0.3) {
-        let [l, _, r, _] = bounds(&asset("table_round"), "table_round", 0.0, 1.1);
+        let table = asset("table_round");
+        let [l, _, r, _] = bounds(&table, "table_round", 0.0, 1.1);
         let rad = (r - l) / 2.0 + out;
         for (k, rot) in [0.0f32, 90.0, 180.0, 270.0].into_iter().enumerate() {
             if k > 0 && !rng.chance(0.85) {
                 continue;
             }
             let a = (rot - 90.0).to_radians();
-            drop(m, seat, [c[0] + rad * a.cos(), c[1] + rad * a.sin()], rot, FURNITURE);
+            drop_pick(m, &chair, [c[0] + rad * a.cos(), c[1] + rad * a.sin()], rot, FURNITURE);
         }
-        drop(m, "table_round", c, 0.0, 1.1);
+        drop_pick(m, &table, c, 0.0, 1.1);
     } else {
-        let [l, t, r, u] = bounds(&asset("table"), "table", 0.0, FURNITURE);
+        let table = asset("table");
+        let [l, t, r, u] = bounds(&table, "table", 0.0, FURNITURE);
         let along = (r - l) * 0.25;
         for (side, rot) in [(-1.0f32, 0.0), (1.0, 180.0)] {
             let edge = if side < 0.0 { t } else { u };
             for dx in [-along, along] {
                 if rng.chance(0.85) {
-                    drop(m, seat, [c[0] + dx, c[1] + edge + side * out], rot, FURNITURE);
+                    drop_pick(m, &chair, [c[0] + dx, c[1] + edge + side * out], rot, FURNITURE);
                 }
             }
         }
-        drop(m, "table", c, 0.0, FURNITURE);
+        drop_pick(m, &table, c, 0.0, FURNITURE);
     }
     true
 }
@@ -1898,7 +1903,7 @@ mod tests {
             a("Furniture/Bed_Single_A_1x2.webp", K::Object),
             a("Furniture/Bed_Double_A_2x2.webp", K::Object),
             a("Nature/Oak_Tree_A_3x3.webp", K::Object),
-            a("Nature/Pine_Tree_B_4x4.webp", K::Object),
+            a("Nature/Pine_Tree_B_3x3.webp", K::Object),
             a("Terrain/Grass_Green_A.webp", K::Floor),
             a("Terrain/Wood_Planks_A.webp", K::Floor),
             a("Walls/Wall_Timber_A.webp", K::Wall),

@@ -305,6 +305,22 @@ pub fn dimensions(sources: &Sources, key: &str) -> Option<[u32; 2]> {
     Some([w, h])
 }
 
+/// Видимая часть картинки: рамка непрозрачного в долях от середины (-0.5…0.5).
+/// У FA у стола вокруг прозрачные поля, и стулья, придвинутые к краю холста,
+/// висели в стороне от столешницы.
+pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
+    let bytes = read_source(key, sources).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let (mut l, mut t, mut r, mut b) = (w, h, 0, 0);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p[3] > 40 {
+            (l, t, r, b) = (l.min(x), t.min(y), r.max(x + 1), b.max(y + 1));
+        }
+    }
+    (r > l && b > t).then(|| [l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5])
+}
+
 /// Встроенные предметы с вариантами: всё, что начинается с этих имён, — одна семья.
 const BUILTIN_FAMILIES: [&str; 12] = ["market_stall", "chest", "weapon_rack", "door", "window", "rug", "bed", "table", "roof_clay", "roof_slate", "frame_wood", "frame_stone"];
 
@@ -337,6 +353,22 @@ pub fn size_from_name(name: &str) -> Option<[f32; 2]> {
     let tail = name.rsplit('_').next()?;
     let (w, h) = tail.split_once(['x', 'X'])?;
     Some([w.parse().ok()?, h.parse().ok()?])
+}
+
+/// Ассеты пака без загрузчика: для проверок подбора на настоящих паках.
+#[cfg(test)]
+pub fn pack_assets(file: &std::path::Path) -> Result<Vec<Asset>, String> {
+    let pack = crate::pck::read_index(file)?;
+    Ok(pack
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let kind = kind_of(&e.path, true)?;
+            let inner = e.path.strip_prefix("textures/").unwrap_or(&e.path);
+            let inner = inner.split_once('/').map_or(inner, |(_, rest)| rest);
+            Some(Asset::new(pack_key(&pack.file, &e.path), &format!("{}/{inner}", pack.name), kind))
+        })
+        .collect())
 }
 
 /// Вид ассета по папке. Для паков — по разделу Dungeondraft, для своих папок —

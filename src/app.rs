@@ -354,6 +354,8 @@ pub struct App {
     drawer_frame: u64,
     /// Где на экране первая миниатюра библиотеки и открытая шторка — для самопроверки.
     pub first_thumb: Rect,
+    /// План из командной строки ждёт, пока прочитаются паки.
+    pending_plan: Option<PathBuf>,
     pub drawer_area: Rect,
     family_pick: std::collections::HashMap<String, String>,
     pub fly: Option<usize>,
@@ -539,6 +541,7 @@ impl App {
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
             used_only: false,
             first_thumb: Rect::NOTHING,
+            pending_plan: None,
             drawer_area: Rect::NOTHING,
             door_asset: Some(library::DEFAULT_DOOR.into()),
             door_kind: PortalKind::Door,
@@ -561,9 +564,8 @@ impl App {
         if let Some(file) = args.file {
             app.open_path(&file);
         }
-        if let Some(plan) = args.plan {
-            app.build_from_file(&plan);
-        }
+        // План строится, когда прочитаны паки: иначе план «из библиотеки» взял бы встроенное.
+        app.pending_plan = args.plan;
         app
     }
 
@@ -1283,8 +1285,8 @@ impl App {
             self.material = procgen::dungeon_look(&mut self.map);
         }
         let palette = if plan.assets == crate::plan::Assets::Library {
-            let sources = self.textures.sources.clone();
-            Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key)))
+            let (sources, seen) = (self.textures.sources.clone(), self.textures.sources.clone());
+            Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
         } else {
             Palette::builtin()
         };
@@ -1478,6 +1480,11 @@ impl App {
         ctx.options_mut(|o| o.input_options.max_click_dist = if on_map { 12.0 } else { 28.0 });
         self.textures.poll(&ctx);
         self.library.poll(&self.textures);
+        if !self.library.loading()
+            && let Some(plan) = self.pending_plan.take()
+        {
+            self.build_from_file(&plan);
+        }
         if self.library.loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -4515,6 +4522,7 @@ impl App {
         if self.export.is_none()
             && let Some((dir, px)) = self.export_args.clone()
             && self.frame >= 10
+            && self.pending_plan.is_none()
             && !self.library.loading()
             && self.textures.idle()
             && self.canvas.width() > 100.0

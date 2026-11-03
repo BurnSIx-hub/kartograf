@@ -2,9 +2,12 @@
 //!
 //! Генераторы просят ассеты по слотам — встроенным именам: `chair`, `grass_green`,
 //! `wall_timber`, `roof_clay_red`, `door_wood`. У каждого слота список слов, по
-//! которым в библиотеке ищется замена целыми словами имени и папки: слот `bed`
-//! найдёт `Bed_Wooden_A_1x2`, но не `Bedroll`. Нашлось несколько — каждый раз
-//! берётся случайный, повторимо по зерну. Не нашлось — встроенный.
+//! которым в библиотеке ищется замена. Первое слово — то, что предмет есть: у FA
+//! оно первым и стоит в имени файла (`Table_Rectangle_…`, `Fancy_Chair_…`), поэтому
+//! `Coffee_Table`, `Barricade` и всё из папки «Tables» столом не считаются. Остальные
+//! слова — где угодно в имени, исключения — в имени и в папке. Слот `bed` найдёт
+//! `Bed_Wooden_A_1x2`, но не `Bedroll`. Нашлось несколько — каждый раз берётся
+//! случайный, повторимо по зерну. Не нашлось — встроенный.
 //!
 //! Размер своего объекта в клетках — по имени (`_2x2`), иначе по картинке
 //! (256 точек на клетку). Косяки дверей всегда встроенные: они подгоняются под
@@ -20,7 +23,7 @@ type Slot = (&'static str, &'static [&'static [&'static str]], &'static [&'stati
 
 const FLOORS: &[Slot] = &[
     ("flagstones", &[&["flagstone"], &["flagstones"], &["плиты"]], &["dungeon", "moss"]),
-    ("wood_planks", &[&["wood", "planks"], &["wooden", "planks"], &["planks"], &["wood", "floor"], &["доски"]], &["wall"]),
+    ("wood_planks", &[&["wood", "planks"], &["wood", "flooring"], &["wooden", "planks"], &["planks"], &["wood", "floor"], &["доски"]], &["wall"]),
     ("dirt", &[&["dirt"], &["earth"], &["soil"], &["земля"]], &["road", "path"]),
     ("grass_green", &[&["grass"], &["трава"]], &["dry", "dead", "yellow", "frost", "snow", "burnt"]),
     ("stone_tiles", &[&["tiles"], &["tile"], &["плитка"]], &["roof", "mosaic"]),
@@ -51,7 +54,7 @@ const FLOORS: &[Slot] = &[
 const OBJECTS: &[Slot] = &[
     ("chair", &[&["chair"], &["стул"]], &["arm", "armchair"]),
     ("stool", &[&["stool"], &["табурет"]], &[]),
-    ("table", &[&["table"], &["стол"]], &["round", "side", "nightstand", "end", "круглый"]),
+    ("table", &[&["table"], &["стол"]], &["round", "side", "nightstand", "end", "runner", "leg", "cover", "cloth", "knife", "misc", "tray", "triangle", "halfcircle", "poligon", "круглый"]),
     ("table_round", &[&["table", "round"], &["стол", "круглый"]], &[]),
     ("desk", &[&["desk"], &["writing", "table"]], &[]),
     ("sofa", &[&["sofa"], &["couch"], &["диван"]], &[]),
@@ -65,11 +68,11 @@ const OBJECTS: &[Slot] = &[
     ("chest_open", &[&["chest", "open"], &["сундук", "открытый"]], &["empty"]),
     ("chest_empty", &[&["chest", "empty"], &["сундук", "пустой"]], &[]),
     ("barrel", &[&["barrel"], &["бочка"]], &["broken"]),
-    ("crate", &[&["crate"], &["box"], &["ящик"]], &["broken", "flower", "planter"]),
+    ("crate", &[&["crate"], &["ящик"]], &["broken", "flower", "planter"]),
     ("sacks", &[&["sack"], &["sacks"], &["bag"], &["мешки"], &["мешок"]], &["sleeping"]),
     ("rug", &[&["rug"], &["carpet"], &["ковёр"], &["ковер"]], &["round", "круглый"]),
     ("rug_round", &[&["rug", "round"], &["carpet", "round"], &["ковёр", "круглый"]], &[]),
-    ("fireplace", &[&["fireplace"], &["hearth"], &["камин"]], &[]),
+    ("fireplace", &[&["fireplace"], &["hearth"], &["камин"]], &["accessories", "holder", "tool", "tools"]),
     ("cauldron", &[&["cauldron"], &["pot", "cooking"], &["котёл"], &["котел"]], &["plant"]),
     ("anvil", &[&["anvil"], &["наковальня"]], &[]),
     ("campfire", &[&["campfire"], &["bonfire"], &["костёр"], &["костер"]], &[]),
@@ -83,7 +86,7 @@ const OBJECTS: &[Slot] = &[
     ("altar", &[&["altar"], &["алтарь"]], &[]),
     ("statue", &[&["statue"], &["статуя"]], &["broken"]),
     ("pillar", &[&["pillar"], &["column"], &["колонна"]], &["broken", "ruined"]),
-    ("rubble", &[&["rubble"], &["debris"], &["обломки"]], &["wall"]),
+    ("rubble", &[&["rubble", "pile"], &["rubble"], &["debris"], &["обломки"]], &["wall"]),
     ("boulder", &[&["boulder"], &["rock"], &["валун"]], &["wall", "ground", "floor", "small"]),
     ("well", &[&["well"], &["колодец"]], &[]),
     ("plant_pot", &[&["plant", "pot"], &["potted"], &["plant"], &["растение"]], &["wall"]),
@@ -137,10 +140,57 @@ const ROOFS: &[Slot] = &[
     ("roof_slate_blue", &[&["slate", "blue"], &["slate"], &["сланец"]], &[]),
     ("roof_slate_gray", &[&["slate", "gray"], &["slate", "grey"], &["slate"], &["сланец"]], &[]),
     ("roof_shingle", &[&["shingle"], &["shingles"], &["wood"], &["дранка"]], &[]),
-    ("roof_thatch", &[&["thatch"], &["straw"], &["солома"]], &[]),
+    ("roof_thatch", &[&["thatch"], &["straw"], &["hay"], &["солома"]], &[]),
     ("roof_metal", &[&["corrugated"], &["metal"], &["профнастил"]], &["copper"]),
     ("roof_copper", &[&["copper"], &["медь"]], &[]),
 ];
+
+/// Слова в начале имени, что не говорят, что за предмет: `Fancy_Chair` — стул,
+/// `Wall_Brick` — кирпич, `Double_Bed` — кровать (двуспальность ловит исключение).
+const MODIFIERS: &[&str] = &["fancy", "single", "double", "small", "large", "big", "old", "wall", "walls", "roof", "texture", "fa"];
+
+/// Чего генератор не берёт никогда: серые заготовки под перекраску и накладки.
+const NEVER: &[&str] = &["colorable", "overlay", "path"];
+
+/// Части и обломки предметов у FA: каркас кровати, дверца шкафа, ножка стола, конец
+/// моста. Сами по себе они не мебель, а целые наборы (`Arrangement`) — неведомого размера.
+const PARTS: &[&str] = &[
+    "frame", "headboard", "base", "lid", "insert", "sticker", "side", "end", "corner", "branch", "brackets", "support", "decoration",
+    "winch", "patch", "shadow", "piece", "pieces", "part", "top", "leg", "cloth", "runner", "cover", "door", "drawer", "broken", "fallen",
+    "arrangement", "filled", "spit", "pile", "flap",
+];
+
+/// Размер из имени не сильно больше встроенного: генератор раскладывает места под
+/// встроенные размеры, и стол 5×2 вместо 2×1 налезает на стулья и соседей.
+fn fits_size(slot: &str, name: &str) -> bool {
+    let (Some(own), Some(base)) = (library::size_from_name(name), library::builtin_size(&format!("{}{slot}", library::BUILTIN))) else { return true };
+    let (big, small) = (own[0].max(own[1]), own[0].min(own[1]));
+    let (bb, bs) = (base[0].max(base[1]), base[0].min(base[1]));
+    // И не мельче: столик 1×1 вместо стола 2×1 оставляет стулья висеть в воздухе.
+    big <= bb + 0.5 && small <= bs + 0.5 && big >= bb * 0.75
+}
+
+/// Близкие слоты: чем заменить, когда своего под слот нет.
+const NEAR: &[(&str, &str)] = &[
+    ("grass_dry", "grass_green"),
+    ("grass_frost", "grass_green"),
+    ("moss", "grass_green"),
+    ("forest_floor", "grass_green"),
+    ("mud", "dirt"),
+    ("ash", "dirt"),
+    ("water_deep", "water_shallow"),
+    ("stone_tiles", "flagstones"),
+    ("dungeon_flagstones", "flagstones"),
+    ("dungeon_flagstones_moss", "flagstones"),
+    ("rug_round", "rug"),
+    ("chest_open", "chest"),
+    ("chest_empty", "chest"),
+];
+
+/// Слова имени файла, строчными.
+fn file_words(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect()
+}
 
 /// Выбранный под слот ассет: ключ и размер в клетках. `own` — из библиотеки.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +198,8 @@ pub struct Pick {
     pub key: String,
     pub size: [f32; 2],
     pub own: bool,
+    /// Видимая рамка своего объекта в клетках от середины, без масштаба.
+    pub visible: Option<[f32; 4]>,
 }
 
 /// Чем мерить картинку, когда размер не в имени: ширина и высота в точках.
@@ -158,6 +210,9 @@ pub struct Palette {
     slots: BTreeMap<&'static str, Vec<(String, String)>>,
     measure: Measure,
     sizes: RefCell<HashMap<String, [f32; 2]>>,
+    /// Чем найти видимую часть картинки (доли от середины); нет — весь холст.
+    visible: Option<Box<dyn Fn(&str) -> Option<[f32; 4]>>>,
+    boxes: RefCell<HashMap<String, Option<[f32; 4]>>>,
     rng: RefCell<Rng>,
 }
 
@@ -174,7 +229,7 @@ fn table_of(kind: Kind) -> &'static [Slot] {
 impl Palette {
     /// Всё встроенное.
     pub fn builtin() -> Self {
-        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
+        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
     }
 
     /// Замены из библиотеки: только не встроенные ассеты. Слот крыши без своих
@@ -184,13 +239,17 @@ impl Palette {
         let mut roofs = Vec::new();
         for a in assets.iter().filter(|a| !a.is_builtin()) {
             let words = a.words();
-            let has = |w: &str| words.contains(&w);
+            let file = file_words(&a.name);
+            let head = file.iter().find(|w| !MODIFIERS.contains(&w.as_str())).map_or("", |w| w.as_str());
+            let in_file = |w: &str| file.iter().any(|f| f == w);
             for (slot, alternatives, none) in table_of(a.kind) {
-                if alternatives.iter().any(|alt| alt.iter().all(|w| has(w))) && !none.iter().any(|w| has(w)) {
+                let named = alternatives.iter().any(|alt| alt[0] == head && alt[1..].iter().all(|w| in_file(w)));
+                let part = a.kind == Kind::Object && PARTS.iter().any(|w| in_file(w)) && !alternatives.iter().any(|alt| alt.iter().any(|w| PARTS.contains(w)));
+                if named && !part && !NEVER.iter().any(|w| in_file(w)) && !none.iter().any(|w| in_file(w) || words.contains(w)) && fits_size(slot, &a.name) {
                     slots.entry(slot).or_default().push((a.key.clone(), a.name.clone()));
                 }
             }
-            if a.kind == Kind::Roof {
+            if a.kind == Kind::Roof && !NEVER.iter().any(|w| file.iter().any(|f| f == w)) {
                 roofs.push((a.key.clone(), a.name.clone()));
             }
         }
@@ -203,7 +262,12 @@ impl Palette {
             v.sort();
             v.dedup();
         }
-        Self { slots, measure, sizes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
+        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
+    }
+
+    pub fn with_visible(mut self, f: Box<dyn Fn(&str) -> Option<[f32; 4]>>) -> Self {
+        self.visible = Some(f);
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -218,12 +282,15 @@ impl Palette {
     /// Встроенный ассет слота — когда библиотека не в деле.
     pub fn builtin_pick(slot: &str) -> Pick {
         let key = format!("{}{slot}", library::BUILTIN);
-        Pick { size: library::builtin_size(&key).unwrap_or([1.0, 1.0]), key, own: false }
+        Pick { size: library::builtin_size(&key).unwrap_or([1.0, 1.0]), key, own: false, visible: None }
     }
 
-    /// Ассет под слот: свой, если нашёлся, иначе встроенный.
+    /// Ассет под слот: свой, если нашёлся; нет — свой у близкого слота (сухая трава —
+    /// просто трава: встроенное пятно на чужой траве режет глаз); иначе встроенный.
     pub fn pick(&self, slot: &str) -> Pick {
-        let Some(found) = self.slots.get(slot).filter(|v| !v.is_empty()) else { return Self::builtin_pick(slot) };
+        let near = NEAR.iter().find(|n| n.0 == slot).map(|n| n.1);
+        let own = |s: &str| self.slots.get(s).filter(|v| !v.is_empty());
+        let Some(found) = own(slot).or_else(|| near.and_then(own)) else { return Self::builtin_pick(slot) };
         let i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
         let (key, name) = &found[i];
         let size = *self.sizes.borrow_mut().entry(key.clone()).or_insert_with(|| {
@@ -232,7 +299,9 @@ impl Palette {
                 .or_else(|| (self.measure)(key).map(|px| [(px[0] as f32 / PX_PER_CELL).max(0.25), (px[1] as f32 / PX_PER_CELL).max(0.25)]))
                 .unwrap_or([1.0, 1.0])
         });
-        Pick { key: key.clone(), size, own: true }
+        let visible = *self.boxes.borrow_mut().entry(key.clone()).or_insert_with(|| self.visible.as_ref().and_then(|f| f(key)));
+        let visible = visible.map(|[l, t, r, b]| [l * size[0], t * size[1], r * size[0], b * size[1]]);
+        Pick { key: key.clone(), size, own: true, visible }
     }
 
     /// Ключ — один из ассетов слота (свой или встроенный).
@@ -255,12 +324,15 @@ mod tests {
             asset("Furniture/Bed_Wooden_A_1x2.webp", Kind::Object),
             asset("Furniture/Bedroll_A_1x2.webp", Kind::Object),
             asset("Furniture/Bed_Double_B_2x2.webp", Kind::Object),
-            asset("Nature/Oak_Tree_A_3x3.webp", Kind::Object),
-            asset("Nature/Oak_Tree_B_4x4.webp", Kind::Object),
+            asset("Nature/Tree_Oak_A_3x3.webp", Kind::Object),
+            asset("Nature/Oak_Tree_B_3x3.webp", Kind::Object),
+            asset("Tables/Coffee_Table_A_2x1.webp", Kind::Object),
+            asset("Tables/Fancy_Chair_Red_A_1x1.webp", Kind::Object),
             asset("Terrain/Grass_Green_A.webp", Kind::Floor),
             asset("Terrain/Grass_Dry_B.webp", Kind::Floor),
             asset("Walls/Wall_Timber_A.webp", Kind::Wall),
             asset("Patterns/Roof_Slate_Blue.webp", Kind::Roof),
+            asset("Wood_Terrain/Wood_Ashen_Flooring_A.webp", Kind::Floor),
             Asset::new(format!("{}chair", library::BUILTIN), "Встроенные/Стул", Kind::Object),
         ];
         let p = Palette::from_library(&assets, Box::new(|_| Some([512, 768])));
@@ -268,16 +340,20 @@ mod tests {
         let bed = p.pick("bed");
         assert!(bed.own && bed.key.contains("Bed_Wooden") && bed.size == [1.0, 2.0], "{bed:?}");
         assert!(p.pick("bed_double").key.contains("Bed_Double"));
-        // Встроенный стул не считается своим: слот без замены — встроенный.
-        assert_eq!(p.pick("chair"), Pick { key: "builtin:chair".into(), size: [1.0, 1.0], own: false });
-        assert_eq!(p.pick("grass_green").key, assets[5].key);
-        assert_eq!(p.pick("grass_dry").key, assets[6].key);
-        assert_eq!(p.pick("wall_timber").key, assets[7].key);
+        // Стул — «Fancy_Chair», а не встроенный; кофейный столик — не стол.
+        assert_eq!(p.pick("chair").key, assets[6].key);
+        assert_eq!(p.pick("table"), Pick { key: "builtin:table".into(), size: [2.0, 1.0], own: false, visible: None });
+        assert_eq!(p.pick("grass_green").key, assets[7].key);
+        assert_eq!(p.pick("grass_dry").key, assets[8].key);
+        assert_eq!(p.pick("wall_timber").key, assets[9].key);
+        assert_eq!(p.pick("wood_planks").key, assets[11].key);
         // Любая крыша закрывает все слоты крыш.
-        assert_eq!(p.pick("roof_thatch").key, assets[8].key);
+        assert_eq!(p.pick("roof_thatch").key, assets[10].key);
         let picks: std::collections::HashSet<String> = (0..20).map(|_| p.pick("tree").key).collect();
         assert_eq!(picks.len(), 2);
         assert!(p.fits("tree", &assets[3].key) && p.fits("tree", "builtin:tree") && !p.fits("tree", &assets[0].key));
+        // Дуб без слова «tree» первым — тоже дерево: слот знает «oak».
+        assert!(p.fits("tree", &assets[4].key));
         // Повторимость по зерну.
         let seq = |s: &str| {
             p.seed(s);
@@ -285,6 +361,26 @@ mod tests {
         };
         assert_eq!(seq("а"), seq("а"));
         assert!(Palette::builtin().is_empty());
+    }
+
+    /// Что подберётся из настоящих паков FA: `cargo test --release fa_picks -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fa_picks() {
+        let dir = std::path::Path::new(r"E:\D&D\FA_Objects_A_v3.51");
+        let mut assets = Vec::new();
+        for f in std::fs::read_dir(dir).unwrap().flatten().filter(|f| f.path().extension().is_some_and(|e| e == "dungeondraft_pack")) {
+            assets.extend(library::pack_assets(&f.path()).unwrap_or_default());
+        }
+        let p = Palette::from_library(&assets, Box::new(|_| None));
+        p.seed("проба");
+        for table in [FLOORS, OBJECTS, WALLS, PORTALS, ROOFS] {
+            for (slot, _, _) in table {
+                let n = p.slots.get(slot).map_or(0, Vec::len);
+                let names: Vec<String> = (0..3).map(|_| p.pick(slot)).filter(|x| x.own).map(|x| library::label(&x.key)).collect();
+                println!("{slot:24} {n:5}  {}", names.join(" | "));
+            }
+        }
     }
 
     #[test]
