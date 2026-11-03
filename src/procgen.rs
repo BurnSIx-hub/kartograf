@@ -392,7 +392,11 @@ fn portal(a: [f32; 2], b: [f32; 2], kind: PortalKind, wood: bool) -> Portal {
         PortalKind::Door | PortalKind::DoubleDoor => Some(asset("door_wood").key),
         PortalKind::Opening | PortalKind::Secret => None,
     };
-    let frame = (!matches!(kind, PortalKind::Window | PortalKind::Secret)).then(|| key(&format!("frame_{style}_{}", len.clamp(1, 3))));
+    let frame = match kind {
+        PortalKind::Window => asset.as_deref().and_then(|k| PALETTE.with(|p| p.borrow().as_ref().and_then(|pal| pal.window_frame(k)))),
+        PortalKind::Secret => None,
+        _ => Some(key(&format!("frame_{style}_{}", len.clamp(1, 3)))),
+    };
     Portal { a, b, kind, asset, frame }
 }
 

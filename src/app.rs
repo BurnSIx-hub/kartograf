@@ -395,6 +395,8 @@ pub struct App {
     pub query: String,
     filtered: Vec<usize>,
     filter_key: (Kind, String, usize, usize),
+    /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
+    window_bands: std::collections::HashMap<String, f32>,
     /// Библиотека показывает только то, что уже стоит на карте.
     used_only: bool,
     pub door_asset: Option<String>,
@@ -539,6 +541,7 @@ impl App {
             query: String::new(),
             filtered: Vec::new(),
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
+            window_bands: std::collections::HashMap::new(),
             used_only: false,
             first_thumb: Rect::NOTHING,
             pending_plan: None,
@@ -3543,8 +3546,11 @@ impl App {
         self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS);
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
-        // ложатся и на объекты у стены.
+        // ложатся и на объекты у стены. Подоконники — под стенами.
         let style = self.map.wall_style.clone();
+        for portal in self.map.portals.clone().iter().filter(|p| p.sill_under_wall()) {
+            self.draw_sill(painter, canvas, portal, style.width);
+        }
         let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
         for s in self.room_edges().to_vec() {
             let st = self.map.edge_look(map::edge_key(&s));
@@ -3820,14 +3826,35 @@ impl App {
     /// картинки (у FA холст створки 1×1 с доской посередине). Правый край картинки
     /// (петля створки) — у `e`. `false` — картинка ещё не готова.
     fn draw_along(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2]) -> bool {
+        self.draw_across(painter, canvas, key, s, e, None)
+    }
+
+    /// То же, но толщина холста поперёк отрезка задана (`thick`, клетки).
+    fn draw_across(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2], thick: Option<f32>) -> bool {
         let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
         let len = (dx * dx + dy * dy).sqrt();
         let Some((_, px)) = self.textures.get(key, false) else { return false };
-        let half = len * px[1] as f32 / px[0].max(1) as f32 / 2.0;
+        let half = thick.unwrap_or(len * px[1] as f32 / px[0].max(1) as f32) / 2.0;
         let (nx, ny) = (-dy / len * half, dx / len * half);
         let c = [[s[0] + nx, s[1] + ny], [e[0] + nx, e[1] + ny], [e[0] - nx, e[1] - ny], [s[0] - nx, s[1] - ny]];
         let full = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
         self.quad(painter, canvas, key, c, full, Color32::WHITE)
+    }
+
+    /// Толщина холста подоконника поперёк стены: видимая доска — в полторы стены
+    /// (у FA так и есть: доска 0,375 клетки на стене в четверть).
+    fn sill_thick(&mut self, key: &str, wall_width: f32) -> f32 {
+        let sources = &self.textures.sources;
+        let band = *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or(1.0, |[_, t, _, b]| (b - t).max(0.05)));
+        wall_width * 1.5 / band
+    }
+
+    /// Подоконник по всей длине окна; стена ляжет на него сверху.
+    fn draw_sill(&mut self, painter: &egui::Painter, canvas: Rect, p: &Portal, wall_width: f32) {
+        if let Some(key) = p.asset.clone() {
+            let thick = self.sill_thick(&key, wall_width);
+            self.draw_across(painter, canvas, &key, p.a, p.b, Some(thick));
+        }
     }
 
     /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
@@ -3840,6 +3867,21 @@ impl App {
         }
         let (ux, uy) = (dx / len, dy / len);
         let mid = p.center();
+        if p.sill_under_wall() {
+            // Подоконник уже под стеной (`draw_sill`); поверх стены — рама FA. Окно
+            // без картинки — светлой полосой поверх стены.
+            let thick = self.sill_thick(p.asset.as_deref().unwrap_or(""), wall_width);
+            let ready = p.asset.as_ref().is_some_and(|k| self.textures.get(k, false).is_some());
+            if !ready {
+                let (nx, ny) = (-uy * wall_width * 0.3, ux * wall_width * 0.3);
+                let q = [[p.a[0] + nx, p.a[1] + ny], [p.b[0] + nx, p.b[1] + ny], [p.b[0] - nx, p.b[1] - ny], [p.a[0] - nx, p.a[1] - ny]];
+                let q: Vec<Pos2> = q.iter().map(|&w| self.cam.to_screen(canvas, w)).collect();
+                painter.add(Shape::convex_polygon(q, Color32::from_rgb(150, 196, 220), Stroke::new(1.5, Color32::from_rgb(20, 16, 13))));
+            } else if let Some(f) = p.frame.clone() {
+                self.draw_across(painter, canvas, &f, p.a, p.b, Some(thick));
+            }
+            return;
+        }
         if let Some(f) = p.frame.clone() {
             let size = self.asset_size(&f);
             let (hx, hy) = (ux * size[0] / 2.0, uy * size[0] / 2.0);

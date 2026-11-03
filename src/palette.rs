@@ -130,7 +130,7 @@ const PORTALS: &[Slot] = &[
     ("door_wood_iron", &[&["door", "iron"], &["door", "reinforced"], &["дверь", "окованная"]], &["frame", "double"]),
     ("door_metal", &[&["door", "metal"], &["door", "steel"], &["дверь", "железная"]], &["frame", "double"]),
     // Малые подоконники FA нарисованы торчком, часть — на чёрном фоне.
-    ("window_stone", &[&["window"], &["окно"]], &["frame", "glass", "stained", "broken", "small"]),
+    ("window_stone", &[&["window", "stone"], &["window"], &["окно"]], &["frame", "glass", "stained", "broken", "small"]),
     ("window_wood", &[&["window", "wood"], &["window", "wooden"], &["window"]], &["frame", "glass", "stained", "broken", "small"]),
 ];
 
@@ -254,6 +254,8 @@ pub struct Palette {
     visible: Option<Box<dyn Fn(&str) -> Option<[f32; 4]>>>,
     boxes: RefCell<HashMap<String, Option<[f32; 4]>>>,
     rng: RefCell<Rng>,
+    /// Рамы окон FA (`Window_Frame_*`): ставятся поверх подоконника.
+    frames: Vec<(String, String)>,
 }
 
 fn table_of(kind: Kind) -> &'static [Slot] {
@@ -269,7 +271,7 @@ fn table_of(kind: Kind) -> &'static [Slot] {
 impl Palette {
     /// Всё встроенное.
     pub fn builtin() -> Self {
-        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
+        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
     }
 
     /// Замены из библиотеки: только не встроенные ассеты. Слот крыши без своих
@@ -277,9 +279,13 @@ impl Palette {
     pub fn from_library(assets: &[Asset], measure: Measure) -> Self {
         let mut slots: BTreeMap<&'static str, Vec<(String, String)>> = BTreeMap::new();
         let mut roofs = Vec::new();
+        let mut frames = Vec::new();
         for a in assets.iter().filter(|a| !a.is_builtin()) {
             let words = a.words();
             let file = file_words(&a.name);
+            if a.kind == Kind::Door && file.iter().any(|w| w == "window") && file.iter().any(|w| w == "frame") {
+                frames.push((a.key.clone(), a.name.clone()));
+            }
             let head = file.iter().find(|w| !MODIFIERS.contains(&w.as_str())).map_or("", |w| w.as_str());
             let in_file = |w: &str| file.iter().any(|f| f == w);
             for (slot, alternatives, none) in table_of(a.kind) {
@@ -309,7 +315,29 @@ impl Palette {
             v.sort();
             v.dedup();
         }
-        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")) }
+        frames.sort();
+        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
+    }
+
+    /// Рама под подоконник FA: того же размера (`1x1`, `2x1`, «large»), ближе всех
+    /// по материалу и цвету. У FA окно — подоконник и рама, без рамы стоек нет.
+    pub fn window_frame(&self, sill: &str) -> Option<String> {
+        let file = sill.rsplit(['/', '|']).next().unwrap_or(sill);
+        let name = file.rsplit_once('.').map_or(file, |(n, _)| n);
+        let words = file_words(name);
+        if !words.iter().any(|w| w == "sill") {
+            return None;
+        }
+        let size = words.last()?;
+        let large = words.iter().any(|w| w == "large");
+        self.frames
+            .iter()
+            .filter_map(|(key, n)| {
+                let f = file_words(n);
+                (f.last() == Some(size) && f.iter().any(|w| w == "large") == large).then(|| (f.iter().filter(|w| words.contains(w)).count(), key))
+            })
+            .max_by_key(|(score, key)| (*score, std::cmp::Reverse(*key)))
+            .map(|(_, key)| key.clone())
     }
 
     pub fn with_visible(mut self, f: Box<dyn Fn(&str) -> Option<[f32; 4]>>) -> Self {
@@ -454,6 +482,23 @@ mod tests {
         assert_eq!((fire.key.as_str(), fire.turn), (assets[4].key.as_str(), 270.0));
         // Малые подоконники FA стоят торчком и бывают без прозрачности.
         assert_eq!(p.pick("window_stone").key, assets[7].key);
+    }
+
+    #[test]
+    fn fa_window_gets_frame_of_its_size_and_material() {
+        let assets = vec![
+            asset("Windows/Window_Sill_Stone_Slate_A1_1x1.webp", Kind::Door),
+            asset("Windows/Window_Sill_Large_Wood_Light_A1_2x1.webp", Kind::Door),
+            asset("Windows/Window_Frames/Window_Frame_Wood_Light_A_1x1.webp", Kind::Door),
+            asset("Windows/Window_Frames/Window_Frame_Stone_Slate_A_1x1.webp", Kind::Door),
+            asset("Windows/Window_Frames/Window_Frame_Large_Wood_Light_A_2x1.webp", Kind::Door),
+        ];
+        let p = Palette::from_library(&assets, Box::new(|_| None));
+        assert_eq!(p.window_frame(&assets[0].key).as_deref(), Some(assets[3].key.as_str()));
+        assert_eq!(p.window_frame(&assets[1].key).as_deref(), Some(assets[4].key.as_str()));
+        // Рама — не окно, и встроенному окну своя рама не нужна.
+        assert!(!p.fits("window_wood", &assets[2].key));
+        assert_eq!(p.window_frame("builtin:window_wood"), None);
     }
 
     #[test]
