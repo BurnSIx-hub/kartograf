@@ -352,8 +352,10 @@ pub struct App {
     /// Открытая шторка: индексы вариантов и миниатюра, над которой она висит.
     pub drawer: Option<(Vec<usize>, Rect)>,
     drawer_frame: u64,
+    /// Где на экране первая миниатюра библиотеки и открытая шторка — для самопроверки.
+    pub first_thumb: Rect,
+    pub drawer_area: Rect,
     family_pick: std::collections::HashMap<String, String>,
-    shelf_rows: u32,
     pub fly: Option<usize>,
     fly_rect: Rect,
     fly_frame: u64,
@@ -390,7 +392,9 @@ pub struct App {
     pub browse: Kind,
     pub query: String,
     filtered: Vec<usize>,
-    filter_key: (Kind, String, usize),
+    filter_key: (Kind, String, usize, usize),
+    /// Библиотека показывает только то, что уже стоит на карте.
+    used_only: bool,
     pub door_asset: Option<String>,
     pub door_kind: PortalKind,
     pub door_width: f32,
@@ -507,7 +511,6 @@ impl App {
             drawer: None,
             drawer_frame: 0,
             family_pick: Default::default(),
-            shelf_rows: 1,
             fly: None,
             fly_rect: Rect::NOTHING,
             fly_frame: 0,
@@ -533,7 +536,10 @@ impl App {
             browse: Kind::Floor,
             query: String::new(),
             filtered: Vec::new(),
-            filter_key: (Kind::Floor, String::from("\u{0}"), 0),
+            filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
+            used_only: false,
+            first_thumb: Rect::NOTHING,
+            drawer_area: Rect::NOTHING,
             door_asset: Some(library::DEFAULT_DOOR.into()),
             door_kind: PortalKind::Door,
             door_width: 1.0,
@@ -1443,9 +1449,17 @@ impl App {
 
     /// Ассеты текущей вкладки под строку поиска; пересчёт только когда что-то поменялось.
     pub fn filtered(&mut self) -> &[usize] {
-        let key = (self.browse, self.query.clone(), self.library.assets.len());
+        // С фильтром «на карте» пересчёт и при правках карты: их видно по числу вещей.
+        let m = &self.map;
+        let used = if self.used_only { 1 + m.props.len() + m.portals.len() + m.roofs.len() + m.materials.len() + m.wall_looks.len() + m.walls.len() } else { 0 };
+        let key = (self.browse, self.query.clone(), self.library.assets.len(), used);
         if key != self.filter_key {
             self.filtered = self.library.filter(self.browse, &self.query);
+            if self.used_only {
+                let on_map = self.map.used_assets();
+                let assets = &self.library.assets;
+                self.filtered.retain(|&i| on_map.contains(&assets[i].key));
+            }
             self.groups = self.library.group(&self.filtered);
             self.drawer = None;
             self.filter_key = key;
@@ -1482,11 +1496,11 @@ impl App {
         self.export_step(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
-        egui::Panel::top("options").exact_size(38.0).resizable(false).show(ui, |ui| self.options_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));
-        let shelf = 44.0 + self.shelf_rows as f32 * (THUMB + 4.0);
-        egui::Panel::bottom("shelf").exact_size(shelf).resizable(false).show(ui, |ui| self.shelf(ui));
-        egui::Panel::left("tools").exact_size(96.0).resizable(false).frame(egui::Frame::new().fill(PANEL)).show(ui, |ui| self.tool_cells(ui));
+        // Как в привычных редакторах карт: слева инструменты и их настройки, справа библиотека.
+        egui::Panel::left("tools").exact_size(64.0).resizable(false).frame(egui::Frame::new().fill(PANEL)).show(ui, |ui| self.tool_cells(ui));
+        egui::Panel::left("options").default_size(250.0).size_range(200.0..=420.0).resizable(true).show(ui, |ui| self.options_bar(ui));
+        egui::Panel::right("library").default_size(330.0).size_range(200.0..=700.0).resizable(true).show(ui, |ui| self.shelf(ui));
         egui::CentralPanel::no_frame().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas_ui(ui));
         if self.export.is_none() {
             self.levels_overlay(&ctx);
@@ -2067,10 +2081,10 @@ impl App {
             let p = ui.painter();
             p.rect_filled(rect, 0.0, fill);
             p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, LINE));
-            let icon = Rect::from_center_size(pos2(rect.center().x, rect.center().y - 9.0), vec2(26.0, 26.0));
+            let icon = Rect::from_center_size(pos2(rect.center().x - 3.0, rect.center().y - 8.0), vec2(24.0, 24.0));
             tool_icon(p, icon, group, ink);
             let label = if on { self.mode_label() } else { tool.label().to_owned() };
-            p.text(pos2(rect.center().x, rect.center().y + 15.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.5), ink);
+            p.text(pos2(rect.center().x - 3.0, rect.center().y + 14.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.0), ink);
             if !modes.is_empty() {
                 let c = arrow.center();
                 p.add(Shape::convex_polygon(vec![c + vec2(-3.0, -5.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 5.0)], ink, Stroke::NONE));
@@ -2263,11 +2277,13 @@ impl App {
     /// Строка над картой: настройки инструмента и выбранного. Высота постоянная:
     /// иначе карта прыгала бы под курсором; что не влезло — прокруткой вбок.
     fn options_bar(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::horizontal().id_salt("options").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().slider_width = 90.0;
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.strong(self.tool.label());
+        egui::ScrollArea::vertical().id_salt("options").auto_shrink([false, false]).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().slider_width = 120.0;
+                ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                ui.add_space(4.0);
+                ui.heading(self.tool.label());
+                ui.separator();
                 if matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
                     self.material_picker(ui);
                 }
@@ -2594,17 +2610,20 @@ impl App {
 
     /// Полка ассетов: слева разделы, справа поиск и большие миниатюры.
     fn shelf(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_top(|ui| {
-            if self.shelf_rows > 0 {
-                ui.vertical(|ui| {
-                    ui.set_width(84.0);
-                    for k in Kind::ALL {
-                        ui.selectable_value(&mut self.browse, k, k.label());
-                    }
-                });
+        ui.set_max_width(ui.available_width());
+        ui.add_space(4.0);
+        ui.heading("Библиотека");
+        ui.horizontal_wrapped(|ui| {
+            for k in Kind::ALL {
+                ui.selectable_value(&mut self.browse, k, k.label());
             }
-            ui.vertical(|ui| self.browser(ui));
         });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.used_only, false, "Все");
+            ui.selectable_value(&mut self.used_only, true, "На карте").on_hover_text("Только то, что уже стоит на этой карте");
+        });
+        ui.separator();
+        self.browser(ui);
     }
 
     /// Шторка вариантов над миниатюрой семьи — как у эмодзи с оттенками.
@@ -2613,7 +2632,8 @@ impl App {
         const SIZE: f32 = 96.0;
         const IN_ROW: usize = 6;
         let mut picked = None;
-        let area = egui::Area::new(egui::Id::new("variants")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(rect.left_top() - vec2(0.0, 6.0)).show(ctx, |ui| {
+        // Библиотека справа: варианты раскрываются влево от миниатюры, на карту.
+        let area = egui::Area::new(egui::Id::new("variants")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(rect.left_top() - vec2(6.0, 0.0)).constrain(true).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 for row in group.chunks(IN_ROW) {
                     ui.horizontal(|ui| {
@@ -2632,6 +2652,7 @@ impl App {
                 }
             });
         });
+        self.drawer_area = area.response.rect;
         if let Some(key) = &picked {
             let family = self.library.assets[group[0]].family.clone();
             self.family_pick.insert(family, key.clone());
@@ -2643,8 +2664,9 @@ impl App {
     }
 
     fn browser(&mut self, ui: &mut egui::Ui) {
+        // Поиск на всю ширину своей строкой: рядом с кнопками он раздувал панель.
+        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Поиск").desired_width(ui.available_width()));
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Поиск").desired_width(180.0));
             let found = self.filtered().len();
             ui.weak(format!("Найдено: {found}"));
             ui.menu_button("Источники", |ui| {
@@ -2671,15 +2693,7 @@ impl App {
                     };
                 }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (n, label) in [(2, "2 ряда"), (1, "1 ряд"), (0, "Скрыть")] {
-                    ui.selectable_value(&mut self.shelf_rows, n, label);
-                }
-            });
         });
-        if self.shelf_rows == 0 {
-            return;
-        }
         if self.library.assets.is_empty() && !self.library.loading() {
             ui.weak("Пусто. Подключите папку с картинками или пак Dungeondraft: кнопка «Источники».");
         }
@@ -2718,6 +2732,9 @@ impl App {
                         let asset = &self.library.assets[i];
                         let (key, tip) = (asset.key.clone(), format!("{}\n{}", asset.name, asset.folder));
                         let (rect, resp) = ui.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
+                        if row == 0 && Some(group) == groups.first() {
+                            self.first_thumb = rect;
+                        }
                         self.thumb(ui.painter(), rect, &key);
                         if group.iter().any(|&g| current.as_deref() == Some(self.library.assets[g].key.as_str())) {
                             ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);

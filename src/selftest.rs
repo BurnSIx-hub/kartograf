@@ -774,7 +774,7 @@ impl SelfTest {
             64 => {
                 // Стрелка ячейки «Кисть» открывает её режимы.
                 let h = (app.canvas.height() / 7.0).floor();
-                self.click(egui::pos2(88.0, app.canvas.top() + h * 1.5));
+                self.click(egui::pos2(56.0, app.canvas.top() + h * 1.5));
                 self.resume_at = now + CLICK_GAP;
             }
             65 => {
@@ -806,8 +806,8 @@ impl SelfTest {
                 self.resume_at = now + 0.3;
             }
             70 => {
-                // Три сундука лежат на полке одной миниатюрой, щелчок открывает шторку.
-                self.click(egui::pos2(145.0, app.canvas.bottom() + 70.0));
+                // Три сундука лежат в библиотеке одной миниатюрой, щелчок открывает шторку.
+                self.click(app.first_thumb.center());
                 self.resume_at = now + CLICK_GAP;
             }
             71 => {
@@ -816,9 +816,10 @@ impl SelfTest {
                 self.snap(ctx, "шторка вариантов");
             }
             72 => {
-                if let Some((_, r)) = app.drawer.clone() {
-                    // Вторая миниатюра шторки.
-                    self.click(egui::pos2(r.left() + 150.0, r.top() - 60.0));
+                if app.drawer.is_some() {
+                    // Вторая миниатюра шторки: поля рамки, первая миниатюра и середина второй.
+                    let r = app.drawer_area;
+                    self.click(egui::pos2(r.left() + 8.0 + 96.0 + 4.0 + 48.0, r.top() + 8.0 + 48.0));
                 }
                 self.resume_at = now + CLICK_GAP;
             }

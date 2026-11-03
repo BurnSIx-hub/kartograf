@@ -1267,6 +1267,26 @@ impl Map {
     }
 
     /// После правки комнат: стоявшие отрезки хранят свой вид, новые берут вид новых стен.
+    /// Ключи всех картинок, что стоят на карте: пол, стены, проёмы, объекты, крыши.
+    pub fn used_assets(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut paint = |p: &Paint| {
+            if let Paint::Texture(k) = p {
+                out.insert(k.clone());
+            }
+        };
+        self.materials.iter().for_each(|m| paint(&m.paint));
+        paint(&self.wall_style.paint);
+        self.wall_looks.iter().for_each(|w| paint(&w.paint));
+        self.walls.iter().filter_map(|w| w.style.as_ref()).for_each(|w| paint(&w.paint));
+        for p in &self.portals {
+            out.extend(p.asset.iter().chain(p.frame.iter()).cloned());
+        }
+        out.extend(self.props.iter().map(|p| p.asset.clone()));
+        out.extend(self.roofs.iter().map(|r| r.paint.clone()));
+        out
+    }
+
     pub fn sync_edge_looks(&mut self, edges: &[Segment]) {
         let fresh = self.wall_style.clone();
         let id = self.look_id(&fresh);
