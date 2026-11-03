@@ -136,7 +136,17 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
-    Layout { walls, portals, lights, zones: zones(map) }
+    let mut zones = zones(map);
+    // Костёр под открытым небом — маленькая область: пламя и дым рисует модуль.
+    for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("campfire")) {
+        let r = 0.45 * p.size[0] * p.scale;
+        let round: Vec<[f32; 2]> = (0..=12).map(|i| {
+            let a = i as f32 / 12.0 * std::f32::consts::TAU;
+            [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
+        }).collect();
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)] });
+    }
+    Layout { walls, portals, lights, zones }
 }
 
 /// Предел формата по стороне: карта больше уходит в JPEG.
@@ -296,6 +306,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             let (title, color) = match z.effect {
                 "lava" => ("Лава", "#ff6a1a"),
                 "swamp" => ("Болото", "#6a8f3a"),
+                "fire" => ("Огонь", "#ff9a3c"),
                 _ => ("Вода", "#2a8fd6"),
             };
             let region = json!({
