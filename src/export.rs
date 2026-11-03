@@ -282,7 +282,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
             // Крону качает ветер «Живой карты»; крыша стоит.
-            // Осенью с неё летят листья, зимой снег, в магическом лесу — светлячки.
+            // Осенью с неё летят листья, в магическом лесу — светлячки.
             if !r.shelter {
                 tile["flags"] = json!({LIVE_MODULE: {"wind": 1}});
                 if !map.particles.is_empty() {
@@ -333,6 +333,8 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         "levels": docs,
         "initialLevel": LEVEL_ID,
         "tokenVision": true,
+        // Зимний лес — со снегом Foundry.
+        "weather": map.weather,
         "walls": walls,
         "lights": lights,
         "regions": regions,
@@ -527,6 +529,9 @@ mod tests {
         let scene = foundry_levels(&autumn, "Дом", &levels, 100, &Default::default());
         assert_eq!(scene["tiles"][1]["flags"][LIVE_MODULE]["particles"], "leaves");
         assert!(scene["tiles"][0].get("flags").is_none());
+        assert_eq!(scene["weather"], "");
+        autumn.weather = "snow".into();
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["weather"], "snow");
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 

@@ -366,14 +366,18 @@ impl Season {
         *self == Season::Summer
     }
 
-    /// Что «Живая карта» пускает от крон леса: листопад, снег, светлячков.
+    /// Что «Живая карта» пускает от крон леса: листопад, светлячков.
     pub fn particles(self) -> &'static str {
         match self {
             Season::Autumn => "leaves",
-            Season::Winter => "snow",
             Season::Magic => "fireflies",
-            Season::Summer | Season::Spring => "",
+            _ => "",
         }
+    }
+
+    /// Погода сцены Foundry: зимой свой снег Foundry.
+    pub fn weather(self) -> &'static str {
+        if self == Season::Winter { "snow" } else { "" }
     }
 }
 

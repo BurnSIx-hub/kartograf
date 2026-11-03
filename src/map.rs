@@ -896,9 +896,12 @@ pub struct Map {
     /// Сид, из которого карта сгенерирована; пусто — нарисована руками.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seed: String,
-    /// Частицы от крон в «Живой карте» (`leaves`, `snow`, `fireflies`); пусто — без них.
+    /// Частицы от крон в «Живой карте» (`leaves`, `fireflies`); пусто — без них.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub particles: String,
+    /// Погода сцены Foundry (`snow`); пусто — без погоды.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub weather: String,
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1035,6 +1038,7 @@ impl Map {
             format: FORMAT,
             seed: String::new(),
             particles: String::new(),
+            weather: String::new(),
             width,
             height,
             materials: builtin_materials(),
