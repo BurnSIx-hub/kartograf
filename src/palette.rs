@@ -91,7 +91,18 @@ const OBJECTS: &[Slot] = &[
     ("well", &[&["well"], &["колодец"]], &[]),
     ("plant_pot", &[&["plant", "pot"], &["potted"], &["plant"], &["растение"]], &["wall"]),
     ("bush", &[&["bush"], &["shrub"], &["куст"]], &["berry", "dead"]),
+    ("bush_summer", &[&["bush", "green"], &["bush", "multicolor1"]], &["berry", "dead"]),
+    ("bush_spring", &[&["berry", "bush", "green"], &["bush", "green"]], &["dead"]),
+    ("bush_autumn", &[&["bush", "red"], &["bush", "yellow"]], &["berry", "dead"]),
+    ("bush_magic", &[&["bush", "multicolor2"], &["bush", "multicolor3"]], &["berry", "dead"]),
     ("tree", &[&["tree"], &["oak"], &["pine"], &["дерево"]], &["dead", "stump", "fallen", "log", "palm"]),
+    // Времена года по цветам крон FA: Multicolor1 — оливковая зелень, 2 и 3 — бирюза с сиренью.
+    ("tree_summer", &[&["tree", "green"], &["tree", "multicolor1"], &["pine", "green"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
+    ("tree_spring", &[&["tree", "green"], &["pine", "green"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
+    ("tree_autumn", &[&["tree", "red"], &["tree", "yellow"], &["pine", "orange"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
+    ("tree_winter", &[&["pine", "green"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
+    ("tree_magic", &[&["tree", "multicolor2"], &["tree", "multicolor3"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
+    ("tree_bare", &[&["bare", "tree"]], &["shadow", "branch", "fallen"]),
     ("fountain", &[&["fountain"], &["фонтан"]], &[]),
     ("market_stall", &[&["stall"], &["market"], &["лавка"]], &[]),
     ("market_stall_blue", &[&["stall", "blue"], &["market", "blue"]], &[]),
@@ -193,6 +204,16 @@ const PREFER: &[(&str, &str)] = &[("bed", "arranged"), ("bed_double", "arranged"
 
 /// Близкие слоты: чем заменить, когда своего под слот нет.
 const NEAR: &[(&str, &str)] = &[
+    ("tree_summer", "tree"),
+    ("tree_spring", "tree"),
+    ("tree_autumn", "tree"),
+    ("tree_winter", "tree"),
+    ("tree_magic", "tree"),
+    ("tree_bare", "tree_winter"),
+    ("bush_summer", "bush"),
+    ("bush_spring", "bush"),
+    ("bush_autumn", "bush"),
+    ("bush_magic", "bush"),
     ("grass_dry", "grass_green"),
     ("grass_frost", "grass_green"),
     ("moss", "grass_green"),
@@ -357,6 +378,12 @@ impl Palette {
     /// Встроенный ассет слота — когда библиотека не в деле.
     pub fn builtin_pick(slot: &str) -> Pick {
         let key = format!("{}{slot}", library::BUILTIN);
+        // Встроенного под слот нет (дерево осени) — встроенный у близкого слота.
+        if library::builtin_size(&key).is_none()
+            && let Some(near) = NEAR.iter().find(|n| n.0 == slot)
+        {
+            return Self::builtin_pick(near.1);
+        }
         Pick { size: library::builtin_size(&key).unwrap_or([1.0, 1.0]), key, own: false, visible: None, turn: 0.0 }
     }
 
@@ -365,7 +392,8 @@ impl Palette {
     pub fn pick(&self, slot: &str) -> Pick {
         let near = NEAR.iter().find(|n| n.0 == slot).map(|n| n.1);
         let own = |s: &str| self.slots.get(s).filter(|v| !v.is_empty());
-        let Some(found) = own(slot).or_else(|| near.and_then(own)) else { return Self::builtin_pick(slot) };
+        let far = near.and_then(|n| NEAR.iter().find(|f| f.0 == n)).map(|f| f.1);
+        let Some(found) = own(slot).or_else(|| near.and_then(own)).or_else(|| far.and_then(own)) else { return Self::builtin_pick(slot) };
         let i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
         let (key, name) = &found[i];
         let size = *self.sizes.borrow_mut().entry(key.clone()).or_insert_with(|| {
@@ -504,6 +532,27 @@ mod tests {
         // Рама — не окно, и встроенному окну своя рама не нужна.
         assert!(!p.fits("window_wood", &assets[2].key));
         assert_eq!(p.window_frame("builtin:window_wood"), None);
+    }
+
+    #[test]
+    fn forest_seasons_pick_fa_colors() {
+        let assets = vec![
+            asset("Trees/Tree_Tops/Tree_Green_A1_6x6.webp", Kind::Object),
+            asset("Trees/Tree_Tops/Tree_Red_A1_6x6.webp", Kind::Object),
+            asset("Trees/Tree_Tops/Tree_Multicolor3_A1_6x6.webp", Kind::Object),
+            asset("Trees/Pine_Trees/Pine_Blue_A1_4x4.webp", Kind::Object),
+            asset("Trees/Bare_Trees/Bare_Tree_Dark_A1_8x9.webp", Kind::Object),
+            asset("Trees/Bare_Trees_Shadows/Bare_Tree_Shadow_Dark_A1_8x9.webp", Kind::Object),
+        ];
+        let p = Palette::from_library(&assets, Box::new(|_| None));
+        assert_eq!(p.keys("tree_summer"), vec![assets[0].key.clone()]);
+        assert_eq!(p.keys("tree_autumn"), vec![assets[1].key.clone()]);
+        assert_eq!(p.keys("tree_bare"), vec![assets[4].key.clone()]);
+        assert!(p.keys("tree_magic").contains(&assets[2].key) && p.keys("tree_winter") == vec![assets[3].key.clone()]);
+        // Весной своих нет — летние; встроенного осеннего нет — встроенное дерево.
+        assert_eq!(p.pick("tree_spring").key, assets[0].key);
+        assert_eq!(Palette::builtin_pick("tree_autumn").key, "builtin:tree");
+        assert_eq!(Palette::builtin_pick("tree_bare").key, "builtin:tree");
     }
 
     #[test]

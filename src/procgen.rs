@@ -11,7 +11,7 @@ use crate::library;
 use crate::map::{Label, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
 use crate::mask::{self, Brush, Mask, Shape};
 use crate::palette::{Palette, Pick};
-use crate::plan::{self, Assets, LinkKind, Mood, Plan, River, Role, Size, SizeName, OUTSIDE};
+use crate::plan::{self, Assets, LinkKind, Mood, Plan, River, Role, Season, Size, SizeName, OUTSIDE};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -123,19 +123,68 @@ impl Spots {
 
 /// Объект без проверки места: `pos` — центр холста.
 fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
-    drop_pick(m, &asset(name), pos, rot, scale);
-    // Слот дерева — лиственное (сухие и пни не берутся): своё тоже уходит в Foundry
-    // кроной над токенами, как встроенное.
-    if name == "tree"
-        && let Some(p) = m.props.last_mut()
-        && !crate::map::canopy_by_name(&p.asset)
-    {
+    let pick = asset(name);
+    // Голые деревья FA по 8–11 клеток — втрое больше кроны: без ужатия ветви
+    // накрывают весь зимний лес.
+    let scale = if name == "tree_bare" && pick.own { scale * (5.0 / pick.size[0].max(pick.size[1])).min(1.0) } else { scale };
+    drop_pick(m, &pick, pos, rot, scale);
+    let Some(p) = m.props.last_mut() else { return };
+    // Слот дерева — дерево (пни, бревна и пальмы не берутся): своё тоже уходит
+    // в Foundry кроной над токенами, как встроенное.
+    if name.starts_with("tree") && !crate::map::canopy_by_name(&p.asset) {
         p.canopy = Some(true);
+    }
+    // У встроенного дерева и куста одна картинка на все сезоны — подкрашиваем.
+    if !pick.own {
+        p.tint = season_tint(name);
+    }
+}
+
+/// Подкраска встроенного под время года: умножение, поэтому только темнее и в цвет.
+fn season_tint(slot: &str) -> Option<[u8; 3]> {
+    match slot.split_once('_').map(|(_, s)| s) {
+        Some("autumn") => Some([255, 150, 70]),
+        Some("spring") => Some([215, 255, 190]),
+        Some("winter" | "bare") => Some([120, 165, 185]),
+        Some("magic") => Some([130, 160, 255]),
+        _ => None,
+    }
+}
+
+/// Лес по времени года: земля, пятна на ней, подстилка под деревьями, кусты.
+struct ForestLook {
+    ground: &'static str,
+    patches: &'static str,
+    under: &'static str,
+    bush: &'static str,
+    /// Доля голых деревьев: зимой больше половины, ранней весной немного.
+    bare: f64,
+    /// Сколько кустов против летнего: зимой их почти нет.
+    brush: f32,
+}
+
+fn forest_look(season: Season) -> ForestLook {
+    match season {
+        Season::Summer => ForestLook { ground: "grass_green", patches: "grass_dry", under: "forest_floor", bush: "bush_summer", bare: 0.0, brush: 1.0 },
+        Season::Spring => ForestLook { ground: "grass_green", patches: "mud", under: "moss", bush: "bush_spring", bare: 0.15, brush: 1.2 },
+        Season::Autumn => ForestLook { ground: "grass_dry", patches: "forest_floor", under: "forest_floor", bush: "bush_autumn", bare: 0.1, brush: 1.0 },
+        Season::Winter => ForestLook { ground: "snow", patches: "grass_frost", under: "grass_frost", bush: "bush_summer", bare: 0.55, brush: 0.3 },
+        Season::Magic => ForestLook { ground: "moss", patches: "grass_green", under: "forest_floor", bush: "bush_magic", bare: 0.0, brush: 1.3 },
+    }
+}
+
+fn tree_slot(season: Season) -> &'static str {
+    match season {
+        Season::Summer => "tree_summer",
+        Season::Spring => "tree_spring",
+        Season::Autumn => "tree_autumn",
+        Season::Winter => "tree_winter",
+        Season::Magic => "tree_magic",
     }
 }
 
 fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
-    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None, layer: None });
+    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None });
 }
 
 /// Объект в свободные клетки, `x`, `y` — левый верхний угол занятого места.
@@ -907,9 +956,10 @@ fn stream(line: Vec<[f32; 2]>, water: usize, gravel: usize) -> (Path, Path) {
 
 fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let density = p.options.density;
+    let look = forest_look(p.options.season);
     let (w, h) = (m.width as f32, m.height as f32);
-    ground(m, "grass_green");
-    patches(m, rng, "grass_dry", (w * h / 60.0) as i32, (2.0, 4.5), 0.6);
+    ground(m, look.ground);
+    patches(m, rng, look.patches, (w * h / 60.0) as i32, (2.0, 4.5), 0.6);
     let (dirt, water, gravel) = (mat(m, "dirt"), mat(m, "water_shallow"), mat(m, "gravel"));
     let glade = 2.5 + w.min(h) * 0.08;
 
@@ -945,7 +995,7 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let line = trail.curve();
     let join = line.iter().copied().min_by(|a, b| (a[0] - camp[0]).hypot(a[1] - camp[1]).total_cmp(&(b[0] - camp[0]).hypot(b[1] - camp[1]))).unwrap_or(camp);
     let side_path = Path { points: road(rng, join, camp, 0.8), material: dirt, width: 1.1, soft: 0.6, rough: 0.3, along: false };
-    let floor = mat(m, "forest_floor");
+    let floor = mat(m, look.under);
     let bare = blobs(m, &[(camp, glade * 0.55)], 0.2, 0.6);
     m.paint(Layer::Floor, dirt, &bare);
     m.paths = match &water_paths {
@@ -971,12 +1021,12 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let shade = blobs(m, &under, 0.15, 0.8);
     m.paint(Layer::Floor, floor, &shade);
     // Сначала низкое, деревья последними: кроны накрывают камни и кусты, а не наоборот.
-    let brush = (w * h * (0.02 + density * 0.03)) as i32;
+    let brush = (w * h * (0.02 + density * 0.03) * look.brush) as i32;
     for _ in 0..brush {
         let q = [rng.random() as f32 * w, rng.random() as f32 * h];
         let clear_of_tree = trees.iter().all(|t| (t[0] - q[0]).hypot(t[1] - q[1]) > 1.4);
         if clear_of_tree && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
-            let n = pick(rng, &["bush", "bush", "bush", "boulder"]);
+            let n = pick(rng, &[look.bush, look.bush, look.bush, "boulder"]);
             drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.6);
         }
     }
@@ -998,7 +1048,8 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     }
     for &q in &trees {
         let (rot, scale) = (rng.int(0, 3) as f32 * 90.0, 0.8 + rng.random() as f32 * 0.5);
-        drop(m, "tree", q, rot, scale);
+        let slot = if rng.chance(look.bare) { "tree_bare" } else { tree_slot(p.options.season) };
+        drop(m, slot, q, rot, scale);
     }
     trees.len()
 }
@@ -2041,6 +2092,24 @@ mod tests {
             assert!(d.portals.iter().any(|p| p.kind == PortalKind::DoubleDoor));
             assert!(d.props.iter().any(|p| p.asset.ends_with("stairs")));
         }
+    }
+
+    #[test]
+    fn builtin_forest_follows_the_season() {
+        let mut p = Plan::random(&opt(Kind::Forest, "зима"), [40, 30]);
+        p.options.season = Season::Winter;
+        let mut m = Map::new(40, 30);
+        build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert!(m.materials.iter().any(|t| matches!(&t.paint, Paint::Texture(k) if k.ends_with("snow"))));
+        let trees: Vec<_> = m.props.iter().filter(|q| q.asset == "builtin:tree").collect();
+        assert!(!trees.is_empty() && trees.iter().all(|q| q.tint.is_some() && q.is_canopy()));
+        // Лето — как было: без подкраски.
+        let mut m = Map::new(40, 30);
+        build(&mut m, &Plan::random(&opt(Kind::Forest, "лето"), [40, 30]), 0, Palette::builtin()).unwrap();
+        assert!(m.props.iter().all(|q| q.tint.is_none()));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"season\":\"winter\""));
+        assert_eq!(Plan::from_json(&json.replace("winter", "зима")).unwrap().options.season, Season::Winter);
     }
 
     #[test]

@@ -332,6 +332,9 @@ pub struct Prop {
     /// Слой высоты, как в Dungeondraft: кто кого накрывает. `None` — по имени.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<i16>,
+    /// Подкраска картинки (умножением): встроенное дерево осенью, зимой, в магическом лесу.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tint: Option<[u8; 3]>,
 }
 
 /// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
@@ -890,6 +893,9 @@ pub struct Coat {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Map {
     pub format: u32,
+    /// Сид, из которого карта сгенерирована; пусто — нарисована руками.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seed: String,
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1024,6 +1030,7 @@ impl Map {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             format: FORMAT,
+            seed: String::new(),
             width,
             height,
             materials: builtin_materials(),
@@ -1573,7 +1580,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -1605,7 +1612,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();

@@ -85,11 +85,13 @@ pub struct Options {
     pub seed: String,
     /// Строить своими ассетами из библиотеки, а не встроенными.
     pub library: bool,
+    /// Лес: время года.
+    pub season: crate::plan::Season,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer }
     }
 }
 

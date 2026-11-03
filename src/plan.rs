@@ -332,6 +332,41 @@ impl River {
     }
 }
 
+/// Время года леса: какие деревья, кусты и земля.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Season {
+    #[default]
+    #[serde(alias = "лето")]
+    Summer,
+    #[serde(alias = "весна")]
+    Spring,
+    #[serde(alias = "осень")]
+    Autumn,
+    #[serde(alias = "зима")]
+    Winter,
+    #[serde(alias = "магический", alias = "магия")]
+    Magic,
+}
+
+impl Season {
+    pub const ALL: [Season; 5] = [Season::Summer, Season::Spring, Season::Autumn, Season::Winter, Season::Magic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Season::Summer => "Летний",
+            Season::Spring => "Весенний",
+            Season::Autumn => "Осенний",
+            Season::Winter => "Зимний",
+            Season::Magic => "Магический",
+        }
+    }
+
+    pub fn is_summer(&self) -> bool {
+        *self == Season::Summer
+    }
+}
+
 /// Настройки генератора; у каждого вида карты свои значимые.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Opts {
@@ -347,6 +382,9 @@ pub struct Opts {
     /// Подземелье: сторона комнаты от и до, в клетках, для комнат без своего размера.
     #[serde(default = "room_size")]
     pub room_size: [u32; 2],
+    /// Лес: время года.
+    #[serde(default, skip_serializing_if = "Season::is_summer")]
+    pub season: Season,
 }
 
 fn half() -> f32 {
@@ -367,7 +405,7 @@ fn room_size() -> [u32; 2] {
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10] }
+        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer }
     }
 }
 
@@ -460,7 +498,7 @@ impl Plan {
         plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
-        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)] };
+        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season };
         match opt.kind {
             Kind::Dungeon => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
             Kind::House | Kind::Tavern => {

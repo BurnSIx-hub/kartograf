@@ -401,6 +401,8 @@ pub struct App {
     window_bands: std::collections::HashMap<String, f32>,
     /// Библиотека показывает только то, что уже стоит на карте.
     used_only: bool,
+    /// Время года последнего леса: окно генератора открывается с ним.
+    gen_season: crate::plan::Season,
     pub door_asset: Option<String>,
     pub door_kind: PortalKind,
     pub door_width: f32,
@@ -545,6 +547,7 @@ impl App {
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
             window_bands: std::collections::HashMap::new(),
             used_only: false,
+            gen_season: crate::plan::Season::Summer,
             first_thumb: Rect::NOTHING,
             pending_plan: None,
             drawer_area: Rect::NOTHING,
@@ -1034,7 +1037,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -1098,7 +1101,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -1160,7 +1163,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -1297,6 +1300,8 @@ impl App {
         };
         match procgen::build(&mut self.map, plan, self.material, palette) {
             Ok(r) => {
+                // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
+                self.map.seed = plan.seed.clone();
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
                 Some(r)
@@ -1658,7 +1663,14 @@ impl App {
             let mut go = false;
             let dungeon = opt.kind == generate::Kind::Dungeon;
             let own_assets = self.library.assets.iter().any(|a| !a.is_builtin());
-            egui::Window::new(opt.kind.label()).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let map_seed = self.map.seed.clone();
+            egui::Window::new(opt.kind.label())
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
                 egui::Grid::new("gen").num_columns(2).show(ui, |ui| {
                     ui.label("Ассеты");
                     ui.horizontal(|ui| {
@@ -1672,18 +1684,20 @@ impl App {
                         }
                     });
                     ui.end_row();
+                    if opt.kind == generate::Kind::Forest {
+                        ui.label("Лес");
+                        ui.horizontal(|ui| {
+                            for s in crate::plan::Season::ALL {
+                                ui.selectable_value(&mut opt.season, s, s.label());
+                            }
+                        });
+                        ui.end_row();
+                    }
                     if !dungeon {
                         ui.label("Густота");
                         ui.add(egui::Slider::new(&mut opt.density, 0.0..=1.0));
                         ui.end_row();
-                        ui.label("Зерно");
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut opt.seed).desired_width(110.0));
-                            if ui.button("🎲").on_hover_text("Новое зерно").clicked() {
-                                opt.seed = generate::new_seed();
-                            }
-                        });
-                        ui.end_row();
+                        seed_rows(ui, &mut opt.seed, &map_seed);
                         return;
                     }
                     ui.label("Комнат");
@@ -1704,14 +1718,7 @@ impl App {
                     ui.label("Стены");
                     self.wall_combo(ui);
                     ui.end_row();
-                    ui.label("Зерно");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut opt.seed).desired_width(110.0));
-                        if ui.button("🎲").on_hover_text("Новое зерно").clicked() {
-                            opt.seed = generate::new_seed();
-                        }
-                    });
-                    ui.end_row();
+                    seed_rows(ui, &mut opt.seed, &map_seed);
                 });
                 if dungeon {
                     ui.checkbox(&mut opt.fill, "Двери и объекты");
@@ -1730,7 +1737,10 @@ impl App {
                     self.settings.gen_library = opt.library;
                     self.save_settings();
                 }
+                self.gen_season = opt.season;
                 self.generate(&opt);
+                // Карта построена — окно уходит; откроют снова — с новым сидом.
+                open = false;
             }
             if open {
                 self.generator = Some(opt);
@@ -1961,7 +1971,7 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, ..Default::default() });
+                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, ..Default::default() });
                     }
                 }
                 ui.separator();
@@ -3673,7 +3683,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -4393,7 +4403,8 @@ impl App {
                 let stump = Prop { asset, size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
             } else {
-                self.draw_prop(painter, canvas, prop, Color32::WHITE);
+                let tint = prop.tint.map_or(Color32::WHITE, |[r, g, b]| Color32::from_rgb(r, g, b));
+                self.draw_prop(painter, canvas, prop, tint);
             }
             if self.sel == Some(Sel::Prop(i)) {
                 let q: Vec<Pos2> = c.iter().map(|&p| cam.to_screen(canvas, p)).collect();
@@ -4714,17 +4725,28 @@ impl App {
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && p.is_canopy()) {
-                if !canopies.contains_key(&prop.asset) {
+                // Подкрашенная крона — свой файл: та же картинка в другом цвете.
+                let look = prop.tint.map_or_else(|| prop.asset.clone(), |t| format!("{}#{t:?}", prop.asset));
+                if !canopies.contains_key(&look) {
                     let bytes = self.textures.bytes(&prop.asset)?;
-                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
+                    let mut img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
+                    if let Some(t) = prop.tint {
+                        let mut rgba = img.to_rgba8();
+                        for p in rgba.pixels_mut() {
+                            for c in 0..3 {
+                                p[c] = (p[c] as u16 * t[c] as u16 / 255) as u8;
+                            }
+                        }
+                        img = image::DynamicImage::ImageRgba8(rgba);
+                    }
                     let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let file = e.dir.join(format!("{}_дерево_{}.webp", e.name, canopies.len() + 1));
                     std::fs::write(&file, export::webp_bytes(&img.to_rgba8(), 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
-                    canopies.insert(prop.asset.clone(), export::foundry_src(&file));
+                    canopies.insert(look.clone(), export::foundry_src(&file));
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
-                tiles.push(export::canopy_tile(canopies[&prop.asset].clone(), prop.pos, size, prop.rot, e.px));
+                tiles.push(export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px));
             }
             roof_tiles.push(tiles);
         }
@@ -4809,6 +4831,29 @@ impl eframe::App for App {
             test.feed(raw);
         }
     }
+}
+
+/// Строки сида в окне генератора: «Сид этой карты» — из чего построена открытая
+/// (только если её строили), «Сид» — для следующей.
+fn seed_rows(ui: &mut egui::Ui, seed: &mut String, this_map: &str) {
+    if !this_map.is_empty() {
+        ui.label("Сид этой карты");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut this_map.to_owned()).desired_width(110.0).interactive(false));
+            if ui.button("Взять").on_hover_text("Построить следующую карту с этим же сидом").clicked() {
+                *seed = this_map.to_owned();
+            }
+        });
+        ui.end_row();
+    }
+    ui.label("Сид");
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(seed).desired_width(110.0));
+        if ui.button("🎲").on_hover_text("Новый сид").clicked() {
+            *seed = generate::new_seed();
+        }
+    });
+    ui.end_row();
 }
 
 /// Оформление: графит и янтарь.
@@ -5201,7 +5246,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.
