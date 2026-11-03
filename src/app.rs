@@ -3546,11 +3546,8 @@ impl App {
         self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS);
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
-        // ложатся и на объекты у стены. Подоконники — под стенами.
+        // ложатся и на объекты у стены.
         let style = self.map.wall_style.clone();
-        for portal in self.map.portals.clone().iter().filter(|p| p.sill_under_wall()) {
-            self.draw_sill(painter, canvas, portal, style.width);
-        }
         let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
         for s in self.room_edges().to_vec() {
             let st = self.map.edge_look(map::edge_key(&s));
@@ -3841,20 +3838,12 @@ impl App {
         self.quad(painter, canvas, key, c, full, Color32::WHITE)
     }
 
-    /// Толщина холста подоконника поперёк стены: видимая доска — в полторы стены
-    /// (у FA так и есть: доска 0,375 клетки на стене в четверть).
+    /// Толщина холста подоконника поперёк стены: видимая доска — чуть толще стены,
+    /// как в Dungeondraft. Нарисована FA под свои стены, у нас они тоньше.
     fn sill_thick(&mut self, key: &str, wall_width: f32) -> f32 {
         let sources = &self.textures.sources;
         let band = *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or(1.0, |[_, t, _, b]| (b - t).max(0.05)));
-        wall_width * 1.5 / band
-    }
-
-    /// Подоконник по всей длине окна; стена ляжет на него сверху.
-    fn draw_sill(&mut self, painter: &egui::Painter, canvas: Rect, p: &Portal, wall_width: f32) {
-        if let Some(key) = p.asset.clone() {
-            let thick = self.sill_thick(&key, wall_width);
-            self.draw_across(painter, canvas, &key, p.a, p.b, Some(thick));
-        }
+        wall_width * 1.1 / band
     }
 
     /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
@@ -3867,12 +3856,11 @@ impl App {
         }
         let (ux, uy) = (dx / len, dy / len);
         let mid = p.center();
-        if p.sill_under_wall() {
-            // Подоконник уже под стеной (`draw_sill`); поверх стены — рама FA. Окно
-            // без картинки — светлой полосой поверх стены.
-            let thick = self.sill_thick(p.asset.as_deref().unwrap_or(""), wall_width);
-            let ready = p.asset.as_ref().is_some_and(|k| self.textures.get(k, false).is_some());
-            if !ready {
+        if p.own_window() {
+            // В разрезе стены подоконник FA и рама поверх, по всей длине проёма.
+            let key = p.asset.clone().unwrap_or_default();
+            let thick = self.sill_thick(&key, wall_width);
+            if !self.draw_across(painter, canvas, &key, p.a, p.b, Some(thick)) {
                 let (nx, ny) = (-uy * wall_width * 0.3, ux * wall_width * 0.3);
                 let q = [[p.a[0] + nx, p.a[1] + ny], [p.b[0] + nx, p.b[1] + ny], [p.b[0] - nx, p.b[1] - ny], [p.a[0] - nx, p.a[1] - ny]];
                 let q: Vec<Pos2> = q.iter().map(|&w| self.cam.to_screen(canvas, w)).collect();

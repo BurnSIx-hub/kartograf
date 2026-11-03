@@ -303,9 +303,9 @@ impl Portal {
         [(self.a[0] + self.b[0]) / 2.0, (self.a[1] + self.b[1]) / 2.0]
     }
 
-    /// Окно из паков: подоконник FA лежит под стеной, и стена его не прерывает,
-    /// как в Dungeondraft. Встроенное окно со стеклом — в разрезе стены.
-    pub fn sill_under_wall(&self) -> bool {
+    /// Окно из паков: подоконник FA и рама поверх, в толщину стены. Встроенное
+    /// окно со стеклом — в свою толщину.
+    pub fn own_window(&self) -> bool {
         self.kind == PortalKind::Window && self.asset.as_deref().is_some_and(|k| !k.starts_with(crate::library::BUILTIN))
     }
 }
@@ -826,7 +826,7 @@ pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
 /// на `grow` с каждой стороны — и стена встаёт в край проёма, а не заходит в него.
 /// Тайные ходы стену не рвут.
 pub fn cut_portals_wide(segs: &[Segment], portals: &[Portal], grow: f32) -> Vec<Segment> {
-    cut(segs, portals.iter().filter(|p| !p.kind.hidden() && !p.sill_under_wall()), grow)
+    cut(segs, portals.iter().filter(|p| !p.kind.hidden()), grow)
 }
 
 fn cut<'a>(segs: &[Segment], portals: impl Iterator<Item = &'a Portal>, grow: f32) -> Vec<Segment> {
