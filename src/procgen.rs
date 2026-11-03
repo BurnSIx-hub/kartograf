@@ -1,11 +1,50 @@
-//! Готовые карты из зерна: подземелье, пещера, лес, городской квартал, дом и таверна.
-//! Всё строится встроенными ассетами; одно зерно с теми же настройками и размером карты
-//! даёт одну и ту же карту.
+//! Готовые карты по плану (`plan.rs`): подземелье, пещера, лес, городской квартал,
+//! дом и таверна. План говорит, что и зачем, а здесь это превращается в пол, стены,
+//! двери, мебель, крыши и свет встроенными ассетами. Случайная карта идёт тем же
+//! путём: окно генератора пишет случайный план, строитель его исполняет.
+//!
+//! Один план с тем же зерном даёт одну и ту же карту: вся случайность — из `Rng`,
+//! порядок обхода везде постоянный.
 
-use crate::generate::{self, Kind, Options, Rng, Room};
+use crate::generate::{self, Corridor, Kind, Rng, Room};
 use crate::library;
-use crate::map::{self, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
+use crate::map::{Label, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
 use crate::mask::{self, Brush, Mask, Shape};
+use crate::palette::{Palette, Pick};
+use crate::plan::{self, Assets, LinkKind, Mood, Plan, River, Role, Size, SizeName, OUTSIDE};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+thread_local! {
+    /// Подбор ассетов на время постройки: помощники просят ассет по слоту и не
+    /// таскают лишний параметр. Ставится в `build`, снимается по его концу.
+    static PALETTE: RefCell<Option<Palette>> = const { RefCell::new(None) };
+}
+
+/// Снимает подбор, когда постройка кончилась — и при ошибке тоже.
+struct PaletteGuard;
+
+impl Drop for PaletteGuard {
+    fn drop(&mut self) {
+        PALETTE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// Ассет под слот: свой из библиотеки или встроенный.
+fn asset(slot: &str) -> Pick {
+    PALETTE.with(|p| match p.borrow().as_ref() {
+        Some(pal) => pal.pick(slot),
+        None => Palette::builtin_pick(slot),
+    })
+}
+
+/// Ключ объекта — ассет этого слота (свой или встроенный).
+fn fits(slot: &str, asset: &str) -> bool {
+    PALETTE.with(|p| match p.borrow().as_ref() {
+        Some(pal) => pal.fits(slot, asset),
+        None => asset == key(slot),
+    })
+}
 
 include!("prop_bounds.rs");
 
@@ -14,29 +53,35 @@ const FURNITURE: f32 = 1.35;
 /// Сколько от оси стены до предмета: половина её толщины.
 const WALL_GAP: f32 = 0.2;
 
+/// Что вышло: сколько главного (комнат, домов, деревьев) и что из плана не удалось.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Report {
+    pub count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Ключ встроенного ассета — для косяков, которые всегда встроенные.
 fn key(name: &str) -> String {
     format!("{}{name}", library::BUILTIN)
 }
 
 fn mat(m: &mut Map, name: &str) -> usize {
-    let k = key(name);
+    let k = asset(name).key;
     m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto }).unwrap_or(0)
 }
 
+/// Стена слота: картинка своя или встроенная, толщина — встроенной полосы.
 fn wall(name: &str) -> WallStyle {
-    let k = key(name);
-    let width = library::builtin_wall_width(&k).unwrap_or(0.35);
-    WallStyle { paint: Paint::Texture(k), width }
-}
-
-fn size(name: &str) -> [f32; 2] {
-    library::builtin_size(&key(name)).unwrap_or([1.0, 1.0])
+    let width = library::builtin_wall_width(&key(name)).unwrap_or(0.35);
+    WallStyle { paint: Paint::Texture(asset(name).key), width }
 }
 
 /// Видимый предмет от центра с учётом поворота на четверти: лево, верх, право, низ.
-fn bounds(name: &str, rot: f32, scale: f32) -> [f32; 4] {
-    let s = size(name);
-    let b = BOUNDS.iter().find(|t| t.0 == name).map_or([-s[0] / 2.0, -s[1] / 2.0, s[0] / 2.0, s[1] / 2.0], |t| t.1);
+/// У встроенных — по таблице, у своих — весь холст.
+fn bounds(p: &Pick, slot: &str, rot: f32, scale: f32) -> [f32; 4] {
+    let s = p.size;
+    let whole = [-s[0] / 2.0, -s[1] / 2.0, s[0] / 2.0, s[1] / 2.0];
+    let b = if p.own { whole } else { BOUNDS.iter().find(|t| t.0 == slot).map_or(whole, |t| t.1) };
     let [l, t, r, u] = b.map(|v| v * scale);
     match (rot / 90.0).round() as i32 % 4 {
         0 => [l, t, r, u],
@@ -78,27 +123,37 @@ impl Spots {
 
 /// Объект без проверки места: `pos` — центр холста.
 fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
-    m.props.push(Prop { asset: key(name), pos, size: size(name), rot, scale, shadow: None });
+    drop_pick(m, &asset(name), pos, rot, scale);
+}
+
+fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
+    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None });
 }
 
 /// Объект в свободные клетки, `x`, `y` — левый верхний угол занятого места.
 fn put(m: &mut Map, sp: &mut Spots, name: &str, x: i32, y: i32, rot: f32, scale: f32) -> bool {
-    let [l, t, r, u] = bounds(name, rot, scale);
+    put_pick(m, sp, &asset(name), name, x, y, rot, scale)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_pick(m: &mut Map, sp: &mut Spots, p: &Pick, slot: &str, x: i32, y: i32, rot: f32, scale: f32) -> bool {
+    let [l, t, r, u] = bounds(p, slot, rot, scale);
     let (fw, fh) = (cells_of(r - l), cells_of(u - t));
     if !sp.free(x, y, fw, fh) {
         return false;
     }
     sp.block(x, y, fw, fh);
-    drop(m, name, [x as f32 + fw as f32 / 2.0 - (l + r) / 2.0, y as f32 + fh as f32 / 2.0 - (t + u) / 2.0], rot, scale);
+    drop_pick(m, p, [x as f32 + fw as f32 / 2.0 - (l + r) / 2.0, y as f32 + fh as f32 / 2.0 - (t + u) / 2.0], rot, scale);
     true
 }
 
 /// Спиной вплотную к случайной стене комнаты; `corner` — ещё и боком к соседней.
 fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32, corner: bool) -> bool {
+    let p = asset(name);
     for _ in 0..40 {
         let side = rng.int(0, 3);
         let rot = side as f32 * 90.0;
-        let [left, top, right, low] = bounds(name, rot, scale);
+        let [left, top, right, low] = bounds(&p, name, rot, scale);
         let (fw, fh) = (cells_of(right - left), cells_of(low - top));
         if fw > r.w || fh > r.h {
             continue;
@@ -129,21 +184,22 @@ fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scal
         if y == hi_y && (side == 2 || corner) {
             pos[1] = (r.y + r.h) as f32 - WALL_GAP - low;
         }
-        drop(m, name, pos, rot, scale);
+        drop_pick(m, &p, pos, rot, scale);
         return true;
     }
     false
 }
 
 fn inside(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32) -> bool {
-    let [left, top, right, low] = bounds(name, 0.0, scale);
+    let p = asset(name);
+    let [left, top, right, low] = bounds(&p, name, 0.0, scale);
     let (fw, fh) = (cells_of(right - left), cells_of(low - top));
     if fw > r.w || fh > r.h {
         return false;
     }
     (0..16).any(|_| {
         let (x, y) = (rng.int(r.x, r.x + r.w - fw), rng.int(r.y, r.y + r.h - fh));
-        put(m, sp, name, x, y, 0.0, scale)
+        put_pick(m, sp, &p, name, x, y, 0.0, scale)
     })
 }
 
@@ -173,22 +229,6 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
     true
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Role {
-    Entrance,
-    Exit,
-    Treasure,
-    Shrine,
-    Barracks,
-    Storage,
-    Library,
-    Armoury,
-    Ruin,
-    Kitchen,
-    Bedroom,
-    Living,
-}
-
 fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
     let big = r.w.min(r.h) >= 6;
     let f = FURNITURE;
@@ -198,6 +238,7 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
         }
     }
     match role {
+        Role::Auto | Role::Empty => {}
         Role::Entrance => {
             by_wall(m, sp, rng, r, "brazier", 1.0, false);
             by_wall(m, sp, rng, r, "brazier", 1.0, false);
@@ -279,7 +320,7 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
                 put(m, sp, "rug_round", r.x + r.w / 2 - 1, r.y + r.h / 2 - 1, 0.0, 1.3);
             }
         }
-        Role::Living => {
+        Role::Hall | Role::Living => {
             by_wall(m, sp, rng, r, "fireplace", 1.0, false);
             by_wall(m, sp, rng, r, "bookshelf", 1.0, false);
             by_wall(m, sp, rng, r, "sofa", f, false);
@@ -292,12 +333,35 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
     }
 }
 
+/// Обязательные объекты комнаты из плана: чего в ней ещё нет — ставится у стены
+/// или внутри; что не влезло, уходит в предупреждения.
+fn wanted(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, names: &[String], who: &str, warn: &mut Vec<String>) {
+    for name in names {
+        let Some(id) = plan::object_id(name) else { continue };
+        let here = |p: &Prop| fits(id, &p.asset) && p.pos[0] >= r.x as f32 && p.pos[0] <= (r.x + r.w) as f32 && p.pos[1] >= r.y as f32 && p.pos[1] <= (r.y + r.h) as f32;
+        if m.props.iter().any(here) {
+            continue;
+        }
+        let s = Palette::builtin_pick(id).size;
+        let scale = if s[0].max(s[1]) >= 3.0 { 1.0 } else { FURNITURE };
+        if !by_wall(m, sp, rng, r, id, scale, false) && !inside(m, sp, rng, r, id, scale) && !inside(m, sp, rng, r, id, 1.0) {
+            warn.push(format!("{who}: объект «{}» не поместился", library::label(&key(id))));
+        }
+    }
+}
+
+/// Проём на стене с нужными створкой и косяком. Пустой проём остаётся с косяком,
+/// тайный ход — ничем не выдаёт себя.
 fn portal(a: [f32; 2], b: [f32; 2], kind: PortalKind, wood: bool) -> Portal {
     let style = if wood { "wood" } else { "stone" };
     let len = ((b[0] - a[0]).abs() + (b[1] - a[1]).abs()).round() as i32;
-    let asset = if kind == PortalKind::Window { format!("window_{style}") } else { "door_wood".to_owned() };
-    let frame = (kind != PortalKind::Window).then(|| key(&format!("frame_{style}_{}", len.clamp(1, 3))));
-    Portal { a, b, kind, asset: Some(key(&asset)), frame }
+    let asset = match kind {
+        PortalKind::Window => Some(asset(&format!("window_{style}")).key),
+        PortalKind::Door | PortalKind::DoubleDoor => Some(asset("door_wood").key),
+        PortalKind::Opening | PortalKind::Secret => None,
+    };
+    let frame = (!matches!(kind, PortalKind::Window | PortalKind::Secret)).then(|| key(&format!("frame_{style}_{}", len.clamp(1, 3))));
+    Portal { a, b, kind, asset, frame }
 }
 
 fn opening(a: [f32; 2], b: [f32; 2]) -> Portal {
@@ -311,21 +375,59 @@ pub fn dungeon_look(m: &mut Map) -> usize {
 }
 
 /// Вокруг помещений темно: скала не спорит с комнатами.
-fn dark_outside(m: &mut Map) {
+fn dark_outside(m: &mut Map, level: f32) {
     let dark: Vec<(usize, f32)> = m.rooms.data.iter().enumerate().filter(|(_, v)| **v < 128).map(|(i, _)| (i, 1.0)).collect();
-    m.shade_paint(&dark, 0.8);
+    m.shade_paint(&dark, level);
 }
 
-fn dungeon(m: &mut Map, opt: &Options, material: usize, rng: &mut Rng) -> usize {
-    let (mut cells, rooms) = generate::dungeon(m.width, m.height, opt);
+/// Подпись комнаты из плана — посередине неё.
+fn label(m: &mut Map, spec: &plan::RoomSpec, r: Room) {
+    if !spec.name.trim().is_empty() {
+        let mut l = Label::new(spec.name.trim().to_owned(), [r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0]);
+        l.size = 0.5;
+        m.labels.push(l);
+    }
+}
+
+/// Пределы ширины и высоты комнаты подземелья по плану.
+fn dungeon_room_size(sz: Size, lo: i32, hi: i32) -> ([i32; 2], [i32; 2]) {
+    let third = (hi - lo) / 3;
+    match sz {
+        Size::Cells([w, h]) => ([w as i32, h as i32], [w as i32, h as i32]),
+        Size::Named(SizeName::Small) => ([lo, lo], [lo + third, lo + third]),
+        Size::Named(SizeName::Medium) => ([lo, lo], [hi, hi]),
+        Size::Named(SizeName::Large) => ([hi - third, hi - third], [hi, hi]),
+    }
+}
+
+fn dungeon(m: &mut Map, p: &Plan, material: usize, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let (w, h) = (m.width as i32, m.height as i32);
+    let [lo, hi] = p.options.room_size;
+    let (lo, hi) = (lo.max(2) as i32, hi.max(lo.max(2)) as i32);
+    let sizes: Vec<_> = p.rooms.iter().map(|r| dungeon_room_size(r.size, lo, hi)).collect();
+    let links: Vec<(usize, usize)> = p.inner_links().filter_map(|l| Some((p.room_index(&l.from)?, p.room_index(&l.to)?))).collect();
+    let (mut cells, rooms, corridors) = generate::dungeon_with(m.width, m.height, &sizes, (!p.links.is_empty()).then_some(&links[..]), p.options.loops, &mut Rng::new(&p.seed));
+    let material = p.style.floor.as_deref().and_then(plan::texture_id).map_or(material, |t| mat(m, t));
+    if let Some(st) = p.style.walls.as_deref().and_then(plan::wall_id) {
+        m.wall_style = wall(st);
+    }
     ground(m, "rocky_ground");
+    // Безликая комната без связей — пожелание о числе комнат, а не требование.
+    for spec in p.rooms[rooms.len()..].iter().filter(|r| r.role != Role::Auto || !r.name.is_empty() || !r.objects.is_empty() || p.links.iter().any(|l| l.touches(&r.id))) {
+        warn.push(format!("комната «{}» не поместилась", spec.id));
+    }
     if rooms.is_empty() {
         return 0;
     }
     // Коридор в клетку при толстых стенах — щель: ширим до двух.
     let was = cells.clone();
     let in_room = |x: i32, y: i32| rooms.iter().any(|r| x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h);
+    let mut wide: Vec<Vec<bool>> = corridors.iter().map(|_| vec![false; cells.len()]).collect();
+    for (c, w2) in corridors.iter().zip(&mut wide) {
+        for &i in &c.cells {
+            w2[i] = true;
+        }
+    }
     for y in 0..h - 1 {
         for x in 0..w - 1 {
             if was[(y * w + x) as usize] && !in_room(x, y) {
@@ -335,9 +437,22 @@ fn dungeon(m: &mut Map, opt: &Options, material: usize, rng: &mut Rng) -> usize 
             }
         }
     }
-    // Вход — ворота на краю карты: ближайшая к краю комната получает ход наружу.
+    for (c, w2) in corridors.iter().zip(&mut wide) {
+        for &i in &c.cells {
+            let (x, y) = (i as i32 % w, i as i32 / w);
+            if in_room(x, y) {
+                continue;
+            }
+            for (dx, dy) in [(1, 0), (0, 1), (1, 1)] {
+                if x + dx < w && y + dy < h {
+                    w2[((y + dy) * w + x + dx) as usize] = true;
+                }
+            }
+        }
+    }
+    // Вход — ворота на краю карты: комната входа по плану, иначе ближайшая к краю.
     let reach = |r: &Room| [r.y, r.x, h - r.y - r.h, w - r.x - r.w];
-    let first = (0..rooms.len()).min_by_key(|&i| *reach(&rooms[i]).iter().min().unwrap_or(&0)).unwrap_or(0);
+    let first = p.entrance().filter(|&i| i < rooms.len() && (p.rooms[i].role == Role::Entrance || p.links.iter().any(|l| l.touches(OUTSIDE)))).unwrap_or_else(|| (0..rooms.len()).min_by_key(|&i| *reach(&rooms[i]).iter().min().unwrap_or(&0)).unwrap_or(0));
     let r = rooms[first];
     let side = (0..4).min_by_key(|&s| reach(&r)[s]).unwrap_or(0);
     let (cx, cy) = r.center();
@@ -375,30 +490,53 @@ fn dungeon(m: &mut Map, opt: &Options, material: usize, rng: &mut Rng) -> usize 
         })
         .collect();
     m.paint(Layer::Rooms, material, &weights);
+    for (spec, r) in p.rooms.iter().zip(&rooms) {
+        if let Some(t) = spec.floor.as_deref().and_then(plan::texture_id) {
+            let t = mat(m, t);
+            m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(t));
+        }
+    }
     let edges = m.room_edges();
     m.sync_edge_looks(&edges);
-    dark_outside(m);
-    m.portals.push(portal(gate.0, gate.1, PortalKind::DoubleDoor, false));
-    if opt.fill {
-        furnish_dungeon(m, &cells, &rooms, first, rng);
+    dark_outside(m, if p.mood == Mood::Gloomy { 0.95 } else { 0.8 });
+    let gate_kind = p.links.iter().find(|l| l.touches(OUTSIDE)).map_or(LinkKind::DoubleDoor, |l| l.kind);
+    match gate_kind {
+        LinkKind::Opening => m.portals.push(opening(gate.0, gate.1)),
+        LinkKind::Secret => m.portals.push(portal(gate.0, gate.1, PortalKind::Secret, false)),
+        LinkKind::Door => m.portals.push(portal(gate.0, gate.1, PortalKind::Door, false)),
+        LinkKind::DoubleDoor | LinkKind::Bridge => m.portals.push(portal(gate.0, gate.1, PortalKind::DoubleDoor, false)),
+    }
+    for (spec, r) in p.rooms.iter().zip(&rooms) {
+        label(m, spec, *r);
+    }
+    if p.options.fill {
+        furnish_dungeon(m, &cells, &rooms, first, rng, p, &corridors, &wide, warn);
     }
     rooms.len()
 }
 
 /// Двери на входах коридоров, объекты по назначению комнат.
-fn furnish_dungeon(m: &mut Map, cells: &[bool], rooms: &[Room], first: usize, rng: &mut Rng) {
+#[allow(clippy::too_many_arguments)]
+fn furnish_dungeon(m: &mut Map, cells: &[bool], rooms: &[Room], first: usize, rng: &mut Rng, p: &Plan, corridors: &[Corridor], wide: &[Vec<bool>], warn: &mut Vec<String>) {
     let (w, h) = (m.width as i32, m.height as i32);
     let mut sp = Spots::new(m);
     let in_room = |x: i32, y: i32| rooms.iter().any(|r| x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h);
     let corridor = |x: i32, y: i32| x >= 0 && y >= 0 && x < w && y < h && cells[(y * w + x) as usize] && !in_room(x, y);
-    for r in rooms {
+    // Чей коридор выходит в эту клетку у комнаты `k` — и какой связью он задан.
+    let link_at = |k: usize, x: i32, y: i32| -> Option<LinkKind> {
+        let i = (y * w + x) as usize;
+        let c = corridors.iter().zip(wide).find(|(c, w2)| (c.a == k || c.b == k) && w2[i]).map(|(c, _)| c)?;
+        let (a, b) = (&p.rooms[c.a].id, &p.rooms[c.b].id);
+        p.links.iter().find(|l| (l.from == *a && l.to == *b) || (l.from == *b && l.to == *a)).map(|l| l.kind)
+    };
+    for (k, r) in rooms.iter().enumerate() {
         // Вход коридора — ровно две клетки у стены комнаты; шире — это уже не проём.
         let mut doors = Vec::new();
         for x in r.x..r.x + r.w {
             for (y, out, inner) in [(r.y, r.y - 1, r.y), (r.y + r.h, r.y + r.h, r.y + r.h - 1)] {
                 if corridor(x, out) && !corridor(x - 1, out) {
                     let pair = corridor(x + 1, out) && !corridor(x + 2, out);
-                    doors.push((pair, [x as f32, y as f32], [x as f32 + 2.0, y as f32], x, inner));
+                    doors.push((pair, [x as f32, y as f32], [x as f32 + 2.0, y as f32], x, inner, link_at(k, x, out)));
                 }
             }
         }
@@ -406,18 +544,29 @@ fn furnish_dungeon(m: &mut Map, cells: &[bool], rooms: &[Room], first: usize, rn
             for (x, out, inner) in [(r.x, r.x - 1, r.x), (r.x + r.w, r.x + r.w, r.x + r.w - 1)] {
                 if corridor(out, y) && !corridor(out, y - 1) {
                     let pair = corridor(out, y + 1) && !corridor(out, y + 2);
-                    doors.push((pair, [x as f32, y as f32], [x as f32, y as f32 + 2.0], inner, y));
+                    doors.push((pair, [x as f32, y as f32], [x as f32, y as f32 + 2.0], inner, y, link_at(k, out, y)));
                 }
             }
         }
-        for (pair, a, b, x, y) in doors {
+        for (pair, a, b, x, y, link) in doors {
             sp.block(x - 1, y - 1, 4, 4);
-            if pair && rng.chance(0.6) {
-                m.portals.push(portal(a, b, PortalKind::DoubleDoor, false));
+            let one = [if a[0] == b[0] { a[0] } else { a[0] + 1.0 }, if a[1] == b[1] { a[1] } else { a[1] + 1.0 }];
+            match link {
+                None => {
+                    if pair && rng.chance(0.6) {
+                        m.portals.push(portal(a, b, PortalKind::DoubleDoor, false));
+                    }
+                }
+                Some(LinkKind::Opening) => {}
+                Some(LinkKind::Secret) => m.portals.push(portal(a, if pair { b } else { one }, PortalKind::Secret, false)),
+                Some(LinkKind::DoubleDoor) if pair => m.portals.push(portal(a, b, PortalKind::DoubleDoor, false)),
+                Some(LinkKind::Door) if pair => m.portals.push(portal(a, b, PortalKind::DoubleDoor, false)),
+                Some(_) => m.portals.push(portal(a, one, PortalKind::Door, false)),
             }
         }
     }
     // Чем дальше от входа, тем важнее комната: в самой дальней лестница вниз, перед ней клад.
+    // Роли из плана главнее.
     let (ox, oy) = rooms[first].center();
     let mut order: Vec<usize> = (0..rooms.len()).collect();
     order.sort_by_key(|&i| {
@@ -425,18 +574,27 @@ fn furnish_dungeon(m: &mut Map, cells: &[bool], rooms: &[Room], first: usize, rn
         (x - ox).abs() + (y - oy).abs()
     });
     let last = order.len() - 1;
+    let has_exit = p.rooms.iter().any(|r| r.role == Role::Exit);
     for (k, &i) in order.iter().enumerate() {
-        let role = if k == 0 {
+        let given = p.rooms[i].role;
+        let role = if given != Role::Auto {
+            given
+        } else if k == 0 {
             Role::Entrance
-        } else if k == last {
+        } else if k == last && !has_exit {
             Role::Exit
-        } else if k + 1 == last {
+        } else if k + 1 == last && !has_exit {
             Role::Treasure
         } else {
             [Role::Shrine, Role::Barracks, Role::Storage, Role::Library, Role::Armoury, Role::Ruin, Role::Storage, Role::Ruin][rng.int(0, 7) as usize]
         };
         furnish(m, &mut sp, rng, rooms[i], role);
+        if p.mood == Mood::Abandoned {
+            furnish(m, &mut sp, rng, rooms[i], Role::Ruin);
+        }
+        wanted(m, &mut sp, rng, rooms[i], &p.rooms[i].objects, &format!("комната «{}»", p.rooms[i].id), warn);
     }
+    wanted(m, &mut sp, rng, rooms[first], &p.objects, "подземелье", warn);
 }
 
 /// Карта с чистого листа: палитра и вид стен остаются.
@@ -488,13 +646,41 @@ fn patches(m: &mut Map, rng: &mut Rng, name: &str, count: i32, r: (f32, f32), fl
     m.paint(Layer::Floor, g, &weights);
 }
 
-fn cave(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
+/// Объекты плана вокруг точки: по кругу, не ближе `keep` к тропам, на свободное место.
+fn around(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[String], c: [f32; 2], who: &str, avoid: &[Path], keep: f32, warn: &mut Vec<String>) {
+    for name in names {
+        let Some(id) = plan::object_id(name) else { continue };
+        let p = asset(id);
+        let [l, t, r, u] = bounds(&p, id, 0.0, 1.0);
+        let (fw, fh) = (cells_of(r - l), cells_of(u - t));
+        let mut done = false;
+        for _ in 0..60 {
+            let a = rng.random() as f32 * std::f32::consts::TAU;
+            let d = 1.5 + rng.random() as f32 * 4.0;
+            let (x, y) = ((c[0] + a.cos() * d - fw as f32 / 2.0).floor() as i32, (c[1] + a.sin() * d - fh as f32 / 2.0).floor() as i32);
+            let centre = [x as f32 + fw as f32 / 2.0, y as f32 + fh as f32 / 2.0];
+            if avoid.iter().any(|p| p.distance(centre) < keep) {
+                continue;
+            }
+            if put_pick(m, sp, &p, id, x, y, 0.0, 1.0) {
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            warn.push(format!("{who}: объект «{}» не поместился", library::label(&key(id))));
+        }
+    }
+}
+
+fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
+    let density = p.options.density;
     let (w, h) = (m.width as i32, m.height as i32);
     let at = |x: i32, y: i32| (y * w + x) as usize;
     let mut open = Vec::new();
     // Клеточный автомат: стены собираются в массивы, пустоты — в залы. Берём самую большую пустоту.
     for _ in 0..30 {
-        let fill = 0.5 + opt.density as f64 * 0.1;
+        let fill = 0.5 + density as f64 * 0.1;
         let mut c: Vec<bool> = (0..w * h).map(|i| i % w >= 2 && i % w < w - 2 && i / w >= 2 && i / w < h - 2 && rng.chance(fill)).collect();
         for _ in 0..5 {
             let was = c.clone();
@@ -563,14 +749,14 @@ fn cave(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     }
     let open: Vec<usize> = (0..cells.len()).filter(|&i| cells[i]).collect();
     let cell_pos = |i: usize| [(i as i32 % w) as f32 + 0.5, (i as i32 / w) as f32 + 0.5];
-    let floor = mat(m, "cave_floor");
+    let floor = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("cave_floor"));
     let spots: Vec<_> = open.iter().map(|&i| (cell_pos(i), 0.95)).collect();
     let weights = blobs(m, &spots, 0.8, 1.0);
     m.paint(Layer::Rooms, floor, &weights);
-    m.wall_style = wall("wall_cave");
+    m.wall_style = wall(p.style.walls.as_deref().and_then(plan::wall_id).unwrap_or("wall_cave"));
     let edges = m.room_edges();
     m.sync_edge_looks(&edges);
-    dark_outside(m);
+    dark_outside(m, if p.mood == Mood::Gloomy { 0.95 } else { 0.8 });
     m.portals = gates;
 
     // Внутренние клетки: от них до стены хотя бы две клетки.
@@ -614,7 +800,7 @@ fn cave(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
             sp.block(c[0] as i32 - 3, c[1] as i32 - 3, 7, 7);
         }
     }
-    let scatter = (open.len() as f32 * (0.03 + opt.density * 0.05)) as i32;
+    let scatter = (open.len() as f32 * (0.03 + density * 0.05)) as i32;
     for _ in 0..scatter {
         let i = open[rng.int(0, open.len() as i32 - 1) as usize] as i32;
         let n = pick(rng, &["boulder", "boulder", "rubble"]);
@@ -633,6 +819,9 @@ fn cave(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
         if let Some(f) = far {
             put(m, &mut sp, "chest", f as i32 % w, f as i32 / w, 0.0, 1.0);
         }
+        around(m, &mut sp, rng, &p.objects, [x as f32 + 0.5, y as f32 + 0.5], "пещера", &[], 0.0, warn);
+    } else if !p.objects.is_empty() {
+        warn.push("пещера: негде поставить объекты, нет глубины".into());
     }
     open.len()
 }
@@ -663,7 +852,15 @@ fn crossing(a: &Path, b: &Path) -> Option<([f32; 2], f32)> {
     })
 }
 
-fn forest(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
+/// Ручей с галечным берегом: две полосы по одной линии.
+fn stream(line: Vec<[f32; 2]>, water: usize, gravel: usize) -> (Path, Path) {
+    let bank = Path { points: line.clone(), material: gravel, width: 3.2, soft: 0.6, rough: 0.35, along: false };
+    let water = Path { points: line, material: water, width: 2.0, soft: 0.45, rough: 0.3, along: false };
+    (bank, water)
+}
+
+fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
+    let density = p.options.density;
     let (w, h) = (m.width as f32, m.height as f32);
     ground(m, "grass_green");
     patches(m, rng, "grass_dry", (w * h / 60.0) as i32, (2.0, 4.5), 0.6);
@@ -673,23 +870,30 @@ fn forest(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     let (left, right) = (h * (0.25 + rng.random() as f32 * 0.5), h * (0.25 + rng.random() as f32 * 0.5));
     let line = road(rng, [-1.0, left], [w + 1.0, right], h * 0.14);
     let trail = Path { points: line, material: dirt, width: 2.0, soft: 0.5, rough: 0.25, along: false };
-    let side = rng.chance(0.5);
-    let x = if side { w * 0.75 } else { w * 0.25 };
-    let (top, low) = (x + (rng.random() as f32 - 0.5) * w * 0.15, x + (rng.random() as f32 - 0.5) * w * 0.15);
-    let river = road(rng, [top, -1.0], [low, h + 1.0], w * 0.09);
-    let bank = Path { points: river.clone(), material: gravel, width: 3.2, soft: 0.6, rough: 0.35, along: false };
-    let stream = Path { points: river, material: water, width: 2.0, soft: 0.45, rough: 0.3, along: false };
+    // Ручей с севера на юг; план выбирает берег или убирает ручей вовсе.
+    let river = match p.river {
+        River::None => None,
+        River::East => Some(true),
+        River::West => Some(false),
+        _ => Some(rng.chance(0.5)),
+    };
+    let water_paths = river.map(|side| {
+        let x = if side { w * 0.75 } else { w * 0.25 };
+        let (top, low) = (x + (rng.random() as f32 - 0.5) * w * 0.15, x + (rng.random() as f32 - 0.5) * w * 0.15);
+        stream(road(rng, [top, -1.0], [low, h + 1.0], w * 0.09), water, gravel)
+    });
+    let near_water = |p: [f32; 2], d: f32| water_paths.as_ref().is_some_and(|(bank, _)| bank.distance(p) < d);
 
     // Лагерь в стороне от дороги и ручья, к нему идёт своя тропинка.
     let mut camp = [w / 2.0, h / 2.0];
     let mut best = f32::MIN;
     for _ in 0..200 {
-        let p = [w * (0.15 + rng.random() as f32 * 0.7), h * (0.15 + rng.random() as f32 * 0.7)];
-        let room = trail.distance(p).min(bank.distance(p));
+        let q = [w * (0.15 + rng.random() as f32 * 0.7), h * (0.15 + rng.random() as f32 * 0.7)];
+        let room = water_paths.as_ref().map_or(trail.distance(q), |(bank, _)| trail.distance(q).min(bank.distance(q)));
         let score = -(room - glade - 2.0).abs();
         if score > best {
             best = score;
-            camp = p;
+            camp = q;
         }
     }
     let line = trail.curve();
@@ -698,33 +902,36 @@ fn forest(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     let floor = mat(m, "forest_floor");
     let bare = blobs(m, &[(camp, glade * 0.55)], 0.2, 0.6);
     m.paint(Layer::Floor, dirt, &bare);
-    m.paths = vec![bank.clone(), stream.clone(), trail.clone(), side_path.clone()];
-    let bridge = crossing(&trail, &stream);
+    m.paths = match &water_paths {
+        Some((bank, water)) => vec![bank.clone(), water.clone(), trail.clone(), side_path.clone()],
+        None => vec![trail.clone(), side_path.clone()],
+    };
+    let bridge = water_paths.as_ref().and_then(|(_, water)| crossing(&trail, water));
 
     // Деревья дротиками: новое ставится, только если не лезет на тропу, ручей и соседей.
-    let spacing = 3.4 - opt.density * 1.5;
+    let spacing = 3.4 - density * 1.5;
     let mut trees: Vec<[f32; 2]> = Vec::new();
     let mut tries = (w * h * 3.0) as i32;
     while tries > 0 {
         tries -= 1;
-        let p = [rng.random() as f32 * w, rng.random() as f32 * h];
-        let far = |c: [f32; 2], d: f32| (c[0] - p[0]).hypot(c[1] - p[1]) >= d;
-        if !far(camp, glade + 1.0) || trail.distance(p) < 2.2 || side_path.distance(p) < 1.6 || bank.distance(p) < 2.6 || !trees.iter().all(|&t| far(t, spacing)) {
+        let q = [rng.random() as f32 * w, rng.random() as f32 * h];
+        let far = |c: [f32; 2], d: f32| (c[0] - q[0]).hypot(c[1] - q[1]) >= d;
+        if !far(camp, glade + 1.0) || trail.distance(q) < 2.2 || side_path.distance(q) < 1.6 || near_water(q, 2.6) || !trees.iter().all(|&t| far(t, spacing)) {
             continue;
         }
-        trees.push(p);
+        trees.push(q);
     }
     let under: Vec<_> = trees.iter().map(|&t| (t, 2.4)).collect();
     let shade = blobs(m, &under, 0.15, 0.8);
     m.paint(Layer::Floor, floor, &shade);
     // Сначала низкое, деревья последними: кроны накрывают камни и кусты, а не наоборот.
-    let brush = (w * h * (0.02 + opt.density * 0.03)) as i32;
+    let brush = (w * h * (0.02 + density * 0.03)) as i32;
     for _ in 0..brush {
-        let p = [rng.random() as f32 * w, rng.random() as f32 * h];
-        let clear_of_tree = trees.iter().all(|t| (t[0] - p[0]).hypot(t[1] - p[1]) > 1.4);
-        if clear_of_tree && trail.distance(p) > 1.5 && side_path.distance(p) > 1.2 && bank.distance(p) > 2.0 && (p[0] - camp[0]).hypot(p[1] - camp[1]) > glade * 0.7 {
+        let q = [rng.random() as f32 * w, rng.random() as f32 * h];
+        let clear_of_tree = trees.iter().all(|t| (t[0] - q[0]).hypot(t[1] - q[1]) > 1.4);
+        if clear_of_tree && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
             let n = pick(rng, &["bush", "bush", "bush", "boulder"]);
-            drop(m, n, p, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.6);
+            drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.6);
         }
     }
     drop(m, "campfire", camp, 0.0, 1.0);
@@ -734,15 +941,25 @@ fn forest(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     if let Some((at, angle)) = bridge {
         drop(m, "bridge", at, angle, 1.0);
     }
-    for &p in &trees {
+    if !p.objects.is_empty() {
+        let mut sp = Spots::new(m);
+        sp.block(camp[0] as i32 - 2, camp[1] as i32 - 2, 5, 5);
+        let avoid: Vec<Path> = m.paths.clone();
+        around(m, &mut sp, rng, &p.objects, camp, "лес", &avoid, 1.8, warn);
+    }
+    if p.mood == Mood::Abandoned {
+        abandon(m, rng, &[]);
+    }
+    for &q in &trees {
         let (rot, scale) = (rng.int(0, 3) as f32 * 90.0, 0.8 + rng.random() as f32 * 0.5);
-        drop(m, "tree", p, rot, scale);
+        drop(m, "tree", q, rot, scale);
     }
     trees.len()
 }
 
 /// Дом с крышей: комната, стены, дверь и окна на стороне `door` (0 — север, 1 — восток, 2 — юг, 3 — запад).
-fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32) {
+/// `look` — стены и крыша по плану; без него — случайные из набора.
+fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32, look: Option<(&str, &str)>) {
     const LOOKS: [(&str, &str, bool); 8] = [
         ("wall_timber", "roof_clay_red", true),
         ("wall_timber", "roof_thatch", true),
@@ -753,14 +970,17 @@ fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32) {
         ("wall_fieldstone", "roof_shingle", false),
         ("wall_wood", "roof_shingle", true),
     ];
-    let (st, roof, wood) = LOOKS[rng.int(0, LOOKS.len() as i32 - 1) as usize];
+    let (st, roof, wood) = match look {
+        Some((st, roof)) => (st, roof, !["stone", "brick", "cave", "dwarven", "drow", "metal"].iter().any(|s| st.contains(s))),
+        None => LOOKS[rng.int(0, LOOKS.len() as i32 - 1) as usize],
+    };
     let planks = mat(m, "wood_planks");
     m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(planks));
     let (ax, ay, bx, by) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
     sp.block(r.x, r.y, r.w, r.h);
     let own: Vec<_> = m.room_edges().into_iter().filter(|s| [s.0, s.1].iter().all(|p| p[0] >= ax && p[0] <= bx && p[1] >= ay && p[1] <= by)).collect();
     m.set_edge_look(&own, &wall(st));
-    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(r.h > r.w), overhang: 0.3 });
+    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: asset(roof).key, turn: u8::from(r.h > r.w), overhang: 0.3 });
 
     let along = if door % 2 == 0 { r.w } else { r.h };
     let at = rng.int(1, (along - 2).max(1));
@@ -861,7 +1081,8 @@ fn push_curb(m: &mut Map, run: &mut Vec<[f32; 2]>, material: usize) {
     run.clear();
 }
 
-fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
+fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
+    let density = p.options.density;
     let (w, h) = (m.width as i32, m.height as i32);
     ground(m, "dirt");
     patches(m, rng, "grass_green", w * h / 90, (1.2, 3.0), 0.75);
@@ -871,7 +1092,7 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     let mut todo = vec![Room { x: 0, y: 0, w, h }];
     let mut blocks = Vec::new();
     let mut streets: Vec<Room> = Vec::new();
-    let top = 12 + ((1.0 - opt.density) * 8.0) as i32;
+    let top = 12 + ((1.0 - density) * 8.0) as i32;
     while let Some(b) = todo.pop() {
         let wide = b.w >= b.h;
         let long = if wide { b.w } else { b.h };
@@ -909,7 +1130,7 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     let weights: Vec<(usize, f32)> = paved.data.iter().enumerate().filter(|(_, v)| **v > 0).map(|(i, _)| (i, 1.0)).collect();
     m.paint(Layer::Floor, cobble, &weights);
     if let Some(b) = middle {
-        let paving = mat(m, "flagstones");
+        let paving = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("flagstones"));
         m.paint_rect(Layer::Floor, (b.x, b.y), (b.x + b.w - 1, b.y + b.h - 1), Some(paving));
     }
     // Улица грязная: земля наползает с краёв, местами брусчатка стёрта.
@@ -926,9 +1147,10 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     if let Some(b) = middle {
         let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
         let centre = if b.w >= 9 && b.h >= 9 { "fountain" } else { "well" };
-        let s = size(centre)[0] as i32;
+        let c = asset(centre);
+        let s = c.size[0] as i32;
         let (ox, oy) = (rng.int(-1, 1), rng.int(-1, 1));
-        put(m, &mut sp, centre, cx - s / 2 + ox, cy - s / 2 + oy, 0.0, 1.0);
+        put_pick(m, &mut sp, &c, centre, cx - s / 2 + ox, cy - s / 2 + oy, 0.0, 1.0);
         for _ in 0..(b.w * b.h / 24).clamp(2, 5) {
             let n = pick(rng, &["market_stall", "market_stall_blue", "market_stall_ochre"]);
             by_wall(m, &mut sp, rng, b, n, 1.0, false);
@@ -942,7 +1164,14 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
         for (x, y) in [(b.x + 1, b.y + 1), (b.x + b.w - 2, b.y + b.h - 2)] {
             put(m, &mut sp, "street_lamp", x, y, 0.0, 0.7);
         }
+        wanted(m, &mut sp, rng, b, &p.objects, "площадь", warn);
+    } else if !p.objects.is_empty() {
+        warn.push("квартал: площади не вышло, объектам негде встать".into());
     }
+    let look = match (p.style.walls.as_deref().and_then(plan::wall_id), p.style.roof.as_deref().and_then(plan::roof_id)) {
+        (None, None) => None,
+        (st, roof) => Some((st.unwrap_or("wall_timber"), roof.unwrap_or("roof_clay_red"))),
+    };
     let mut count = 0;
     for b in blocks.iter().copied().filter(|b| Some(*b) != middle) {
         // Дома вдоль длинной стороны, лицом к улице; отступы и пустыри у всех разные.
@@ -977,7 +1206,7 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
                 let door = if edge { (outward + 2) % 4 } else { outward };
                 // Ряды одного квартала могут сойтись: дом на занятое место не встаёт.
                 if sp.free(r.x - 1, r.y - 1, r.w + 2, r.h + 2) {
-                    house(m, rng, &mut sp, r, door);
+                    house(m, rng, &mut sp, r, door, look);
                     count += 1;
                 }
                 t += len + rng.int(1, 3);
@@ -994,6 +1223,10 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
             inside(m, &mut sp, rng, b, n, 0.9);
         }
     }
+    if p.mood == Mood::Abandoned {
+        let houses: Vec<Room> = m.roofs.iter().map(|r| Room { x: r.a[0] as i32, y: r.a[1] as i32, w: (r.b[0] - r.a[0]) as i32, h: (r.b[1] - r.a[1]) as i32 }).collect();
+        abandon(m, rng, &houses);
+    }
     let edges = m.room_edges();
     let looks = std::mem::take(&mut m.edge_looks);
     m.sync_edge_looks(&edges);
@@ -1001,184 +1234,722 @@ fn town(m: &mut Map, opt: &Options, rng: &mut Rng) -> usize {
     count
 }
 
-fn interior(m: &mut Map, opt: &Options, rng: &mut Rng, tavern: bool) -> usize {
+// ----- дом и таверна по плану -----
+
+/// Вес комнаты при делении дома: во сколько раз она больше кладовой.
+fn room_weight(spec: &plan::RoomSpec, tavern: bool) -> f32 {
+    let base = match spec.role {
+        Role::Hall | Role::Living => {
+            if tavern {
+                6.0
+            } else {
+                4.0
+            }
+        }
+        Role::Barracks => 3.0,
+        Role::Kitchen | Role::Bedroom | Role::Library | Role::Shrine | Role::Armoury | Role::Ruin | Role::Entrance | Role::Auto => 2.0,
+        Role::Treasure | Role::Exit | Role::Empty => 1.5,
+        Role::Storage => 1.2,
+    };
+    base * spec.size.weight()
+}
+
+/// Обход комнат от входа по связям: соседи по плану идут рядом и в раскладке
+/// оказываются рядом. Кто не связан — в конце, по порядку плана.
+fn bfs_order(n: usize, start: usize, graph: &BTreeMap<usize, Vec<usize>>) -> Vec<usize> {
+    let mut seen = vec![false; n];
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([start]);
+    seen[start] = true;
+    while let Some(i) = queue.pop_front() {
+        out.push(i);
+        if let Some(ns) = graph.get(&i) {
+            for &j in ns {
+                if !seen[j] {
+                    seen[j] = true;
+                    queue.push_back(j);
+                }
+            }
+        }
+    }
+    out.extend((0..n).filter(|&i| !seen[i]));
+    out
+}
+
+fn shuffle(v: &mut [usize], rng: &mut Rng) {
+    for i in (1..v.len()).rev() {
+        let j = rng.int(0, i as i32) as usize;
+        v.swap(i, j);
+    }
+}
+
+/// Деление прямоугольника дома между комнатами по весам: группа комнат делится
+/// надвое поперёк длинной стороны, каждая половина — дальше. Первые в списке
+/// ложатся слева и сверху. Меньше четырёх клеток по стороне не бывает; кому не
+/// хватило места, остаётся без комнаты.
+fn slice(r: Room, items: &[usize], w: &[f32], out: &mut [Option<Room>], rng: &mut Rng) {
+    const MIN: i32 = 4;
+    if items.len() == 1 {
+        out[items[0]] = Some(r);
+        return;
+    }
+    let total: f32 = items.iter().map(|&i| w[i]).sum::<f32>().max(1e-3);
+    let (mut k, mut acc, mut best) = (1, 0.0f32, f32::MAX);
+    for c in 1..items.len() {
+        acc += w[items[c - 1]];
+        let d = (acc / total - 0.5).abs();
+        if d < best {
+            best = d;
+            k = c;
+        }
+    }
+    let f = items[..k].iter().map(|&i| w[i]).sum::<f32>() / total;
+    let mut vertical = r.w >= r.h;
+    if (if vertical { r.w } else { r.h }) < 2 * MIN {
+        vertical = !vertical;
+    }
+    let long = if vertical { r.w } else { r.h };
+    if long < 2 * MIN {
+        out[items[0]] = Some(r);
+        return;
+    }
+    let cut = ((long as f32 * f).round() as i32 + rng.int(-1, 1)).clamp(MIN, long - MIN);
+    let (p, q) = if vertical { (Room { w: cut, ..r }, Room { x: r.x + cut, w: r.w - cut, ..r }) } else { (Room { h: cut, ..r }, Room { y: r.y + cut, h: r.h - cut, ..r }) };
+    slice(p, &items[..k], w, out, rng);
+    slice(q, &items[k..], w, out, rng);
+}
+
+/// Общая стена двух комнат: отрезок по узлам сетки, концы по возрастанию. Касание углом не считается.
+fn shared(a: Room, b: Room) -> Option<Segment> {
+    if a.x + a.w == b.x || b.x + b.w == a.x {
+        let x = if a.x + a.w == b.x { b.x } else { a.x } as f32;
+        let (y0, y1) = (a.y.max(b.y), (a.y + a.h).min(b.y + b.h));
+        if y1 - y0 >= 1 {
+            return Some(([x, y0 as f32], [x, y1 as f32]));
+        }
+    }
+    if a.y + a.h == b.y || b.y + b.h == a.y {
+        let y = if a.y + a.h == b.y { b.y } else { a.y } as f32;
+        let (x0, x1) = (a.x.max(b.x), (a.x + a.w).min(b.x + b.w));
+        if x1 - x0 >= 1 {
+            return Some(([x0 as f32, y], [x1 as f32, y]));
+        }
+    }
+    None
+}
+
+fn seg_len(s: &Segment) -> i32 {
+    ((s.1[0] - s.0[0]).abs() + (s.1[1] - s.0[1]).abs()).round() as i32
+}
+
+/// Насколько раскладка отвечает плану: сошедшиеся связи, размеры, вход у южной стены.
+fn layout_score(p: &Plan, rooms: &[Option<Room>], building: Room, start: usize) -> f32 {
+    let mut s = 0.0;
+    for l in p.inner_links() {
+        if let (Some(a), Some(b)) = (p.room_index(&l.from), p.room_index(&l.to))
+            && let (Some(ra), Some(rb)) = (rooms[a], rooms[b])
+            && let Some(seg) = shared(ra, rb)
+        {
+            let need = if l.kind == LinkKind::DoubleDoor { 2 } else { 1 };
+            if seg_len(&seg) >= need {
+                s += 10.0;
+            }
+        }
+    }
+    for (i, spec) in p.rooms.iter().enumerate() {
+        if let (Size::Cells([cw, ch]), Some(r)) = (spec.size, rooms[i]) {
+            s -= ((r.w * r.h) as f32 - (cw * ch) as f32).abs() / (cw * ch) as f32 * 3.0;
+        }
+    }
+    if let Some(r) = rooms[start]
+        && r.y + r.h == building.y + building.h
+    {
+        s += 2.0;
+    }
+    s - rooms.iter().filter(|r| r.is_none()).count() as f32 * 50.0
+}
+
+/// Место для двери на стене `seg` шириной `width` клеток: не у самого угла и не там,
+/// где в стену упирается поперечная (`corners` — такие точки вдоль стены), и не на
+/// уже занятом куске. Без хорошего места — посередине.
+fn door_spot(seg: Segment, width: i32, corners: &[i32], taken: &[(i32, i32)], rng: &mut Rng) -> Option<(i32, i32)> {
+    let vertical = seg.0[0] == seg.1[0];
+    let (s, e) = if vertical { (seg.0[1] as i32, seg.1[1] as i32) } else { (seg.0[0] as i32, seg.1[0] as i32) };
+    if e - s < width {
+        return None;
+    }
+    let free = |t: i32| !taken.iter().any(|&(a, b)| t < b + 1 && t + width > a - 1);
+    let good: Vec<i32> = (s + 1..=e - width - 1).filter(|&t| free(t) && !corners.iter().any(|&c| t - 1 < c && c < t + width + 1)).collect();
+    if !good.is_empty() {
+        let t = good[rng.int(0, good.len() as i32 - 1) as usize];
+        return Some((t, t + width));
+    }
+    let t = s + (e - s - width) / 2;
+    free(t).then_some((t, t + width))
+}
+
+/// Проём на стене между `from` и `to` вдоль неё.
+fn along(seg: Segment, from: i32, to: i32) -> ([f32; 2], [f32; 2]) {
+    if seg.0[0] == seg.1[0] { ([seg.0[0], from as f32], [seg.0[0], to as f32]) } else { ([from as f32, seg.0[1]], [to as f32, seg.0[1]]) }
+}
+
+/// Внешние стены комнаты в доме: сторона (0 — север, 1 — восток, 2 — юг, 3 — запад) и отрезок.
+fn outer_sides(r: Room, b: Room) -> Vec<(i32, Segment)> {
+    let (ax, ay, bx, by) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
+    let mut out = Vec::new();
+    if r.y == b.y {
+        out.push((0, ([ax, ay], [bx, ay])));
+    }
+    if r.x + r.w == b.x + b.w {
+        out.push((1, ([bx, ay], [bx, by])));
+    }
+    if r.y + r.h == b.y + b.h {
+        out.push((2, ([ax, by], [bx, by])));
+    }
+    if r.x == b.x {
+        out.push((3, ([ax, ay], [ax, by])));
+    }
+    out
+}
+
+/// Запустение: обломки и валуны там, где нет комнат.
+fn abandon(m: &mut Map, rng: &mut Rng, rooms: &[Room]) {
+    let (w, h) = (m.width as f32, m.height as f32);
+    for _ in 0..((w * h) / 70.0) as i32 {
+        let q = [rng.random() as f32 * w, rng.random() as f32 * h];
+        let inside = rooms.iter().any(|r| q[0] >= r.x as f32 - 1.0 && q[0] <= (r.x + r.w) as f32 + 1.0 && q[1] >= r.y as f32 - 1.0 && q[1] <= (r.y + r.h) as f32 + 1.0);
+        if !inside && m.paths.iter().all(|p| p.distance(q) > 1.0) {
+            let n = pick(rng, &["rubble", "rubble", "boulder"]);
+            drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.5);
+        }
+    }
+}
+
+fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
+    let tavern = p.kind == Kind::Tavern;
     let (w, h) = (m.width as i32, m.height as i32);
     ground(m, "grass_green");
     patches(m, rng, "grass_dry", w * h / 60, (2.0, 4.0), 0.6);
-    // Здание не растёт вместе с картой: дом на 40 клеток — это уже не дом.
-    let (max_w, max_h) = if tavern { (28, 22) } else { (18, 14) };
-    let (bw, bh) = (((w as f32 * 0.8) as i32).min(max_w).clamp(6, (w - 2).max(6)), ((h as f32 * 0.7) as i32).min(max_h).clamp(6, (h - 4).max(6)));
+    let (bw, bh) = plan::building_size(p.kind, m.width, m.height);
     let building = Room { x: (w - bw) / 2, y: ((h - bh) / 2 - 1).max(0), w: bw, h: bh };
-    let planks = mat(m, "wood_planks");
+    let planks = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("wood_planks"));
     m.paint_rect(Layer::Rooms, (building.x, building.y), (building.x + bw - 1, building.y + bh - 1), Some(planks));
-    let outer = if tavern { wall("wall_timber") } else { wall(pick(rng, &["wall_timber", "wall_fieldstone", "wall_brick"])) };
+    let outer = match p.style.walls.as_deref().and_then(plan::wall_id) {
+        Some(st) => wall(st),
+        None if tavern => wall("wall_timber"),
+        None => wall(pick(rng, &["wall_timber", "wall_fieldstone", "wall_brick"])),
+    };
     let wood = !matches!(&outer.paint, Paint::Texture(k) if k.ends_with("fieldstone"));
     m.wall_style = outer.clone();
     let edges = m.room_edges();
     m.sync_edge_looks(&edges);
     let inner = WallStyle { width: outer.width * 0.8, ..outer };
 
-    // Дом режется перегородками; в каждой дверь, новые перегородки в двери не упираются.
-    let area = 30 + ((1.0 - opt.density) * 36.0) as i32;
-    let mut todo = vec![building];
-    let mut rooms: Vec<Room> = Vec::new();
-    let mut doors: Vec<[f32; 2]> = Vec::new();
-    while let Some(r) = todo.pop() {
-        // В таверне зал во всю высоту дома: первая перегородка отрезает меньшую долю и зал больше не делится.
-        let first = rooms.is_empty() && todo.is_empty() && tavern;
-        let tall = r.h > r.w && !first;
-        let long = if tall { r.h } else { r.w };
-        if long < 9 || r.w * r.h <= area + rng.int(0, 14) {
-            rooms.push(r);
-            continue;
+    // Раскладка: комнаты от входа по связям, несколько попыток с перестановками,
+    // лучшая — где сошлось больше связей.
+    let n = p.rooms.len();
+    let weights: Vec<f32> = p.rooms.iter().map(|s| room_weight(s, tavern)).collect();
+    let graph = plan::adjacency(p);
+    let start = p.entrance().unwrap_or(0);
+    let order = bfs_order(n, start, &graph);
+    let mut best: Option<(f32, Vec<Option<Room>>)> = None;
+    for attempt in 0..24 {
+        let mut ord = order.clone();
+        if attempt > 0 {
+            shuffle(&mut ord, rng);
         }
-        let (lo, hi) = if first { (long * 3 / 5, long * 7 / 10) } else { (4, long - 4) };
-        let free: Vec<i32> = (lo..=hi)
-            .filter(|c| {
-                let line = if tall { r.y + c } else { r.x + c } as f32;
-                let (x0, y0, x1, y1) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
-                let here = |d: &&[f32; 2]| d[0] >= x0 - 0.6 && d[0] <= x1 + 0.6 && d[1] >= y0 - 0.6 && d[1] <= y1 + 0.6;
-                !doors.iter().filter(here).any(|d| (if tall { d[1] } else { d[0] } - line).abs() < 2.1)
-            })
-            .collect();
-        if free.is_empty() {
-            rooms.push(r);
-            continue;
+        let mut rooms = vec![None; n];
+        slice(building, &ord, &weights, &mut rooms, rng);
+        let score = layout_score(p, &rooms, building, start);
+        if best.as_ref().is_none_or(|b| score > b.0 + 1e-6) {
+            best = Some((score, rooms));
         }
-        let cut = free[rng.int(0, free.len() as i32 - 1) as usize];
-        let (a, b, p, q) = if tall {
-            let y = (r.y + cut) as f32;
-            ([r.x as f32, y], [(r.x + r.w) as f32, y], Room { h: cut, ..r }, Room { y: r.y + cut, h: r.h - cut, ..r })
-        } else {
-            let x = (r.x + cut) as f32;
-            ([x, r.y as f32], [x, (r.y + r.h) as f32], Room { w: cut, ..r }, Room { x: r.x + cut, w: r.w - cut, ..r })
-        };
-        m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(inner.clone()) });
-        // Дверь не прижата к углу: косяк шире проёма и иначе уходит в поперечную стену.
-        let span = if tall { r.w } else { r.h };
-        let t = rng.int(2, (span - 3).max(2)) as f32;
-        let (da, db) = if tall { ([a[0] + t, a[1]], [a[0] + t + 1.0, a[1]]) } else { ([a[0], a[1] + t], [a[0], a[1] + t + 1.0]) };
-        m.portals.push(portal(da, db, PortalKind::Door, true));
-        doors.push([(da[0] + db[0]) / 2.0, (da[1] + db[1]) / 2.0]);
-        if first {
-            rooms.push(p);
-        } else {
-            todo.push(p);
+    }
+    let laid = best.map(|b| b.1).unwrap_or_default();
+    for (spec, r) in p.rooms.iter().zip(&laid) {
+        if r.is_none() {
+            warn.push(format!("комната «{}» не поместилась в дом {bw}×{bh}", spec.id));
         }
-        todo.push(q);
+    }
+    let placed: Vec<(usize, Room)> = laid.iter().enumerate().filter_map(|(i, r)| r.map(|r| (i, r))).collect();
+    if placed.is_empty() {
+        return 0;
     }
 
-    // Зал — самая большая комната у южной стены: через неё вход.
-    let south = building.y + building.h;
-    let hall = (0..rooms.len()).filter(|&i| rooms[i].y + rooms[i].h == south).max_by_key(|&i| rooms[i].w * rooms[i].h).unwrap_or(0);
+    // Перегородки: общие стены соседей, слитые в прямые линии.
+    let mut lines: BTreeMap<(bool, i32), Vec<(i32, i32)>> = BTreeMap::new();
+    let mut corners: BTreeMap<(bool, i32), Vec<i32>> = BTreeMap::new();
+    for &(_, r) in &placed {
+        for (vertical, c, along_c) in [(true, r.x, r.y), (true, r.x + r.w, r.y), (false, r.y, r.x), (false, r.y + r.h, r.x)] {
+            let ends = if vertical { [along_c, along_c + r.h] } else { [along_c, along_c + r.w] };
+            corners.entry((vertical, c)).or_default().extend(ends);
+        }
+    }
+    for (k, &(_, a)) in placed.iter().enumerate() {
+        for &(_, b) in &placed[k + 1..] {
+            if let Some(seg) = shared(a, b) {
+                let vertical = seg.0[0] == seg.1[0];
+                let (c, s, e) = if vertical { (seg.0[0] as i32, seg.0[1] as i32, seg.1[1] as i32) } else { (seg.0[1] as i32, seg.0[0] as i32, seg.1[0] as i32) };
+                lines.entry((vertical, c)).or_default().push((s, e));
+            }
+        }
+    }
+    for (&(vertical, c), iv) in &mut lines {
+        iv.sort();
+        let mut merged: Vec<(i32, i32)> = Vec::new();
+        for &(s, e) in iv.iter() {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        for (s, e) in merged {
+            let (a, b) = if vertical { ([c as f32, s as f32], [c as f32, e as f32]) } else { ([s as f32, c as f32], [e as f32, c as f32]) };
+            m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(inner.clone()) });
+        }
+    }
+
+    // Двери по связям; занятые куски стен — чтобы двери не легли друг на друга.
+    let mut taken: BTreeMap<(bool, i32), Vec<(i32, i32)>> = BTreeMap::new();
+    let mut door_at: Vec<[f32; 2]> = Vec::new();
+    // Дверь между комнатами: кто с кем уже соединён.
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    let room_of = |i: usize| laid[i];
+    let place_door = |m: &mut Map, rng: &mut Rng, a: usize, b: usize, kind: LinkKind, taken: &mut BTreeMap<(bool, i32), Vec<(i32, i32)>>, door_at: &mut Vec<[f32; 2]>| -> Result<(), String> {
+        let (Some(ra), Some(rb)) = (room_of(a), room_of(b)) else { return Err("комната не поместилась".into()) };
+        let Some(seg) = shared(ra, rb) else { return Err("комнаты не смежны".into()) };
+        let vertical = seg.0[0] == seg.1[0];
+        let line = (vertical, if vertical { seg.0[0] } else { seg.0[1] } as i32);
+        let width = match kind {
+            LinkKind::DoubleDoor | LinkKind::Opening if seg_len(&seg) >= 4 => 2,
+            _ => 1,
+        };
+        let (no_corners, no_taken) = (Vec::new(), Vec::new());
+        let (s, e) = door_spot(seg, width, corners.get(&line).unwrap_or(&no_corners), taken.get(&line).unwrap_or(&no_taken), rng).ok_or("на общей стене нет места")?;
+        taken.entry(line).or_default().push((s, e));
+        let (da, db) = along(seg, s, e);
+        let pk = match kind {
+            LinkKind::Door => PortalKind::Door,
+            LinkKind::DoubleDoor if width == 2 => PortalKind::DoubleDoor,
+            LinkKind::DoubleDoor | LinkKind::Bridge => PortalKind::Door,
+            LinkKind::Opening => PortalKind::Opening,
+            LinkKind::Secret => PortalKind::Secret,
+        };
+        m.portals.push(portal(da, db, pk, true));
+        door_at.push([(da[0] + db[0]) / 2.0, (da[1] + db[1]) / 2.0]);
+        Ok(())
+    };
+    for l in p.inner_links() {
+        let (Some(a), Some(b)) = (p.room_index(&l.from), p.room_index(&l.to)) else { continue };
+        if l.kind == LinkKind::Bridge {
+            warn.push(format!("связь «{}» — «{}»: мост внутри дома — обычная дверь", l.from, l.to));
+        }
+        match place_door(m, rng, a, b, l.kind, &mut taken, &mut door_at) {
+            Ok(()) => joined.push((a, b)),
+            Err(why) => warn.push(format!("связь «{}» — «{}» ({}) не поставлена: {why}", l.from, l.to, l.kind.label())),
+        }
+    }
+    // Проходимость: до каждой комнаты должно быть как дойти. Куда дверей не хватило,
+    // они добавляются по смежности — от уже достижимых комнат.
+    let mut reach = vec![false; n];
+    reach[start] = room_of(start).is_some();
+    if !reach[start] && let Some(&(i, _)) = placed.first() {
+        reach[i] = true;
+    }
+    loop {
+        let mut grew = false;
+        for &(a, b) in &joined {
+            if reach[a] != reach[b] {
+                reach[a] = true;
+                reach[b] = true;
+                grew = true;
+            }
+        }
+        if grew {
+            continue;
+        }
+        let Some(&(i, ri)) = placed.iter().find(|(i, _)| !reach[*i]) else { break };
+        // Сосед среди достижимых с самой длинной общей стеной.
+        let near = placed.iter().filter(|(j, rj)| reach[*j] && shared(ri, *rj).is_some()).max_by_key(|(_, rj)| shared(ri, *rj).map_or(0, |s| seg_len(&s))).map(|(j, _)| *j);
+        let Some(j) = near else {
+            warn.push(format!("комната «{}» отрезана от остальных", p.rooms[i].id));
+            reach[i] = true;
+            continue;
+        };
+        match place_door(m, rng, i, j, LinkKind::Door, &mut taken, &mut door_at) {
+            Ok(()) => {
+                if p.inner_links().next().is_some() {
+                    warn.push(format!("комната «{}»: добавлена дверь в «{}», иначе не пройти", p.rooms[i].id, p.rooms[j].id));
+                }
+                joined.push((i, j));
+            }
+            Err(why) => {
+                warn.push(format!("комната «{}»: не удалось поставить дверь в «{}»: {why}", p.rooms[i].id, p.rooms[j].id));
+                reach[i] = true;
+            }
+        }
+    }
+
+    // Входы: связи с улицей; без них — зал (или первая комната) с юга.
+    let mut outs: Vec<(usize, Option<LinkKind>)> = p.links.iter().filter(|l| l.touches(OUTSIDE)).filter_map(|l| Some((p.room_index(l.other(OUTSIDE))?, Some(l.kind)))).collect();
+    if outs.is_empty() {
+        outs.push((start, None));
+    }
     let mut sp = Spots::new(m);
-    for d in &doors {
+    for d in &door_at {
         sp.block(d[0].floor() as i32 - 1, d[1].floor() as i32 - 1, 3, 3);
     }
-    let main = rooms[hall];
-    let wide_gate = main.w >= 6;
-    let gate = main.x + main.w / 2 - i32::from(wide_gate);
-    let gate_len = if wide_gate { 2.0 } else { 1.0 };
-    let (ga, gb) = ([gate as f32, south as f32], [gate as f32 + gate_len, south as f32]);
-    m.portals.push(portal(ga, gb, if wide_gate { PortalKind::DoubleDoor } else { PortalKind::Door }, wood));
-    sp.block(gate - 1, south - 3, 4, 3);
-    // Окна на внешних стенах.
-    for r in &rooms {
-        for (on, a, b) in [
-            (r.y == building.y, [r.x as f32 + 2.0, r.y as f32], [r.x as f32 + 4.0, r.y as f32]),
-            (r.y + r.h == south && r.x != main.x, [r.x as f32 + 2.0, south as f32], [r.x as f32 + 4.0, south as f32]),
-            (r.x == building.x, [r.x as f32, r.y as f32 + 2.0], [r.x as f32, r.y as f32 + 4.0]),
-            (r.x + r.w == building.x + building.w, [(r.x + r.w) as f32, r.y as f32 + 2.0], [(r.x + r.w) as f32, r.y as f32 + 4.0]),
-        ] {
-            let len = if a[0] == b[0] { r.h } else { r.w };
-            if on && len >= 6 {
-                m.portals.push(portal(a, b, PortalKind::Window, wood));
-            }
-        }
-    }
-
-    if tavern {
-        // Стойка отгораживает угол зала: за ней бочки и полки, перед ней табуреты.
-        let scale = ((main.w - 3) as f32 / 7.0).clamp(0.6, 1.0);
-        let [left, top, right, low] = bounds("bar_counter", 0.0, scale);
-        let y = main.y as f32 + 2.2 - top;
-        let x = main.x as f32 + 1.6 - left;
-        drop(m, "bar_counter", [x, y], 0.0, scale);
-        let width = cells_of(right - left);
-        sp.block(main.x, main.y, width + 2, 5);
-        for i in 0..width / 2 {
-            drop(m, pick(rng, &["barrel", "barrel", "crate"]), [main.x as f32 + 1.0 + i as f32 * 2.0, main.y as f32 + 0.75], 0.0, FURNITURE);
-        }
-        for i in 0..(width + 1) / 2 {
-            drop(m, "stool", [main.x as f32 + 2.2 + i as f32 * 2.0, y + low + 0.5], 0.0, FURNITURE);
-        }
-        by_wall(m, &mut sp, rng, main, "fireplace", 1.0, false);
-        let mut ty = main.y + 5;
-        while ty + 3 < main.y + main.h - 1 {
-            let mut tx = main.x + 1 + rng.int(0, 1);
-            while tx + 3 < main.x + main.w {
-                if rng.chance(0.85) {
-                    dining(m, &mut sp, rng, tx, ty);
-                }
-                tx += 5;
-            }
-            ty += 5;
-        }
-    } else {
-        furnish(m, &mut sp, rng, main, Role::Living);
-        dining(m, &mut sp, rng, main.x + 1, main.y + main.h - 5);
-    }
-    let tiles = mat(m, "stone_tiles");
-    let mut order = [Role::Kitchen, Role::Storage, Role::Bedroom, Role::Bedroom, Role::Library, Role::Bedroom, Role::Storage].into_iter();
-    for (i, r) in rooms.iter().enumerate() {
-        if i == hall {
+    let river_side = p.river.side();
+    let mut entrance: Option<(i32, [f32; 2], [f32; 2])> = None;
+    let mut outer_doors: Vec<(usize, i32)> = Vec::new();
+    for (ri, kind) in outs {
+        let Some(r) = room_of(ri) else { continue };
+        let mut sides = outer_sides(r, building);
+        if sides.is_empty() {
+            warn.push(format!("комната «{}» не у внешней стены: вход через неё невозможен", p.rooms[ri].id));
             continue;
         }
-        let role = order.next().unwrap_or(Role::Bedroom);
-        if role == Role::Kitchen {
-            m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(tiles));
+        // Юг — лицо дома; мост просит сторону реки.
+        let rank = |side: i32| if kind == Some(LinkKind::Bridge) && river_side == Some(side) { -1 } else { [3, 2, 0, 1][side as usize] };
+        sides.sort_by_key(|(s, _)| rank(*s));
+        let (side, seg) = sides[0];
+        let vertical = side % 2 == 1;
+        let line = (vertical, if vertical { seg.0[0] } else { seg.0[1] } as i32);
+        let wide = seg_len(&seg) >= 6;
+        let (width, pk) = match kind {
+            None | Some(LinkKind::DoubleDoor) | Some(LinkKind::Bridge) if wide => (2, PortalKind::DoubleDoor),
+            None | Some(LinkKind::DoubleDoor) | Some(LinkKind::Bridge) | Some(LinkKind::Door) => (1, PortalKind::Door),
+            Some(LinkKind::Opening) => (if wide { 2 } else { 1 }, PortalKind::Opening),
+            Some(LinkKind::Secret) => (1, PortalKind::Secret),
+        };
+        if kind == Some(LinkKind::Bridge) && river_side != Some(side) {
+            warn.push(format!("комната «{}»: для моста нужна река с той же стороны, что вход", p.rooms[ri].id));
         }
-        furnish(m, &mut sp, rng, *r, role);
+        let (no_corners, no_taken) = (Vec::new(), Vec::new());
+        let Some((s, e)) = door_spot(seg, width, corners.get(&line).unwrap_or(&no_corners), taken.get(&line).unwrap_or(&no_taken), rng) else {
+            warn.push(format!("комната «{}»: на внешней стене нет места для входа", p.rooms[ri].id));
+            continue;
+        };
+        taken.entry(line).or_default().push((s, e));
+        let (ga, gb) = along(seg, s, e);
+        m.portals.push(portal(ga, gb, pk, wood));
+        outer_doors.push((ri, side));
+        // Перед дверью внутри свободно.
+        let (dx, dy): (i32, i32) = [(0, -1), (1, 0), (0, 1), (-1, 0)][side as usize];
+        let mid = [(ga[0] + gb[0]) / 2.0, (ga[1] + gb[1]) / 2.0];
+        let (ix, iy) = ((mid[0] - dx as f32 * 1.5).floor() as i32, (mid[1] - dy as f32 * 1.5).floor() as i32);
+        sp.block(ix - 1, iy - 1, 3, 3);
+        if entrance.is_none() {
+            entrance = Some((side, ga, gb));
+        }
+    }
+    // Окна на внешних стенах длиной от шести клеток, кроме стены с входом.
+    for &(i, r) in &placed {
+        for (side, seg) in outer_sides(r, building) {
+            if seg_len(&seg) < 6 || outer_doors.contains(&(i, side)) {
+                continue;
+            }
+            let (a, b) = along(seg, if side % 2 == 1 { r.y + 2 } else { r.x + 2 }, if side % 2 == 1 { r.y + 4 } else { r.x + 4 });
+            m.portals.push(portal(a, b, PortalKind::Window, wood));
+        }
     }
 
-    // Снаружи: дорожка от двери к югу, двор вокруг.
+    // Мебель: зал с баром или гостиной, остальные по роли; плановые объекты и подписи.
+    let hall = placed.iter().find(|(i, _)| p.rooms[*i].role.is_hall()).or_else(|| placed.iter().max_by_key(|(_, r)| r.w * r.h)).map(|(i, _)| *i).unwrap_or(start);
+    let tiles = mat(m, "stone_tiles");
+    let mut auto_roles = [Role::Kitchen, Role::Storage, Role::Bedroom, Role::Bedroom, Role::Library, Role::Bedroom, Role::Storage].into_iter();
+    let mut bar_done = false;
+    for &(i, r) in &placed {
+        let spec = &p.rooms[i];
+        let role = if i == hall {
+            if tavern { Role::Hall } else { Role::Living }
+        } else if spec.role == Role::Auto {
+            auto_roles.next().unwrap_or(Role::Bedroom)
+        } else {
+            spec.role
+        };
+        match spec.floor.as_deref().and_then(plan::texture_id) {
+            Some(t) => {
+                let t = mat(m, t);
+                m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(t));
+            }
+            None if role == Role::Kitchen => {
+                m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(tiles));
+            }
+            None => {}
+        }
+        if role == Role::Hall && tavern && !bar_done {
+            bar_done = true;
+            let main = r;
+            // Стойка отгораживает угол зала: за ней бочки и полки, перед ней табуреты.
+            let scale = ((main.w - 3) as f32 / 7.0).clamp(0.6, 1.0);
+            let bar = asset("bar_counter");
+            let [left, top, right, low] = bounds(&bar, "bar_counter", 0.0, scale);
+            let y = main.y as f32 + 2.2 - top;
+            let x = main.x as f32 + 1.6 - left;
+            drop_pick(m, &bar, [x, y], 0.0, scale);
+            let width = cells_of(right - left);
+            sp.block(main.x, main.y, width + 2, 5);
+            for k in 0..width / 2 {
+                drop(m, pick(rng, &["barrel", "barrel", "crate"]), [main.x as f32 + 1.0 + k as f32 * 2.0, main.y as f32 + 0.75], 0.0, FURNITURE);
+            }
+            for k in 0..(width + 1) / 2 {
+                drop(m, "stool", [main.x as f32 + 2.2 + k as f32 * 2.0, y + low + 0.5], 0.0, FURNITURE);
+            }
+            by_wall(m, &mut sp, rng, main, "fireplace", 1.0, false);
+            let mut ty = main.y + 5;
+            while ty + 3 < main.y + main.h - 1 {
+                let mut tx = main.x + 1 + rng.int(0, 1);
+                while tx + 3 < main.x + main.w {
+                    if rng.chance(0.85) {
+                        dining(m, &mut sp, rng, tx, ty);
+                    }
+                    tx += 5;
+                }
+                ty += 5;
+            }
+        } else if role.is_hall() {
+            furnish(m, &mut sp, rng, r, Role::Living);
+            dining(m, &mut sp, rng, r.x + 1, r.y + r.h - 5);
+        } else {
+            furnish(m, &mut sp, rng, r, role);
+        }
+        if p.mood == Mood::Abandoned {
+            furnish(m, &mut sp, rng, r, Role::Ruin);
+        }
+        wanted(m, &mut sp, rng, r, &spec.objects, &format!("комната «{}»", spec.id), warn);
+        label(m, spec, r);
+    }
+
+    // Снаружи: река по плану, дорожка от входа к краю карты, мост, двор вокруг.
     let dirt = mat(m, "dirt");
-    let end = gate as f32 + 1.0 + (rng.random() as f32 - 0.5) * 6.0;
-    let path = road(rng, [gate as f32 + 1.0, south as f32 + 0.3], [end, h as f32 + 1.0], 0.7);
-    m.paths.push(Path { points: path, material: dirt, width: 2.0, soft: 0.5, rough: 0.3, along: false });
+    let (wf, hf) = (w as f32, h as f32);
+    let water_paths = river_side.and_then(|side| {
+        let (water, gravel) = (mat(m, "water_shallow"), mat(m, "gravel"));
+        let (near, far) = match side {
+            0 => (0.0, building.y as f32),
+            1 => ((building.x + building.w) as f32, wf),
+            2 => ((building.y + building.h) as f32, hf),
+            _ => (0.0, building.x as f32),
+        };
+        if far - near < 6.0 {
+            warn.push(format!("для реки с {} не хватает места: нужно шесть клеток между домом и краем", ["севера", "востока", "юга", "запада"][side as usize]));
+            return None;
+        }
+        let c = (near + far) / 2.0 + (rng.random() as f32 - 0.5) * (far - near - 5.0);
+        let line = if side % 2 == 0 { road(rng, [-1.0, c], [wf + 1.0, c], 1.0) } else { road(rng, [c, -1.0], [c, hf + 1.0], 1.0) };
+        Some(stream(line, water, gravel))
+    });
+    if let Some((bank, water)) = &water_paths {
+        m.paths.push(bank.clone());
+        m.paths.push(water.clone());
+    }
+    let mut lane: Option<Path> = None;
+    if let Some((side, ga, gb)) = entrance {
+        let (dx, dy): (f32, f32) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][side as usize];
+        let mid = [(ga[0] + gb[0]) / 2.0, (ga[1] + gb[1]) / 2.0];
+        let from = [mid[0] + dx * 0.3, mid[1] + dy * 0.3];
+        let jitter = (rng.random() as f32 - 0.5) * 6.0;
+        let to = match side {
+            0 => [mid[0] + jitter, -1.0],
+            1 => [wf + 1.0, mid[1] + jitter],
+            2 => [mid[0] + jitter, hf + 1.0],
+            _ => [-1.0, mid[1] + jitter],
+        };
+        let path = Path { points: road(rng, from, to, 0.7), material: dirt, width: 2.0, soft: 0.5, rough: 0.3, along: false };
+        if let Some((_, water)) = &water_paths
+            && let Some((at, angle)) = crossing(&path, water)
+        {
+            drop(m, "bridge", at, angle, 1.0);
+        }
+        m.paths.push(path.clone());
+        lane = Some(path);
+    }
+    let avoid: Vec<Path> = m.paths.clone();
     for _ in 0..(w + h) / 2 {
-        let p = [rng.random() as f32 * w as f32, rng.random() as f32 * h as f32];
-        let near = p[0] > building.x as f32 - 1.5 && p[0] < (building.x + bw) as f32 + 1.5 && p[1] > building.y as f32 - 1.5 && p[1] < south as f32 + 1.5;
-        let lane = (p[0] - gate as f32 - 1.0).abs() < 3.0 && p[1] > south as f32;
-        if !near && !lane {
+        let q = [rng.random() as f32 * wf, rng.random() as f32 * hf];
+        let near = q[0] > building.x as f32 - 1.5 && q[0] < (building.x + bw) as f32 + 1.5 && q[1] > building.y as f32 - 1.5 && q[1] < (building.y + bh) as f32 + 1.5;
+        let on_lane = lane.as_ref().is_some_and(|l| l.distance(q) < 2.0);
+        let on_water = water_paths.as_ref().is_some_and(|(bank, _)| bank.distance(q) < 2.4);
+        if !near && !on_lane && !on_water {
             let n = pick(rng, &["bush", "bush", "bush", "tree"]);
-            drop(m, n, p, rng.int(0, 3) as f32 * 90.0, 0.8);
+            drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.8);
         }
     }
-    rooms.len()
+    if !p.objects.is_empty() {
+        sp.block(building.x - 1, building.y - 1, bw + 2, bh + 2);
+        let c = match entrance {
+            Some((side, ga, gb)) => {
+                let (dx, dy): (f32, f32) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][side as usize];
+                [(ga[0] + gb[0]) / 2.0 + dx * 3.0, (ga[1] + gb[1]) / 2.0 + dy * 3.0]
+            }
+            None => [building.x as f32 + bw as f32 / 2.0, (building.y + bh) as f32 + 3.0],
+        };
+        around(m, &mut sp, rng, &p.objects, c, "двор", &avoid, 1.6, warn);
+    }
+    if p.mood == Mood::Abandoned {
+        abandon(m, rng, &[building]);
+    }
+    placed.len()
 }
 
-/// Вся карта заново. Возвращает, сколько получилось главного: комнат, домов, деревьев.
-/// `material` — пол подземелья; у остальных видов покрытия свои.
-pub fn build(m: &mut Map, opt: &Options, material: usize) -> usize {
-    let mut rng = Rng::new(&format!("{}/{:?}", opt.seed, opt.kind));
-    clear(m);
-    match opt.kind {
-        Kind::Dungeon => dungeon(m, opt, material, &mut rng),
-        Kind::Cave => cave(m, opt, &mut rng),
-        Kind::Forest => forest(m, opt, &mut rng),
-        Kind::Town => town(m, opt, &mut rng),
-        Kind::House => interior(m, opt, &mut rng, false),
-        Kind::Tavern => interior(m, opt, &mut rng, true),
+/// Настроение, общее для всех видов: мрачно — темнее и тени гуще.
+fn mood(m: &mut Map, p: &Plan) {
+    if p.mood == Mood::Gloomy {
+        m.shadows.opacity = 0.75;
+        m.shadows.dist = 0.9;
+        let all: Vec<(usize, f32)> = (0..m.rooms.data.len()).map(|i| (i, 1.0)).collect();
+        m.shade_paint(&all, 0.3);
     }
+}
+
+/// Вся карта заново по плану. Ошибка — план не проходит проверку или не для этой
+/// карты; что не удалось из задуманного — в предупреждениях отчёта.
+/// `material` — пол подземелья из окна генератора; план со своим полом его перекрывает.
+/// `palette` — свои ассеты из библиотеки; в деле только когда план просит
+/// `assets: library`, иначе всё встроенное.
+pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result<Report, String> {
+    p.validate([m.width, m.height])?;
+    if let Some(size) = p.size
+        && size != [m.width, m.height]
+    {
+        return Err(format!("план рассчитан на карту {}×{}, а эта {}×{}", size[0], size[1], m.width, m.height));
+    }
+    let mut warnings = p.unused();
+    let _guard = PaletteGuard;
+    if p.assets == Assets::Library {
+        if palette.is_empty() {
+            warnings.push("в библиотеке нет своих ассетов: построено встроенными".into());
+        } else {
+            palette.seed(&p.seed);
+            PALETTE.with(|slot| *slot.borrow_mut() = Some(palette));
+        }
+    }
+    let mut rng = Rng::new(&format!("{}/{:?}", p.seed, p.kind));
+    clear(m);
+    let count = match p.kind {
+        Kind::Dungeon => dungeon(m, p, material, &mut rng, &mut warnings),
+        Kind::Cave => cave(m, p, &mut rng, &mut warnings),
+        Kind::Forest => forest(m, p, &mut rng, &mut warnings),
+        Kind::Town => town(m, p, &mut rng, &mut warnings),
+        Kind::House | Kind::Tavern => interior(m, p, &mut rng, &mut warnings),
+    };
+    mood(m, p);
+    Ok(Report { count, warnings })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Options;
+    use crate::map;
+    use crate::plan::{Link, RoomSpec};
+    use std::collections::VecDeque;
+
+    /// Библиотека как у паков FA: по паре вариантов на слот, часть слотов без замены.
+    fn fake_library() -> Palette {
+        use crate::library::{Asset, Kind as K};
+        let a = |path: &str, kind: K| Asset::new(format!("pack:fa.dungeondraft_pack|textures/x/{path}"), &format!("FA/{path}"), kind);
+        let assets = vec![
+            a("Furniture/Chair_Wooden_A_1x1.webp", K::Object),
+            a("Furniture/Chair_Wooden_B_1x1.webp", K::Object),
+            a("Furniture/Table_Long_A_2x1.webp", K::Object),
+            a("Furniture/Bed_Single_A_1x2.webp", K::Object),
+            a("Furniture/Bed_Double_A_2x2.webp", K::Object),
+            a("Nature/Oak_Tree_A_3x3.webp", K::Object),
+            a("Nature/Pine_Tree_B_4x4.webp", K::Object),
+            a("Terrain/Grass_Green_A.webp", K::Floor),
+            a("Terrain/Wood_Planks_A.webp", K::Floor),
+            a("Walls/Wall_Timber_A.webp", K::Wall),
+            a("Portals/Door_Wooden_A_1x1.webp", K::Door),
+        ];
+        Palette::from_library(&assets, Box::new(|_| Some([256, 256])))
+    }
+
+    #[test]
+    fn library_assets_replace_builtin_slots_and_repeat() {
+        let mut p = tavern_plan();
+        p.assets = Assets::Library;
+        let mut m = Map::new(40, 30);
+        let r = build(&mut m, &p, 0, fake_library()).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let count = |word: &str| m.props.iter().filter(|q| q.asset.contains(word)).count();
+        assert!(count("Chair_Wooden") > 0 && count("builtin:chair") == 0, "стулья не из библиотеки");
+        assert!(count("builtin:barrel") > 0, "у бочки замены нет — встроенная");
+        assert!(m.materials.iter().any(|t| matches!(&t.paint, Paint::Texture(k) if k.contains("Wood_Planks"))));
+        assert!(matches!(&m.wall_style.paint, Paint::Texture(k) if k.contains("Wall_Timber")));
+        assert!(m.portals.iter().any(|q| q.asset.as_deref().is_some_and(|k| k.contains("Door_Wooden"))));
+        // Косяки всегда встроенные, окна без замены — тоже.
+        assert!(m.portals.iter().filter_map(|q| q.frame.as_deref()).all(|f| f.starts_with("builtin:")));
+        assert!(m.portals.iter().filter(|q| q.kind == PortalKind::Window).all(|q| q.asset.as_deref().is_some_and(|k| k.starts_with("builtin:"))));
+        // Размер своего объекта — из имени.
+        let bed = m.props.iter().find(|q| q.asset.contains("Bed_")).expect("кровать");
+        assert_eq!(bed.size, if bed.asset.contains("Double") { [2.0, 2.0] } else { [1.0, 2.0] });
+        let mut again = Map::new(40, 30);
+        build(&mut again, &p, 0, fake_library()).unwrap();
+        assert_eq!(m.to_json(), again.to_json());
+        // Лес: деревья чередуются между вариантами.
+        let mut f = Plan::random(&opt(Kind::Forest, "лес"), [40, 30]);
+        f.assets = Assets::Library;
+        let mut fm = Map::new(40, 30);
+        build(&mut fm, &f, 0, fake_library()).unwrap();
+        assert!(fm.props.iter().any(|q| q.asset.contains("Oak_Tree")) && fm.props.iter().any(|q| q.asset.contains("Pine_Tree")));
+        // Просили библиотеку, а она пуста — предупреждение и всё встроенное.
+        let mut e = Map::new(40, 30);
+        let r = build(&mut e, &p, 0, Palette::builtin()).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("нет своих ассетов")), "{:?}", r.warnings);
+        assert!(e.props.iter().all(|q| q.asset.starts_with("builtin:")));
+    }
 
     fn opt(kind: Kind, seed: &str) -> Options {
         Options { kind, seed: seed.into(), ..Default::default() }
+    }
+
+    fn random(m: &mut Map, kind: Kind, seed: &str) -> Report {
+        let plan = Plan::random(&opt(kind, seed), [m.width, m.height]);
+        build(m, &plan, 0, Palette::builtin()).unwrap()
+    }
+
+    /// Комнаты, в которые можно попасть из `start` через двери на общих стенах.
+    fn reachable(m: &Map, rooms: &[Room], start: usize) -> Vec<bool> {
+        let mut seen = vec![false; rooms.len()];
+        seen[start] = true;
+        let mut queue = VecDeque::from([start]);
+        while let Some(i) = queue.pop_front() {
+            for j in 0..rooms.len() {
+                if seen[j] {
+                    continue;
+                }
+                let Some(seg) = shared(rooms[i], rooms[j]) else { continue };
+                let door = m.portals.iter().any(|p| p.kind != PortalKind::Window && map::segment_distance(p.center(), seg.0, seg.1) < 0.01);
+                if door {
+                    seen[j] = true;
+                    queue.push_back(j);
+                }
+            }
+        }
+        seen
+    }
+
+    fn tavern_plan() -> Plan {
+        let mut p = Plan::new(Kind::Tavern);
+        p.seed = "ясень".into();
+        p.rooms = vec![
+            RoomSpec { size: Size::Named(SizeName::Large), name: "Зал".into(), objects: vec!["камин".into()], ..RoomSpec::new("hall", Role::Hall) },
+            RoomSpec::new("kitchen", Role::Kitchen),
+            RoomSpec { name: "Подвал".into(), ..RoomSpec::new("cellar", Role::Storage) },
+            RoomSpec::new("pantry", Role::Storage),
+            RoomSpec::new("room", Role::Bedroom),
+        ];
+        p.links = vec![
+            Link::new("hall", OUTSIDE, LinkKind::DoubleDoor),
+            Link::new("hall", "kitchen", LinkKind::Door),
+            Link::new("kitchen", "pantry", LinkKind::Door),
+            Link::new("hall", "cellar", LinkKind::Door),
+            Link::new("cellar", "pantry", LinkKind::Secret),
+            Link::new("hall", "room", LinkKind::Door),
+        ];
+        p
     }
 
     #[test]
@@ -1187,11 +1958,12 @@ mod tests {
             for (w, h) in [(40, 30), (24, 24), (12, 10), (80, 20), (60, 60)] {
                 for seed in ["а", "б", "в"] {
                     let (mut a, mut b) = (Map::new(w, h), Map::new(w, h));
-                    let n = build(&mut a, &opt(kind, seed), 0);
-                    build(&mut b, &opt(kind, seed), 0);
+                    let r = random(&mut a, kind, seed);
+                    random(&mut b, kind, seed);
                     assert_eq!(a.to_json(), b.to_json(), "{kind:?} {w}×{h}");
                     if (w, h) == (40, 30) {
-                        assert!(n > 0 && !a.props.is_empty(), "{kind:?} пуста");
+                        assert!(r.count > 0 && !a.props.is_empty(), "{kind:?} пуста");
+                        assert!(r.warnings.is_empty(), "{kind:?}: {:?}", r.warnings);
                     }
                     for p in &a.props {
                         assert!(p.pos[0].is_finite() && p.pos[1].is_finite());
@@ -1205,8 +1977,8 @@ mod tests {
     fn caves_and_dungeons_have_a_way_out() {
         for seed in ["а", "б", "в", "г"] {
             let (mut c, mut d) = (Map::new(40, 30), Map::new(40, 30));
-            build(&mut c, &opt(Kind::Cave, seed), 0);
-            build(&mut d, &opt(Kind::Dungeon, seed), 0);
+            random(&mut c, Kind::Cave, seed);
+            random(&mut d, Kind::Dungeon, seed);
             assert_eq!(c.portals.iter().filter(|p| p.kind == PortalKind::Opening).count(), 2);
             assert!(d.portals.iter().any(|p| p.kind == PortalKind::DoubleDoor));
             assert!(d.props.iter().any(|p| p.asset.ends_with("stairs")));
@@ -1216,17 +1988,24 @@ mod tests {
     #[test]
     fn forest_keeps_camp_off_the_road_and_trees_on_top() {
         let mut m = Map::new(40, 30);
-        build(&mut m, &opt(Kind::Forest, "лагерь"), 0);
+        random(&mut m, Kind::Forest, "лагерь");
         let camp = m.props.iter().find(|p| p.asset.ends_with("campfire")).unwrap();
         assert!(m.paths[2].distance(camp.pos) > 2.0);
         let first_tree = m.props.iter().position(|p| p.asset.ends_with("tree")).unwrap();
         assert!(m.props[first_tree..].iter().all(|p| p.asset.ends_with("tree")));
+        // Без реки — ни моста, ни берега.
+        let mut p = Plan::random(&opt(Kind::Forest, "сухо"), [40, 30]);
+        p.river = River::None;
+        let mut dry = Map::new(40, 30);
+        build(&mut dry, &p, 0, Palette::builtin()).unwrap();
+        assert_eq!(dry.paths.len(), 2);
+        assert!(!dry.props.iter().any(|p| p.asset.ends_with("bridge")));
     }
 
     #[test]
     fn props_stay_out_of_town_houses() {
         let mut m = Map::new(48, 36);
-        build(&mut m, &opt(Kind::Town, "дома"), 0);
+        random(&mut m, Kind::Town, "дома");
         assert!(!m.roofs.is_empty());
         assert!(m.paths.iter().any(|p| p.along), "нет бордюра");
         for (i, a) in m.roofs.iter().enumerate() {
@@ -1242,12 +2021,183 @@ mod tests {
     #[test]
     fn furniture_touches_the_wall() {
         let mut m = Map::new(30, 24);
-        build(&mut m, &opt(Kind::House, "мебель"), 0);
+        random(&mut m, Kind::House, "мебель");
         let segs: Vec<Segment> = m.room_edges().into_iter().chain(m.walls.iter().flat_map(|w| w.chords().collect::<Vec<_>>())).collect();
         let bed = m.props.iter().find(|p| p.asset.contains("bed")).expect("кровать");
-        let [l, t, r, u] = bounds(bed.asset.trim_start_matches(library::BUILTIN), bed.rot, bed.scale);
+        let slot = bed.asset.trim_start_matches(library::BUILTIN);
+        let [l, t, r, u] = bounds(&Palette::builtin_pick(slot), slot, bed.rot, bed.scale);
         let near = [[bed.pos[0] + l, bed.pos[1]], [bed.pos[0] + r, bed.pos[1]], [bed.pos[0], bed.pos[1] + t], [bed.pos[0], bed.pos[1] + u]];
         let gap = near.iter().flat_map(|p| segs.iter().map(move |s| map::segment_distance(*p, s.0, s.1))).fold(f32::MAX, f32::min);
         assert!(gap < 0.35, "{gap}");
+    }
+
+    #[test]
+    fn planned_tavern_has_its_rooms_links_and_secret_passage() {
+        let p = tavern_plan();
+        let mut m = Map::new(40, 30);
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert_eq!(r.count, 5, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // Комнаты восстанавливаются по перегородкам: тайный ход — между подвалом и кладовой.
+        let secret = m.portals.iter().filter(|q| q.kind == PortalKind::Secret).count();
+        assert_eq!(secret, 1);
+        assert!(m.portals.iter().any(|q| q.kind == PortalKind::DoubleDoor), "нет парадного входа");
+        assert!(m.labels.iter().any(|l| l.text == "Подвал") && m.labels.iter().any(|l| l.text == "Зал"));
+        assert!(m.props.iter().filter(|q| q.asset.ends_with("fireplace")).count() >= 1);
+        assert!(m.props.iter().any(|q| q.asset.ends_with("bar_counter")));
+        // Тот же план — та же карта; другое зерно — другая.
+        let mut again = Map::new(40, 30);
+        build(&mut again, &p, 0, Palette::builtin()).unwrap();
+        assert_eq!(m.to_json(), again.to_json());
+        let mut other = Map::new(40, 30);
+        build(&mut other, &Plan { seed: "дуб".into(), ..p.clone() }, 0, Palette::builtin()).unwrap();
+        assert_ne!(m.to_json(), other.to_json());
+    }
+
+    #[test]
+    fn planned_rooms_are_all_reachable() {
+        for (seed, links) in [("а", true), ("б", true), ("в", false), ("г", false)] {
+            let mut p = tavern_plan();
+            p.seed = seed.into();
+            if !links {
+                p.links.clear();
+            }
+            let mut m = Map::new(40, 30);
+            let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+            assert_eq!(r.count, 5, "{seed}: {:?}", r.warnings);
+            let (bw, bh) = plan::building_size(Kind::Tavern, 40, 30);
+            let building = Room { x: (40 - bw) / 2, y: ((30 - bh) / 2 - 1).max(0), w: bw, h: bh };
+            // Комнаты — по перегородкам и внешним стенам: восстановим их из стен.
+            let rooms = rooms_from_walls(&m, building);
+            assert_eq!(rooms.len(), 5, "{seed}: {rooms:?}");
+            let hall = rooms.iter().position(|r| m.labels.iter().any(|l| l.text == "Зал" && l.pos[0] > r.x as f32 && l.pos[0] < (r.x + r.w) as f32 && l.pos[1] > r.y as f32 && l.pos[1] < (r.y + r.h) as f32)).unwrap();
+            let seen = reachable(&m, &rooms, hall);
+            assert!(seen.iter().all(|&s| s), "{seed}: недостижимы {seen:?}");
+            // Вход — на внешней стене дома.
+            let gate = m.portals.iter().find(|q| q.kind == PortalKind::DoubleDoor || (q.kind == PortalKind::Door && outer_sides(building, building).iter().any(|(_, s)| map::segment_distance(q.center(), s.0, s.1) < 0.01))).expect("вход");
+            assert!(outer_sides(building, building).iter().any(|(_, s)| map::segment_distance(gate.center(), s.0, s.1) < 0.01));
+        }
+    }
+
+    /// Комнаты дома по перегородкам: клетки, разделённые стенами, — разные комнаты.
+    fn rooms_from_walls(m: &Map, b: Room) -> Vec<Room> {
+        let blocked = |x: i32, y: i32, nx: i32, ny: i32| -> bool {
+            let (a, c) = if nx != x { let xx = x.max(nx) as f32; ([xx, y as f32], [xx, y as f32 + 1.0]) } else { let yy = y.max(ny) as f32; ([x as f32, yy], [x as f32 + 1.0, yy]) };
+            let mid = [(a[0] + c[0]) / 2.0, (a[1] + c[1]) / 2.0];
+            m.walls.iter().any(|w| w.distance(mid) < 0.01)
+        };
+        let mut owner = vec![usize::MAX; (b.w * b.h) as usize];
+        let mut rooms = Vec::new();
+        for s in 0..owner.len() {
+            if owner[s] != usize::MAX {
+                continue;
+            }
+            let id = rooms.len();
+            let mut stack = vec![s];
+            owner[s] = id;
+            let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
+            while let Some(i) = stack.pop() {
+                let (x, y) = (b.x + i as i32 % b.w, b.y + i as i32 / b.w);
+                lo = (lo.0.min(x), lo.1.min(y));
+                hi = (hi.0.max(x), hi.1.max(y));
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < b.x || ny < b.y || nx >= b.x + b.w || ny >= b.y + b.h || blocked(x, y, nx, ny) {
+                        continue;
+                    }
+                    let n = ((ny - b.y) * b.w + nx - b.x) as usize;
+                    if owner[n] == usize::MAX {
+                        owner[n] = id;
+                        stack.push(n);
+                    }
+                }
+            }
+            rooms.push(Room { x: lo.0, y: lo.1, w: hi.0 - lo.0 + 1, h: hi.1 - lo.1 + 1 });
+        }
+        rooms
+    }
+
+    #[test]
+    fn planned_dungeon_follows_roles_and_links() {
+        let mut p = Plan::new(Kind::Dungeon);
+        p.seed = "культ".into();
+        p.rooms = vec![
+            RoomSpec::new("gate", Role::Entrance),
+            RoomSpec { size: Size::Named(SizeName::Large), name: "Храм".into(), ..RoomSpec::new("temple", Role::Shrine) },
+            RoomSpec::new("vault", Role::Treasure),
+            RoomSpec { size: Size::Cells([4, 4]), ..RoomSpec::new("stairs", Role::Exit) },
+        ];
+        p.links = vec![
+            Link::new("gate", OUTSIDE, LinkKind::DoubleDoor),
+            Link::new("gate", "temple", LinkKind::Door),
+            Link::new("temple", "vault", LinkKind::Secret),
+            Link::new("temple", "stairs", LinkKind::Opening),
+        ];
+        let mut m = Map::new(40, 30);
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert_eq!(r.count, 4, "{:?}", r.warnings);
+        assert!(m.portals.iter().any(|q| q.kind == PortalKind::Secret), "{:?}", m.portals);
+        assert!(m.props.iter().any(|q| q.asset.ends_with("altar")) && m.props.iter().any(|q| q.asset.ends_with("stairs")));
+        assert!(m.labels.iter().any(|l| l.text == "Храм"));
+        // Ровно одна лестница: выход задан планом, дальняя комната её не дублирует.
+        assert_eq!(m.props.iter().filter(|q| q.asset.ends_with("stairs")).count(), 1);
+    }
+
+    #[test]
+    fn river_and_mood_change_the_yard() {
+        let mut p = Plan::random(&opt(Kind::House, "река"), [36, 30]);
+        p.river = River::South;
+        p.links = vec![Link::new("hall", OUTSIDE, LinkKind::Bridge)];
+        p.objects = vec!["колодец".into(), "телега".into()];
+        p.mood = Mood::Gloomy;
+        let mut m = Map::new(36, 30);
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(m.props.iter().any(|q| q.asset.ends_with("bridge")), "нет моста");
+        assert!(m.props.iter().any(|q| q.asset.ends_with("well")) && m.props.iter().any(|q| q.asset.ends_with("cart")));
+        assert!(m.shade.is_some() && m.shadows.opacity > 0.7);
+        // Объекты не в доме.
+        let (bw, bh) = plan::building_size(Kind::House, 36, 30);
+        let (bx, by) = ((36 - bw) / 2, ((30 - bh) / 2 - 1).max(0));
+        for q in m.props.iter().filter(|q| q.asset.ends_with("well") || q.asset.ends_with("cart")) {
+            assert!(!(q.pos[0] > bx as f32 && q.pos[0] < (bx + bw) as f32 && q.pos[1] > by as f32 && q.pos[1] < (by + bh) as f32), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn unused_fields_warn_and_bad_plan_fails() {
+        let mut p = Plan::random(&opt(Kind::Cave, "x"), [30, 20]);
+        p.rooms.push(RoomSpec::new("a", Role::Auto));
+        let mut m = Map::new(30, 20);
+        let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("комнаты не используются")), "{:?}", r.warnings);
+        p.size = Some([10, 10]);
+        assert!(build(&mut m, &p, 0, Palette::builtin()).unwrap_err().contains("рассчитан на карту"));
+        let mut bad = Plan::new(Kind::House);
+        bad.rooms = vec![RoomSpec::new("a", Role::Auto)];
+        bad.links = vec![Link::new("a", "b", LinkKind::Door)];
+        assert!(build(&mut m, &bad, 0, Palette::builtin()).unwrap_err().contains("«b» нет"));
+    }
+
+    #[test]
+    fn example_plans_build_clean() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plans");
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
+        files.sort();
+        assert!(files.len() >= 3, "мало примеров в {}", dir.display());
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let p = Plan::from_json(&text).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            let [w, h] = p.map_size([40, 30]);
+            p.validate([w, h]).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            let mut m = Map::new(w, h);
+            let material = dungeon_look(&mut m);
+            let r = build(&mut m, &p, material, Palette::builtin()).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            assert!(r.warnings.is_empty(), "{}: {:?}", f.display(), r.warnings);
+            assert!(r.count > 0 && !m.props.is_empty(), "{}", f.display());
+            // Карта из плана сохраняется и открывается.
+            let again = Map::from_json(&m.to_json()).unwrap();
+            assert_eq!(again, m);
+        }
     }
 }

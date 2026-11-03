@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "town",
+  "name": "Заброшенный квартал",
+  "size": [48, 36],
+  "seed": "запустение",
+  "mood": "abandoned",
+  "style": { "walls": "stone_blocks", "roof": "slate_gray", "floor": "flagstones" },
+  "objects": ["statue"],
+  "options": { "density": 0.4 }
+}

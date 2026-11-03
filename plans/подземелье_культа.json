@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "kind": "dungeon",
+  "name": "Подземелье культа",
+  "size": [44, 32],
+  "seed": "культ",
+  "mood": "gloomy",
+  "style": { "walls": "dwarven", "floor": "dungeon_flagstones_moss" },
+  "rooms": [
+    { "id": "gate", "name": "Привратная", "role": "entrance" },
+    { "id": "barracks", "name": "Казарма", "role": "barracks" },
+    { "id": "temple", "name": "Храм", "role": "shrine", "size": "large" },
+    { "id": "library", "name": "Скрипторий", "role": "library" },
+    { "id": "crypt", "name": "Крипта", "role": "treasure", "size": "small" },
+    { "id": "stairs", "name": "Спуск", "role": "exit", "size": [5, 5] }
+  ],
+  "links": [
+    { "from": "gate", "to": "outside", "kind": "double_door" },
+    { "from": "gate", "to": "barracks" },
+    { "from": "gate", "to": "temple", "kind": "double_door" },
+    { "from": "temple", "to": "library" },
+    { "from": "temple", "to": "crypt", "kind": "secret" },
+    { "from": "library", "to": "stairs", "kind": "opening" }
+  ],
+  "options": { "room_size": [5, 9], "fill": true }
+}

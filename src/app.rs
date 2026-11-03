@@ -6,6 +6,9 @@ use crate::library::{self, Kind, Library, PX_PER_CELL, Textures};
 use crate::blend::Blend;
 use crate::map::{self, Coat, Layer, Map, Material, Paint, Portal, PortalKind, Prop, Segment, Wall};
 use crate::mask::{self, Brush, Mask, RES, Shape as Tip};
+use crate::palette::Palette;
+use crate::plan::Plan;
+use crate::procgen;
 use crate::recovery::{self, Orphan, Recovery};
 use crate::roofs;
 use crate::selftest::SelfTest;
@@ -201,6 +204,8 @@ pub struct Args {
     pub export: Option<PathBuf>,
     /// `--px N`: пикселей на клетку в выгрузке.
     pub px: Option<u32>,
+    /// `--plan файл.json`: построить карту по плану при запуске.
+    pub plan: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -211,6 +216,12 @@ pub struct Settings {
     /// Объекты встают по сетке; Alt на время меняет на обратное.
     #[serde(default = "yes")]
     pub snap: bool,
+    /// Генераторы строят своими ассетами из библиотеки, а не встроенными.
+    #[serde(default)]
+    pub gen_library: bool,
+    /// Выгрузка: кроны деревьев отдельными тайлами над токенами, в картинке пни.
+    #[serde(default = "yes")]
+    pub export_canopies: bool,
 }
 
 fn yes() -> bool {
@@ -219,7 +230,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false, export_canopies: true }
     }
 }
 
@@ -268,6 +279,8 @@ struct Export {
     asked: bool,
     /// Выгрузка из командной строки: по окончании выйти.
     quit: bool,
+    /// Кроны деревьев — тайлами над токенами; иначе деревья остаются в картинке как есть.
+    canopies: bool,
 }
 
 /// Окно выгрузки: сколько пикселей на клетку.
@@ -541,6 +554,9 @@ impl App {
         };
         if let Some(file) = args.file {
             app.open_path(&file);
+        }
+        if let Some(plan) = args.plan {
+            app.build_from_file(&plan);
         }
         app
     }
@@ -956,8 +972,8 @@ impl App {
         if (b[0], b[1]) < (a[0], a[1]) {
             std::mem::swap(&mut a, &mut b);
         }
-        let asset = if self.door_kind == PortalKind::Opening { None } else { self.door_asset.clone() };
-        let frame = self.door_frame.as_deref().map(|f| library::frame_for_width(f, w));
+        let asset = if matches!(self.door_kind, PortalKind::Opening | PortalKind::Secret) { None } else { self.door_asset.clone() };
+        let frame = if self.door_kind.hidden() { None } else { self.door_frame.as_deref().map(|f| library::frame_for_width(f, w)) };
         let portal = Portal { a, b, kind: self.door_kind, asset, frame };
         // На том же месте уже есть проём — новый его заменяет.
         let clash = self.map.portals.iter().position(|q| map::segment_distance(q.center(), portal.a, portal.b) < 0.01);
@@ -1005,7 +1021,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -1068,7 +1084,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -1130,7 +1146,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -1229,11 +1245,76 @@ impl App {
 
     /// Новая карта вместо нынешней, отменяется как обычная правка.
     pub fn generate(&mut self, opt: &Options) -> usize {
+        let plan = Plan::random(opt, [self.map.width, self.map.height]);
+        self.build_plan(&plan, false).map_or(0, |r| r.count)
+    }
+
+    /// Карта по плану: заменяет текущий этаж, отменяется Ctrl+Z. План другого
+    /// размера пересоздаёт карту. `fresh_look` — вид подземелья по умолчанию, как
+    /// при открытии окна генератора (из окна вид уже выбран). Ошибка плана — в окно
+    /// ошибки, что не удалось из задуманного — в строку состояния.
+    pub fn build_plan(&mut self, plan: &Plan, fresh_look: bool) -> Option<procgen::Report> {
+        let size = plan.map_size([self.map.width, self.map.height]);
+        if let Err(e) = plan.validate(size) {
+            self.error = Some(format!("План не годится:\n{e}"));
+            return None;
+        }
+        if size != [self.map.width, self.map.height] && self.levels.len() > 1 {
+            self.error = Some(format!("План рассчитан на карту {}×{}, а у этой карты несколько этажей размером {}×{}", size[0], size[1], self.map.width, self.map.height));
+            return None;
+        }
         self.checkpoint();
         self.sel = None;
-        let n = crate::procgen::build(&mut self.map, opt, self.material);
-        self.edges_dirty = true;
-        n
+        if size != [self.map.width, self.map.height] {
+            let mut fresh = Map::new(size[0], size[1]);
+            fresh.materials = self.map.materials.clone();
+            fresh.wall_style = self.map.wall_style.clone();
+            self.map = fresh;
+            self.fitted = false;
+        }
+        if fresh_look && plan.kind == generate::Kind::Dungeon {
+            self.material = procgen::dungeon_look(&mut self.map);
+        }
+        let palette = if plan.assets == crate::plan::Assets::Library {
+            let sources = self.textures.sources.clone();
+            Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key)))
+        } else {
+            Palette::builtin()
+        };
+        match procgen::build(&mut self.map, plan, self.material, palette) {
+            Ok(r) => {
+                self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
+                self.edges_dirty = true;
+                Some(r)
+            }
+            Err(e) => {
+                self.undo();
+                self.error = Some(format!("План не построился:\n{e}"));
+                None
+            }
+        }
+    }
+
+    /// «Построить из плана…»: JSON-файл плана (см. `plans/README.md`).
+    pub fn build_from_file(&mut self, path: &Path) -> bool {
+        let plan = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Plan::from_json(&t)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(format!("{}: {e}", path.display()));
+                return false;
+            }
+        };
+        let Some(r) = self.build_plan(&plan, true) else { return false };
+        if self.notice.is_none() {
+            let name = if plan.name.is_empty() { path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { plan.name.clone() };
+            self.notice = Some(format!("Построено по плану «{name}»: {} {}", r.count, match plan.kind {
+                generate::Kind::Dungeon | generate::Kind::House | generate::Kind::Tavern => "комнат",
+                generate::Kind::Town => "домов",
+                generate::Kind::Forest => "деревьев",
+                generate::Kind::Cave => "клеток",
+            }));
+        }
+        true
     }
 
     // ----- файлы -----
@@ -1515,7 +1596,12 @@ impl App {
                 let (w, h) = (self.map.width * dlg.px, self.map.height * dlg.px);
                 ui.weak(format!("Картинка {w}×{h}."));
                 ui.add_space(4.0);
-                ui.weak("Рядом лягут три файла: картинка, сцена для Foundry (.json) и Universal VTT (.dd2vtt). В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
+                let trees = self.map.props.iter().filter(|p| p.is_canopy()).count();
+                if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Сама так уходит только встроенная крона; чужому дереву крону включают галочкой в панели объекта.").changed() {
+                    self.save_settings();
+                }
+                ui.add_space(4.0);
+                ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt) и картинки створок, крыш и крон — их надо держать рядом со сценой. В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
                 ui.add_space(6.0);
                 go = ui.button("Выбрать место и выгрузить").clicked();
             });
@@ -1542,8 +1628,21 @@ impl App {
             let mut open = true;
             let mut go = false;
             let dungeon = opt.kind == generate::Kind::Dungeon;
+            let own_assets = self.library.assets.iter().any(|a| !a.is_builtin());
             egui::Window::new(opt.kind.label()).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
                 egui::Grid::new("gen").num_columns(2).show(ui, |ui| {
+                    ui.label("Ассеты");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut opt.library, false, "Встроенные");
+                        ui.add_enabled_ui(own_assets, |ui| {
+                            ui.selectable_value(&mut opt.library, true, "Из библиотеки").on_hover_text("Паки и папка из «Правка»; чего там нет — встроенные");
+                        });
+                        if !own_assets {
+                            opt.library = false;
+                            ui.weak("(паков и папки нет)");
+                        }
+                    });
+                    ui.end_row();
                     if !dungeon {
                         ui.label("Густота");
                         ui.add(egui::Slider::new(&mut opt.density, 0.0..=1.0));
@@ -1597,6 +1696,10 @@ impl App {
             if go {
                 if opt.seed.trim().is_empty() {
                     opt.seed = generate::new_seed();
+                }
+                if self.settings.gen_library != opt.library {
+                    self.settings.gen_library = opt.library;
+                    self.save_settings();
                 }
                 self.generate(&opt);
             }
@@ -1829,8 +1932,14 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        self.generator = Some(Options { kind, seed: generate::new_seed(), ..Default::default() });
+                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, ..Default::default() });
                     }
+                }
+                ui.separator();
+                if item(ui, "Построить из плана…", "")
+                    && let Some(path) = rfd::FileDialog::new().add_filter("План карты", &["json"]).pick_file()
+                {
+                    self.build_from_file(&path);
                 }
             });
             ui.menu_button("Вид", |ui| {
@@ -2194,7 +2303,7 @@ impl App {
                             }
                         });
                         ui.add(egui::Slider::new(&mut self.door_width, 1.0..=4.0).step_by(0.5).text("ширина, кл."));
-                        if self.door_kind != PortalKind::Opening {
+                        if !matches!(self.door_kind, PortalKind::Opening | PortalKind::Secret) {
                             ui.horizontal(|ui| {
                                 ui.label(if self.door_kind == PortalKind::Window { "Окно:" } else { "Створка:" });
                                 match self.door_asset.clone() {
@@ -2368,6 +2477,29 @@ impl App {
                     if ui.checkbox(&mut casts, "Отбрасывает тень").changed() {
                         self.checkpoint();
                         self.map.props[i].shadow = Some(casts);
+                    }
+                    // Что уйдёт в Foundry: свет и крона. «Авто» — по имени, как у встроенных.
+                    let by_name = map::glow_by_name(&self.map.props[i].asset);
+                    let mut glow = self.map.props[i].light;
+                    let shown = match glow {
+                        None => format!("авто: {}", by_name.map_or("нет", map::Glow::label)),
+                        Some(g) => g.label().to_owned(),
+                    };
+                    ui.label("Свет:");
+                    egui::ComboBox::from_id_salt("prop_light").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut glow, None, "авто по имени");
+                        for g in map::Glow::CHOICES {
+                            ui.selectable_value(&mut glow, Some(g), g.label());
+                        }
+                    });
+                    if glow != self.map.props[i].light {
+                        self.checkpoint();
+                        self.map.props[i].light = glow;
+                    }
+                    let mut canopy = self.map.props[i].is_canopy();
+                    if ui.checkbox(&mut canopy, "Крона над токенами").on_hover_text("В Foundry уходит тайлом выше токенов, в картинке карты на его месте пень. Авто — по имени: деревья.").changed() {
+                        self.checkpoint();
+                        self.map.props[i].canopy = Some(canopy);
                     }
                 }
 
@@ -3383,9 +3515,10 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            if exporting && library::is_canopy(&prop.asset) {
+            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
-                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0] / 3.0, ..prop.clone() };
+                // Пень размером со ствол, а не со всю крону.
+                let stump = Prop { asset: library::STUMP.to_owned(), size: [3.0, 3.0], scale: prop.scale * prop.size[0].max(prop.size[1]) * library::STUMP_SHARE / 3.0, ..prop.clone() };
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
             } else {
                 self.draw_prop(painter, canvas, prop, Color32::WHITE);
@@ -3520,7 +3653,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -3722,6 +3855,14 @@ impl App {
                 if !key.is_some_and(|k| self.draw_along(painter, canvas, &k, p.a, p.b)) {
                     plain(painter, &self.cam, wall_width * 0.3, Color32::from_rgb(150, 196, 220));
                 }
+            }
+            // Тайный ход виден только ведущему: пунктир по стене, в выгрузку не попадает.
+            PortalKind::Secret if exporting => {}
+            PortalKind::Secret => {
+                let pts: Vec<Pos2> = to_screen(rect_around(wall_width * 0.5 + 0.08), &self.cam);
+                let mut ring = pts.clone();
+                ring.push(pts[0]);
+                painter.extend(Shape::dashed_line(&ring, Stroke::new(1.5, ACCENT), 5.0, 4.0));
             }
         }
     }
@@ -4301,6 +4442,7 @@ impl App {
             settle: 0,
             asked: false,
             quit,
+            canopies: self.settings.export_canopies,
         });
     }
 
@@ -4459,7 +4601,7 @@ impl App {
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
-            for prop in map.props.iter().filter(|p| library::is_canopy(&p.asset)) {
+            for prop in map.props.iter().filter(|p| e.canopies && p.is_canopy()) {
                 if !canopies.contains_key(&prop.asset) {
                     let bytes = self.textures.bytes(&prop.asset)?;
                     let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
@@ -4947,7 +5089,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

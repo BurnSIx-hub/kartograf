@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "kind": "house",
+  "name": "Дом лесника",
+  "size": [32, 26],
+  "seed": "лесник",
+  "river": "west",
+  "style": { "walls": "fieldstone" },
+  "rooms": [
+    { "id": "living", "name": "Горница", "role": "living", "size": "large" },
+    { "id": "kitchen", "name": "Кухня", "role": "kitchen", "objects": ["cauldron"] },
+    { "id": "bedroom", "name": "Спальня", "role": "bedroom", "size": "small" },
+    { "id": "study", "name": "Кабинет", "role": "library", "size": "small" }
+  ],
+  "links": [
+    { "from": "living", "to": "outside", "kind": "door" },
+    { "from": "living", "to": "kitchen", "kind": "opening" },
+    { "from": "living", "to": "bedroom" },
+    { "from": "living", "to": "study" }
+  ],
+  "objects": ["well", "stump"]
+}

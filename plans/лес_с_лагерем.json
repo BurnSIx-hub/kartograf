@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "kind": "forest",
+  "name": "Лагерь у ручья",
+  "size": [40, 30],
+  "seed": "ручей",
+  "river": "east",
+  "objects": ["cart", "notice_board"],
+  "options": { "density": 0.7 }
+}

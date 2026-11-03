@@ -90,18 +90,6 @@ pub struct Light {
     pub animation: &'static str,
 }
 
-/// Огонь среди встроенных объектов: что светит и как.
-fn light_of(asset: &str) -> Option<(f32, f32, &'static str, &'static str)> {
-    let id = asset.strip_prefix(crate::library::BUILTIN)?;
-    match id {
-        "campfire" => Some((3.0, 6.0, "#ff9a3c", "flame")),
-        "fireplace" => Some((2.0, 5.0, "#ff8a2c", "flame")),
-        "brazier" => Some((2.0, 4.0, "#ffa040", "torch")),
-        "street_lamp" => Some((3.0, 6.0, "#ffc870", "torch")),
-        _ => None,
-    }
-}
-
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
 /// ломаные и упрощённые — Foundry медленнеет от тысяч мелких отрезков.
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
@@ -132,7 +120,8 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         .props
         .iter()
         .filter_map(|p| {
-            let (bright, dim, color, animation) = light_of(&p.asset)?;
+            // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой.
+            let (bright, dim, color, animation) = p.light()?.params()?;
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
@@ -377,6 +366,10 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
                     w["flags"] = json!({"core": {"textureGridSize": tgs}});
                 }
             }
+            // Потайная дверь Foundry: игроки видят стену, пока ведущий не откроет.
+            PortalKind::Secret => {
+                w["door"] = json!(2);
+            }
             // Окно: сквозь него видно и светит, но не пройти.
             PortalKind::Window => {
                 w["sight"] = json!(0);
@@ -410,7 +403,7 @@ pub fn dd2vtt(map: &Map, px: u32, image_b64: &str, layout: &Layout) -> Value {
             json!({
                 "position": pt(mid), "bounds": [pt(*a), pt(*b)],
                 "rotation": (b[1] - a[1]).atan2(b[0] - a[0]),
-                "closed": kind.is_door(), "freestanding": false
+                "closed": kind.is_door() || kind.hidden(), "freestanding": false
             })
         })
         .collect();
@@ -536,7 +529,12 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None });
+        // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None };
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
+        m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
         let lay = layout(&m, &m.room_edges());
         let mut leaves = std::collections::HashMap::new();
         leaves.insert(crate::library::DEFAULT_DOOR.to_owned(), LeafFile { src: "kartograf/door.webp".into(), width: 512 });
@@ -563,9 +561,31 @@ mod tests {
         assert!(ids.len() == walls.len() && ids.iter().all(|i| i.len() == 16));
         let light = &scene["lights"][0];
         assert_eq!((light["x"].as_i64(), light["y"].as_i64(), light["config"]["dim"].as_f64()), (Some(300), Some(200), Some(30.0)));
+        assert_eq!(scene["lights"].as_array().unwrap().len(), 3, "костёр, чужая жаровня и бочка по выбору");
+        assert_eq!(scene["lights"][1]["config"]["animation"]["type"], "torch");
+        assert_eq!(scene["lights"][2]["config"]["color"], "#ffc870");
         let uv = dd2vtt(&m, 100, "", &lay);
         assert_eq!(uv["portals"].as_array().unwrap().len(), 3);
         assert_eq!(uv["resolution"]["pixels_per_grid"], 100);
+    }
+
+    #[test]
+    fn secret_passage_is_a_foundry_secret_door_but_a_solid_wall_in_the_picture() {
+        let mut m = Map::new(8, 6);
+        m.paint_rect(Layer::Rooms, (1, 1), (4, 3), Some(0));
+        m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Secret, asset: None, frame: None });
+        let lay = layout(&m, &m.room_edges());
+        let scene = foundry_scene(&m, "Тайна", "t.jpg", 100, &lay, &Default::default());
+        let walls = scene["walls"].as_array().unwrap();
+        let secret = walls.iter().find(|w| w["door"] == 2).expect("потайная дверь");
+        assert_eq!(secret["c"], json!([200, 100, 300, 100]));
+        assert!(secret.get("animation").is_none());
+        // В сцене стена вокруг хода разрезана, а на холсте (ширина с запасом) — нет.
+        assert!(lay.walls.iter().all(|l| l.windows(2).all(|w| !(w[0][1] == 1.0 && w[1][1] == 1.0 && w[0][0] < 2.5 && w[1][0] > 2.5))));
+        let drawn = map::cut_portals_wide(&m.room_edges(), &m.portals, 0.1);
+        assert!(drawn.iter().any(|(a, b)| a[1] == 1.0 && b[1] == 1.0 && a[0].min(b[0]) <= 2.0 && a[0].max(b[0]) >= 3.0));
+        let uv = dd2vtt(&m, 100, "", &lay);
+        assert_eq!(uv["portals"][0]["closed"], true);
     }
 
     #[test]

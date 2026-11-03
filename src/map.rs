@@ -255,10 +255,13 @@ pub enum PortalKind {
     /// Две створки на петлях по краям проёма.
     DoubleDoor,
     Window,
+    /// Тайный ход: на картинке стена цельная, в редакторе — пунктирная пометка,
+    /// в Foundry — потайная дверь.
+    Secret,
 }
 
 impl PortalKind {
-    pub const ALL: [PortalKind; 4] = [PortalKind::Opening, PortalKind::Door, PortalKind::DoubleDoor, PortalKind::Window];
+    pub const ALL: [PortalKind; 5] = [PortalKind::Opening, PortalKind::Door, PortalKind::DoubleDoor, PortalKind::Window, PortalKind::Secret];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -266,7 +269,13 @@ impl PortalKind {
             PortalKind::Door => "Дверь",
             PortalKind::DoubleDoor => "Двойная",
             PortalKind::Window => "Окно",
+            PortalKind::Secret => "Тайный ход",
         }
+    }
+
+    /// Не рвёт стену на картинке: тайный ход снаружи неотличим от стены.
+    pub fn hidden(self) -> bool {
+        self == PortalKind::Secret
     }
 
     /// Есть ли створка, которая открывается.
@@ -308,6 +317,86 @@ pub struct Prop {
     /// Отбрасывает ли тень; `None` — по имени: ковры, лужи и готовые тени плоские.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<bool>,
+    /// Чем светит в Foundry; `None` — по имени: костры, камины, жаровни, фонари, свечи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<Glow>,
+    /// Крона над токенами в Foundry (в картинке остаётся пень); `None` — по имени: деревья.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canopy: Option<bool>,
+}
+
+/// Огонь или лампа: как светит в Foundry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Glow {
+    /// Не светит, хотя по имени похоже.
+    Off,
+    Campfire,
+    Fireplace,
+    Brazier,
+    Candle,
+    Lamp,
+}
+
+impl Glow {
+    pub const CHOICES: [Glow; 6] = [Glow::Off, Glow::Campfire, Glow::Fireplace, Glow::Brazier, Glow::Candle, Glow::Lamp];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Glow::Off => "нет",
+            Glow::Campfire => "костёр",
+            Glow::Fireplace => "камин",
+            Glow::Brazier => "жаровня",
+            Glow::Candle => "свеча",
+            Glow::Lamp => "фонарь",
+        }
+    }
+
+    /// Радиус яркого и тусклого в клетках, цвет и анимация Foundry. `None` — не светит.
+    pub fn params(self) -> Option<(f32, f32, &'static str, &'static str)> {
+        match self {
+            Glow::Off => None,
+            Glow::Campfire => Some((3.0, 6.0, "#ff9a3c", "flame")),
+            Glow::Fireplace => Some((2.0, 5.0, "#ff8a2c", "flame")),
+            Glow::Brazier => Some((2.0, 4.0, "#ffa040", "torch")),
+            Glow::Candle => Some((1.0, 2.0, "#ffd9a0", "torch")),
+            Glow::Lamp => Some((3.0, 6.0, "#ffc870", "torch")),
+        }
+    }
+}
+
+/// Слова имени ассета в нижнем регистре: `Oak_Tree_A_3x3` → oak, tree, a, 3x3.
+/// У встроенных — слова ключа (`street_lamp` → street, lamp), у чужих — имени файла.
+pub fn name_words(key: &str) -> Vec<String> {
+    let name = key.strip_prefix(crate::library::BUILTIN).map_or_else(|| crate::library::label(key), str::to_owned).to_lowercase();
+    name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect()
+}
+
+/// Чем светит по имени. Встроенные — по ключу, чужие — по словам в названии файла.
+pub fn glow_by_name(key: &str) -> Option<Glow> {
+    let words = name_words(key);
+    let has = |ws: &[&str]| ws.iter().any(|w| words.iter().any(|x| x == w));
+    let pair = |a: &str, b: &str| words.iter().any(|x| x == a) && words.iter().any(|x| x == b);
+    if has(&["campfire", "bonfire", "firepit", "костёр", "костер"]) || pair("fire", "pit") || pair("camp", "fire") {
+        Some(Glow::Campfire)
+    } else if has(&["fireplace", "hearth", "камин", "очаг"]) || pair("fire", "place") {
+        Some(Glow::Fireplace)
+    } else if has(&["brazier", "torch", "torches", "sconce", "жаровня", "факел"]) {
+        Some(Glow::Brazier)
+    } else if has(&["candle", "candles", "candlestick", "candelabra", "chandelier", "свеча", "свечи", "люстра"]) {
+        Some(Glow::Candle)
+    } else if has(&["lamp", "lamps", "lantern", "lanterns", "streetlight", "lamppost", "фонарь", "лампа"]) || pair("street", "light") {
+        Some(Glow::Lamp)
+    } else {
+        None
+    }
+}
+
+/// Крона по имени: только встроенное дерево. У чужих деревьев листва может быть любой
+/// или не быть вовсе (сухие, зимние), поэтому они остаются в картинке, пока крону не
+/// включат у объекта рукой.
+pub fn canopy_by_name(key: &str) -> bool {
+    key == crate::library::TREE
 }
 
 impl Prop {
@@ -320,6 +409,16 @@ impl Prop {
 
     pub fn casts_shadow(&self) -> bool {
         self.shadow.unwrap_or_else(|| !flat_by_name(&self.asset))
+    }
+
+    /// Чем светит в Foundry: выбранное вручную или узнанное по имени.
+    pub fn light(&self) -> Option<Glow> {
+        self.light.or_else(|| glow_by_name(&self.asset)).filter(|g| *g != Glow::Off)
+    }
+
+    /// Крона: в Foundry тайлом над токенами, в картинке пень.
+    pub fn is_canopy(&self) -> bool {
+        self.canopy.unwrap_or_else(|| canopy_by_name(&self.asset))
     }
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
@@ -670,14 +769,21 @@ pub fn smooth_line(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     out
 }
 
-/// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них.
+/// Отрезки стен за вычетом проёмов дверей и окон, лежащих на них, — для выгрузки:
+/// тайный ход тоже вырезан, в VTT на его месте потайная дверь.
 pub fn cut_portals(segs: &[Segment], portals: &[Portal]) -> Vec<Segment> {
-    cut_portals_wide(segs, portals, 0.0)
+    cut(segs, portals.iter(), 0.0)
 }
 
 /// То же для рисования: концы стены продлеваются на полтолщины, поэтому дыра шире
 /// на `grow` с каждой стороны — и стена встаёт в край проёма, а не заходит в него.
+/// Тайные ходы стену не рвут.
 pub fn cut_portals_wide(segs: &[Segment], portals: &[Portal], grow: f32) -> Vec<Segment> {
+    cut(segs, portals.iter().filter(|p| !p.kind.hidden()), grow)
+}
+
+fn cut<'a>(segs: &[Segment], portals: impl Iterator<Item = &'a Portal>, grow: f32) -> Vec<Segment> {
+    let portals: Vec<&Portal> = portals.collect();
     let mut out = Vec::new();
     for &(a, b) in segs {
         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -1399,8 +1505,34 @@ mod tests {
     }
 
     #[test]
+    fn lights_and_canopies_by_name_and_by_hand() {
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None };
+        assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
+        assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
+        assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
+        assert_eq!(prop("C:\\assets\\objects\\Chandelier_Iron_2x2.webp").light(), Some(Glow::Candle));
+        assert_eq!(prop("pack:x|textures/objects/Lamp_Post_A.webp").light(), Some(Glow::Lamp));
+        assert_eq!(prop("pack:x|textures/objects/Barrel_A.webp").light(), None);
+        // Рукой: выключить похожее по имени и зажечь непохожее.
+        assert_eq!(Prop { light: Some(Glow::Off), ..prop("builtin:campfire") }.light(), None);
+        assert_eq!(Prop { light: Some(Glow::Brazier), ..prop("pack:x|textures/objects/Barrel_A.webp") }.light(), Some(Glow::Brazier));
+        assert!(prop("builtin:tree").is_canopy());
+        // Чужие деревья — только рукой: листва у них любая, сухим крона ни к чему.
+        assert!(!prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
+        assert!(!prop("pack:x|textures/objects/Dead_Tree_Roots_A_6x6.webp").is_canopy());
+        assert!(!prop("builtin:stump").is_canopy());
+        assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
+        assert!(Prop { canopy: Some(true), ..prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp") }.is_canopy());
+        // В файле необязательные поля не пишутся, старые карты читаются.
+        let json = serde_json::to_string(&prop("builtin:tree")).unwrap();
+        assert!(!json.contains("light") && !json.contains("canopy"));
+        let back: Prop = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, prop("builtin:tree"));
+    }
+
+    #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();

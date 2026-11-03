@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "kind": "tavern",
+  "name": "Таверна «Серый гусь»",
+  "size": [40, 30],
+  "seed": "гусь",
+  "mood": "calm",
+  "river": "south",
+  "style": { "walls": "timber", "floor": "wood_planks" },
+  "rooms": [
+    { "id": "hall", "name": "Зал", "role": "hall", "size": "large", "objects": ["fireplace"] },
+    { "id": "kitchen", "name": "Кухня", "role": "kitchen" },
+    { "id": "pantry", "name": "Кладовая", "role": "storage", "size": "small" },
+    { "id": "cellar", "name": "Подвал", "role": "storage", "floor": "stone_tiles" },
+    { "id": "guest", "name": "Комната", "role": "bedroom" }
+  ],
+  "links": [
+    { "from": "hall", "to": "outside", "kind": "bridge" },
+    { "from": "hall", "to": "kitchen" },
+    { "from": "kitchen", "to": "pantry" },
+    { "from": "hall", "to": "cellar" },
+    { "from": "cellar", "to": "pantry", "kind": "secret" },
+    { "from": "hall", "to": "guest" }
+  ],
+  "objects": ["well", "cart"]
+}
