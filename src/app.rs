@@ -2380,9 +2380,10 @@ impl App {
                             r
                         });
                         st.color = [color.r(), color.g(), color.b()];
+                        let gm = ui.checkbox(&mut st.gm, "только ведущему").on_hover_text("Видна здесь, но не попадает в выгрузку для игроков");
                         match chosen {
                             Some(i) => {
-                                if text.gained_focus() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) || picked.inner.changed() {
+                                if text.gained_focus() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) || picked.inner.changed() || gm.changed() {
                                     self.checkpoint();
                                 }
                                 self.map.labels[i] = st;
@@ -3718,6 +3719,9 @@ impl App {
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {
+            if exporting && label.gm {
+                continue;
+            }
             self.draw_label(painter, canvas, label);
             if self.sel == Some(Sel::Label(i)) && !exporting {
                 let [hw, hh] = label.half_extent();

@@ -627,11 +627,14 @@ pub struct Label {
     /// Поворот в градусах по часовой.
     #[serde(default)]
     pub rot: f32,
+    /// Только для ведущего: видна в редакторе, в картинку для игроков не идёт.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gm: bool,
 }
 
 impl Label {
     pub fn new(text: String, pos: [f32; 2]) -> Self {
-        Self { text, pos, size: 0.6, color: [240, 228, 200], rot: 0.0 }
+        Self { text, pos, size: 0.6, color: [240, 228, 200], rot: 0.0, gm: false }
     }
 
     /// Приблизительная рамка в своих осях: полуширина и полувысота.
