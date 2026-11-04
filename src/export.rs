@@ -35,6 +35,11 @@ fn scene_flags(map: &Map) -> Value {
     let mut flags = json!({"kartograf": {"format": 1}});
     if !map.ambience.is_empty() {
         flags[LIVE_MODULE] = json!({"ambience": map.ambience});
+        // Под открытым небом — тени облаков «Живой карты».
+        if map.ambience.starts_with("forest-") || map.ambience.starts_with("town-") {
+            flags[LIVE_MODULE]["clouds"] = json!(0.6);
+            flags[LIVE_MODULE]["cloudCover"] = json!(0.5);
+        }
     }
     flags
 }
@@ -545,6 +550,9 @@ mod tests {
         assert!(scene["flags"].get(LIVE_MODULE).is_none());
         autumn.ambience = "forest-autumn".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["ambience"], "forest-autumn");
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["clouds"], 0.6);
+        autumn.ambience = "cave-1".into();
+        assert!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE].get("clouds").is_none());
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 
