@@ -341,6 +341,34 @@ pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
     (r > l && b > t).then(|| [l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5])
 }
 
+/// Средняя непрозрачность картинки, 0..1 (каждая восьмая точка). У FA среди полов
+/// есть накладки — редкие доски на прозрачном (`Wood_Ashen_Flooring_H`, ~0,2 при
+/// ~0,8 у прочих досок): полом комнаты такая не годится, сквозь неё виден двор.
+/// Замер помнится до конца работы программы: файл не меняется, а разбор долгий.
+pub fn opacity(sources: &Sources, key: &str) -> Option<f32> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<f32>>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(a) = seen.lock().ok()?.get(key) {
+        return *a;
+    }
+    let a = measure_opacity(sources, key);
+    seen.lock().ok()?.insert(key.to_owned(), a);
+    a
+}
+
+fn measure_opacity(sources: &Sources, key: &str) -> Option<f32> {
+    let bytes = read_source(key, sources).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in (0..img.height()).step_by(8) {
+        for x in (0..img.width()).step_by(8) {
+            sum += img.get_pixel(x, y)[3] as u64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum as f32 / n as f32 / 255.0)
+}
+
 /// Встроенные предметы с вариантами: всё, что начинается с этих имён, — одна семья.
 const BUILTIN_FAMILIES: [&str; 12] = ["market_stall", "chest", "weapon_rack", "door", "window", "rug", "bed", "table", "roof_clay", "roof_slate", "frame_wood", "frame_stone"];
 

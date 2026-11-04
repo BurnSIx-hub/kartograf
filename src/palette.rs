@@ -60,6 +60,9 @@ const FLOORS: &[Slot] = &[
     ("marble", &[&["marble"], &["мрамор"]], &["wall"]),
 ];
 
+/// Полы комнат: сквозь них не должно быть видно двора (см. [`Palette::solid`]).
+const INDOOR_FLOORS: &[&str] = &["wood_planks", "flagstones", "stone_tiles", "dungeon_flagstones", "dungeon_flagstones_moss", "cobblestone", "brick_floor", "sandstone", "marble"];
+
 const OBJECTS: &[Slot] = &[
     ("chair", &[&["chair"], &["стул"]], &["arm", "armchair"]),
     ("stool", &[&["stool"], &["табурет"]], &[]),
@@ -300,6 +303,8 @@ pub struct Pick {
 
 /// Чем мерить картинку, когда размер не в имени: ширина и высота в точках.
 pub type Measure = Box<dyn Fn(&str) -> Option<[u32; 2]>>;
+/// Чем мерить непрозрачность текстуры, 0..1.
+pub type Opacity = Box<dyn Fn(&str) -> Option<f32>>;
 
 pub struct Palette {
     /// Слот → ключи и имена подходящих ассетов, по алфавиту ключей.
@@ -309,6 +314,9 @@ pub struct Palette {
     /// Чем найти видимую часть картинки (доли от середины); нет — весь холст.
     visible: Option<Box<dyn Fn(&str) -> Option<[f32; 4]>>>,
     boxes: RefCell<HashMap<String, Option<[f32; 4]>>>,
+    /// Чем мерить непрозрачность текстуры пола; нет — не мерить.
+    opacity: Option<Opacity>,
+    alphas: RefCell<HashMap<String, Option<f32>>>,
     rng: RefCell<Rng>,
     /// Рамы окон FA (`Window_Frame_*`): ставятся поверх подоконника.
     frames: Vec<(String, String)>,
@@ -327,7 +335,7 @@ fn table_of(kind: Kind) -> &'static [Slot] {
 impl Palette {
     /// Всё встроенное.
     pub fn builtin() -> Self {
-        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
+        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
     }
 
     /// Замены из библиотеки: только не встроенные ассеты. Слот крыши без своих
@@ -372,7 +380,7 @@ impl Palette {
             v.dedup();
         }
         frames.sort();
-        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
+        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
     }
 
     /// Рама под подоконник FA: того же размера (`1x1`, `2x1`, «large»), ближе всех
@@ -394,6 +402,24 @@ impl Palette {
             })
             .max_by_key(|(score, key)| (*score, std::cmp::Reverse(*key)))
             .map(|(_, key)| key.clone())
+    }
+
+    pub fn with_opacity(mut self, f: Opacity) -> Self {
+        self.opacity = Some(f);
+        self
+    }
+
+    fn alpha(&self, key: &str) -> Option<f32> {
+        let f = self.opacity.as_ref()?;
+        *self.alphas.borrow_mut().entry(key.to_owned()).or_insert_with(|| f(key))
+    }
+
+    /// Пол комнаты, а не накладка. Полы FA непрозрачны от 0,30 (брусчатка, кирпич)
+    /// до 0,9, накладки — редкие доски `Flooring_H`, `Shack_Floor_*_B1/B2` — до 0,26.
+    /// Трава и земля FA тоже около 0,3 (так они смешиваются), поэтому мерится только
+    /// пол комнат. Не смогли измерить — годится.
+    fn solid(&self, key: &str) -> bool {
+        self.alpha(key).is_none_or(|a| a >= 0.28)
     }
 
     pub fn with_visible(mut self, f: Box<dyn Fn(&str) -> Option<[f32; 4]>>) -> Self {
@@ -428,10 +454,15 @@ impl Palette {
     /// просто трава: встроенное пятно на чужой траве режет глаз); иначе встроенный.
     pub fn pick(&self, slot: &str) -> Pick {
         let near = NEAR.iter().find(|n| n.0 == slot).map(|n| n.1);
+        let indoor = INDOOR_FLOORS.contains(&slot);
         let own = |s: &str| self.slots.get(s).filter(|v| !v.is_empty());
         let far = near.and_then(|n| NEAR.iter().find(|f| f.0 == n)).map(|f| f.1);
         let Some(found) = own(slot).or_else(|| near.and_then(own)).or_else(|| far.and_then(own)) else { return Self::builtin_pick(slot) };
-        let i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
+        let mut i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
+        // Выпала накладка — следующий по списку: мерить все варианты долго (секунды).
+        if indoor && let Some(k) = (0..found.len()).map(|step| (i + step) % found.len()).find(|&k| self.solid(&found[k].0)) {
+            i = k;
+        }
         let (key, name) = &found[i];
         let size = *self.sizes.borrow_mut().entry(key.clone()).or_insert_with(|| {
             library::size_from_name(name)
@@ -530,6 +561,22 @@ mod tests {
                 println!("{slot:24} {n:5}  {}", names.join(" | "));
             }
         }
+    }
+
+    #[test]
+    fn floor_overlays_are_not_floors() {
+        let assets = vec![
+            asset("Wood/Wood_Ashen_Flooring_A.webp", Kind::Floor),
+            asset("Wood/Wood_Ashen_Flooring_B.webp", Kind::Floor),
+            asset("Wood/Wood_Ashen_Flooring_H.webp", Kind::Floor),
+            asset("Grass/Grass_F.webp", Kind::Floor),
+            asset("Grass/Grass_G.webp", Kind::Floor),
+        ];
+        let alpha = |k: &str| Some(if k.contains("_H") { 0.2 } else if k.contains("Grass_F") { 0.32 } else if k.contains("Grass") { 0.9 } else { 0.83 });
+        let p = Palette::from_library(&assets, Box::new(|_| None)).with_opacity(Box::new(alpha));
+        assert!((0..20).all(|_| !p.pick("wood_planks").key.contains("_H")));
+        // Трава — не пол комнаты: прозрачная трава FA остаётся в деле.
+        assert!((0..40).any(|_| p.pick("grass_green").key.contains("Grass_F")));
     }
 
     #[test]

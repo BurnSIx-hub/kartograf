@@ -1301,8 +1301,9 @@ impl App {
             self.material = procgen::dungeon_look(&mut self.map);
         }
         let palette = if plan.assets == crate::plan::Assets::Library {
-            let (sources, seen) = (self.textures.sources.clone(), self.textures.sources.clone());
+            let (sources, seen, dense) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
             Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
+                .with_opacity(Box::new(move |key| library::opacity(&dense, key)))
         } else {
             Palette::builtin()
         };
