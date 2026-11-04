@@ -200,6 +200,11 @@ fn builtin(key: &str) -> Option<(&'static str, &'static [u8])> {
         .or_else(|| BUILTIN_ROOFS.iter().find(|t| t.0 == id).map(|t| (t.1, t.2)))
 }
 
+/// Встроенный ассет с таким ключом есть: текстура, объект, стена, дверь или крыша.
+pub fn is_builtin_key(key: &str) -> bool {
+    builtin(key).is_some()
+}
+
 fn is_cliff_path(lower: &str) -> bool {
     lower.contains("cliff") && !lower.contains("under_cliff")
 }

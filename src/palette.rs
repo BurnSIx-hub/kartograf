@@ -33,11 +33,18 @@ const FLOORS: &[Slot] = &[
     ("water_shallow", &[&["water", "shallow"], &["shallow"], &["water"], &["мелководье"], &["вода"]], &["deep", "fall", "lily"]),
     ("water_deep", &[&["water", "deep"], &["deep"], &["глубина"]], &["fall"]),
     ("cave_floor", &[&["cave"], &["пещера"]], &["wall"]),
+    // Полы пещер FA по породе: `Cave_Floor_02_Slate`, `_01_Earthy`, `_03_Sandstone`, `_05_Volcanic`.
+    ("cave_slate", &[&["cave", "slate"]], &["wall"]),
+    ("cave_earthy", &[&["cave", "earthy"]], &["wall"]),
+    ("cave_sandstone", &[&["cave", "sandstone"]], &["wall"]),
+    ("cave_volcanic", &[&["cave", "volcanic"]], &["wall"]),
     ("gravel", &[&["gravel"], &["pebbles"], &["гравий"]], &[]),
     ("ice", &[&["ice"], &["лёд"], &["лед"]], &["cream"]),
     ("sand", &[&["sand"], &["песок"]], &["stone", "sandstone"]),
-    ("mud", &[&["mud"], &["грязь"]], &[]),
+    // У FA грязь — `Wet_Mud_*`: первое слово «wet».
+    ("mud", &[&["mud"], &["wet", "mud"], &["грязь"]], &[]),
     ("swamp", &[&["swamp"], &["bog"], &["marsh"], &["болото"]], &[]),
+    ("swamp_wet", &[&["marsh", "wet"], &["swamp", "wet"], &["топь"]], &[]),
     ("forest_floor", &[&["forest", "floor"], &["leaves"], &["подстилка"]], &[]),
     ("moss", &[&["moss"], &["мох"]], &["stone", "flagstone", "wall"]),
     ("rocky_ground", &[&["rock"], &["rocky"], &["stone", "ground"], &["камни"]], &["wall", "lava"]),
@@ -116,6 +123,12 @@ const OBJECTS: &[Slot] = &[
     ("bridge", &[&["bridge"], &["мост"]], &[]),
     ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral"]),
     ("stump", &[&["stump"], &["пень"]], &[]),
+    ("stalagmite_ice", &[&["arctic", "stalagmite", "ice"], &["stalagmite", "ice"], &["сосулька"]], &[]),
+    ("crystal", &[&["underdark", "crystal"], &["crystal", "rock"], &["кристалл"]], &[]),
+    // Грибы у болота — бурые и белые; светящиеся Подземья — для грибной пещеры.
+    ("mushroom", &[&["mushroom", "brown"], &["mushroom", "tan"], &["mushroom", "white"], &["гриб"]], &["stalk"]),
+    ("mushroom_glow", &[&["underdark", "mushroom"]], &["stalk"]),
+    ("cattail", &[&["cattail", "brown"], &["cattail", "yellow"], &["рогоз"]], &[]),
 ];
 
 const WALLS: &[Slot] = &[
@@ -133,6 +146,14 @@ const WALLS: &[Slot] = &[
     ("wall_hedge", &[&["hedge"], &["изгородь"]], &[]),
     // Скалы FA (`Cliff_Stone_*`): земляные, ледяные, песчаные — не пещера; верх скалы — часть.
     ("wall_cave", &[&["cliff", "stone"], &["cave"], &["rock"], &["скала"]], &["top"]),
+    // Скалы под вид пещеры: каменная — сланец и бурый камень, болотная — мшистый и
+    // земляной, грибная — лиловый.
+    ("wall_cave_stone", &[&["cliff", "stone", "slate"], &["cliff", "stone", "earthy"]], &["top", "sand", "desert"]),
+    ("wall_cave_ice", &[&["cliff", "ice"], &["arctic", "ice", "cliff"]], &["top"]),
+    ("wall_cave_sand", &[&["cliff", "stone", "sandstone"], &["cliff", "sandy"]], &["top"]),
+    ("wall_cave_moss", &[&["cliff", "stone", "mossy"], &["cliff", "dirt"]], &["top"]),
+    ("wall_cave_volcanic", &[&["cliff", "stone", "volcanic"]], &["top", "sand", "desert"]),
+    ("wall_cave_purple", &[&["cliff", "stone", "purple"]], &["top"]),
     ("wall_dwarven", &[&["dwarven"], &["dwarf"], &["гномья"]], &[]),
     ("wall_drow", &[&["drow"], &["obsidian"], &["обсидиан"]], &[]),
 ];
@@ -220,6 +241,7 @@ const NEAR: &[(&str, &str)] = &[
     ("moss", "grass_green"),
     ("forest_floor", "grass_green"),
     ("mud", "dirt"),
+    ("swamp_wet", "swamp"),
     ("ash", "dirt"),
     ("water_deep", "water_shallow"),
     ("stone_tiles", "flagstones"),
@@ -234,6 +256,16 @@ const NEAR: &[(&str, &str)] = &[
     ("wall_ruined", "wall_stone_blocks"),
     ("wall_ruined_blocks", "wall_stone_blocks"),
     ("wall_cave", "wall_stone_blocks"),
+    ("wall_cave_stone", "wall_cave"),
+    ("wall_cave_ice", "wall_cave"),
+    ("wall_cave_sand", "wall_cave"),
+    ("wall_cave_moss", "wall_cave"),
+    ("wall_cave_volcanic", "wall_cave"),
+    ("wall_cave_purple", "wall_cave"),
+    ("cave_slate", "cave_floor"),
+    ("cave_earthy", "cave_floor"),
+    ("cave_sandstone", "sand"),
+    ("cave_volcanic", "ash"),
     ("wall_hedge", "wall_wood"),
     ("door_wood_iron", "door_wood"),
     ("weapon_rack_spears", "weapon_rack"),
@@ -380,7 +412,9 @@ impl Palette {
     pub fn builtin_pick(slot: &str) -> Pick {
         let key = format!("{}{slot}", library::BUILTIN);
         // Встроенного под слот нет (дерево осени) — встроенный у близкого слота.
-        if library::builtin_size(&key).is_none()
+        // Проверка по всем встроенным, а не по размеру объекта: иначе у мха, грязи,
+        // глубокой воды и скалы брался «близкий» — трава, земля, мелководье, блоки.
+        if !library::is_builtin_key(&key)
             && let Some(near) = NEAR.iter().find(|n| n.0 == slot)
         {
             return Self::builtin_pick(near.1);

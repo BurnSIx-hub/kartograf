@@ -430,6 +430,58 @@ impl Season {
     }
 }
 
+/// Вид пещеры: из чего пол и стены, чем полны водоёмы, что растёт.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaveKind {
+    #[default]
+    #[serde(alias = "каменная", alias = "камень")]
+    Stone,
+    #[serde(alias = "ледяная", alias = "лёд", alias = "лед")]
+    Ice,
+    #[serde(alias = "песчаная", alias = "песок")]
+    Sand,
+    #[serde(alias = "болотная", alias = "болото")]
+    Swamp,
+    #[serde(alias = "вулканическая", alias = "огненная", alias = "лава")]
+    Volcanic,
+    #[serde(alias = "грибная", alias = "грибы")]
+    Fungal,
+}
+
+impl CaveKind {
+    pub const ALL: [CaveKind; 6] = [CaveKind::Stone, CaveKind::Ice, CaveKind::Sand, CaveKind::Swamp, CaveKind::Volcanic, CaveKind::Fungal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CaveKind::Stone => "Каменная",
+            CaveKind::Ice => "Ледяная",
+            CaveKind::Sand => "Песчаная",
+            CaveKind::Swamp => "Болотная",
+            CaveKind::Volcanic => "Вулканическая",
+            CaveKind::Fungal => "Грибная",
+        }
+    }
+
+    pub fn is_stone(&self) -> bool {
+        *self == CaveKind::Stone
+    }
+
+    /// Звук пещеры в «Живой карте»: у льда и болота капель, у грибной — жуть.
+    pub fn ambience(self) -> &'static str {
+        match self {
+            CaveKind::Ice | CaveKind::Swamp => "cave-3",
+            CaveKind::Fungal => "cave-2",
+            CaveKind::Stone | CaveKind::Sand | CaveKind::Volcanic => "cave-1",
+        }
+    }
+
+    /// Грибная светится спорами — светлячки «Живой карты».
+    pub fn particles(self) -> &'static str {
+        if self == CaveKind::Fungal { "fireflies" } else { "" }
+    }
+}
+
 /// Настройки генератора; у каждого вида карты свои значимые.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Opts {
@@ -448,6 +500,9 @@ pub struct Opts {
     /// Лес: время года.
     #[serde(default, skip_serializing_if = "Season::is_summer")]
     pub season: Season,
+    /// Пещера: каменная, ледяная, песчаная…
+    #[serde(default, skip_serializing_if = "CaveKind::is_stone")]
+    pub cave: CaveKind,
 }
 
 fn half() -> f32 {
@@ -468,7 +523,7 @@ fn room_size() -> [u32; 2] {
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer }
+        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer, cave: CaveKind::Stone }
     }
 }
 
@@ -561,7 +616,7 @@ impl Plan {
         plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
-        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season };
+        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave };
         match opt.kind {
             Kind::Dungeon => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
             Kind::House | Kind::Tavern => {

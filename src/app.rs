@@ -403,6 +403,7 @@ pub struct App {
     used_only: bool,
     /// Время года последнего леса: окно генератора открывается с ним.
     gen_season: crate::plan::Season,
+    gen_cave: crate::plan::CaveKind,
     pub door_asset: Option<String>,
     pub door_kind: PortalKind,
     pub door_width: f32,
@@ -548,6 +549,7 @@ impl App {
             window_bands: std::collections::HashMap::new(),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
+            gen_cave: crate::plan::CaveKind::Stone,
             first_thumb: Rect::NOTHING,
             pending_plan: None,
             drawer_area: Rect::NOTHING,
@@ -1309,9 +1311,14 @@ impl App {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
                 let forest = plan.kind == generate::Kind::Forest;
-                self.map.particles = if forest { plan.options.season.particles().to_owned() } else { String::new() };
+                self.map.particles = match plan.kind {
+                    generate::Kind::Forest => plan.options.season.particles(),
+                    generate::Kind::Cave => plan.options.cave.particles(),
+                    _ => "",
+                }
+                .to_owned();
                 self.map.weather = if forest { plan.options.season.weather().to_owned() } else { String::new() };
-                self.map.ambience = plan.kind.ambience(plan.options.season).to_owned();
+                self.map.ambience = plan.kind.ambience(&plan.options).to_owned();
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
                 Some(r)
@@ -1703,6 +1710,15 @@ impl App {
                         });
                         ui.end_row();
                     }
+                    if opt.kind == generate::Kind::Cave {
+                        ui.label("Пещера");
+                        ui.horizontal_wrapped(|ui| {
+                            for c in crate::plan::CaveKind::ALL {
+                                ui.selectable_value(&mut opt.cave, c, c.label());
+                            }
+                        });
+                        ui.end_row();
+                    }
                     if !dungeon {
                         ui.label("Густота");
                         ui.add(egui::Slider::new(&mut opt.density, 0.0..=1.0));
@@ -1748,6 +1764,7 @@ impl App {
                     self.save_settings();
                 }
                 self.gen_season = opt.season;
+                self.gen_cave = opt.cave;
                 self.generate(&opt);
                 // Карта построена — окно уходит; откроют снова — с новым сидом.
                 open = false;
@@ -1981,7 +1998,7 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, ..Default::default() });
+                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, cave: self.gen_cave, ..Default::default() });
                     }
                 }
                 ui.separator();

@@ -11,7 +11,7 @@ use crate::library;
 use crate::map::{Label, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
 use crate::mask::{self, Brush, Mask, Shape};
 use crate::palette::{Palette, Pick};
-use crate::plan::{self, Assets, LinkKind, Mood, Plan, River, Role, Season, Size, SizeName, OUTSIDE};
+use crate::plan::{self, Assets, CaveKind, LinkKind, Mood, Plan, River, Role, Season, Size, SizeName, OUTSIDE};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -173,6 +173,109 @@ fn forest_look(season: Season) -> ForestLook {
         Season::Winter => ForestLook { ground: "snow", patches: "grass_frost", under: "grass_frost", bush: "bush_summer", bare: 0.55, brush: 0.3 },
         Season::Magic => ForestLook { ground: "moss", patches: "grass_green", under: "forest_floor", bush: "bush_magic", bare: 0.0, brush: 1.3 },
     }
+}
+
+/// Пещера по виду: пол, стены, пятна на полу (слот, сколько, радиус, растёкость),
+/// водоём (мелкое и середина, сколько) и что стоит по пещере.
+struct CaveLook {
+    outside: &'static str,
+    floor: &'static str,
+    wall: &'static str,
+    patches: [(&'static str, i32, f32, f32); 3],
+    pool: Option<(&'static str, &'static str)>,
+    pools: [i32; 2],
+    /// Камни и прочее; повторы — чаще. Своего нет (грибов во встроенных) — пропуск.
+    scatter: &'static [&'static str],
+    /// Что растёт у воды.
+    shore: Option<&'static str>,
+    /// Размер водоёма против каменной пещеры.
+    pool_size: f32,
+    /// Сколько всего стоит против каменной.
+    clutter: f32,
+}
+
+fn cave_look(kind: CaveKind) -> CaveLook {
+    match kind {
+        CaveKind::Stone => CaveLook {
+            outside: "rocky_ground",
+            floor: "cave_slate",
+            wall: "wall_cave_stone",
+            patches: [("gravel", 8, 2.2, 0.8), ("moss", 7, 1.8, 0.7), ("rocky_ground", 6, 2.4, 0.6)],
+            pool: Some(("water_shallow", "water_deep")),
+            pools: [1, 2],
+            scatter: &["boulder", "boulder", "rubble"],
+            shore: None,
+            pool_size: 1.0,
+            clutter: 1.0,
+        },
+        CaveKind::Ice => CaveLook {
+            outside: "snow",
+            floor: "ice",
+            wall: "wall_cave_ice",
+            patches: [("snow", 9, 2.4, 0.8), ("gravel", 4, 1.8, 0.7), ("cave_slate", 5, 2.2, 0.6)],
+            // Подо льдом тёмная вода: полынья.
+            pool: Some(("ice", "water_deep")),
+            pools: [1, 2],
+            scatter: &["stalagmite_ice", "stalagmite_ice", "boulder"],
+            shore: None,
+            pool_size: 1.3,
+            clutter: 1.2,
+        },
+        CaveKind::Sand => CaveLook {
+            outside: "sand",
+            floor: "cave_sandstone",
+            wall: "wall_cave_sand",
+            patches: [("sand", 10, 2.6, 0.8), ("gravel", 6, 2.0, 0.7), ("rocky_ground", 4, 2.0, 0.6)],
+            pool: None,
+            pools: [0, 0],
+            scatter: &["boulder", "rubble", "rubble"],
+            shore: None,
+            pool_size: 1.0,
+            clutter: 1.0,
+        },
+        CaveKind::Swamp => CaveLook {
+            outside: "mud",
+            floor: "cave_earthy",
+            wall: "wall_cave_moss",
+            patches: [("mud", 10, 2.4, 0.8), ("moss", 9, 2.0, 0.7), ("swamp", 4, 1.6, 0.6)],
+            pool: Some(("swamp_wet", "water_shallow")),
+            pools: [2, 4],
+            scatter: &["mushroom", "boulder", "cattail"],
+            shore: Some("cattail"),
+            pool_size: 1.7,
+            clutter: 1.4,
+        },
+        CaveKind::Volcanic => CaveLook {
+            outside: "ash",
+            floor: "cave_volcanic",
+            wall: "wall_cave_volcanic",
+            patches: [("ash", 9, 2.4, 0.8), ("rocky_ground", 6, 2.2, 0.7), ("gravel", 4, 1.8, 0.6)],
+            pool: Some(("lava", "lava")),
+            pools: [1, 3],
+            scatter: &["boulder", "boulder", "rubble"],
+            shore: None,
+            pool_size: 1.3,
+            clutter: 1.0,
+        },
+        CaveKind::Fungal => CaveLook {
+            outside: "rocky_ground",
+            floor: "cave_slate",
+            wall: "wall_cave_purple",
+            patches: [("moss", 10, 2.4, 0.8), ("cave_earthy", 6, 2.2, 0.7), ("gravel", 4, 1.8, 0.6)],
+            pool: Some(("water_shallow", "water_deep")),
+            pools: [1, 2],
+            scatter: &["mushroom_glow", "mushroom_glow", "crystal", "mushroom", "boulder"],
+            shore: Some("mushroom_glow"),
+            pool_size: 1.2,
+            clutter: 2.2,
+        },
+    }
+}
+
+/// Слот, которому нет встроенной картинки и не нашлось своей: грибы, кристаллы.
+fn missing(slot: &str) -> bool {
+    let p = asset(slot);
+    !p.own && !library::is_builtin_key(&p.key)
 }
 
 fn tree_slot(season: Season) -> &'static str {
@@ -820,7 +923,8 @@ fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     for &i in &open {
         cells[i] = true;
     }
-    ground(m, "rocky_ground");
+    let look = cave_look(p.options.cave);
+    ground(m, look.outside);
     if open.is_empty() {
         return 0;
     }
@@ -846,11 +950,11 @@ fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     }
     let open: Vec<usize> = (0..cells.len()).filter(|&i| cells[i]).collect();
     let cell_pos = |i: usize| [(i as i32 % w) as f32 + 0.5, (i as i32 / w) as f32 + 0.5];
-    let floor = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("cave_floor"));
+    let floor = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or(look.floor));
     let spots: Vec<_> = open.iter().map(|&i| (cell_pos(i), 0.95)).collect();
     let weights = blobs(m, &spots, 0.8, 1.0);
     m.paint(Layer::Rooms, floor, &weights);
-    m.wall_style = wall(p.style.walls.as_deref().and_then(plan::wall_id).unwrap_or("wall_cave"));
+    m.wall_style = wall(p.style.walls.as_deref().and_then(plan::wall_id).unwrap_or(look.wall));
     let edges = m.room_edges();
     m.sync_edge_looks(&edges);
     dark_outside(m, if p.mood == Mood::Gloomy { 0.95 } else { 0.8 });
@@ -872,7 +976,7 @@ fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
         }
     }
     let inner = |m: &Map, weights: Vec<(usize, f32)>| -> Vec<(usize, f32)> { weights.into_iter().filter(|(i, _)| m.rooms.data[*i] > 200).collect() };
-    for (name, count, radius, flow) in [("gravel", 8, 2.2, 0.8), ("moss", 7, 1.8, 0.7), ("rocky_ground", 6, 2.4, 0.6)] {
+    for (name, count, radius, flow) in look.patches {
         let g = mat(m, name);
         let mut spots = Vec::new();
         for _ in 0..count {
@@ -881,27 +985,56 @@ fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
         let weights = inner(m, blobs(m, &spots, 0.2, flow));
         m.paint(Layer::Rooms, g, &weights);
     }
-    if !deep.is_empty() {
-        let (shallow, depth) = (mat(m, "water_shallow"), mat(m, "water_deep"));
-        for _ in 0..rng.int(1, 2) {
+    let mut shores = Vec::new();
+    if !deep.is_empty()
+        && let Some((shallow, depth)) = look.pool
+    {
+        let (shallow, depth) = (mat(m, shallow), mat(m, depth));
+        for _ in 0..rng.int(look.pools[0], look.pools[1]) {
             let c = cell_pos(deep[rng.int(0, deep.len() as i32 - 1) as usize]);
             let mut lobes = Vec::new();
             for _ in 0..4 {
                 let (dx, dy) = (rng.random() as f32 * 2.0 - 1.0, rng.random() as f32 * 2.0 - 1.0);
-                lobes.push(([c[0] + dx, c[1] + dy], 1.1 + rng.random() as f32 * 0.6));
+                lobes.push(([c[0] + dx * look.pool_size, c[1] + dy * look.pool_size], (1.1 + rng.random() as f32 * 0.6) * look.pool_size));
             }
             let weights = inner(m, blobs(m, &lobes, 0.6, 1.0));
             m.paint(Layer::Rooms, shallow, &weights);
-            let weights = inner(m, blobs(m, &[(c, 0.9)], 0.3, 0.9));
+            let weights = inner(m, blobs(m, &[(c, 0.9 * look.pool_size)], 0.3, 0.9));
             m.paint(Layer::Rooms, depth, &weights);
-            sp.block(c[0] as i32 - 3, c[1] as i32 - 3, 7, 7);
+            let half = (3.0 * look.pool_size).round() as i32;
+            sp.block(c[0] as i32 - half, c[1] as i32 - half, half * 2 + 1, half * 2 + 1);
+            shores.push(c);
         }
     }
-    let scatter = (open.len() as f32 * (0.03 + density * 0.05)) as i32;
+    // У воды — рогоз, у грибной — грибы: кольцом по берегу, за пределами водоёма.
+    if let Some(s) = look.shore.filter(|s| !missing(s)) {
+        for c in &shores {
+            for k in 0..rng.int(4, 7) {
+                let a = k as f32 * 1.1 + rng.random() as f32 * 0.8;
+                let r = 3.6 * look.pool_size + rng.random() as f32 * 0.9;
+                let (x, y) = ((c[0] + a.cos() * r) as i32, (c[1] + a.sin() * r) as i32);
+                if x >= 0 && y >= 0 && x < w && y < h && cells[at(x, y)] {
+                    put(m, &mut sp, s, x, y, rng.int(0, 3) as f32 * 90.0, 0.8 + rng.random() as f32 * 0.4);
+                }
+            }
+        }
+    }
+    let scatter = (open.len() as f32 * (0.03 + density * 0.05) * look.clutter) as i32;
+    let things: Vec<&str> = look.scatter.iter().copied().filter(|s| !missing(s)).collect();
+    let things = if things.is_empty() { vec!["boulder"] } else { things };
     for _ in 0..scatter {
         let i = open[rng.int(0, open.len() as i32 - 1) as usize] as i32;
-        let n = pick(rng, &["boulder", "boulder", "rubble"]);
+        let n = pick(rng, &things);
         put(m, &mut sp, n, i % w, i / w, 0.0, 0.7 + rng.random() as f32 * 0.5);
+        // Грибы, кристаллы, рогоз и ледяные сталагмиты растут кучками.
+        if n != "boulder" && n != "rubble" {
+            for _ in 0..rng.int(1, 3) {
+                let (x, y) = (i % w + rng.int(-1, 1), i / w + rng.int(-1, 1));
+                if x >= 0 && y >= 0 && x < w && y < h && cells[at(x, y)] {
+                    put(m, &mut sp, n, x, y, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.4);
+                }
+            }
+        }
     }
     // Стоянка в глубине и клад там, куда дальше всего идти.
     if !deep.is_empty() {
@@ -2094,6 +2227,35 @@ mod tests {
             assert!(d.portals.iter().any(|p| p.kind == PortalKind::DoubleDoor));
             assert!(d.props.iter().any(|p| p.asset.ends_with("stairs")));
         }
+    }
+
+    #[test]
+    fn every_cave_kind_builds_and_keeps_its_look() {
+        for kind in CaveKind::ALL {
+            let mut p = Plan::random(&opt(Kind::Cave, "кв"), [40, 30]);
+            p.options.cave = kind;
+            let mut m = Map::new(40, 30);
+            let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
+            assert!(r.count > 0, "{kind:?}");
+            assert_eq!(m.portals.iter().filter(|q| q.kind == PortalKind::Opening).count(), 2, "{kind:?}");
+            // Во встроенных грибов и рогоза нет — их и не ставит.
+            assert!(m.props.iter().all(|q| crate::library::builtin_size(&q.asset).is_some()), "{kind:?}");
+            let has = |name: &str| m.room_floor.iter().chain(&m.terrain).any(|c| matches!(&m.materials[c.material as usize].paint, Paint::Texture(k) if k.ends_with(&format!(":{name}"))));
+            match kind {
+                CaveKind::Ice => assert!(has("ice") && has("snow")),
+                CaveKind::Sand => assert!(has("sand") && !has("water_shallow")),
+                CaveKind::Swamp => assert!(has("swamp") && has("mud")),
+                CaveKind::Volcanic => assert!(has("lava") && has("ash")),
+                _ => {}
+            }
+        }
+        let json = Plan::random(&opt(Kind::Cave, "x"), [30, 20]).to_json();
+        assert!(!json.replace(' ', "").contains("\"cave\":"), "каменная по умолчанию не пишется");
+        let mut p = Plan::random(&opt(Kind::Cave, "x"), [30, 20]);
+        p.options.cave = CaveKind::Ice;
+        let json = p.to_json();
+        assert!(json.replace(' ', "").contains("\"cave\":\"ice\""), "{json}");
+        assert_eq!(Plan::from_json(&json.replace("\"ice\"", "\"ледяная\"")).unwrap().options.cave, CaveKind::Ice);
     }
 
     #[test]

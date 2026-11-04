@@ -58,12 +58,12 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 6] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern];
 
-    /// Звук места в «Живой карте»; у леса он по времени года.
-    pub fn ambience(self, season: crate::plan::Season) -> &'static str {
+    /// Звук места в «Живой карте»; у леса он по времени года, у пещеры — по виду.
+    pub fn ambience(self, o: &crate::plan::Opts) -> &'static str {
         match self {
             Kind::Dungeon => "dungeon-1",
-            Kind::Cave => "cave-1",
-            Kind::Forest => season.ambience(),
+            Kind::Cave => o.cave.ambience(),
+            Kind::Forest => o.season.ambience(),
             Kind::Town => "town-1",
             Kind::House => "house",
             Kind::Tavern => "tavern",
@@ -99,11 +99,13 @@ pub struct Options {
     pub library: bool,
     /// Лес: время года.
     pub season: crate::plan::Season,
+    /// Пещера: вид.
+    pub cave: crate::plan::CaveKind,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone }
     }
 }
 
