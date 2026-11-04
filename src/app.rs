@@ -1201,16 +1201,22 @@ impl App {
             Some(i) => self.material = i,
             None => self.error = Some("В карте уже 255 материалов — больше не помещается.".into()),
         }
-        if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
+        // Выбрана дорога или вода — её и перекрасить, инструмент не трогать.
+        if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) && !self.editing_path() {
             self.tool = Tool::Dungeon;
         }
         self.recolor_path();
     }
 
+    /// Выбрана дорога (вода, тропа) инструментом «Выбор» или «Дорога»: панель правит её.
+    fn editing_path(&self) -> bool {
+        matches!(self.sel, Some(Sel::Path(_))) && matches!(self.tool, Tool::Select | Tool::Path)
+    }
+
     /// Выбранная дорога перекрашивается в выбранный материал.
     fn recolor_path(&mut self) {
         if let Some(Sel::Path(i)) = self.sel
-            && self.tool == Tool::Path
+            && self.editing_path()
             && self.map.paths[i].material != self.material
         {
             self.checkpoint();
@@ -2347,6 +2353,33 @@ impl App {
 
     }
 
+    /// Ползунки правят выбранную дорогу, а без неё — образец для новых.
+    fn path_panel(&mut self, ui: &mut egui::Ui) {
+        let chosen = match self.sel {
+            Some(Sel::Path(i)) => Some(i),
+            _ => None,
+        };
+        let mut st = chosen.map_or_else(|| self.path_style.clone(), |i| self.map.paths[i].clone());
+        let rs = [
+            ui.add(egui::Slider::new(&mut st.width, 0.25..=12.0).logarithmic(true).text("ширина, кл.")),
+            ui.add(egui::Slider::new(&mut st.soft, 0.0..=1.0).text("мягкость края")),
+            ui.add(egui::Slider::new(&mut st.rough, 0.0..=1.0).text("неровность")),
+        ];
+        let along = ui.checkbox(&mut st.along, "Текстура вдоль линии").on_hover_text("Для ковра и мостовой. Без галочки текстура лежит по сетке, как пол, — для земли и воды.");
+        match chosen {
+            Some(i) => {
+                if rs.iter().any(|r| r.drag_started()) || along.changed() || rs.iter().any(|r| r.changed() && !r.dragged()) {
+                    self.checkpoint();
+                }
+                self.map.paths[i] = st;
+            }
+            None => {
+                st.points.clear();
+                self.path_style = st;
+            }
+        }
+    }
+
     /// Строка над картой: настройки инструмента и выбранного. Высота постоянная:
     /// иначе карта прыгала бы под курсором; что не влезло — прокруткой вбок.
     fn options_bar(&mut self, ui: &mut egui::Ui) {
@@ -2357,10 +2390,19 @@ impl App {
                 ui.add_space(4.0);
                 ui.heading(self.tool.label());
                 ui.separator();
-                if matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) {
+                // Выбранная «Выбором» дорога или вода правится тут же: материал, «живой», ширина.
+                let path_sel = self.tool == Tool::Select && self.editing_path();
+                if let Some(Sel::Path(i)) = self.sel
+                    && path_sel
+                {
+                    ui.strong("Дорога или вода");
+                    self.material = self.map.paths[i].material.min(self.map.materials.len().saturating_sub(1));
+                }
+                if matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) || path_sel {
                     self.material_picker(ui);
                 }
                 match self.tool {
+                    _ if path_sel => self.path_panel(ui),
                     Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade => {
                         if self.tool == Tool::Shade {
                             ui.horizontal(|ui| {
@@ -2481,32 +2523,7 @@ impl App {
                             None => self.label_style = st,
                         }
                     }
-                    Tool::Path => {
-                        // Ползунки правят выбранную дорогу, а без неё — образец для новых.
-                        let chosen = match self.sel {
-                            Some(Sel::Path(i)) => Some(i),
-                            _ => None,
-                        };
-                        let mut st = chosen.map_or_else(|| self.path_style.clone(), |i| self.map.paths[i].clone());
-                        let rs = [
-                            ui.add(egui::Slider::new(&mut st.width, 0.25..=12.0).logarithmic(true).text("ширина, кл.")),
-                            ui.add(egui::Slider::new(&mut st.soft, 0.0..=1.0).text("мягкость края")),
-                            ui.add(egui::Slider::new(&mut st.rough, 0.0..=1.0).text("неровность")),
-                        ];
-                        let along = ui.checkbox(&mut st.along, "Текстура вдоль линии").on_hover_text("Для ковра и мостовой. Без галочки текстура лежит по сетке, как пол, — для земли и воды.");
-                        match chosen {
-                            Some(i) => {
-                                if rs.iter().any(|r| r.drag_started()) || along.changed() || rs.iter().any(|r| r.changed() && !r.dragged()) {
-                                    self.checkpoint();
-                                }
-                                self.map.paths[i] = st;
-                            }
-                            None => {
-                                st.points.clear();
-                                self.path_style = st;
-                            }
-                        }
-                    }
+                    Tool::Path => self.path_panel(ui),
                     Tool::Scatter => {
                         if self.scatter.set.is_empty() {
                             ui.weak("Набор пуст: щёлкните объекты на полке");
@@ -4445,7 +4462,9 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
+            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
+                // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
+            } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
                 // Пень размером со ствол, а не со всю крону.
                 let asset = self.export.as_ref().map(|e| &e.stumps).filter(|s| !s.is_empty()).map_or_else(
@@ -4774,7 +4793,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 std::fs::write(&file, export::webp_bytes(&img, 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && p.is_canopy()) {
@@ -4799,7 +4818,9 @@ impl App {
                     canopies.insert(look.clone(), export::foundry_src(&file));
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
-                tiles.push(export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px));
+                let mut tile = export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px);
+                tile.fade = !map::is_bare_tree(&prop.asset);
+                tiles.push(tile);
             }
             roof_tiles.push(tiles);
         }

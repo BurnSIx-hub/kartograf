@@ -438,6 +438,13 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
 /// Крона по имени: встроенное дерево и кроны FA (`Tree_Tops`, ствол у них отдельно).
 /// У прочих чужих деревьев листва может быть любой или не быть вовсе (сухие, зимние),
 /// поэтому они остаются в картинке, пока крону не включат у объекта рукой.
+/// Голое дерево (FA `Bare_Tree`): сквозь ветки и так видно — в выгрузке оно
+/// тайлом над токенами без затухания, а в картинке под ним ничего, даже пня.
+pub fn is_bare_tree(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("bare_tree") || lower.contains("tree_bare") || lower.ends_with("builtin:tree_bare")
+}
+
 pub fn canopy_by_name(key: &str) -> bool {
     key == crate::library::TREE || key.contains("/Tree_Tops/")
 }
@@ -1607,6 +1614,8 @@ mod tests {
         assert!(!prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
         assert!(!prop("pack:x|textures/objects/Dead_Tree_Roots_A_6x6.webp").is_canopy());
         assert!(!prop("builtin:stump").is_canopy());
+        assert!(is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Bare_Trees/Bare_Tree_A1_6x6.webp"));
+        assert!(!is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp"));
         assert!(prop("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp").is_canopy());
         assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
         // Слой по имени: ковёр на полу, дерево выше обычного, своё — как выбрано.
