@@ -1985,6 +1985,7 @@ impl App {
                     self.build_from_file(&path);
                 }
             });
+            ui.menu_button("Биом", |ui| self.biome_ui(ui));
             ui.menu_button("Вид", |ui| {
                 if item(ui, "Вся карта", "Home") {
                     self.fitted = false;
@@ -2033,6 +2034,46 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Биом для «Живой карты»: звук сцены, что летит от крон, погода. Процедурная
+    /// карта ставит их сама, нарисованной руками — отсюда. Выбор звука леса
+    /// подставляет его листву и погоду, их можно сменить следом.
+    fn biome_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::plan::{PARTICLES, PLACES, WEATHERS, place_defaults};
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.label("Звук места");
+        let mut place = self.map.ambience.clone();
+        for (key, label) in PLACES {
+            ui.selectable_value(&mut place, key.to_owned(), label);
+        }
+        if place != self.map.ambience {
+            self.checkpoint();
+            let (particles, weather) = place_defaults(&place);
+            self.map.ambience = place;
+            self.map.particles = particles.to_owned();
+            self.map.weather = weather.to_owned();
+        }
+        ui.separator();
+        ui.label("От крон");
+        let mut particles = self.map.particles.clone();
+        for (key, label) in PARTICLES {
+            ui.selectable_value(&mut particles, key.to_owned(), label);
+        }
+        if particles != self.map.particles {
+            self.checkpoint();
+            self.map.particles = particles;
+        }
+        ui.separator();
+        ui.label("Погода");
+        let mut weather = self.map.weather.clone();
+        for (key, label) in WEATHERS {
+            ui.selectable_value(&mut weather, key.to_owned(), label);
+        }
+        if weather != self.map.weather {
+            self.checkpoint();
+            self.map.weather = weather;
+        }
     }
 
     fn swatch(&mut self, ui: &mut egui::Ui, paint: &Paint, size: f32) -> egui::Response {

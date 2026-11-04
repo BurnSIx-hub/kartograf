@@ -332,6 +332,44 @@ impl River {
     }
 }
 
+/// Звуки мест «Живой карты»: ключ флага сцены `ambience` и подпись.
+/// Ключи — те же, что в `PLACES` модуля (`scripts/ambience.js`).
+pub const PLACES: [(&str, &str); 16] = [
+    ("", "Без звука"),
+    ("forest-summer", "Лес летом"),
+    ("forest-spring", "Лес весной"),
+    ("forest-autumn", "Лес осенью"),
+    ("forest-winter", "Лес зимой"),
+    ("forest-magic", "Магический лес"),
+    ("cave-1", "Пещера: гул"),
+    ("cave-2", "Пещера: жуткая"),
+    ("cave-3", "Пещера: капли"),
+    ("dungeon-1", "Подземелье: сквозняк"),
+    ("dungeon-2", "Подземелье: жуткое"),
+    ("dungeon-3", "Подземелье: тёмное"),
+    ("town-1", "Квартал: улица"),
+    ("town-2", "Квартал: деревня"),
+    ("tavern", "Таверна"),
+    ("house", "Дом с камином"),
+];
+
+/// Что летит от крон: ключ флага тайла `particles` и подпись.
+pub const PARTICLES: [(&str, &str); 3] = [("", "Ничего"), ("leaves", "Листопад"), ("fireflies", "Светлячки")];
+
+/// Погода сцены Foundry: ключ и подпись.
+pub const WEATHERS: [(&str, &str); 2] = [("", "Ясно"), ("snow", "Снег")];
+
+/// Что идёт с лесом этого звука: осенью листья, в магическом — светлячки, зимой снег.
+/// Не лес — ничего.
+pub fn place_defaults(place: &str) -> (&'static str, &'static str) {
+    match place {
+        "forest-autumn" => ("leaves", ""),
+        "forest-magic" => ("fireflies", ""),
+        "forest-winter" => ("", "snow"),
+        _ => ("", ""),
+    }
+}
+
 /// Время года леса: какие деревья, кусты и земля.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
