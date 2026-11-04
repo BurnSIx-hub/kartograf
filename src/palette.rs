@@ -131,7 +131,8 @@ const WALLS: &[Slot] = &[
     ("wall_thatch", &[&["thatch"], &["straw"], &["солома"]], &[]),
     ("wall_timber", &[&["timber"], &["halftimber"], &["half", "timber"], &["tudor"], &["фахверк"]], &[]),
     ("wall_hedge", &[&["hedge"], &["изгородь"]], &[]),
-    ("wall_cave", &[&["cave"], &["rock"], &["скала"]], &[]),
+    // Скалы FA (`Cliff_Stone_*`): земляные, ледяные, песчаные — не пещера; верх скалы — часть.
+    ("wall_cave", &[&["cliff", "stone"], &["cave"], &["rock"], &["скала"]], &["top"]),
     ("wall_dwarven", &[&["dwarven"], &["dwarf"], &["гномья"]], &[]),
     ("wall_drow", &[&["drow"], &["obsidian"], &["обсидиан"]], &[]),
 ];

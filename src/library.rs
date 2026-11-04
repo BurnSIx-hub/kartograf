@@ -200,6 +200,21 @@ fn builtin(key: &str) -> Option<(&'static str, &'static [u8])> {
         .or_else(|| BUILTIN_ROOFS.iter().find(|t| t.0 == id).map(|t| (t.1, t.2)))
 }
 
+fn is_cliff_path(lower: &str) -> bool {
+    lower.contains("cliff") && !lower.contains("under_cliff")
+}
+
+/// Скала FA из паков: стена-дорожка, толщина которой — высота картинки.
+pub fn is_cliff(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("|textures/paths/") && is_cliff_path(&lower)
+}
+
+/// Толщина скалы в клетках: у FA 256 точек на клетку, скалы бывают в 1–4 клетки.
+pub fn cliff_width(px: [u32; 2]) -> f32 {
+    (px[1] as f32 / 256.0).max(0.25)
+}
+
 /// Толщина встроенной стены в клетках — под неё нарисована полоса.
 pub fn builtin_wall_width(key: &str) -> Option<f32> {
     let id = key.strip_prefix(BUILTIN)?;
@@ -384,6 +399,9 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
         return match section {
             "terrain" | "patterns" => Some(Kind::Floor),
             "walls" => Some(Kind::Wall),
+            // Скалы FA — дорожки Dungeondraft (`paths/…Cliff…`): полоса вдоль линии,
+            // как стена. Тень под скалой (`Under_Cliff`) — не стена.
+            "paths" if is_cliff_path(&lower) => Some(Kind::Wall),
             "portals" => Some(Kind::Door),
             "objects" => Some(Kind::Object),
             _ => None,
@@ -946,6 +964,13 @@ mod tests {
         assert_eq!(kind_of("textures/portals/Doors/Door_1x1.webp", true), Some(Kind::Door));
         assert_eq!(kind_of("textures/terrain/Grass/Grass_A.webp", true), Some(Kind::Floor));
         assert_eq!(kind_of("textures/lights/Candle.png", true), None);
+        // Скалы FA — дорожки, но в библиотеке это стены; тень под скалой и прочие дорожки — нет.
+        assert_eq!(kind_of("textures/paths/Natural_Decor_Paths/Cliffs_Paths/Cliff_Stone_Earthy_A1.webp", true), Some(Kind::Wall));
+        assert_eq!(kind_of("textures/paths/Cliff_Paths/Under_Cliff_Paths/Under_Cliff_A1.webp", true), None);
+        assert_eq!(kind_of("textures/paths/Cable_Paths/Cable_Metal_Brass_A_Path.webp", true), None);
+        assert!(is_cliff("pack:fa.dungeondraft_pack|textures/paths/Cliff_Paths/Cliff_Ice_A1.webp"));
+        assert!(!is_cliff("pack:fa.dungeondraft_pack|textures/walls/Walls_Stone/Wall_Stone_A.webp"));
+        assert_eq!(cliff_width([768, 512]), 2.0);
         assert_eq!(kind_of("Мои/Объекты/бочка.png", false), Some(Kind::Object));
         assert_eq!(kind_of("плитка.png", false), Some(Kind::Floor));
     }

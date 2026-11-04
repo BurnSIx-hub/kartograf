@@ -2306,6 +2306,10 @@ impl App {
             let mut st = self.map.wall_style.clone();
             if let Some(width) = library::builtin_wall_width(&key) {
                 st.width = width;
+            } else if library::is_cliff(&key)
+                && let Some(px) = library::dimensions(&self.textures.sources, &key)
+            {
+                st.width = library::cliff_width(px);
             }
             st.paint = Paint::Texture(key);
             self.set_wall_style(st);
@@ -2856,6 +2860,10 @@ impl App {
                     let mut st = self.wall_style();
                     if let Some(width) = library::builtin_wall_width(&key) {
                         st.width = width;
+                    } else if library::is_cliff(&key)
+                        && let Some(px) = library::dimensions(&self.textures.sources, &key)
+                    {
+                        st.width = library::cliff_width(px);
                     }
                     st.paint = Paint::Texture(key);
                     self.set_wall_style(st);

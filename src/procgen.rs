@@ -72,8 +72,10 @@ fn mat(m: &mut Map, name: &str) -> usize {
 
 /// Стена слота: картинка своя или встроенная, толщина — встроенной полосы.
 fn wall(name: &str) -> WallStyle {
-    let width = library::builtin_wall_width(&key(name)).unwrap_or(0.35);
-    WallStyle { paint: Paint::Texture(asset(name).key), width }
+    let pick = asset(name);
+    // Скала FA толщиной в свою картинку (`size` — точки / 256), прочие свои — 0,35.
+    let width = library::builtin_wall_width(&pick.key).unwrap_or(if library::is_cliff(&pick.key) { pick.size[1] } else { 0.35 });
+    WallStyle { paint: Paint::Texture(pick.key), width }
 }
 
 /// Видимый предмет от центра с учётом поворота на четверти: лево, верх, право, низ.
