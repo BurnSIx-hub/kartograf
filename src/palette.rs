@@ -28,8 +28,10 @@ const FLOORS: &[Slot] = &[
     ("grass_green", &[&["grass"], &["трава"]], &["dry", "dead", "yellow", "frost", "snow", "burnt"]),
     ("stone_tiles", &[&["tiles"], &["tile"], &["плитка"]], &["roof", "mosaic"]),
     ("grass_dry", &[&["grass", "dry"], &["grass", "dead"], &["grass", "yellow"], &["сухая", "трава"]], &[]),
-    ("grass_frost", &[&["grass", "frost"], &["frost"], &["иней"]], &[]),
-    ("snow", &[&["snow"], &["снег"]], &["roof"]),
+    // У FA иней — `Frosted_Grass`, `Grassy_Snow`; снег с песком (`Snow_Sand`) выглядит
+    // булыжником — не берётся.
+    ("grass_frost", &[&["grass", "frost"], &["frost"], &["frosted", "grass"], &["grassy", "snow"], &["иней"]], &[]),
+    ("snow", &[&["snow"], &["снег"]], &["roof", "sand", "disturbed"]),
     ("water_shallow", &[&["water", "shallow"], &["shallow"], &["water"], &["мелководье"], &["вода"]], &["deep", "fall", "lily"]),
     ("water_deep", &[&["water", "deep"], &["deep"], &["глубина"]], &["fall"]),
     ("cave_floor", &[&["cave"], &["пещера"]], &["wall"]),

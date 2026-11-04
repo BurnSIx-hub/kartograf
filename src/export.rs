@@ -41,6 +41,13 @@ fn scene_flags(map: &Map) -> Value {
             flags[LIVE_MODULE]["cloudCover"] = json!(0.5);
         }
     }
+    // Зерно карты — рыбкам «Живой карты»: на каждой карте свои, у всех игроков те же.
+    if !map.seed.is_empty() {
+        if flags.get(LIVE_MODULE).is_none() {
+            flags[LIVE_MODULE] = json!({});
+        }
+        flags[LIVE_MODULE]["seed"] = json!(map.seed);
+    }
     flags
 }
 
@@ -555,6 +562,10 @@ mod tests {
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["clouds"], 0.6);
         autumn.ambience = "cave-1".into();
         assert!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE].get("clouds").is_none());
+        // Зерно — рыбкам; и без звука места.
+        autumn.ambience.clear();
+        autumn.seed = "озеро".into();
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["seed"], "озеро");
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 

@@ -4134,18 +4134,31 @@ impl App {
                                 mesh.add_triangle(q, q + row + 1, q + row);
                             }
                         }
+                    } else if detail > 1 {
+                        // Ровный кусок вблизи — веер с теми же точками по краям, что у
+                        // дроблёного соседа: стык без Т-образных узлов и щелей. Раньше
+                        // сплошной кусок раздувался на полпикселя, и полоса раздува
+                        // ложилась на соседей светлой сеткой по шагу маски (зимний лес
+                        // в Foundry, 2026-11-04).
+                        let n = detail as f32;
+                        let (x0, y0, d) = (i as f32, j as f32, s as f32);
+                        mesh.vertices.push(vertex(x0 + d / 2.0, y0 + d / 2.0, a[0]));
+                        let ring: Vec<(f32, f32)> = (0..detail)
+                            .map(|k| (k as f32 / n, 0.0))
+                            .chain((0..detail).map(|k| (1.0, k as f32 / n)))
+                            .chain((0..detail).map(|k| (1.0 - k as f32 / n, 1.0)))
+                            .chain((0..detail).map(|k| (0.0, 1.0 - k as f32 / n)))
+                            .collect();
+                        for &(u, v) in &ring {
+                            mesh.vertices.push(vertex(x0 + u * d, y0 + v * d, a[0]));
+                        }
+                        let count = ring.len() as u32;
+                        for k in 0..count {
+                            mesh.add_triangle(base, base + 1 + k, base + 1 + (k + 1) % count);
+                        }
                     } else {
                         for ((x, y), alpha) in corners.into_iter().zip(a) {
                             mesh.vertices.push(vertex(x as f32, y as f32, alpha));
-                        }
-                        if a == [255; 4] && detail > 1 {
-                            // Сплошной кусок рядом с дроблёным чуть шире — на полпикселя,
-                            // чтобы на стыке не проглядывал фон.
-                            let k = 0.5 / (px * s as f32);
-                            let c = (mesh.vertices[base as usize].pos + mesh.vertices[base as usize + 2].pos.to_vec2()) / 2.0;
-                            for v in &mut mesh.vertices[base as usize..] {
-                                v.pos = c + (v.pos - c) * (1.0 + 2.0 * k);
-                            }
                         }
                         mesh.add_triangle(base, base + 1, base + 2);
                         mesh.add_triangle(base, base + 2, base + 3);
