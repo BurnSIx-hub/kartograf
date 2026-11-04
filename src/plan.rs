@@ -400,6 +400,17 @@ impl Season {
         }
     }
 
+    /// Название для окна генератора у дома, таверны, квартала.
+    pub fn name(self) -> &'static str {
+        match self {
+            Season::Summer => "Лето",
+            Season::Spring => "Весна",
+            Season::Autumn => "Осень",
+            Season::Winter => "Зима",
+            Season::Magic => "Магия",
+        }
+    }
+
     pub fn is_summer(&self) -> bool {
         *self == Season::Summer
     }
@@ -497,7 +508,7 @@ pub struct Opts {
     /// Подземелье: сторона комнаты от и до, в клетках, для комнат без своего размера.
     #[serde(default = "room_size")]
     pub room_size: [u32; 2],
-    /// Лес: время года.
+    /// Лес, дом, таверна, квартал: время года.
     #[serde(default, skip_serializing_if = "Season::is_summer")]
     pub season: Season,
     /// Пещера: каменная, ледяная, песчаная…

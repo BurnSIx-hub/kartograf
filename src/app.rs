@@ -1310,14 +1310,15 @@ impl App {
             Ok(r) => {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
-                let forest = plan.kind == generate::Kind::Forest;
+                // Время года — у всего, что под открытым небом, кроме пещеры и подземелья.
+                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern);
                 self.map.particles = match plan.kind {
-                    generate::Kind::Forest => plan.options.season.particles(),
+                    _ if outdoor => plan.options.season.particles(),
                     generate::Kind::Cave => plan.options.cave.particles(),
                     _ => "",
                 }
                 .to_owned();
-                self.map.weather = if forest { plan.options.season.weather().to_owned() } else { String::new() };
+                self.map.weather = if outdoor { plan.options.season.weather().to_owned() } else { String::new() };
                 self.map.ambience = plan.kind.ambience(&plan.options).to_owned();
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
@@ -1706,6 +1707,14 @@ impl App {
                         ui.horizontal(|ui| {
                             for s in crate::plan::Season::ALL {
                                 ui.selectable_value(&mut opt.season, s, s.label());
+                            }
+                        });
+                        ui.end_row();
+                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern) {
+                        ui.label("Время года");
+                        ui.horizontal(|ui| {
+                            for s in crate::plan::Season::ALL {
+                                ui.selectable_value(&mut opt.season, s, s.name());
                             }
                         });
                         ui.end_row();

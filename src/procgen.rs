@@ -278,6 +278,28 @@ fn missing(slot: &str) -> bool {
     !p.own && !library::is_builtin_key(&p.key)
 }
 
+/// Дерево у построек по времени года: зимой больше половины голых.
+fn season_tree(rng: &mut Rng, season: Season) -> &'static str {
+    let look = forest_look(season);
+    if look.bare > 0.0 && rng.chance(look.bare) { "tree_bare" } else { tree_slot(season) }
+}
+
+/// Куст у построек по времени года; зимой их почти нет — тогда ничего.
+fn season_bush(rng: &mut Rng, season: Season) -> Option<&'static str> {
+    let look = forest_look(season);
+    (look.brush >= 1.0 || rng.chance(look.brush as f64)).then_some(look.bush)
+}
+
+/// Трава в квартале: летом и весной зелёная, осенью сухая, зимой снег, в магическом — мох.
+fn town_grass(season: Season) -> (&'static str, &'static str) {
+    match season {
+        Season::Summer | Season::Spring => ("grass_green", "mud"),
+        Season::Autumn => ("grass_dry", "mud"),
+        Season::Winter => ("snow", "grass_frost"),
+        Season::Magic => ("moss", "grass_green"),
+    }
+}
+
 fn tree_slot(season: Season) -> &'static str {
     match season {
         Season::Summer => "tree_summer",
@@ -359,10 +381,17 @@ fn inside(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale
     if fw > r.w || fh > r.h {
         return false;
     }
-    (0..16).any(|_| {
+    let done = (0..16).any(|_| {
         let (x, y) = (rng.int(r.x, r.x + r.w - fw), rng.int(r.y, r.y + r.h - fh));
         put_pick(m, sp, &p, name, x, y, 0.0, scale)
-    })
+    });
+    if done
+        && !p.own
+        && let Some(q) = m.props.last_mut()
+    {
+        q.tint = season_tint(name);
+    }
+    done
 }
 
 fn pick<'a>(rng: &mut Rng, of: &[&'a str]) -> &'a str {
@@ -1316,9 +1345,13 @@ fn push_curb(m: &mut Map, run: &mut Vec<[f32; 2]>, material: usize) {
 fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let density = p.options.density;
     let (w, h) = (m.width as i32, m.height as i32);
+    let season = p.options.season;
+    let (grass, wet) = town_grass(season);
     ground(m, "dirt");
-    patches(m, rng, "grass_green", w * h / 90, (1.2, 3.0), 0.75);
-    patches(m, rng, "mud", w * h / 160, (0.8, 2.0), 0.6);
+    // Зимой снег лежит шире травы: пятна крупнее и чаще.
+    let (count, size) = if season == Season::Winter { (w * h / 50, (2.0, 4.5)) } else { (w * h / 90, (1.2, 3.0)) };
+    patches(m, rng, grass, count, size, 0.75);
+    patches(m, rng, wet, w * h / 160, (0.8, 2.0), 0.6);
     patches(m, rng, "gravel", w * h / 200, (0.8, 1.6), 0.5);
     // Кварталы: прямоугольник делится прямыми улицами разной ширины.
     let mut todo = vec![Room { x: 0, y: 0, w, h }];
@@ -1424,7 +1457,8 @@ fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
                 if rng.chance(0.14) {
                     // Пустырь или сад вместо дома.
                     let c = if row { [(b.x + t) as f32 + len as f32 / 2.0, b.y as f32 + deep as f32 / 2.0] } else { [b.x as f32 + deep as f32 / 2.0, (b.y + t) as f32 + len as f32 / 2.0] };
-                    drop(m, "tree", c, rng.int(0, 3) as f32 * 90.0, 0.8);
+                    let tree = season_tree(rng, season);
+                    drop(m, tree, c, rng.int(0, 3) as f32 * 90.0, 0.8);
                     t += len + 1;
                     continue;
                 }
@@ -1452,7 +1486,10 @@ fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
         }
         for _ in 0..(b.w * b.h / 25) {
             let n = pick(rng, &["bush", "bush", "crate", "barrel", "planter", "rubble", "sacks"]);
-            inside(m, &mut sp, rng, b, n, 0.9);
+            let n = if n == "bush" { season_bush(rng, season) } else { Some(n) };
+            if let Some(n) = n {
+                inside(m, &mut sp, rng, b, n, 0.9);
+            }
         }
     }
     if p.mood == Mood::Abandoned {
@@ -1660,8 +1697,10 @@ fn abandon(m: &mut Map, rng: &mut Rng, rooms: &[Room]) {
 fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let tavern = p.kind == Kind::Tavern;
     let (w, h) = (m.width as i32, m.height as i32);
-    ground(m, "grass_green");
-    patches(m, rng, "grass_dry", w * h / 60, (2.0, 4.0), 0.6);
+    let season = p.options.season;
+    let look = forest_look(season);
+    ground(m, look.ground);
+    patches(m, rng, look.patches, w * h / 60, (2.0, 4.0), 0.6);
     let (bw, bh) = plan::building_size(p.kind, m.width, m.height);
     let building = Room { x: (w - bw) / 2, y: ((h - bh) / 2 - 1).max(0), w: bw, h: bh };
     let planks = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("wood_planks"));
@@ -2016,8 +2055,13 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         let on_lane = lane.as_ref().is_some_and(|l| l.distance(q) < 2.0);
         let on_water = water_paths.as_ref().is_some_and(|(bank, _)| bank.distance(q) < 2.4);
         if !near && !on_lane && !on_water {
-            let n = pick(rng, &["bush", "bush", "bush", "tree"]);
-            drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.8);
+            let n = match pick(rng, &["bush", "bush", "bush", "tree"]) {
+                "tree" => Some(season_tree(rng, season)),
+                _ => season_bush(rng, season),
+            };
+            if let Some(n) = n {
+                drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.8);
+            }
         }
     }
     if !p.objects.is_empty() {
@@ -2256,6 +2300,22 @@ mod tests {
         let json = p.to_json();
         assert!(json.replace(' ', "").contains("\"cave\":\"ice\""), "{json}");
         assert_eq!(Plan::from_json(&json.replace("\"ice\"", "\"ледяная\"")).unwrap().options.cave, CaveKind::Ice);
+    }
+
+    #[test]
+    fn yards_and_streets_follow_the_season() {
+        for kind in [Kind::House, Kind::Tavern, Kind::Town] {
+            let mut p = Plan::random(&opt(kind, "двор"), [40, 30]);
+            p.options.season = Season::Winter;
+            let mut m = Map::new(40, 30);
+            build(&mut m, &p, 0, Palette::builtin()).unwrap();
+            let has = |name: &str| m.terrain.iter().any(|c| matches!(&m.materials[c.material as usize].paint, Paint::Texture(k) if k.ends_with(&format!(":{name}"))));
+            assert!(has("snow"), "{kind:?}: снега нет");
+            assert!(!has("grass_green"), "{kind:?}: зелёная трава зимой");
+            // Встроенные деревья зимой подкрашены холодным; кусты, как в лесу, вечнозелёные.
+            let plants: Vec<_> = m.props.iter().filter(|q| q.asset.ends_with("tree")).collect();
+            assert!(plants.iter().all(|q| q.tint == Some([120, 165, 185])), "{kind:?}");
+        }
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub struct Options {
     pub seed: String,
     /// Строить своими ассетами из библиотеки, а не встроенными.
     pub library: bool,
-    /// Лес: время года.
+    /// Лес, дом, таверна, квартал: время года.
     pub season: crate::plan::Season,
     /// Пещера: вид.
     pub cave: crate::plan::CaveKind,
