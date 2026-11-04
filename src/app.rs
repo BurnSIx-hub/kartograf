@@ -1305,6 +1305,7 @@ impl App {
                 let forest = plan.kind == generate::Kind::Forest;
                 self.map.particles = if forest { plan.options.season.particles().to_owned() } else { String::new() };
                 self.map.weather = if forest { plan.options.season.weather().to_owned() } else { String::new() };
+                self.map.ambience = plan.kind.ambience(plan.options.season).to_owned();
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
                 Some(r)

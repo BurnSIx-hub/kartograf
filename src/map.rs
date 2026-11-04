@@ -902,6 +902,9 @@ pub struct Map {
     /// Погода сцены Foundry (`snow`); пусто — без погоды.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub weather: String,
+    /// Звук места в «Живой карте» (`forest-autumn`, `cave-1`…); пусто — без него.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ambience: String,
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1039,6 +1042,7 @@ impl Map {
             seed: String::new(),
             particles: String::new(),
             weather: String::new(),
+            ambience: String::new(),
             width,
             height,
             materials: builtin_materials(),

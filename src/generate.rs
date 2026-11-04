@@ -58,6 +58,18 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 6] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern];
 
+    /// Звук места в «Живой карте»; у леса он по времени года.
+    pub fn ambience(self, season: crate::plan::Season) -> &'static str {
+        match self {
+            Kind::Dungeon => "dungeon-1",
+            Kind::Cave => "cave-1",
+            Kind::Forest => season.ambience(),
+            Kind::Town => "town-1",
+            Kind::House => "house",
+            Kind::Tavern => "tavern",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::Dungeon => "Случайное подземелье",

@@ -30,6 +30,15 @@ pub struct Zone {
 /// Модуль Foundry, который оживляет области.
 pub const LIVE_MODULE: &str = "burn-living-map";
 
+/// Флаги сцены: формат Картографа и звук места для «Живой карты».
+fn scene_flags(map: &Map) -> Value {
+    let mut flags = json!({"kartograf": {"format": 1}});
+    if !map.ambience.is_empty() {
+        flags[LIVE_MODULE] = json!({"ambience": map.ambience});
+    }
+    flags
+}
+
 /// Контуры живых материалов: по эффекту — все залитые им места, острова — дырами.
 fn zones(map: &Map) -> Vec<Zone> {
     let mut out: Vec<Zone> = Vec::new();
@@ -341,7 +350,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         "tiles": tiles,
         // Версия новее миграций тайла (14.349, 14.355): данные уже в их формате.
         "_stats": {"coreVersion": "14.355"},
-        "flags": {"kartograf": {"format": 1}}
+        "flags": scene_flags(map)
     })
 }
 
@@ -532,6 +541,10 @@ mod tests {
         assert_eq!(scene["weather"], "");
         autumn.weather = "snow".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["weather"], "snow");
+        // Звук места — флагом сцены, без него флага «Живой карты» нет.
+        assert!(scene["flags"].get(LIVE_MODULE).is_none());
+        autumn.ambience = "forest-autumn".into();
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["ambience"], "forest-autumn");
     }
     use crate::map::{Layer, Portal, Prop, Wall};
 

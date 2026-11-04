@@ -375,6 +375,17 @@ impl Season {
         }
     }
 
+    /// Звук леса в «Живой карте».
+    pub fn ambience(self) -> &'static str {
+        match self {
+            Season::Summer => "forest-summer",
+            Season::Spring => "forest-spring",
+            Season::Autumn => "forest-autumn",
+            Season::Winter => "forest-winter",
+            Season::Magic => "forest-magic",
+        }
+    }
+
     /// Погода сцены Foundry: зимой свой снег Foundry.
     pub fn weather(self) -> &'static str {
         if self == Season::Winter { "snow" } else { "" }
