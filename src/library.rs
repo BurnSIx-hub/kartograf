@@ -178,6 +178,45 @@ pub const STUMP: &str = "builtin:stump";
 /// Пень под кроной: доля размера дерева. Ствол, а не вся крона.
 pub const STUMP_SHARE: f32 = 0.4;
 
+/// Слова имени файла ассета: `Window_Sill_Wood_Ashen_A1_1x1` → window, sill, wood…
+fn key_words(key: &str) -> Vec<String> {
+    let file = key.rsplit(['/', '\\', '|']).next().unwrap_or(key);
+    let name = file.rsplit_once('.').map_or(file, |(n, _)| n);
+    name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect()
+}
+
+/// Стекло с переплётом к подоконнику FA. Окно FA — три картинки: подоконник в разрезе
+/// стены, стойки рамы по краям и само окно (`Window_Wood_Ashen_A_1x1`, среди объектов)
+/// поверх. Берётся окно того же материала и цвета; проём от двух клеток — большое
+/// (`Window_Large_*_2x1`). Вариант (A, B, C…) — по ключу подоконника, всегда один.
+pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
+    let words = key_words(sill);
+    if !words.iter().any(|w| w == "sill") {
+        return None;
+    }
+    let large = len >= 1.5;
+    const SKIP: [&str; 9] = ["sill", "frame", "curtain", "curtains", "broken", "stained", "wired", "shutter", "shutters"];
+    let mut best: Vec<(usize, &str)> = Vec::new();
+    for a in assets.iter().filter(|a| a.kind == Kind::Object) {
+        let f = key_words(&a.key);
+        if f.first().map(String::as_str) != Some("window") || f.iter().any(|w| SKIP.contains(&w.as_str())) || f.iter().any(|w| w == "large") != large {
+            continue;
+        }
+        let score = f.iter().filter(|w| words.contains(w)).count();
+        match best.first() {
+            Some((s, _)) if score < *s => {}
+            Some((s, _)) if score == *s => best.push((score, &a.key)),
+            _ => best = vec![(score, &a.key)],
+        }
+    }
+    if best.is_empty() {
+        return None;
+    }
+    best.sort_by(|a, b| a.1.cmp(b.1));
+    let h = sill.bytes().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
+    Some(best[h as usize % best.len()].1.to_owned())
+}
+
 /// Встроенный косяк под ширину проёма: у них варианты на 1, 2 и 3 клетки.
 /// Чужой косяк остаётся как есть.
 pub fn frame_for_width(key: &str, width: f32) -> String {
@@ -883,6 +922,23 @@ impl Library {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fa_sill_gets_its_glass() {
+        let a = |path: &str, kind: Kind| Asset::new(format!("pack:fa.dungeondraft_pack|textures/{path}"), &format!("FA/{path}"), kind);
+        let assets = vec![
+            a("objects/Structures/Windows/Window_Wood_Ashen_A_1x1.webp", Kind::Object),
+            a("objects/Structures/Windows/Window_Wood_Dark_A_1x1.webp", Kind::Object),
+            a("objects/Structures/Windows/Large_Windows/Window_Large_Wood_Ashen_A_2x1.webp", Kind::Object),
+            a("objects/Structures/Windows/Stained_Windows/Stained_Window_Wood_Ashen_A_1x1.webp", Kind::Object),
+            a("objects/Structures/Windows/Window_Sills/Frames/Window_Frame_Wood_Ashen_A_1x1.webp", Kind::Object),
+            a("portals/Windows/Window_Sills/Window_Sill_Wood_Ashen_A1_1x1.webp", Kind::Door),
+        ];
+        let sill = &assets[5].key;
+        assert_eq!(window_glass(&assets, sill, 1.0).as_deref(), Some(assets[0].key.as_str()));
+        assert_eq!(window_glass(&assets, sill, 2.0).as_deref(), Some(assets[2].key.as_str()));
+        assert_eq!(window_glass(&assets, "builtin:window_wood", 1.0), None);
+    }
     #[test]
     fn variants_fall_into_one_family() {
         let fam = |name: &str| super::family_of("pack:x", name, "objects");

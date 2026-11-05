@@ -399,6 +399,8 @@ pub struct App {
     filter_key: (Kind, String, usize, usize),
     /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
     window_bands: std::collections::HashMap<String, f32>,
+    /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
+    window_glass: std::collections::HashMap<(String, bool), Option<String>>,
     /// Библиотека показывает только то, что уже стоит на карте.
     used_only: bool,
     /// Время года последнего леса: окно генератора открывается с ним.
@@ -547,6 +549,7 @@ impl App {
             filtered: Vec::new(),
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
             window_bands: std::collections::HashMap::new(),
+            window_glass: std::collections::HashMap::new(),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
             gen_cave: crate::plan::CaveKind::Stone,
@@ -3976,8 +3979,16 @@ impl App {
                 let q = [[p.a[0] + nx, p.a[1] + ny], [p.b[0] + nx, p.b[1] + ny], [p.b[0] - nx, p.b[1] - ny], [p.a[0] - nx, p.a[1] - ny]];
                 let q: Vec<Pos2> = q.iter().map(|&w| self.cam.to_screen(canvas, w)).collect();
                 painter.add(Shape::convex_polygon(q, Color32::from_rgb(150, 196, 220), Stroke::new(1.5, Color32::from_rgb(20, 16, 13))));
-            } else if let Some(f) = p.frame.clone() {
-                self.draw_across(painter, canvas, &f, p.a, p.b, Some(thick));
+            } else {
+                if let Some(f) = p.frame.clone() {
+                    self.draw_across(painter, canvas, &f, p.a, p.b, Some(thick));
+                }
+                // Само окно — стекло с переплётом поверх подоконника.
+                let assets = &self.library.assets;
+                let glass = self.window_glass.entry((key.clone(), len >= 1.5)).or_insert_with(|| library::window_glass(assets, &key, len)).clone();
+                if let Some(g) = glass {
+                    self.draw_across(painter, canvas, &g, p.a, p.b, Some(thick));
+                }
             }
             return;
         }

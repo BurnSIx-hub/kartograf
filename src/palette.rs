@@ -125,6 +125,15 @@ const OBJECTS: &[Slot] = &[
     ("stocks", &[&["stocks"], &["pillory"], &["колодки"]], &[]),
     ("planter", &[&["planter"], &["flower", "box"], &["flowers"], &["цветы"]], &[]),
     ("bar_counter", &[&["bar", "counter"], &["counter"], &["bar"], &["стойка"]], &["weapon", "оружие"]),
+    // Готовые сценки FA: стол со стульями и едой, утварь на столешницу, полки с
+    // добром, груды ящиков и бочек. Встроенных нет — без паков их не ставят.
+    ("dining_set", &[&["table", "arrangement", "filled"], &["table", "round", "arrangement", "filled"]], &["fancy"]),
+    ("table_clutter", &[&["table", "arrangement"]], &["filled", "wood", "round"]),
+    ("shelf_full", &[&["shelf", "filled"], &["shelf", "arrangement"], &["cupboard", "arrangement"]], &["corner"]),
+    ("storage_pile", &[&["storage", "arrangement"]], &[]),
+    ("hay", &[&["hay", "bale"]], &["bundle"]),
+    ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &[]),
+    ("trough", &[&["trough", "wood"]], &["wine"]),
     ("bridge", &[&["bridge"], &["мост"]], &[]),
     ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral"]),
     ("stump", &[&["stump"], &["пень"]], &[]),
@@ -227,7 +236,8 @@ fn fits_size(slot: &str, name: &str) -> bool {
 
 /// Из найденного под слот брать только с этим словом, если такие есть: у FA
 /// `Single_Bed_*` — голый матрас под одеяло, застеленные — `Arranged_Bed_*`.
-const PREFER: &[(&str, &str)] = &[("bed", "arranged"), ("bed_double", "arranged")];
+/// Окна FA: в деревянной стене — деревянный подоконник, в каменной — каменный.
+const PREFER: &[(&str, &str)] = &[("bed", "arranged"), ("bed_double", "arranged"), ("window_wood", "wood"), ("window_stone", "stone")];
 
 /// Близкие слоты: чем заменить, когда своего под слот нет.
 const NEAR: &[(&str, &str)] = &[

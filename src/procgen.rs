@@ -118,6 +118,15 @@ impl Spots {
         }
     }
 
+    /// Вернуть место: только что занятое и не пригодившееся.
+    fn unblock(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        for j in y.max(0)..(y + h).min(self.h) {
+            for i in x.max(0)..(x + w).min(self.w) {
+                self.used[(j * self.w + i) as usize] = false;
+            }
+        }
+    }
+
     fn free(&self, x: i32, y: i32, w: i32, h: i32) -> bool {
         x >= 0 && y >= 0 && x + w <= self.w && y + h <= self.h && (y..y + h).all(|j| (x..x + w).all(|i| !self.used[(j * self.w + i) as usize]))
     }
@@ -401,12 +410,35 @@ fn pick<'a>(rng: &mut Rng, of: &[&'a str]) -> &'a str {
 /// Стол с местами вокруг. Занимает 3×4 клетки от `x`, `y`. Сиденья придвинуты
 /// вплотную: по клеткам они отъезжали на полклетки. Стол кладётся после них, так что
 /// чуть задвинутое сиденье уходит под столешницу, а не лежит на ней.
+/// Место под обеденный стол со стульями и шаг между ними: у готовых наборов FA
+/// (обычно 2×2) — 2×2 и проход в клетку, у своих стола со стульями — 3×4.
+fn dining_cell() -> (i32, i32) {
+    if missing("dining_set") { (3, 4) } else { (2, 2) }
+}
+
 fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
-    if !sp.free(x, y, 3, 4) {
+    let (cw, ch) = dining_cell();
+    if !sp.free(x, y, cw, ch) {
         return false;
     }
-    sp.block(x, y, 3, 4);
-    let seat = pick(rng, &["stool", "chair"]);
+    sp.block(x, y, cw, ch);
+    // Готовый набор FA — стол, стулья, посуда разом; лишь бы влез в своё место.
+    if !missing("dining_set") {
+        let c = [x as f32 + cw as f32 / 2.0, y as f32 + ch as f32 / 2.0];
+        for _ in 0..6 {
+            let set = asset("dining_set");
+            for rot in [0.0f32, 90.0] {
+                let [l, t, r, u] = bounds(&set, "dining_set", rot, 1.0);
+                if r - l <= cw as f32 + 0.25 && u - t <= ch as f32 + 0.25 && (r - l).min(u - t) >= 1.5 {
+                    drop_pick(m, &set, [c[0] - (l + r) / 2.0, c[1] - (t + u) / 2.0], rot, 1.0);
+                    return true;
+                }
+            }
+        }
+        sp.unblock(x, y, cw, ch);
+        return false;
+    }
+    let seat = pick(rng, &["stool", "chair", "chair"]);
     // Один выбор на весь стол: из библиотеки каждый вызов берёт новый вариант, а мерить
     // надо то, что ставится.
     let chair = asset(seat);
@@ -440,8 +472,185 @@ fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
             }
         }
         drop_pick(m, &table, c, 0.0, FURNITURE);
+        // Утварь на столешницу: кружки, миски, хлеб — если влезает в стол.
+        if !missing("table_clutter") && rng.chance(0.75) {
+            let stuff = asset("table_clutter");
+            for rot in [0.0f32, 90.0] {
+                let [sl, stp, sr, su] = bounds(&stuff, "table_clutter", rot, 1.0);
+                if sr - sl <= (r - l) * 1.02 && su - stp <= (u - t) * 1.02 {
+                    drop_pick(m, &stuff, [c[0] - (sl + sr) / 2.0, c[1] - (stp + su) / 2.0], rot, 1.0);
+                    break;
+                }
+            }
+        }
     }
     true
+}
+
+/// Стол без стульев (рабочий, кухонный) с утварью на нём; `false` — не встал.
+fn dining_free_table(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {
+    let table = asset("table");
+    let [l, t, r, u] = bounds(&table, "table", 0.0, FURNITURE);
+    let (fw, fh) = (cells_of(r - l), cells_of(u - t));
+    if !sp.free(x, y, fw, fh) {
+        return false;
+    }
+    sp.block(x, y, fw, fh);
+    let c = [x as f32 + fw as f32 / 2.0, y as f32 + fh as f32 / 2.0];
+    drop_pick(m, &table, [c[0] - (l + r) / 2.0, c[1] - (t + u) / 2.0], 0.0, FURNITURE);
+    if !missing("table_clutter") && rng.chance(0.85) {
+        let stuff = asset("table_clutter");
+        for rot in [0.0f32, 90.0] {
+            let [sl, st, sr, su] = bounds(&stuff, "table_clutter", rot, 1.0);
+            if sr - sl <= (r - l) * 1.02 && su - st <= (u - t) * 1.02 {
+                drop_pick(m, &stuff, [c[0] - (sl + sr) / 2.0, c[1] - (st + su) / 2.0], rot, 1.0);
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Угол у камина: камин спиной к стене, перед ним ковёр, два кресла к огню.
+/// `sides` — у каких стен можно (0 — север, 1 — восток, 2 — юг, 3 — запад).
+/// Не нашлось места — `false`, тогда камин ставят как придётся.
+fn hearth(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, sides: &[i32]) -> bool {
+    let fire = asset("fireplace");
+    let chair = asset("armchair");
+    let rug = if rng.chance(0.5) { "rug_round" } else { "rug" };
+    let carpet = asset(rug);
+    let mut order: Vec<i32> = sides.to_vec();
+    shuffle_i32(&mut order, rng);
+    for side in order {
+        let len = if side % 2 == 0 { r.w } else { r.h };
+        let rot = (side as f32 * 90.0 + fire.turn) % 360.0;
+        let [fl, ft, fr, fu] = bounds(&fire, "fireplace", rot, 1.0);
+        let (along, depth) = if side % 2 == 0 { (fr - fl, fu - ft) } else { (fu - ft, fr - fl) };
+        // Полоса у стены: камин, ковёр, кресла — глубиной до 4,5 клетки, шириной 4.
+        let zone_w = (along.ceil() as i32).max(4);
+        let zone_d = ((depth + 3.4).ceil() as i32).min(match side % 2 { 0 => r.h - 3, _ => r.w - 3 });
+        if zone_w + 2 > len || zone_d < 3 {
+            continue;
+        }
+        // Из стенных координат (вдоль стены u, от стены v) — в клетки карты.
+        let to_world = |u: f32, v: f32| -> [f32; 2] {
+            match side {
+                0 => [r.x as f32 + u, r.y as f32 + v],
+                1 => [(r.x + r.w) as f32 - v, r.y as f32 + u],
+                2 => [r.x as f32 + u, (r.y + r.h) as f32 - v],
+                _ => [r.x as f32 + v, r.y as f32 + u],
+            }
+        };
+        let cell_rect = |u0: i32, v0: i32, du: i32, dv: i32| -> (i32, i32, i32, i32) {
+            match side {
+                0 => (r.x + u0, r.y + v0, du, dv),
+                1 => (r.x + r.w - v0 - dv, r.y + u0, dv, du),
+                2 => (r.x + u0, r.y + r.h - v0 - dv, du, dv),
+                _ => (r.x + v0, r.y + u0, dv, du),
+            }
+        };
+        // Середина стены, потом сдвиги — где свободно.
+        let mid = (len - zone_w) / 2;
+        let mut tries: Vec<i32> = vec![mid];
+        for d in 1..=(len - zone_w - 1).max(0) {
+            tries.push(mid - d);
+            tries.push(mid + d);
+        }
+        for u0 in tries.into_iter().filter(|&u| u >= 1 && u + zone_w < len) {
+            let (x, y, w, h) = cell_rect(u0, 0, zone_w, zone_d);
+            if !sp.free(x, y, w, h) {
+                continue;
+            }
+            sp.block(x, y, w, h);
+            let uc = u0 as f32 + zone_w as f32 / 2.0;
+            let c = to_world(uc, WALL_GAP + depth / 2.0);
+            drop_pick(m, &fire, [c[0] - (fl + fr) / 2.0, c[1] - (ft + fu) / 2.0], rot, 1.0);
+            let rug_rot = side as f32 * 90.0;
+            let [rl, rt, rr, ru] = bounds(&carpet, rug, rug_rot, 1.0);
+            let rug_depth = if side % 2 == 0 { ru - rt } else { rr - rl };
+            let rc = to_world(uc, WALL_GAP + depth + 0.2 + rug_depth.min(2.4) / 2.0);
+            drop_pick(m, &carpet, [rc[0] - (rl + rr) / 2.0, rc[1] - (rt + ru) / 2.0], rug_rot, 1.0);
+            // Кресла лицом к огню: спинкой от стены.
+            let crot = (side as f32 * 90.0 + 180.0 + chair.turn) % 360.0;
+            let [cl, ct, cr, cu] = bounds(&chair, "armchair", crot, FURNITURE);
+            for du in [-1.25f32, 1.25] {
+                let cc = to_world(uc + du, WALL_GAP + depth + 1.9);
+                drop_pick(m, &chair, [cc[0] - (cl + cr) / 2.0, cc[1] - (ct + cu) / 2.0], crot, FURNITURE);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn shuffle_i32(v: &mut [i32], rng: &mut Rng) {
+    for i in (1..v.len()).rev() {
+        let j = rng.int(0, i as i32) as usize;
+        v.swap(i, j);
+    }
+}
+
+/// Вдоль стен зала: скамьи, бочки, полки с добром, цветы — не на проходах и не у дверей.
+fn dress_walls(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room) {
+    let mut names: Vec<&str> = vec!["bench", "barrel", "plant_pot", "barrel", "crate", "bench"];
+    if !missing("shelf_full") {
+        names.push("shelf_full");
+    }
+    if !missing("storage_pile") {
+        names.push("storage_pile");
+        names.push("storage_pile");
+    }
+    for _ in 0..(r.w + r.h) / 4 {
+        let n = pick(rng, &names);
+        let scale = if ["shelf_full", "storage_pile"].contains(&n) { 1.0 } else { FURNITURE };
+        by_wall(m, sp, rng, r, n, scale, false);
+    }
+}
+
+/// Двор у дома: что нужно хозяйству, вокруг точки `c`; чего нет в паках — без того.
+fn yard(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[&str], c: [f32; 2], avoid: &[Path]) {
+    for &id in names {
+        if missing(id) {
+            continue;
+        }
+        let p = asset(id);
+        let rot = rng.int(0, 3) as f32 * 90.0;
+        let [l, t, r, u] = bounds(&p, id, rot, 1.0);
+        let (fw, fh) = (cells_of(r - l), cells_of(u - t));
+        for _ in 0..40 {
+            let a = rng.random() as f32 * std::f32::consts::TAU;
+            let d = 0.5 + rng.random() as f32 * 3.5;
+            let (x, y) = ((c[0] + a.cos() * d - fw as f32 / 2.0).floor() as i32, (c[1] + a.sin() * d - fh as f32 / 2.0).floor() as i32);
+            if x < 0 || y < 0 || x + fw > m.width as i32 || y + fh > m.height as i32 {
+                continue;
+            }
+            let centre = [x as f32 + fw as f32 / 2.0, y as f32 + fh as f32 / 2.0];
+            if avoid.iter().any(|p| p.distance(centre) < 1.6) {
+                continue;
+            }
+            if put_pick(m, sp, &p, id, x, y, rot, 1.0) {
+                break;
+            }
+        }
+    }
+}
+
+/// Проход: клетки от `a` до `b` уголком — сперва прямо по `y` (от двери вглубь),
+/// потом вдоль `x`; на них мебель не встанет.
+fn walkway(sp: &mut Spots, a: [f32; 2], b: [f32; 2], inside: Room) {
+    let (ax, ay) = (a[0].floor() as i32, a[1].floor() as i32);
+    let (bx, by) = (b[0].floor() as i32, b[1].floor() as i32);
+    let keep = |x: i32, y: i32| x >= inside.x && y >= inside.y && x < inside.x + inside.w && y < inside.y + inside.h;
+    for y in ay.min(by)..=ay.max(by) {
+        if keep(ax, y) {
+            sp.block(ax, y, 1, 1);
+        }
+    }
+    for x in ax.min(bx)..=ax.max(bx) {
+        if keep(x, by) {
+            sp.block(x, by, 1, 1);
+        }
+    }
 }
 
 fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
@@ -485,9 +694,15 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
             by_wall(m, sp, rng, r, "chest_empty", f, true);
         }
         Role::Storage => {
+            // Груды FA — уже сложенные ящики и бочки; между ними россыпью свои.
+            let piles = !missing("storage_pile");
             for _ in 0..(r.w * r.h / 4).clamp(3, 12) {
-                let n = pick(rng, &["crate", "barrel", "sacks", "crate"]);
-                by_wall(m, sp, rng, r, n, f, false);
+                if piles && rng.chance(0.5) {
+                    by_wall(m, sp, rng, r, "storage_pile", 1.0, false);
+                } else {
+                    let n = pick(rng, &["crate", "barrel", "sacks", "crate"]);
+                    by_wall(m, sp, rng, r, n, f, false);
+                }
             }
         }
         Role::Library => {
@@ -523,16 +738,28 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
         Role::Kitchen => {
             by_wall(m, sp, rng, r, "fireplace", 1.0, false);
             by_wall(m, sp, rng, r, "cauldron", f, false);
+            if !missing("shelf_full") {
+                by_wall(m, sp, rng, r, "shelf_full", 1.0, false);
+            }
+            if !missing("storage_pile") {
+                by_wall(m, sp, rng, r, "storage_pile", 1.0, true);
+            }
             for n in ["barrel", "sacks", "crate", "barrel"] {
                 by_wall(m, sp, rng, r, n, f, true);
             }
-            put(m, sp, "table", r.x + r.w / 2 - 1, r.y + r.h / 2, 0.0, f);
+            // Рабочий стол посередине — с утварью, если она есть.
+            if !dining_free_table(m, sp, rng, r.x + r.w / 2 - 1, r.y + r.h / 2) {
+                put(m, sp, "table", r.x + r.w / 2 - 1, r.y + r.h / 2, 0.0, f);
+            }
         }
         Role::Bedroom => {
             let bed = pick(rng, &["bed", "bed_double"]);
             by_wall(m, sp, rng, r, bed, f, true);
             by_wall(m, sp, rng, r, "chest", f, false);
             by_wall(m, sp, rng, r, "wardrobe", f, true);
+            if !missing("shelf_full") && rng.chance(0.5) {
+                by_wall(m, sp, rng, r, "shelf_full", 1.0, false);
+            }
             if r.w * r.h >= 30 {
                 by_wall(m, sp, rng, r, "desk", f, false);
                 by_wall(m, sp, rng, r, "bed", f, true);
@@ -544,12 +771,22 @@ fn furnish(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, role: Role) {
             }
         }
         Role::Hall | Role::Living => {
-            by_wall(m, sp, rng, r, "fireplace", 1.0, false);
-            by_wall(m, sp, rng, r, "bookshelf", 1.0, false);
+            // Угол у камина — у любой стены, кроме фасада (там вход).
+            let cosy = hearth(m, sp, rng, r, &[0, 1, 3]) || hearth(m, sp, rng, r, &[2]);
+            if !cosy {
+                by_wall(m, sp, rng, r, "fireplace", 1.0, false);
+            }
+            let shelf = if !missing("shelf_full") && rng.chance(0.6) { "shelf_full" } else { "bookshelf" };
+            by_wall(m, sp, rng, r, shelf, 1.0, false);
             by_wall(m, sp, rng, r, "sofa", f, false);
-            by_wall(m, sp, rng, r, "armchair", f, true);
+            if !cosy {
+                by_wall(m, sp, rng, r, "armchair", f, true);
+            }
             by_wall(m, sp, rng, r, "plant_pot", f, true);
-            if r.w >= 6 && r.h >= 6 {
+            if !missing("storage_pile") && rng.chance(0.5) {
+                by_wall(m, sp, rng, r, "storage_pile", 1.0, true);
+            }
+            if !cosy && r.w >= 6 && r.h >= 6 {
                 put(m, sp, "rug", r.x + r.w / 2 - 2, r.y + r.h / 2 - 1, 0.0, 1.0);
             }
         }
@@ -883,9 +1120,10 @@ fn around(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[String], c: [f32;
         let [l, t, r, u] = bounds(&p, id, 0.0, 1.0);
         let (fw, fh) = (cells_of(r - l), cells_of(u - t));
         let mut done = false;
-        for _ in 0..60 {
+        for k in 0..90 {
             let a = rng.random() as f32 * std::f32::consts::TAU;
-            let d = 1.5 + rng.random() as f32 * 4.0;
+            // Тесно у точки — ищем дальше: каждые 30 попыток кольцо шире.
+            let d = 1.5 + rng.random() as f32 * 4.0 + (k / 30) as f32 * 2.5;
             let (x, y) = ((c[0] + a.cos() * d - fw as f32 / 2.0).floor() as i32, (c[1] + a.sin() * d - fh as f32 / 2.0).floor() as i32);
             let centre = [x as f32 + fw as f32 / 2.0, y as f32 + fh as f32 / 2.0];
             if avoid.iter().any(|p| p.distance(centre) < keep) {
@@ -1662,25 +1900,6 @@ fn along(seg: Segment, from: i32, to: i32) -> ([f32; 2], [f32; 2]) {
     if seg.0[0] == seg.1[0] { ([seg.0[0], from as f32], [seg.0[0], to as f32]) } else { ([from as f32, seg.0[1]], [to as f32, seg.0[1]]) }
 }
 
-/// Внешние стены комнаты в доме: сторона (0 — север, 1 — восток, 2 — юг, 3 — запад) и отрезок.
-fn outer_sides(r: Room, b: Room) -> Vec<(i32, Segment)> {
-    let (ax, ay, bx, by) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
-    let mut out = Vec::new();
-    if r.y == b.y {
-        out.push((0, ([ax, ay], [bx, ay])));
-    }
-    if r.x + r.w == b.x + b.w {
-        out.push((1, ([bx, ay], [bx, by])));
-    }
-    if r.y + r.h == b.y + b.h {
-        out.push((2, ([ax, by], [bx, by])));
-    }
-    if r.x == b.x {
-        out.push((3, ([ax, ay], [ax, by])));
-    }
-    out
-}
-
 /// Запустение: обломки и валуны там, где нет комнат.
 fn abandon(m: &mut Map, rng: &mut Rng, rooms: &[Room]) {
     let (w, h) = (m.width as f32, m.height as f32);
@@ -1694,6 +1913,207 @@ fn abandon(m: &mut Map, rng: &mut Rng, rooms: &[Room]) {
     }
 }
 
+/// Желаемый размер комнаты по назначению, в клетках: ширина вдоль фасада и глубина.
+/// Зал таверны считается от рядов столов (стол со стульями — 3×4 клетки, между
+/// рядами проход), плюс полоса стойки у задней стены. Подсобки — сколько нужно делу.
+fn target(spec: &plan::RoomSpec, tavern: bool) -> (i32, i32) {
+    if let Size::Cells([w, h]) = spec.size {
+        return (w as i32, h as i32);
+    }
+    let k = match spec.size {
+        Size::Named(SizeName::Small) => 0,
+        Size::Named(SizeName::Large) => 2,
+        _ => 1,
+    };
+    let t: [(i32, i32); 3] = match spec.role {
+        // Глубина: полоса стойки (4) + ряды столов по 5 + проход у входа.
+        Role::Hall if tavern => [(9, 10), (13, 11), (17, 15)],
+        Role::Hall | Role::Living => [(6, 5), (7, 6), (9, 7)],
+        Role::Kitchen => [(4, 4), (5, 5), (6, 5)],
+        Role::Storage => [(3, 3), (4, 4), (5, 4)],
+        Role::Bedroom => [(4, 4), (4, 5), (5, 6)],
+        Role::Barracks => [(5, 5), (6, 6), (8, 6)],
+        Role::Treasure | Role::Exit | Role::Empty => [(3, 3), (4, 3), (5, 4)],
+        _ => [(4, 4), (5, 5), (6, 6)],
+    };
+    t[k]
+}
+
+/// Раскладка «от зала»: зал — лицом на юг, у его задней стены ряд подсобок (кухня,
+/// кладовые — ближе к стойке), что не влезло — крыло сбоку, от фасада вглубь.
+/// Дом выходит буквой Г, П или прямоугольником — смотря сколько комнат и какие.
+/// Координаты от угла (0, 0); вторым — рамка дома, третьим — корпуса (зал, задний
+/// ряд, крыло): у каждого своя крыша. Не вышло — `None`.
+type Layout = (Vec<Option<Room>>, Room, Vec<Room>);
+
+fn wings(p: &Plan, tavern: bool, hall: usize, graph: &BTreeMap<usize, Vec<usize>>, rng: &mut Rng, scale: f32, shuffle_some: bool) -> Option<Layout> {
+    let n = p.rooms.len();
+    let dims: Vec<(i32, i32)> = p
+        .rooms
+        .iter()
+        .map(|s| {
+            let (w, h) = target(s, tavern);
+            let k = if matches!(s.size, Size::Cells(_)) { 1.0 } else { scale };
+            (((w as f32 * k).round() as i32).max(3), ((h as f32 * k).round() as i32).max(3))
+        })
+        .collect();
+    let (hw, hh) = dims[hall];
+    // Порядок: от зала по связям; кухня и кладовые — первыми, они за стойкой.
+    let service = |i: usize| matches!(p.rooms[i].role, Role::Kitchen | Role::Storage);
+    let linked = |a: usize, b: usize| graph.get(&a).is_some_and(|v| v.contains(&b));
+    let mut order: Vec<usize> = bfs_order(n, hall, graph).into_iter().filter(|&i| i != hall).collect();
+    order.sort_by_key(|&i| (!linked(hall, i) && !service(i), !service(i)));
+    if shuffle_some && order.len() > 1 {
+        for _ in 0..2 {
+            let a = rng.int(0, order.len() as i32 - 2) as usize;
+            order.swap(a, a + 1);
+        }
+    }
+    // Задний ряд — во всю ширину зала или короче (тогда дом — буквой Г).
+    let mut back: Vec<usize> = Vec::new();
+    let mut rest: Vec<usize> = Vec::new();
+    let mut len = 0;
+    for &i in &order {
+        if len + dims[i].0 <= hw + 1 && (back.is_empty() || !rng.chance(0.12)) {
+            back.push(i);
+            len += dims[i].0;
+        } else {
+            rest.push(i);
+        }
+    }
+    // Рядом с кухней — то, что с ней связано: кладовая у кухни, а не через зал.
+    if let Some(k) = back.iter().position(|&i| p.rooms[i].role == Role::Kitchen) {
+        let kitchen = back[k];
+        let mut row = vec![kitchen];
+        for &i in &back {
+            if i != kitchen && linked(kitchen, i) {
+                row.push(i);
+            }
+        }
+        for &i in &back {
+            if !row.contains(&i) {
+                row.push(i);
+            }
+        }
+        back = row;
+    }
+    let depth = back.iter().map(|&i| dims[i].1).max().unwrap_or(0).min(hh.max(3));
+    // Ряд вплотную к залу: короче зала — прижат к левому или правому краю.
+    let fill = len >= hw - 2;
+    let row_len = if fill { hw } else { len };
+    let row_left = !rng.chance(0.5);
+    // Крыло: ширина по самой широкой комнате, длина — вдоль зала и заднего ряда.
+    let wing_w = rest.iter().map(|&i| dims[i].0).max().unwrap_or(0).clamp(0, 7);
+    let column = depth + hh;
+    let mut wing_hs: Vec<i32> = rest.iter().map(|&i| dims[i].1).collect();
+    let sum: i32 = wing_hs.iter().sum();
+    if sum > column {
+        let k = column as f32 / sum as f32;
+        for h in wing_hs.iter_mut() {
+            *h = ((*h as f32 * k).floor() as i32).max(3);
+        }
+        let mut over = wing_hs.iter().sum::<i32>() - column;
+        for h in wing_hs.iter_mut().rev() {
+            while over > 0 && *h > 3 {
+                *h -= 1;
+                over -= 1;
+            }
+        }
+        if over > 0 {
+            return None;
+        }
+    }
+    // Крыло со стороны, где задний ряд короче, — дом собраннее.
+    let wing_left = if fill { rng.chance(0.5) } else { !row_left };
+    let ox = if wing_left && !rest.is_empty() { wing_w } else { 0 };
+    let hall_room = Room { x: ox, y: depth, w: hw, h: hh };
+    let mut out = vec![None; n];
+    out[hall] = Some(hall_room);
+    // Задний ряд: ширины по желаемым, растянуты до ряда.
+    if !back.is_empty() {
+        let total: i32 = back.iter().map(|&i| dims[i].0).sum();
+        let mut x = if row_left { ox } else { ox + hw - row_len };
+        let mut left = row_len;
+        for (k, &i) in back.iter().enumerate() {
+            let w = if k + 1 == back.len() { left } else { ((dims[i].0 * row_len) as f32 / total as f32).round() as i32 };
+            if w < 3 {
+                return None;
+            }
+            out[i] = Some(Room { x, y: 0, w, h: depth });
+            x += w;
+            left -= w;
+        }
+    }
+    // Крыло: снизу (у фасада) — связанные с залом, выше — остальные.
+    if !rest.is_empty() {
+        let mut idx: Vec<usize> = (0..rest.len()).collect();
+        idx.sort_by_key(|&k| !linked(hall, rest[k]));
+        let x = if wing_left { 0 } else { ox + hw };
+        let mut y = depth + hh;
+        for k in idx {
+            let h = wing_hs[k];
+            y -= h;
+            out[rest[k]] = Some(Room { x, y, w: wing_w, h });
+        }
+    }
+    let rooms: Vec<Room> = out.iter().flatten().copied().collect();
+    let (x0, y0) = (rooms.iter().map(|r| r.x).min()?, rooms.iter().map(|r| r.y).min()?);
+    let (x1, y1) = (rooms.iter().map(|r| r.x + r.w).max()?, rooms.iter().map(|r| r.y + r.h).max()?);
+    let span = |ids: &[usize]| -> Option<Room> {
+        let rs: Vec<Room> = ids.iter().filter_map(|&i| out[i]).collect();
+        let (a, b) = (rs.iter().map(|r| r.x).min()?, rs.iter().map(|r| r.y).min()?);
+        let (c, d) = (rs.iter().map(|r| r.x + r.w).max()?, rs.iter().map(|r| r.y + r.h).max()?);
+        Some(Room { x: a, y: b, w: c - a, h: d - b })
+    };
+    let mut blocks = vec![hall_room];
+    blocks.extend(span(&back));
+    blocks.extend(span(&rest));
+    Some((out, Room { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, blocks))
+}
+
+/// Внешние куски стен комнаты среди комнат дома: сторона (0 — север, 1 — восток,
+/// 2 — юг, 3 — запад) и отрезок. Где к стене прилегает соседняя комната — не внешняя.
+fn outer_pieces(r: Room, all: &[Room]) -> Vec<(i32, Segment)> {
+    let mut out = Vec::new();
+    for side in 0..4 {
+        let (line, s, e) = match side {
+            0 => (r.y, r.x, r.x + r.w),
+            1 => (r.x + r.w, r.y, r.y + r.h),
+            2 => (r.y + r.h, r.x, r.x + r.w),
+            _ => (r.x, r.y, r.y + r.h),
+        };
+        let mut covered: Vec<(i32, i32)> = all
+            .iter()
+            .filter(|o| **o != r)
+            .filter_map(|o| match side {
+                0 if o.y + o.h == line => Some((o.x, o.x + o.w)),
+                1 if o.x == line => Some((o.y, o.y + o.h)),
+                2 if o.y == line => Some((o.x, o.x + o.w)),
+                3 if o.x + o.w == line => Some((o.y, o.y + o.h)),
+                _ => None,
+            })
+            .collect();
+        covered.sort();
+        let mut t = s;
+        let mut push = |a: i32, b: i32| {
+            if b > a {
+                let (a, b) = (a as f32, b as f32);
+                let l = line as f32;
+                out.push((side, if side % 2 == 0 { ([a, l], [b, l]) } else { ([l, a], [l, b]) }));
+            }
+        };
+        for (cs, ce) in covered {
+            if ce <= t || cs >= e {
+                continue;
+            }
+            push(t, cs.max(t));
+            t = t.max(ce);
+        }
+        push(t, e);
+    }
+    out
+}
+
 fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let tavern = p.kind == Kind::Tavern;
     let (w, h) = (m.width as i32, m.height as i32);
@@ -1701,42 +2121,71 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     let look = forest_look(season);
     ground(m, look.ground);
     patches(m, rng, look.patches, w * h / 60, (2.0, 4.0), 0.6);
-    let (bw, bh) = plan::building_size(p.kind, m.width, m.height);
-    let building = Room { x: (w - bw) / 2, y: ((h - bh) / 2 - 1).max(0), w: bw, h: bh };
     let planks = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("wood_planks"));
-    m.paint_rect(Layer::Rooms, (building.x, building.y), (building.x + bw - 1, building.y + bh - 1), Some(planks));
     let outer = match p.style.walls.as_deref().and_then(plan::wall_id) {
         Some(st) => wall(st),
         None if tavern => wall("wall_timber"),
         None => wall(pick(rng, &["wall_timber", "wall_fieldstone", "wall_brick"])),
     };
     let wood = !matches!(&outer.paint, Paint::Texture(k) if k.ends_with("fieldstone"));
-    m.wall_style = outer.clone();
-    let edges = m.room_edges();
-    m.sync_edge_looks(&edges);
-    let inner = WallStyle { width: outer.width * 0.8, ..outer };
+    let inner = WallStyle { width: outer.width * 0.8, ..outer.clone() };
 
-    // Раскладка: комнаты от входа по связям, несколько попыток с перестановками,
-    // лучшая — где сошлось больше связей.
+    // Раскладка «от зала» (`wings`): размеры по назначению, несколько попыток,
+    // лучшая — где сошлось больше связей; не влезло — комнаты помельче. Совсем не
+    // вышло — прежняя нарезка прямоугольника.
     let n = p.rooms.len();
-    let weights: Vec<f32> = p.rooms.iter().map(|s| room_weight(s, tavern)).collect();
     let graph = plan::adjacency(p);
     let start = p.entrance().unwrap_or(0);
-    let order = bfs_order(n, start, &graph);
-    let mut best: Option<(f32, Vec<Option<Room>>)> = None;
-    for attempt in 0..24 {
-        let mut ord = order.clone();
-        if attempt > 0 {
-            shuffle(&mut ord, rng);
+    let hall_i = p.rooms.iter().position(|s| s.role.is_hall()).unwrap_or(start);
+    // По краям — двор: дорожка, деревья, объекты плана.
+    let (room_w, room_h) = (w - 4, h - 5);
+    let mut best: Option<(f32, Layout)> = None;
+    for scale in [1.0f32, 0.85, 0.72, 0.6, 0.5] {
+        for attempt in 0..24 {
+            let Some(layout) = wings(p, tavern, hall_i, &graph, rng, scale, attempt > 0) else { continue };
+            let (rooms, bb) = (&layout.0, layout.1);
+            if bb.w > room_w || bb.h > room_h {
+                continue;
+            }
+            let used: i32 = rooms.iter().flatten().map(|r| r.w * r.h).sum();
+            let score = layout_score(p, rooms, bb, start) - (bb.w * bb.h - used) as f32 / (bb.w * bb.h) as f32 * 4.0;
+            if best.as_ref().is_none_or(|b| score > b.0 + 1e-6) {
+                best = Some((score, layout));
+            }
         }
-        let mut rooms = vec![None; n];
-        slice(building, &ord, &weights, &mut rooms, rng);
-        let score = layout_score(p, &rooms, building, start);
-        if best.as_ref().is_none_or(|b| score > b.0 + 1e-6) {
-            best = Some((score, rooms));
+        if best.is_some() {
+            break;
         }
     }
-    let laid = best.map(|b| b.1).unwrap_or_default();
+    let (laid, building, blocks) = match best {
+        Some((_, (rooms, bb, blocks))) => {
+            let (dx, dy) = ((w - bb.w) / 2, ((h - bb.h) / 2 - 1).max(1));
+            let shift = |r: Room| Room { x: r.x + dx, y: r.y + dy, ..r };
+            let moved = rooms.iter().map(|r| r.map(shift)).collect::<Vec<_>>();
+            (moved, shift(bb), blocks.into_iter().map(shift).collect::<Vec<_>>())
+        }
+        None => {
+            let (bw, bh) = plan::building_size(p.kind, m.width, m.height);
+            let building = Room { x: (w - bw) / 2, y: ((h - bh) / 2 - 1).max(0), w: bw, h: bh };
+            let weights: Vec<f32> = p.rooms.iter().map(|s| room_weight(s, tavern)).collect();
+            let order = bfs_order(n, start, &graph);
+            let mut best: Option<(f32, Vec<Option<Room>>)> = None;
+            for attempt in 0..24 {
+                let mut ord = order.clone();
+                if attempt > 0 {
+                    shuffle(&mut ord, rng);
+                }
+                let mut rooms = vec![None; n];
+                slice(building, &ord, &weights, &mut rooms, rng);
+                let score = layout_score(p, &rooms, building, start);
+                if best.as_ref().is_none_or(|b| score > b.0 + 1e-6) {
+                    best = Some((score, rooms));
+                }
+            }
+            (best.map(|b| b.1).unwrap_or_default(), building, vec![building])
+        }
+    };
+    let (bw, bh) = (building.w, building.h);
     for (spec, r) in p.rooms.iter().zip(&laid) {
         if r.is_none() {
             warn.push(format!("комната «{}» не поместилась в дом {bw}×{bh}", spec.id));
@@ -1745,6 +2194,30 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     let placed: Vec<(usize, Room)> = laid.iter().enumerate().filter_map(|(i, r)| r.map(|r| (i, r))).collect();
     if placed.is_empty() {
         return 0;
+    }
+    let all: Vec<Room> = placed.iter().map(|(_, r)| *r).collect();
+    for r in &all {
+        m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(planks));
+    }
+    m.wall_style = outer.clone();
+    let edges = m.room_edges();
+    m.sync_edge_looks(&edges);
+    // Крыша — над каждым корпусом своя, конёк вдоль длинной стороны; в Foundry она
+    // ляжет тайлом над токенами и спрячет комнаты, пока туда не войдут.
+    let roof = match p.style.roof.as_deref().and_then(plan::roof_id) {
+        Some(r) => r,
+        None => match &outer.paint {
+            Paint::Texture(k) if k.ends_with("fieldstone") || k.ends_with("stone_blocks") => pick(rng, &["roof_slate_gray", "roof_slate_blue", "roof_shingle"]),
+            Paint::Texture(k) if k.ends_with("brick") => pick(rng, &["roof_clay_brown", "roof_clay_red"]),
+            _ => pick(rng, &["roof_clay_red", "roof_thatch", "roof_shingle", "roof_clay_brown"]),
+        },
+    };
+    let roof_key = asset(roof).key;
+    for b in blocks.iter().filter(|b| b.w >= 2 && b.h >= 2) {
+        // Почти квадратный большой зал — шатром на четыре ската, остальное — два ската.
+        let squareish = b.w.min(b.h) * 5 >= b.w.max(b.h) * 4 && b.w.min(b.h) >= 8;
+        let shape = if squareish { RoofShape::Hip } else { RoofShape::Gable };
+        m.roofs.push(Roof { a: [b.x as f32, b.y as f32], b: [(b.x + b.w) as f32, (b.y + b.h) as f32], shape, paint: roof_key.clone(), turn: u8::from(b.h > b.w), overhang: 0.3 });
     }
 
     // Перегородки: общие стены соседей, слитые в прямые линии.
@@ -1875,14 +2348,14 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     let mut outer_doors: Vec<(usize, i32)> = Vec::new();
     for (ri, kind) in outs {
         let Some(r) = room_of(ri) else { continue };
-        let mut sides = outer_sides(r, building);
+        let mut sides = outer_pieces(r, &all);
         if sides.is_empty() {
             warn.push(format!("комната «{}» не у внешней стены: вход через неё невозможен", p.rooms[ri].id));
             continue;
         }
         // Юг — лицо дома; мост просит сторону реки.
         let rank = |side: i32| if kind == Some(LinkKind::Bridge) && river_side == Some(side) { -1 } else { [3, 2, 0, 1][side as usize] };
-        sides.sort_by_key(|(s, _)| rank(*s));
+        sides.sort_by_key(|(s, seg)| (rank(*s), -seg_len(seg)));
         let (side, seg) = sides[0];
         let vertical = side % 2 == 1;
         let line = (vertical, if vertical { seg.0[0] } else { seg.0[1] } as i32);
@@ -1914,13 +2387,39 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             entrance = Some((side, ga, gb));
         }
     }
+    // Задняя дверь кухни — во двор, не на фасад; у неё хозяйство.
+    let mut back_yard: Option<[f32; 2]> = None;
+    if let Some(&(ki, kr)) = placed.iter().find(|(i, _)| p.rooms[*i].role == Role::Kitchen)
+        && !outer_doors.iter().any(|(i, _)| *i == ki)
+    {
+        let mut sides: Vec<(i32, Segment)> = outer_pieces(kr, &all).into_iter().filter(|(s, seg)| *s != 2 && seg_len(seg) >= 3).collect();
+        sides.sort_by_key(|(s, seg)| (*s != 0, -seg_len(seg)));
+        if let Some(&(side, seg)) = sides.first() {
+            let vertical = side % 2 == 1;
+            let line = (vertical, if vertical { seg.0[0] } else { seg.0[1] } as i32);
+            let (no_corners, no_taken) = (Vec::new(), Vec::new());
+            if let Some((s, e)) = door_spot(seg, 1, corners.get(&line).unwrap_or(&no_corners), taken.get(&line).unwrap_or(&no_taken), rng) {
+                taken.entry(line).or_default().push((s, e));
+                let (ga, gb) = along(seg, s, e);
+                m.portals.push(portal(ga, gb, PortalKind::Door, wood));
+                outer_doors.push((ki, side));
+                let (dx, dy): (f32, f32) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][side as usize];
+                let mid = [(ga[0] + gb[0]) / 2.0, (ga[1] + gb[1]) / 2.0];
+                sp.block((mid[0] - dx * 1.5).floor() as i32 - 1, (mid[1] - dy * 1.5).floor() as i32 - 1, 3, 3);
+                sp.block((mid[0] + dx * 0.5).floor() as i32 - 1, (mid[1] + dy * 0.5).floor() as i32 - 1, 3, 3);
+                back_yard = Some([mid[0] + dx * 3.0, mid[1] + dy * 3.0]);
+            }
+        }
+    }
     // Окна на внешних стенах длиной от шести клеток, кроме стены с входом.
-    for &(i, r) in &placed {
-        for (side, seg) in outer_sides(r, building) {
-            if seg_len(&seg) < 6 || outer_doors.contains(&(i, side)) {
+    for &(i, _) in &placed {
+        let Some(r) = room_of(i) else { continue };
+        for (side, seg) in outer_pieces(r, &all) {
+            if seg_len(&seg) < 5 || outer_doors.contains(&(i, side)) {
                 continue;
             }
-            let (a, b) = along(seg, if side % 2 == 1 { r.y + 2 } else { r.x + 2 }, if side % 2 == 1 { r.y + 4 } else { r.x + 4 });
+            let s = if side % 2 == 1 { seg.0[1] } else { seg.0[0] } as i32;
+            let (a, b) = along(seg, s + 2, s + 4);
             m.portals.push(portal(a, b, PortalKind::Window, wood));
         }
     }
@@ -1957,36 +2456,87 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             let bar = asset("bar_counter");
             let [left, top, right, low] = bounds(&bar, "bar_counter", 0.0, scale);
             let y = main.y as f32 + 2.2 - top;
-            let x = main.x as f32 + 1.6 - left;
-            drop_pick(m, &bar, [x, y], 0.0, scale);
             let width = cells_of(right - left);
-            sp.block(main.x, main.y, width + 2, 5);
+            // Дверь кухни в задней стене зала — за стойкой: хозяин выходит из кухни
+            // прямо к прилавку. Нет такой двери — стойка в левом углу, как раньше.
+            let back_door = door_at.iter().filter(|d| (d[1] - main.y as f32).abs() < 0.01 && d[0] > main.x as f32 && d[0] < (main.x + main.w) as f32).map(|d| d[0]).next();
+            let x0 = match back_door {
+                Some(dx) => (dx - 1.0).clamp(main.x as f32 + 1.0, (main.x + main.w - width - 1).max(main.x + 1) as f32),
+                None => main.x as f32 + 1.0,
+            };
+            let x = x0 + 0.6 - left;
+            drop_pick(m, &bar, [x, y], 0.0, scale);
+            let bx = x0.floor() as i32;
+            sp.block(bx - 1, main.y, width + 2, 4);
+            // За стойкой: полки и бочки вдоль стены, кроме места у двери.
             for k in 0..width / 2 {
-                drop(m, pick(rng, &["barrel", "barrel", "crate"]), [main.x as f32 + 1.0 + k as f32 * 2.0, main.y as f32 + 0.75], 0.0, FURNITURE);
+                let px = x0 + k as f32 * 2.0 + 0.4;
+                if back_door.is_some_and(|d| (px - d).abs() < 1.3) {
+                    continue;
+                }
+                let n = if !missing("shelf_full") && k % 2 == 1 { "shelf_full" } else { pick(rng, &["barrel", "barrel", "crate"]) };
+                drop(m, n, [px, main.y as f32 + 0.75], 0.0, if n == "shelf_full" { 1.0 } else { FURNITURE });
             }
             for k in 0..(width + 1) / 2 {
-                drop(m, "stool", [main.x as f32 + 2.2 + k as f32 * 2.0, y + low + 0.5], 0.0, FURNITURE);
+                drop(m, "stool", [x0 + 1.2 + k as f32 * 2.0, y + low + 0.5], 0.0, FURNITURE);
             }
-            by_wall(m, &mut sp, rng, main, "fireplace", 1.0, false);
-            let mut ty = main.y + 5;
-            while ty + 3 < main.y + main.h - 1 {
-                let mut tx = main.x + 1 + rng.int(0, 1);
-                while tx + 3 < main.x + main.w {
-                    if rng.chance(0.85) {
+            // Главный проход: от входа прямо к стойке — столы встанут по обе стороны.
+            // Двери зала и так свободны (у каждой занят квадрат 3×3).
+            let bar_front = [x0 + width as f32 / 2.0, y + low + 1.6];
+            let mut aisle: Option<i32> = None;
+            if let Some((side, ga, gb)) = entrance {
+                let (dx, dy): (f32, f32) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][side as usize];
+                let gate = [(ga[0] + gb[0]) / 2.0 - dx * 0.5, (ga[1] + gb[1]) / 2.0 - dy * 0.5];
+                walkway(&mut sp, gate, bar_front, main);
+                if side % 2 == 0 {
+                    aisle = Some(gate[0].floor() as i32);
+                }
+                // Лестница наверх — в переднем углу у входа, со стороны без стойки.
+                let stairs = asset("stairs");
+                let [sl, st, sr, su] = bounds(&stairs, "stairs", 0.0, 1.0);
+                let (sw, sh) = (cells_of(sr - sl), cells_of(su - st));
+                let left_bar = x0 + (width as f32) / 2.0 < main.x as f32 + main.w as f32 / 2.0;
+                let sx = if left_bar { main.x + main.w - sw } else { main.x };
+                if sh + 5 < main.h {
+                    put_pick(m, &mut sp, &stairs, "stairs", sx, main.y + main.h - sh, 0.0, 1.0);
+                }
+            }
+            // Камин с креслами — у боковой стены: задняя за стойкой, в передней вход.
+            if !hearth(m, &mut sp, rng, main, &[1, 3]) && !hearth(m, &mut sp, rng, main, &[0, 2]) {
+                by_wall(m, &mut sp, rng, main, "fireplace", 1.0, false);
+            }
+            // Ряды столов — сразу за проходом перед стойкой.
+            let mut ty = (bar_front[1].floor() as i32 + 1).max(main.y + 4);
+            let (cw, ch) = dining_cell();
+            while ty + ch <= main.y + main.h {
+                // Столы через клетку прохода; главный проход — в такой промежуток.
+                let off = match aisle {
+                    Some(ax) => (ax - main.x - 1 - cw).rem_euclid(cw + 1),
+                    None => rng.int(0, 1),
+                };
+                let mut tx = main.x + 1 + off.min(main.w - cw - 1).max(0);
+                while tx + cw < main.x + main.w {
+                    if rng.chance(0.92) {
                         dining(m, &mut sp, rng, tx, ty);
                     }
-                    tx += 4;
+                    tx += cw + 1;
                 }
-                ty += 5;
+                ty += ch + 1;
             }
-            // Вдоль стен — бочки и ящики: большой зал без них пустой.
-            for _ in 0..(main.w + main.h) / 6 {
-                let n = pick(rng, &["barrel", "barrel", "crate", "plant_pot"]);
-                by_wall(m, &mut sp, rng, main, n, FURNITURE, false);
-            }
+            // Вдоль стен — скамьи, бочки, полки: большой зал без них пустой.
+            dress_walls(m, &mut sp, rng, main);
         } else if role.is_hall() {
             furnish(m, &mut sp, rng, r, Role::Living);
-            dining(m, &mut sp, rng, r.x + 1, r.y + r.h - 5);
+            // Обеденный стол — от середины комнаты к краям, где первым найдётся место.
+            let (cw, ch) = dining_cell();
+            let (cx, cy) = (r.x + (r.w - cw) / 2, r.y + (r.h - ch) / 2);
+            let mut spots: Vec<(i32, i32)> = (r.y..=r.y + r.h - ch).flat_map(|y| (r.x..=r.x + r.w - cw).map(move |x| (x, y))).collect();
+            spots.sort_by_key(|&(x, y)| (x - cx).abs() + (y - cy).abs());
+            for (x, y) in spots {
+                if dining(m, &mut sp, rng, x, y) {
+                    break;
+                }
+            }
         } else {
             furnish(m, &mut sp, rng, r, role);
         }
@@ -2064,6 +2614,14 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             }
         }
     }
+    // Хозяйство у задней двери: у таверны — конюшенный угол, у дома — дрова.
+    for r in &all {
+        sp.block(r.x - 1, r.y - 1, r.w + 2, r.h + 2);
+    }
+    if let Some(c) = back_yard {
+        let names: &[&str] = if tavern { &["cart", "hay", "hay", "trough", "firewood_pile", "barrel", "crate"] } else { &["firewood_pile", "barrel", "crate", "planter"] };
+        yard(m, &mut sp, rng, names, c, &avoid);
+    }
     if !p.objects.is_empty() {
         sp.block(building.x - 1, building.y - 1, bw + 2, bh + 2);
         let c = match entrance {
@@ -2076,7 +2634,7 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         around(m, &mut sp, rng, &p.objects, c, "двор", &avoid, 1.6, warn);
     }
     if p.mood == Mood::Abandoned {
-        abandon(m, rng, &[building]);
+        abandon(m, rng, &all);
     }
     placed.len()
 }
@@ -2408,6 +2966,12 @@ mod tests {
         assert!(m.labels.iter().any(|l| l.text == "Подвал") && m.labels.iter().any(|l| l.text == "Зал"));
         assert!(m.props.iter().filter(|q| q.asset.ends_with("fireplace")).count() >= 1);
         assert!(m.props.iter().any(|q| q.asset.ends_with("bar_counter")));
+        // Крыша над каждым корпусом и вся дома целиком под крышами.
+        assert!(!m.roofs.is_empty());
+        let covered = |x: f32, y: f32| m.roofs.iter().any(|r| x >= r.a[0] && x <= r.b[0] && y >= r.a[1] && y <= r.b[1]);
+        for l in &m.labels {
+            assert!(covered(l.pos[0], l.pos[1]), "«{}» без крыши", l.text);
+        }
         // Тот же план — та же карта; другое зерно — другая.
         let mut again = Map::new(40, 30);
         build(&mut again, &p, 0, Palette::builtin()).unwrap();
@@ -2428,18 +2992,38 @@ mod tests {
             let mut m = Map::new(40, 30);
             let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
             assert_eq!(r.count, 5, "{seed}: {:?}", r.warnings);
-            let (bw, bh) = plan::building_size(Kind::Tavern, 40, 30);
-            let building = Room { x: (40 - bw) / 2, y: ((30 - bh) / 2 - 1).max(0), w: bw, h: bh };
+            let building = footprint(&m);
             // Комнаты — по перегородкам и внешним стенам: восстановим их из стен.
             let rooms = rooms_from_walls(&m, building);
             assert_eq!(rooms.len(), 5, "{seed}: {rooms:?}");
             let hall = rooms.iter().position(|r| m.labels.iter().any(|l| l.text == "Зал" && l.pos[0] > r.x as f32 && l.pos[0] < (r.x + r.w) as f32 && l.pos[1] > r.y as f32 && l.pos[1] < (r.y + r.h) as f32)).unwrap();
             let seen = reachable(&m, &rooms, hall);
             assert!(seen.iter().all(|&s| s), "{seed}: недостижимы {seen:?}");
-            // Вход — на внешней стене дома.
-            let gate = m.portals.iter().find(|q| q.kind == PortalKind::DoubleDoor || (q.kind == PortalKind::Door && outer_sides(building, building).iter().any(|(_, s)| map::segment_distance(q.center(), s.0, s.1) < 0.01))).expect("вход");
-            assert!(outer_sides(building, building).iter().any(|(_, s)| map::segment_distance(gate.center(), s.0, s.1) < 0.01));
+            // Вход — на внешней стене дома: по одну сторону дом, по другую двор.
+            assert!(m.portals.iter().any(|q| matches!(q.kind, PortalKind::Door | PortalKind::DoubleDoor) && on_outer_wall(&m, q)), "{seed}: нет входа снаружи");
         }
+    }
+
+    /// Клетка — в доме (маска комнат).
+    fn in_house(m: &Map, x: i32, y: i32) -> bool {
+        let r = mask::RES as isize;
+        m.rooms.get(x as isize * r + r / 2, y as isize * r + r / 2) > 127
+    }
+
+    /// Рамка дома по маске комнат.
+    fn footprint(m: &Map) -> Room {
+        let cells: Vec<(i32, i32)> = (0..m.height as i32).flat_map(|y| (0..m.width as i32).map(move |x| (x, y))).filter(|&(x, y)| in_house(m, x, y)).collect();
+        let (x0, y0) = (cells.iter().map(|c| c.0).min().unwrap(), cells.iter().map(|c| c.1).min().unwrap());
+        let (x1, y1) = (cells.iter().map(|c| c.0).max().unwrap(), cells.iter().map(|c| c.1).max().unwrap());
+        Room { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }
+    }
+
+    /// Проём на стене между домом и двором: по одну сторону дом, по другую нет.
+    fn on_outer_wall(m: &Map, q: &Portal) -> bool {
+        let vertical = (q.a[0] - q.b[0]).abs() < 0.01;
+        // Середина первой клетки проёма.
+        let (x, y) = if vertical { (q.a[0].round() as i32, q.a[1].min(q.b[1]).floor() as i32) } else { (q.a[0].min(q.b[0]).floor() as i32, q.a[1].round() as i32) };
+        if vertical { in_house(m, x - 1, y) != in_house(m, x, y) } else { in_house(m, x, y - 1) != in_house(m, x, y) }
     }
 
     /// Комнаты дома по перегородкам: клетки, разделённые стенами, — разные комнаты.
@@ -2452,7 +3036,7 @@ mod tests {
         let mut owner = vec![usize::MAX; (b.w * b.h) as usize];
         let mut rooms = Vec::new();
         for s in 0..owner.len() {
-            if owner[s] != usize::MAX {
+            if owner[s] != usize::MAX || !in_house(m, b.x + s as i32 % b.w, b.y + s as i32 / b.w) {
                 continue;
             }
             let id = rooms.len();
@@ -2465,7 +3049,7 @@ mod tests {
                 hi = (hi.0.max(x), hi.1.max(y));
                 for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let (nx, ny) = (x + dx, y + dy);
-                    if nx < b.x || ny < b.y || nx >= b.x + b.w || ny >= b.y + b.h || blocked(x, y, nx, ny) {
+                    if nx < b.x || ny < b.y || nx >= b.x + b.w || ny >= b.y + b.h || !in_house(m, nx, ny) || blocked(x, y, nx, ny) {
                         continue;
                     }
                     let n = ((ny - b.y) * b.w + nx - b.x) as usize;
@@ -2520,10 +3104,8 @@ mod tests {
         assert!(m.props.iter().any(|q| q.asset.ends_with("well")) && m.props.iter().any(|q| q.asset.ends_with("cart")));
         assert!(m.shade.is_some() && m.shadows.opacity > 0.7);
         // Объекты не в доме.
-        let (bw, bh) = plan::building_size(Kind::House, 36, 30);
-        let (bx, by) = ((36 - bw) / 2, ((30 - bh) / 2 - 1).max(0));
         for q in m.props.iter().filter(|q| q.asset.ends_with("well") || q.asset.ends_with("cart")) {
-            assert!(!(q.pos[0] > bx as f32 && q.pos[0] < (bx + bw) as f32 && q.pos[1] > by as f32 && q.pos[1] < (by + bh) as f32), "{q:?}");
+            assert!(!in_house(&m, q.pos[0].floor() as i32, q.pos[1].floor() as i32), "{q:?}");
         }
     }
 
@@ -2564,3 +3146,4 @@ mod tests {
         }
     }
 }
+
