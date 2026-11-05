@@ -58,6 +58,15 @@ const FLOORS: &[Slot] = &[
     ("brick_floor", &[&["brick"], &["bricks"], &["кирпич"]], &["wall"]),
     ("sandstone", &[&["sandstone"], &["песчаник"]], &["wall"]),
     ("marble", &[&["marble"], &["мрамор"]], &["wall"]),
+    // Колизей: тёплый песок арены (без серого и белого), крупный — пятнами;
+    // ряды — каменные блоки, проходы — большие плиты, подиум — белый мрамор.
+    ("arena_sand", &[&["sand", "02"], &["sand", "04"], &["sand", "05"]], &[]),
+    ("arena_sand_rough", &[&["desert", "pebble", "sand", "yellow"], &["desert", "clumped", "sand", "yellow"]], &[]),
+    ("arena_tiers_sand", &[&["stone", "tiles", "sandstone"]], &["cracked", "hexagonal", "diagonal", "square", "patterned"]),
+    ("arena_tiers_slate", &[&["stone", "tiles", "slate"], &["stone", "tiles", "earthy"]], &["cracked", "hexagonal", "diagonal", "square", "patterned"]),
+    ("arena_walk_sand", &[&["flagstone", "large", "sandstone"]], &[]),
+    ("arena_walk_slate", &[&["flagstone", "large", "slate"]], &[]),
+    ("arena_marble", &[&["marble", "tiles", "white"]], &["cracked"]),
 ];
 
 /// Полы комнат: сквозь них не должно быть видно двора (см. [`Palette::solid`]).
@@ -134,6 +143,19 @@ const OBJECTS: &[Slot] = &[
     ("hay", &[&["hay", "bale"]], &["bundle"]),
     ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &[]),
     ("trough", &[&["trough", "wood"]], &["wine"]),
+    // Колизей. Своих нет у встроенных — без библиотеки этого просто не будет.
+    ("throne", &[&["throne", "leather", "red"]], &[]),
+    ("arena_brazier", &[&["brazier", "orange", "lit"], &["brazier", "red", "lit"]], &[]),
+    ("arena_statue", &[&["statue", "sitting", "lion"]], &["volcanic"]),
+    ("arena_rug", &[&["rug", "red"]], &["round", "circle", "oval", "runner", "1x1", "1x2", "2x1"]),
+    ("arena_obelisk", &[&["statue", "sandstone", "obelisk"], &["statue", "marble", "white", "obelisk"]], &[]),
+    ("arena_barricade", &[&["barricade", "spike"]], &["bilateral"]),
+    ("arena_grate", &[&["torment", "floor", "grate", "circle", "3x3"]], &["damaged", "bloody", "rusty"]),
+    ("arena_trapdoor", &[&["torment", "floor", "grate", "square", "2x2"]], &["bloody", "rusty"]),
+    ("arena_cage", &[&["cage", "metal", "gray", "2x2"]], &["broken", "fallen", "top", "chain"]),
+    ("arena_bones", &[&["beast", "bone", "white", "pile"]], &[]),
+    ("arena_blood", &[&["blood", "splatter"], &["blood", "puddle"]], &[]),
+    ("arena_weapon", &[&["shield", "metal"], &["broken", "spear"], &["trident"], &["shortsword"], &["broken", "shield", "wood"]], &["bloody"]),
     // Цельный бревенчатый мост FA (`Log_Bridge_*_11x4`): без концов, пролётов,
     // верёвочных, подъёмных и мостков в доску.
     ("bridge", &[&["bridge"], &["log", "bridge"], &["мост"]], &["straight", "rope", "draw", "track", "plank"]),
@@ -294,6 +316,17 @@ const NEAR: &[(&str, &str)] = &[
     ("sandstone", "sand"),
     ("chest_open", "chest"),
     ("chest_empty", "chest"),
+    ("arena_sand", "sand"),
+    ("arena_sand_rough", "sand"),
+    ("arena_tiers_sand", "sandstone"),
+    ("arena_tiers_slate", "flagstones"),
+    ("arena_rug", "rug"),
+    ("arena_obelisk", "statue"),
+    ("arena_walk_sand", "flagstones"),
+    ("arena_walk_slate", "flagstones"),
+    ("arena_marble", "marble"),
+    ("arena_brazier", "brazier"),
+    ("arena_statue", "statue"),
 ];
 
 /// Слова имени файла, строчными.

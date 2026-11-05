@@ -53,10 +53,12 @@ pub enum Kind {
     House,
     #[serde(alias = "таверна")]
     Tavern,
+    #[serde(alias = "арена", alias = "колизей", alias = "colosseum")]
+    Arena,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern];
+    pub const ALL: [Kind; 7] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern, Kind::Arena];
 
     /// Звук места в «Живой карте»; у леса он по времени года, у пещеры — по виду.
     /// Дом и таверна стоят в лесу по тому же времени года: снаружи слышна округа.
@@ -65,7 +67,7 @@ impl Kind {
             Kind::Dungeon => "dungeon-1",
             Kind::Cave => o.cave.ambience(),
             Kind::Forest | Kind::House | Kind::Tavern => o.season.ambience(),
-            Kind::Town => "town-1",
+            Kind::Town | Kind::Arena => "town-1",
         }
     }
 
@@ -86,6 +88,7 @@ impl Kind {
             Kind::Town => "Городской квартал",
             Kind::House => "Дом",
             Kind::Tavern => "Таверна",
+            Kind::Arena => "Колизей",
         }
     }
 }

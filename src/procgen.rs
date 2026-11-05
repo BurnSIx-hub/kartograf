@@ -48,6 +48,9 @@ fn fits(slot: &str, asset: &str) -> bool {
 
 include!("prop_bounds.rs");
 
+#[path = "arena.rs"]
+mod arena;
+
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
 
@@ -2753,6 +2756,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         Kind::Forest => forest(m, p, &mut rng, &mut warnings),
         Kind::Town => town(m, p, &mut rng, &mut warnings),
         Kind::House | Kind::Tavern => interior(m, p, &mut rng, &mut warnings),
+        Kind::Arena => arena::arena(m, p, &mut rng, &mut warnings),
     };
     mood(m, p);
     Ok(Report { count, warnings })
