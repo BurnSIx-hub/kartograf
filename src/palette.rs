@@ -134,7 +134,9 @@ const OBJECTS: &[Slot] = &[
     ("hay", &[&["hay", "bale"]], &["bundle"]),
     ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &[]),
     ("trough", &[&["trough", "wood"]], &["wine"]),
-    ("bridge", &[&["bridge"], &["мост"]], &[]),
+    // Цельный бревенчатый мост FA (`Log_Bridge_*_11x4`): без концов, пролётов,
+    // верёвочных, подъёмных и мостков в доску.
+    ("bridge", &[&["bridge"], &["log", "bridge"], &["мост"]], &["straight", "rope", "draw", "track", "plank"]),
     ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral"]),
     ("stump", &[&["stump"], &["пень"]], &[]),
     ("stalagmite_ice", &[&["arctic", "stalagmite", "ice"], &["stalagmite", "ice"], &["сосулька"]], &[]),

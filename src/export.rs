@@ -135,6 +135,12 @@ fn zones(map: &Map) -> Vec<Zone> {
     out
 }
 
+/// Мост по имени файла: встроенный и библиотечные (`Log_Bridge_…`).
+fn is_bridge(key: &str) -> bool {
+    let file = key.rsplit(['/', '\\', '|']).next().unwrap_or(key).to_lowercase();
+    file.split(|c: char| !c.is_alphanumeric()).any(|w| w == "bridge" || w == "мост")
+}
+
 /// Точка внутри замкнутой ломаной (чётность пересечений).
 fn inside(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let mut c = false;
@@ -213,6 +219,14 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
         zones.push(Zone { effect: "fire", loops: vec![(round, false)] });
+    }
+    // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
+    for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
+        let (hw, hh) = (p.size[0] * p.scale * 0.45, p.size[1] * p.scale * 0.42);
+        let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
+        let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
+        let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
+        zones.push(Zone { effect: "cut", loops: vec![(rect, false)] });
     }
     Layout { walls, portals, lights, zones }
 }
@@ -386,6 +400,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "lava" => ("Лава", "#ff6a1a"),
                 "swamp" => ("Болото", "#6a8f3a"),
                 "fire" => ("Огонь", "#ff9a3c"),
+                "cut" => ("Мост", "#8a6a44"),
                 _ => ("Вода", "#2a8fd6"),
             };
             let region = json!({

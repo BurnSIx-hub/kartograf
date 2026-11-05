@@ -48,6 +48,9 @@ fn fits(slot: &str, asset: &str) -> bool {
 
 include!("prop_bounds.rs");
 
+/// Сколько клеток у края карты отдаётся реке у дома.
+const RIVER_ROOM: i32 = 9;
+
 /// Мебель в домах крупнее настоящей: на столе играют фигурки, а не меряют комнаты.
 const FURNITURE: f32 = 1.35;
 /// Сколько от оси стены до предмета: половина её толщины.
@@ -1126,7 +1129,7 @@ fn around(m: &mut Map, sp: &mut Spots, rng: &mut Rng, names: &[String], c: [f32;
             let d = 1.5 + rng.random() as f32 * 4.0 + (k / 30) as f32 * 2.5;
             let (x, y) = ((c[0] + a.cos() * d - fw as f32 / 2.0).floor() as i32, (c[1] + a.sin() * d - fh as f32 / 2.0).floor() as i32);
             let centre = [x as f32 + fw as f32 / 2.0, y as f32 + fh as f32 / 2.0];
-            if avoid.iter().any(|p| p.distance(centre) < keep) {
+            if avoid.iter().any(|p| p.distance(centre) < keep + (p.width / 2.0 - 1.0).max(0.0)) {
                 continue;
             }
             if put_pick(m, sp, &p, id, x, y, 0.0, 1.0) {
@@ -1349,11 +1352,67 @@ fn crossing(a: &Path, b: &Path) -> Option<([f32; 2], f32)> {
     })
 }
 
-/// Ручей с галечным берегом: две полосы по одной линии.
-fn stream(line: Vec<[f32; 2]>, water: usize, gravel: usize) -> (Path, Path) {
-    let bank = Path { points: line.clone(), material: gravel, width: 3.2, soft: 0.6, rough: 0.35, along: false };
-    let water = Path { points: line, material: water, width: 2.0, soft: 0.45, rough: 0.3, along: false };
-    (bank, water)
+/// Река с галечным берегом и глубиной посередине: три полосы по одной линии.
+/// `width` — ширина воды в клетках. Река от четырёх клеток: уже — рыба «Живой
+/// карты» (около клетки длиной) в ней не помещается, а глубины не остаётся вовсе.
+struct Stream {
+    bank: Path,
+    water: Path,
+    deep: Path,
+}
+
+impl Stream {
+    fn paths(&self) -> [Path; 3] {
+        [self.bank.clone(), self.water.clone(), self.deep.clone()]
+    }
+
+    /// Ближе `d` клеток к краю берега.
+    fn near(&self, p: [f32; 2], d: f32) -> bool {
+        self.bank.distance(p) < self.bank.width / 2.0 + d
+    }
+}
+
+fn stream(m: &mut Map, line: Vec<[f32; 2]>, width: f32) -> Stream {
+    let (water, deep, gravel) = (mat(m, "water_shallow"), mat(m, "water_deep"), mat(m, "gravel"));
+    let bank = Path { points: line.clone(), material: gravel, width: width + 1.6, soft: 0.6, rough: 0.35, along: false };
+    let deep = Path { points: line.clone(), material: deep, width: (width * 0.45).max(1.2), soft: 0.8, rough: 0.35, along: false };
+    let water = Path { points: line, material: water, width, soft: 0.45, rough: 0.3, along: false };
+    Stream { bank, water, deep }
+}
+
+/// Мост через реку там, где `path` её пересекает: поперёк течения, серединой на
+/// стрежне, концами на сухом за галькой. Картинка тянется по длине под ширину
+/// реки (до полутора раз), а сверх того — растёт целиком.
+fn bridge(m: &mut Map, path: &Path, river: &Stream) -> bool {
+    let Some((_, along)) = crossing(path, &river.water) else { return false };
+    let line = river.water.curve();
+    let near = |q: [f32; 2]| path.distance(q);
+    let Some(i) = (1..line.len().saturating_sub(1)).min_by(|&a, &b| near(line[a]).total_cmp(&near(line[b]))) else { return false };
+    let (p, q) = (line[i.saturating_sub(2)], line[(i + 2).min(line.len() - 1)]);
+    let flow = (q[1] - p[1]).atan2(q[0] - p[0]).to_degrees();
+    // Из двух поперечных — ближняя к ходу тропы.
+    let mut rot = flow + 90.0;
+    let diff = ((rot - along).rem_euclid(360.0) + 180.0).rem_euclid(360.0) - 180.0;
+    if diff.abs() > 90.0 {
+        rot += 180.0;
+    }
+    let pick = asset("bridge");
+    let [l, t, r, u] = bounds(&pick, "bridge", 0.0, 1.0);
+    // Длинная сторона картинки — вдоль хода: у встроенного и у FA мост лежит по x.
+    let lengthwise = r - l >= u - t;
+    let long = if lengthwise { r - l } else { u - t };
+    if !lengthwise {
+        rot -= 90.0;
+    }
+    let span = river.bank.width + 1.4;
+    let f = span / long.max(0.5);
+    let scale = if f > 1.5 { f / 1.5 } else if f < 0.75 { f / 0.75 } else { 1.0 };
+    let stretch = f / scale;
+    drop_pick(m, &pick, line[i], rot.rem_euclid(360.0), scale);
+    if let Some(pr) = m.props.last_mut() {
+        pr.size[if lengthwise { 0 } else { 1 }] *= stretch;
+    }
+    true
 }
 
 fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
@@ -1362,7 +1421,7 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let (w, h) = (m.width as f32, m.height as f32);
     ground(m, look.ground);
     patches(m, rng, look.patches, (w * h / 60.0) as i32, (2.0, 4.5), 0.6);
-    let (dirt, water, gravel) = (mat(m, "dirt"), mat(m, "water_shallow"), mat(m, "gravel"));
+    let dirt = mat(m, "dirt");
     let glade = 2.5 + w.min(h) * 0.08;
 
     let (left, right) = (h * (0.25 + rng.random() as f32 * 0.5), h * (0.25 + rng.random() as f32 * 0.5));
@@ -1378,16 +1437,19 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let water_paths = river.map(|side| {
         let x = if side { w * 0.75 } else { w * 0.25 };
         let (top, low) = (x + (rng.random() as f32 - 0.5) * w * 0.15, x + (rng.random() as f32 - 0.5) * w * 0.15);
-        stream(road(rng, [top, -1.0], [low, h + 1.0], w * 0.09), water, gravel)
+        let width = (w * 0.12).clamp(4.0, 5.5);
+        let line = road(rng, [top, -1.0], [low, h + 1.0], w * 0.09);
+        stream(m, line, width)
     });
-    let near_water = |p: [f32; 2], d: f32| water_paths.as_ref().is_some_and(|(bank, _)| bank.distance(p) < d);
+    // Расстояния считаются от края гальки.
+    let near_water = |p: [f32; 2], d: f32| water_paths.as_ref().is_some_and(|s| s.near(p, d - 1.6));
 
     // Лагерь в стороне от дороги и ручья, к нему идёт своя тропинка.
     let mut camp = [w / 2.0, h / 2.0];
     let mut best = f32::MIN;
     for _ in 0..200 {
         let q = [w * (0.15 + rng.random() as f32 * 0.7), h * (0.15 + rng.random() as f32 * 0.7)];
-        let room = water_paths.as_ref().map_or(trail.distance(q), |(bank, _)| trail.distance(q).min(bank.distance(q)));
+        let room = water_paths.as_ref().map_or(trail.distance(q), |s| trail.distance(q).min(s.bank.distance(q) - s.bank.width / 2.0 + 1.6));
         let score = -(room - glade - 2.0).abs();
         if score > best {
             best = score;
@@ -1401,10 +1463,9 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let bare = blobs(m, &[(camp, glade * 0.55)], 0.2, 0.6);
     m.paint(Layer::Floor, dirt, &bare);
     m.paths = match &water_paths {
-        Some((bank, water)) => vec![bank.clone(), water.clone(), trail.clone(), side_path.clone()],
+        Some(s) => s.paths().into_iter().chain([trail.clone(), side_path.clone()]).collect(),
         None => vec![trail.clone(), side_path.clone()],
     };
-    let bridge = water_paths.as_ref().and_then(|(_, water)| crossing(&trail, water));
 
     // Деревья дротиками: новое ставится, только если не лезет на тропу, ручей и соседей.
     let spacing = 3.4 - density * 1.5;
@@ -1436,8 +1497,8 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     for (dx, dy, n) in [(-1.8, 0.6, "sacks"), (1.7, -0.8, "crate"), (0.4, 1.9, "boulder"), (-1.2, -1.6, "barrel")] {
         drop(m, n, [camp[0] + dx, camp[1] + dy], 0.0, 0.9);
     }
-    if let Some((at, angle)) = bridge {
-        drop(m, "bridge", at, angle, 1.0);
+    if let Some(s) = &water_paths {
+        bridge(m, &trail, s);
     }
     if !p.objects.is_empty() {
         let mut sp = Spots::new(m);
@@ -2138,7 +2199,13 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     let start = p.entrance().unwrap_or(0);
     let hall_i = p.rooms.iter().position(|s| s.role.is_hall()).unwrap_or(start);
     // По краям — двор: дорожка, деревья, объекты плана.
-    let (room_w, room_h) = (w - 4, h - 5);
+    // Река по плану просит полосу у своего края: вода в пять клеток, галька и суша.
+    let river_at = p.river.side();
+    let (room_w, room_h) = match river_at {
+        Some(s) if s % 2 == 1 => (w - 4 - RIVER_ROOM, h - 5),
+        Some(_) => (w - 4, h - 5 - RIVER_ROOM),
+        None => (w - 4, h - 5),
+    };
     let mut best: Option<(f32, Layout)> = None;
     for scale in [1.0f32, 0.85, 0.72, 0.6, 0.5] {
         for attempt in 0..24 {
@@ -2159,7 +2226,15 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     }
     let (laid, building, blocks) = match best {
         Some((_, (rooms, bb, blocks))) => {
-            let (dx, dy) = ((w - bb.w) / 2, ((h - bb.h) / 2 - 1).max(1));
+            let (mut dx, mut dy) = ((w - bb.w) / 2, ((h - bb.h) / 2 - 1).max(1));
+            // Дом — подальше от реки: середина оставшейся части карты.
+            match river_at {
+                Some(0) => dy = RIVER_ROOM + ((h - RIVER_ROOM - bb.h) / 2).max(0),
+                Some(1) => dx = ((w - RIVER_ROOM - bb.w) / 2).max(1),
+                Some(2) => dy = ((h - RIVER_ROOM - bb.h) / 2).max(1),
+                Some(3) => dx = RIVER_ROOM + ((w - RIVER_ROOM - bb.w) / 2).max(0),
+                _ => {}
+            }
             let shift = |r: Room| Room { x: r.x + dx, y: r.y + dy, ..r };
             let moved = rooms.iter().map(|r| r.map(shift)).collect::<Vec<_>>();
             (moved, shift(bb), blocks.into_iter().map(shift).collect::<Vec<_>>())
@@ -2551,7 +2626,6 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
     let dirt = mat(m, "dirt");
     let (wf, hf) = (w as f32, h as f32);
     let water_paths = river_side.and_then(|side| {
-        let (water, gravel) = (mat(m, "water_shallow"), mat(m, "gravel"));
         let (near, far) = match side {
             0 => (0.0, building.y as f32),
             1 => ((building.x + building.w) as f32, wf),
@@ -2562,13 +2636,14 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             warn.push(format!("для реки с {} не хватает места: нужно шесть клеток между домом и краем", ["севера", "востока", "юга", "запада"][side as usize]));
             return None;
         }
-        let c = (near + far) / 2.0 + (rng.random() as f32 - 0.5) * (far - near - 5.0);
+        // Вода — до пяти клеток, но с клеткой суши у дома и у края карты.
+        let width = (far - near - 3.6).clamp(2.4, 5.0);
+        let c = (near + far) / 2.0 + (rng.random() as f32 - 0.5) * (far - near - width - 3.6).max(0.0);
         let line = if side % 2 == 0 { road(rng, [-1.0, c], [wf + 1.0, c], 1.0) } else { road(rng, [c, -1.0], [c, hf + 1.0], 1.0) };
-        Some(stream(line, water, gravel))
+        Some(stream(m, line, width))
     });
-    if let Some((bank, water)) = &water_paths {
-        m.paths.push(bank.clone());
-        m.paths.push(water.clone());
+    if let Some(s) = &water_paths {
+        m.paths.extend(s.paths());
     }
     let mut lane: Option<Path> = None;
     if let Some((side, ga, gb)) = entrance {
@@ -2590,10 +2665,8 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         }).collect::<Vec<_>>();
         let points = if water_paths.is_some() { straight(((to[0] - from[0]).hypot(to[1] - from[1]) as usize).max(2)) } else { road(rng, from, to, 0.7) };
         let path = Path { points, material: dirt, width: 2.0, soft: 0.5, rough: 0.3, along: false };
-        if let Some((_, water)) = &water_paths
-            && let Some((at, angle)) = crossing(&path, water)
-        {
-            drop(m, "bridge", at, angle, 1.0);
+        if let Some(s) = &water_paths {
+            bridge(m, &path, s);
         }
         m.paths.push(path.clone());
         lane = Some(path);
@@ -2603,7 +2676,7 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         let q = [rng.random() as f32 * wf, rng.random() as f32 * hf];
         let near = q[0] > building.x as f32 - 1.5 && q[0] < (building.x + bw) as f32 + 1.5 && q[1] > building.y as f32 - 1.5 && q[1] < (building.y + bh) as f32 + 1.5;
         let on_lane = lane.as_ref().is_some_and(|l| l.distance(q) < 2.0);
-        let on_water = water_paths.as_ref().is_some_and(|(bank, _)| bank.distance(q) < 2.4);
+        let on_water = water_paths.as_ref().is_some_and(|s| s.near(q, 0.8));
         if !near && !on_lane && !on_water {
             let n = match pick(rng, &["bush", "bush", "bush", "tree"]) {
                 "tree" => Some(season_tree(rng, season)),
@@ -3101,6 +3174,12 @@ mod tests {
         let r = build(&mut m, &p, 0, Palette::builtin()).unwrap();
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(m.props.iter().any(|q| q.asset.ends_with("bridge")), "нет моста");
+        // Река не уже четырёх клеток, мост длиннее берега с галькой и лежит поперёк.
+        let bank = m.paths.iter().map(|q| q.width).fold(0.0, f32::max);
+        assert!(bank >= 4.0 + 1.6, "река узкая: берег {bank}");
+        let br = m.props.iter().find(|q| q.asset.ends_with("bridge")).unwrap();
+        assert!(br.size[0] * br.scale * 0.85 >= bank, "мост короче реки: {br:?}");
+        assert!((br.rot.rem_euclid(180.0) - 90.0).abs() < 15.0, "мост не поперёк: {}", br.rot);
         assert!(m.props.iter().any(|q| q.asset.ends_with("well")) && m.props.iter().any(|q| q.asset.ends_with("cart")));
         assert!(m.shade.is_some() && m.shadows.opacity > 0.7);
         // Объекты не в доме.
