@@ -48,7 +48,65 @@ fn scene_flags(map: &Map) -> Value {
         }
         flags[LIVE_MODULE]["seed"] = json!(map.seed);
     }
+    // Поверхности под шагами.
+    if let Some(s) = surfaces(map) {
+        if flags.get(LIVE_MODULE).is_none() {
+            flags[LIVE_MODULE] = json!({});
+        }
+        flags[LIVE_MODULE]["surfaces"] = s;
+    }
     flags
+}
+
+/// Поверхности для шагов «Живой карты»: по букве на клетку, строки подряд,
+/// `.` — не знаем, молчать. Берётся верхний слой в середине клетки: дорога поверх
+/// пола комнаты, пол комнаты поверх местности.
+pub fn surfaces(map: &Map) -> Option<Value> {
+    let (w, h) = (map.width as usize, map.height as usize);
+    let res = mask::RES as isize;
+    let mut cells = vec!['.'; w * h];
+    let mut known = false;
+    let at = |m: &mask::Mask, x: usize, y: usize| m.get(x as isize * res + res / 2, y as isize * res + res / 2);
+    for y in 0..h {
+        for x in 0..w {
+            let mut top: Option<usize> = None;
+            for c in &map.terrain {
+                if at(&c.mask, x, y) > 127 {
+                    top = Some(c.material as usize);
+                }
+            }
+            if at(&map.rooms, x, y) > 127 {
+                for c in &map.room_floor {
+                    if at(&c.mask, x, y) > 127 {
+                        top = Some(c.material as usize);
+                    }
+                }
+            }
+            if let Some(s) = top.and_then(|m| map.materials.get(m)).and_then(|m| m.surface()) {
+                cells[y * w + x] = s;
+                known = true;
+            }
+        }
+    }
+    // Дороги и реки — поверх: середина клетки в пределах полуширины линии.
+    for p in &map.paths {
+        let Some(s) = map.materials.get(p.material).and_then(|m| m.surface()) else { continue };
+        let line = p.curve();
+        let hw = p.width / 2.0;
+        for seg in line.windows(2) {
+            let (lo, hi) = (seg[0][0].min(seg[1][0]) - hw, seg[0][0].max(seg[1][0]) + hw);
+            let (top, bot) = (seg[0][1].min(seg[1][1]) - hw, seg[0][1].max(seg[1][1]) + hw);
+            for y in (top.floor().max(0.0) as usize)..(bot.ceil().max(0.0) as usize).min(h) {
+                for x in (lo.floor().max(0.0) as usize)..(hi.ceil().max(0.0) as usize).min(w) {
+                    if map::segment_distance([x as f32 + 0.5, y as f32 + 0.5], seg[0], seg[1]) <= hw {
+                        cells[y * w + x] = s;
+                        known = true;
+                    }
+                }
+            }
+        }
+    }
+    known.then(|| json!({"w": w, "h": h, "cells": cells.into_iter().collect::<String>()}))
 }
 
 /// Контуры живых материалов: по эффекту — все залитые им места, острова — дырами.
@@ -555,8 +613,8 @@ mod tests {
         assert_eq!(scene["weather"], "");
         autumn.weather = "snow".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["weather"], "snow");
-        // Звук места — флагом сцены, без него флага «Живой карты» нет.
-        assert!(scene["flags"].get(LIVE_MODULE).is_none());
+        // Звук места — флагом сцены; без него его нет (поверхности для шагов — есть).
+        assert!(scene["flags"][LIVE_MODULE].get("ambience").is_none());
         autumn.ambience = "forest-autumn".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["ambience"], "forest-autumn");
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["clouds"], 0.6);
@@ -568,6 +626,30 @@ mod tests {
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["seed"], "озеро");
     }
     use crate::map::{Layer, Portal, Prop, Wall};
+
+    #[test]
+    fn surfaces_follow_the_top_floor() {
+        let mut m = Map::new(4, 2);
+        assert!(surfaces(&m).is_none());
+        // Трава (3) везде, доски (1) слева, вода (8) в правом нижнем углу.
+        m.paint_rect(Layer::Floor, (0, 0), (3, 1), Some(3));
+        m.paint_rect(Layer::Floor, (0, 0), (0, 1), Some(1));
+        m.paint_rect(Layer::Floor, (3, 1), (3, 1), Some(8));
+        let s = surfaces(&m).unwrap();
+        assert_eq!((s["w"].as_u64(), s["h"].as_u64()), (Some(4), Some(2)));
+        assert_eq!(s["cells"], "orrrorrw");
+        let flags = scene_flags(&m);
+        assert_eq!(flags[LIVE_MODULE]["surfaces"]["cells"], "orrrorrw");
+        // Песчаник — камень, иней — снег, брусчатка — камень, песок — песок.
+        let sf = |i: usize| m.materials[i].surface();
+        let by = |name: &str| m.materials.iter().position(|x| x.name == name).unwrap();
+        assert_eq!(sf(by("Песчаник")), Some('s'));
+        assert_eq!(sf(by("Иней")), Some('n'));
+        assert_eq!(sf(by("Брусчатка")), Some('s'));
+        assert_eq!(sf(by("Песок")), Some('a'));
+        assert_eq!(sf(by("Лава")), None);
+        assert_eq!(sf(by("Болото")), Some('m'));
+    }
 
     #[test]
     fn simplify_keeps_corners_and_drops_collinear_points() {

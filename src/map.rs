@@ -102,6 +102,51 @@ impl Material {
     }
 }
 
+impl Material {
+    /// По чему звучат шаги в «Живой карте»: буква поверхности или `None` — молчать.
+    /// Вода и болото — от живого материала; остальное по имени картинки и материала.
+    /// Порядок проверок важен: «песчаник» — камень, а не песок; «иней на траве» — снег.
+    pub fn surface(&self) -> Option<char> {
+        match self.live() {
+            Live::Water => return Some('w'),
+            Live::Swamp => return Some('m'),
+            Live::Lava => return None,
+            _ => {}
+        }
+        let key = match &self.paint {
+            Paint::Texture(k) => format!("{} {} {}", k.to_lowercase(), crate::library::label(k).to_lowercase(), self.name.to_lowercase()),
+            Paint::Color(_) => self.name.to_lowercase(),
+        };
+        let has = |ws: &[&str]| ws.iter().any(|w| key.contains(w));
+        if has(&["metal", "iron", "steel", "grate", "металл", "желез", "решётк"]) {
+            Some('e')
+        } else if has(&["snow", "frost", "ice", "снег", "иней", "лёд", "лед"]) {
+            Some('n')
+        } else if has(&["gravel", "pebble", "гравий", "галька", "щебень"]) {
+            Some('g')
+        } else if has(&["mud", "грязь", "wet"]) {
+            Some('m')
+        } else if has(&["shack", "rotten", "old_wood", "broken", "гнил", "лачуг", "скрип"]) {
+            Some('k')
+        } else if has(&["wood", "plank", "board", "parquet", "deck", "floor_h", "доск", "дерев", "паркет", "настил"]) {
+            Some('o')
+        } else if has(&[
+            "stone", "cobble", "flagstone", "tile", "brick", "marble", "slate", "rock", "dungeon", "cave", "granite", "basalt", "volcanic",
+            "камен", "камн", "плит", "брусчат", "кирпич", "мрамор", "пещер", "песчаник", "скал",
+        ]) {
+            Some('s')
+        } else if has(&["sand", "beach", "desert", "dune", "песок", "песч", "пустын", "пляж"]) {
+            Some('a')
+        } else if has(&["grass", "moss", "meadow", "lawn", "flora", "трав", "мох", "луг", "подстилк", "forest_floor"]) {
+            Some('r')
+        } else if has(&["dirt", "earth", "soil", "path", "road", "ash", "земл", "почв", "тропа", "дорог", "пепел"]) {
+            Some('d')
+        } else {
+            None
+        }
+    }
+}
+
 /// Вид стен: и нарисованных вручную, и тех, что встают вокруг комнат.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WallStyle {
