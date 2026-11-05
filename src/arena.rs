@@ -396,46 +396,61 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
     let door_t = (1.0 / a).min(1.0).asin();
     let pen0 = (PEN / a).min(1.0).asin();
     let gate = |x: [f32; 2], y: [f32; 2]| Portal { a: x, b: y, kind: PortalKind::DoubleDoor, asset: Some(asset("door_metal").key), frame: Some(key("frame_stone_3")) };
+    // Стена рисуется с концами, продлёнными на полтолщины: куски вокруг проёма
+    // кончаются на полтолщины раньше — и торец встаёт ровно в косяк, а не
+    // заходит под него. Куски, что упираются в стену прохода, — без отступа.
+    let half_w = style.width / 2.0;
+    let back = |s: f32, t: f32| half_w / ((bowl.a + s).powi(2) * t.sin().powi(2) + (bowl.b + s).powi(2) * t.cos().powi(2)).sqrt().max(0.1);
+    let piece = |m: &mut Map, s: f32, t0: f32, t1: f32, stops: &[f32]| {
+        if t1 - t0 > 1e-3 {
+            m.walls.push(Wall { points: ring_line(&bowl, s, t0, t1, &[], stops), closed: false, bends: Vec::new(), style: Some(style.clone()) });
+        }
+    };
     if pit {
         // Стена кругом, ворота по длинной оси.
-        let chords = [(-g0, g0), (PI - g0, PI + g0)];
-        let mut pts = ring_line(&bowl, 0.0, -g0, TAU - g0, &chords, &[]);
-        pts.pop();
-        m.walls.push(Wall { points: pts, closed: true, bends: Vec::new(), style: Some(style.clone()) });
-        for (c0, c1) in chords {
-            m.portals.push(gate(bowl.ring(0.0, c0), bowl.ring(0.0, c1)));
-        }
-    } else {
-        // Стена арены: хорды ворот и загона, стыки со стенами загона.
-        let pen_door = (FRAC_PI_2 - door_t, FRAC_PI_2 + door_t);
-        let chords = [(-g0, g0), pen_door, (PI - g0, PI + g0)];
-        let stops = [FRAC_PI_2 - pen0, FRAC_PI_2 + pen0];
-        let mut pts = ring_line(&bowl, 0.0, -g0, TAU - g0, &chords, &stops);
-        pts.pop();
-        m.walls.push(Wall { points: pts, closed: true, bends: Vec::new(), style: Some(style.clone()) });
+        piece(m, 0.0, g0 + back(0.0, g0), PI - g0 - back(0.0, g0), &[]);
+        piece(m, 0.0, PI + g0 + back(0.0, g0), TAU - g0 - back(0.0, g0), &[]);
         for (c0, c1) in [(-g0, g0), (PI - g0, PI + g0)] {
             m.portals.push(gate(bowl.ring(0.0, c0), bowl.ring(0.0, c1)));
         }
-        m.portals.push(Portal { a: bowl.ring(0.0, pen_door.0), b: bowl.ring(0.0, pen_door.1), kind: PortalKind::DoubleDoor, asset: Some(asset("door_wood_iron").key), frame: Some(key("frame_stone_2")) });
-        // Внешняя стена: две дуги между проходами, в них арки.
-        let g1 = (GATE / (b + outer)).min(1.0).asin();
-        let r_out = (a + b) / 2.0 + outer;
-        for (t0, t1) in [(g1, PI - g1), (PI + g1, TAU - g1)] {
-            let span = (t1 - t0) * r_out;
-            let count = (span / 4.0).floor().max(1.0) as i32;
-            let half = 0.5 / r_out;
-            let chords: Vec<(f32, f32)> = (0..count).map(|k| t0 + (k as f32 + 0.5) / count as f32 * (t1 - t0)).map(|c| (c - half, c + half)).collect();
-            let pts = ring_line(&bowl, outer - WALL_BAND / 2.0, t0, t1, &chords, &[]);
-            m.walls.push(Wall { points: pts, closed: false, bends: Vec::new(), style: Some(style.clone()) });
-            for (c0, c1) in chords {
-                let s = outer - WALL_BAND / 2.0;
-                m.portals.push(Portal { a: bowl.ring(s, c0), b: bowl.ring(s, c1), kind: PortalKind::Opening, asset: None, frame: Some(key("frame_stone_1")) });
+    } else {
+        // Стена арены: от ворот до ворот, на юге — разрыв под решётку загона.
+        let (d0, d1) = (FRAC_PI_2 - door_t, FRAC_PI_2 + door_t);
+        // У ворот — тоже с отступом: торец дуги ложится в угол со стеной прохода,
+        // а не торчит клином в арену.
+        let bg = back(0.0, g0);
+        piece(m, 0.0, g0 + bg, d0 - back(0.0, d0), &[FRAC_PI_2 - pen0]);
+        piece(m, 0.0, d1 + back(0.0, d1), PI - g0 - bg, &[FRAC_PI_2 + pen0]);
+        piece(m, 0.0, PI + g0 + bg, TAU - g0 - bg, &[]);
+        for (c0, c1) in [(-g0, g0), (PI - g0, PI + g0)] {
+            m.portals.push(gate(bowl.ring(0.0, c0), bowl.ring(0.0, c1)));
+        }
+        m.portals.push(Portal { a: bowl.ring(0.0, d0), b: bowl.ring(0.0, d1), kind: PortalKind::DoubleDoor, asset: Some(asset("door_wood_iron").key), frame: Some(key("frame_stone_2")) });
+        // Внешняя стена: две дуги между проходами, в них арки по клетке.
+        // У проходов дуга упирается в их стену — там без отступа.
+        let s_out = outer - WALL_BAND / 2.0;
+        let g_out = (GATE / (b + s_out)).min(1.0).asin();
+        let r_out = (a + b) / 2.0 + s_out;
+        for (t0, t1) in [(g_out, PI - g_out), (PI + g_out, TAU - g_out)] {
+            let count = ((t1 - t0) * r_out / 4.0).floor().max(1.0) as i32;
+            let arches: Vec<(f32, f32)> = (0..count)
+                .map(|k| t0 + (k as f32 + 0.5) / count as f32 * (t1 - t0))
+                .map(|c| {
+                    let half = 0.5 / ((a + s_out).powi(2) * c.sin().powi(2) + (b + s_out).powi(2) * c.cos().powi(2)).sqrt();
+                    (c - half, c + half)
+                })
+                .collect();
+            let mut from = t0;
+            for &(c0, c1) in &arches {
+                piece(m, s_out, from, c0 - back(s_out, c0), &[]);
+                m.portals.push(Portal { a: bowl.ring(s_out, c0), b: bowl.ring(s_out, c1), kind: PortalKind::Opening, asset: None, frame: Some(key("frame_stone_1")) });
+                from = c1 + back(s_out, c1);
             }
+            piece(m, s_out, from, t1, &[]);
         }
         // Стены проходов: от ворот до площади.
-        let g_out = (GATE / (b + outer - WALL_BAND / 2.0)).min(1.0).asin();
         for (t_in, t_out) in [(-g0, -g_out), (g0, g_out), (PI - g0, PI - g_out), (PI + g0, PI + g_out)] {
-            m.walls.push(Wall { points: vec![bowl.ring(0.0, t_in), bowl.ring(outer - WALL_BAND / 2.0, t_out)], closed: false, bends: Vec::new(), style: Some(style.clone()) });
+            m.walls.push(Wall { points: vec![bowl.ring(0.0, t_in), bowl.ring(s_out, t_out)], closed: false, bends: Vec::new(), style: Some(style.clone()) });
         }
         // Загон: две стены вглубь и задняя по кольцу.
         let depth = bowl.box_depth();
@@ -771,5 +786,29 @@ mod tests {
         assert!(far[20..50].iter().all(|&x| x < 110), "густая тень на солнечной стороне: {far:?}");
         let feet = far[34..50].windows(2).filter(|w| w[0] < 10 && w[1] > 25).count();
         assert!(feet >= 2, "нет тени под ступенями на дальней стороне: {far:?}");
+    }
+
+    /// Проёмы чисты: ни стена, ни её продлённый торец не заходят в арку,
+    /// ворота и решётку загона.
+    #[test]
+    fn walls_stop_at_every_opening() {
+        for (w, h, seed) in [(40, 30, "кровь"), (70, 50, "лев"), (16, 12, "яма"), (30, 44, "башня")] {
+            let mut p = Plan::new(Kind::Arena);
+            p.seed = seed.into();
+            let mut m = Map::new(w, h);
+            build(&mut m, &p, 0, crate::palette::Palette::builtin()).unwrap();
+            assert!(m.portals.iter().any(|q| q.kind == PortalKind::Opening) || w < 20, "нет арок {w}×{h}");
+            for po in &m.portals {
+                for k in 1..10 {
+                    let f = k as f32 / 10.0;
+                    let q = [po.a[0] + (po.b[0] - po.a[0]) * f, po.a[1] + (po.b[1] - po.a[1]) * f];
+                    for wall in &m.walls {
+                        let half = wall.style.as_ref().map_or(0.2, |st| st.width / 2.0);
+                        let d = wall.distance(q);
+                        assert!(d >= half * 0.9, "{w}×{h}: стена в проёме {:?} {:?} у {q:?}: {d}", po.kind, po.a);
+                    }
+                }
+            }
+        }
     }
 }
