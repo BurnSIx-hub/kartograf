@@ -59,14 +59,22 @@ impl Kind {
     pub const ALL: [Kind; 6] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern];
 
     /// Звук места в «Живой карте»; у леса он по времени года, у пещеры — по виду.
+    /// Дом и таверна стоят в лесу по тому же времени года: снаружи слышна округа.
     pub fn ambience(self, o: &crate::plan::Opts) -> &'static str {
         match self {
             Kind::Dungeon => "dungeon-1",
             Kind::Cave => o.cave.ambience(),
-            Kind::Forest => o.season.ambience(),
+            Kind::Forest | Kind::House | Kind::Tavern => o.season.ambience(),
             Kind::Town => "town-1",
+        }
+    }
+
+    /// Звук внутри комнат: таверна, дом с камином; у прочих — нет.
+    pub fn indoor(self) -> &'static str {
+        match self {
             Kind::House => "house",
             Kind::Tavern => "tavern",
+            _ => "",
         }
     }
 

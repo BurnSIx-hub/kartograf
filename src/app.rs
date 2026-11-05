@@ -1324,6 +1324,7 @@ impl App {
                 .to_owned();
                 self.map.weather = if outdoor { plan.options.season.weather().to_owned() } else { String::new() };
                 self.map.ambience = plan.kind.ambience(&plan.options).to_owned();
+                self.map.indoor = plan.kind.indoor().to_owned();
                 self.notice = (!r.warnings.is_empty()).then(|| format!("Построено, но: {}", r.warnings.join("; ")));
                 self.edges_dirty = true;
                 Some(r)

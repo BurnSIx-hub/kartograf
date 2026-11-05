@@ -957,6 +957,10 @@ pub struct Map {
     /// Звук места в «Живой карте» (`forest-autumn`, `cave-1`…); пусто — без него.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ambience: String,
+    /// Звук внутри комнат (`tavern`, `house`): при выгрузке комнаты обводятся областью
+    /// «Живой карты», внутри неё играет он, снаружи — `ambience`. Пусто — без неё.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub indoor: String,
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1095,6 +1099,7 @@ impl Map {
             particles: String::new(),
             weather: String::new(),
             ambience: String::new(),
+            indoor: String::new(),
             width,
             height,
             materials: builtin_materials(),

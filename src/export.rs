@@ -25,6 +25,8 @@ pub struct Layout {
 pub struct Zone {
     pub effect: &'static str,
     pub loops: Vec<(Vec<[f32; 2]>, bool)>,
+    /// У области «внутри» (`effect` = "place") — ключ её звука.
+    pub place: String,
 }
 
 /// Модуль Foundry, который оживляет области.
@@ -129,7 +131,7 @@ fn zones(map: &Map) -> Vec<Zone> {
             .collect::<Vec<_>>();
         match out.iter_mut().find(|z| z.effect == effect) {
             Some(z) => z.loops.extend(tagged),
-            None => out.push(Zone { effect, loops: tagged }),
+            None => out.push(Zone { effect, loops: tagged, place: String::new() }),
         }
     }
     out
@@ -218,7 +220,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let a = i as f32 / 12.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fire", loops: vec![(round, false)] });
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new() });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
@@ -226,7 +228,15 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
         let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
         let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-        zones.push(Zone { effect: "cut", loops: vec![(rect, false)] });
+        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new() });
+    }
+    // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
+    if !map.indoor.is_empty() && !map.rooms.is_empty() {
+        let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
+        let tagged: Vec<_> = loops.iter().map(|l| (l.clone(), loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1)).collect();
+        if !tagged.is_empty() {
+            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone() });
+        }
     }
     Layout { walls, portals, lights, zones }
 }
@@ -401,12 +411,13 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "swamp" => ("Болото", "#6a8f3a"),
                 "fire" => ("Огонь", "#ff9a3c"),
                 "cut" => ("Мост", "#8a6a44"),
+                "place" => ("Звук внутри", "#c9a24a"),
                 _ => ("Вода", "#2a8fd6"),
             };
             let region = json!({
                 "_id": doc_id('r', regions.len()), "name": title, "color": color, "shapes": shapes,
                 "elevation": {"bottom": null, "top": null},
-                "flags": {LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}
+                "flags": if z.effect == "place" { json!({LIVE_MODULE: {"place": z.place}}) } else { json!({LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}) }
             });
             regions.push(tag(region));
         }
@@ -559,6 +570,19 @@ pub fn foundry_data_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rooms_get_their_own_sound_region() {
+        let mut m = Map::new(12, 12);
+        let rooms = crate::mask::cells(m.rooms.w, m.rooms.h, (2, 2), (7, 6));
+        m.paint(crate::map::Layer::Rooms, 0, &rooms);
+        assert!(layout(&m, &m.room_edges()).zones.iter().all(|z| z.effect != "place"), "без indoor области нет");
+        m.indoor = "tavern".into();
+        let lay = layout(&m, &m.room_edges());
+        let z = lay.zones.iter().find(|z| z.effect == "place").expect("нет области звука");
+        assert_eq!(z.place, "tavern");
+        assert_eq!(z.loops.len(), 1);
+    }
 
     #[test]
     fn water_becomes_living_region_with_island_hole() {

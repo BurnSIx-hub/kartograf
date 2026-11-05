@@ -1540,7 +1540,7 @@ fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32, look: O
     sp.block(r.x, r.y, r.w, r.h);
     let own: Vec<_> = m.room_edges().into_iter().filter(|s| [s.0, s.1].iter().all(|p| p[0] >= ax && p[0] <= bx && p[1] >= ay && p[1] <= by)).collect();
     m.set_edge_look(&own, &wall(st));
-    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: asset(roof).key, turn: u8::from(r.h > r.w), overhang: 0.3 });
+    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(r.h > r.w), overhang: 0.3 });
 
     let along = if door % 2 == 0 { r.w } else { r.h };
     let at = rng.int(1, (along - 2).max(1));
@@ -2287,7 +2287,8 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
             _ => pick(rng, &["roof_clay_red", "roof_thatch", "roof_shingle", "roof_clay_brown"]),
         },
     };
-    let roof_key = asset(roof).key;
+    // Крыши — всегда встроенные: они нарисованы под скаты и конёк, библиотечные — нет.
+    let roof_key = key(roof);
     for b in blocks.iter().filter(|b| b.w >= 2 && b.h >= 2) {
         // Почти квадратный большой зал — шатром на четыре ската, остальное — два ската.
         let squareish = b.w.min(b.h) * 5 >= b.w.max(b.h) * 4 && b.w.min(b.h) >= 8;
