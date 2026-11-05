@@ -35,6 +35,10 @@ const ATTIC: f32 = 2.8;
 const SUN: f32 = 1.25;
 /// Насколько темна тень трибун.
 const SHADE: f32 = 0.55;
+/// Тень у подножия каждой ступени и стены — со всех сторон, не от солнца:
+/// свет из-под уступа не достаёт. Насколько темна и как далеко тянется.
+const CONTACT: f32 = 0.42;
+const CONTACT_REACH: f32 = 0.55;
 
 /// Вид камня: пол рядов, проходов, подиума и стены.
 struct Look {
@@ -498,8 +502,34 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
             }
         }
     }
-    let shade: Vec<(usize, f32)> = shade.into_iter().enumerate().filter(|(_, v)| *v > 0.01).collect();
-    m.shade_paint(&shade, SHADE);
+    // Под каждым уступом — мягкая тень со всех сторон: чем выше соседний уступ и
+    // чем он ближе, тем темнее; к половине клетки сходит на нет.
+    let mut contact = vec![0.0f32; mw * mh];
+    for j in 0..mh {
+        for i in 0..mw {
+            let here = height[j * mw + i];
+            let mut dark = 0.0f32;
+            for d in 0..16 {
+                let a = d as f32 / 16.0 * TAU;
+                let (dx, dy) = (a.cos(), a.sin());
+                for step in 1..=5 {
+                    let r = CONTACT_REACH * step as f32 / 5.0;
+                    let hq = sample(i as f32 + dx * r * res, j as f32 + dy * r * res);
+                    let rise = ((hq - here) / 0.5).clamp(0.0, 1.0);
+                    dark = dark.max(rise * (1.0 - r / (CONTACT_REACH + 0.05)).powf(1.5));
+                }
+            }
+            contact[j * mw + i] = dark;
+        }
+    }
+    let shade: Vec<(usize, f32)> = shade
+        .into_iter()
+        .zip(contact)
+        .map(|(sun, near)| 1.0 - (1.0 - sun * SHADE) * (1.0 - near * CONTACT))
+        .enumerate()
+        .filter(|(_, v)| *v > 0.005)
+        .collect();
+    m.shade_paint(&shade, 1.0);
     // Объекты отбрасывают тень под то же солнце: подлиннее обычного.
     m.shadows.dist = 0.3;
     m.shadows.fade = 0.5;
@@ -716,7 +746,7 @@ mod tests {
     use super::*;
 
     /// Тень по высотам: серп на песке у солнечной стены, полосы под ступенями
-    /// на солнечной стороне, на дальней — нет.
+    /// на солнечной стороне, на дальней — только мягкая у подножий.
     #[test]
     fn stands_cast_shadows_toward_the_arena_on_the_sun_side() {
         let mut p = Plan::new(Kind::Arena);
@@ -737,6 +767,9 @@ mod tests {
         assert!(dark(&sun[20..34]) >= 4, "нет серпа у солнечной стены: {sun:?}");
         let stripes = sun[34..50].windows(2).filter(|w| w[0] < 60 && w[1] > 100).count();
         assert!(stripes >= 2, "нет полос под ступенями: {sun:?}");
-        assert!(far[20..50].iter().all(|&x| x < 60), "тень на солнечной стороне: {far:?}");
+        // На дальней стороне солнце в лицо ступеням: только мягкая тень у подножий.
+        assert!(far[20..50].iter().all(|&x| x < 110), "густая тень на солнечной стороне: {far:?}");
+        let feet = far[34..50].windows(2).filter(|w| w[0] < 10 && w[1] > 25).count();
+        assert!(feet >= 2, "нет тени под ступенями на дальней стороне: {far:?}");
     }
 }
