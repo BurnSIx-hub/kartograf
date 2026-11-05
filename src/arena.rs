@@ -422,8 +422,12 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
         piece(m, 0.0, g0 + bg, d0 - back(0.0, d0), &[FRAC_PI_2 - pen0]);
         piece(m, 0.0, d1 + back(0.0, d1), PI - g0 - bg, &[FRAC_PI_2 + pen0]);
         piece(m, 0.0, PI + g0 + bg, TAU - g0 - bg, &[]);
-        for (c0, c1) in [(-g0, g0), (PI - g0, PI + g0)] {
-            m.portals.push(gate(bowl.ring(0.0, c0), bowl.ring(0.0, c1)));
+        // Ворота — в полуклетке вглубь прохода: косяки лежат на его стенах, а не
+        // висят над песком у их торцов.
+        let corner = a * (1.0 - (GATE / b).powi(2)).max(0.0).sqrt();
+        for side in [1.0f32, -1.0] {
+            let u = side * (corner + 0.5);
+            m.portals.push(gate(bowl.world(u, -GATE), bowl.world(u, GATE)));
         }
         m.portals.push(Portal { a: bowl.ring(0.0, d0), b: bowl.ring(0.0, d1), kind: PortalKind::DoubleDoor, asset: Some(asset("door_wood_iron").key), frame: Some(key("frame_stone_2")) });
         // Внешняя стена: две дуги между проходами, в них арки по клетке.
