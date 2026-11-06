@@ -1052,11 +1052,16 @@ dependencies = [
  "eframe",
  "flate2",
  "image",
+ "js-sys",
  "rfd",
  "serde",
  "serde_json",
  "sha2",
  "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "webp",
 ]
 

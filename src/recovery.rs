@@ -42,7 +42,7 @@ pub struct Recovery {
 }
 
 pub fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Открывает файл так, чтобы никто другой не смог открыть его, пока он открыт у нас.
@@ -71,7 +71,7 @@ impl Recovery {
         // Счётчик — на случай двух копий в одном процессе за одну секунду.
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = format!("{}-{}-{n}", std::process::id(), now_unix());
+        let id = format!("{}-{}-{n}", crate::plat::pid(), now_unix());
         let lock = open_exclusive(&dir.join(format!("{id}.lock"))).ok();
         Self { dir, id, lock, saved_rev: 0, last: f64::NEG_INFINITY }
     }

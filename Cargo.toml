@@ -9,12 +9,23 @@ base64 = "0.22.1"
 flate2 = "1.1.10"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
-webp = "0.3"
-ureq = "3"
 sha2 = "0.10"
-rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+# Только программа (exe): сжатие WebP через libwebp, сеть для обновлений, системные окна файлов.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+webp = "0.3"
+ureq = "3"
+rfd = "0.17.2"
+
+# Только модуль Foundry (WebAssembly).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+web-time = "1.1.0"
 
 [profile.dev]
 opt-level = 1

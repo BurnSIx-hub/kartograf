@@ -283,11 +283,15 @@ struct Export {
     quit: bool,
     /// Кроны деревьев — тайлами над токенами; иначе деревья остаются в картинке как есть.
     canopies: bool,
+    /// Модуль: обновить последнюю сцену, а не заводить новую.
+    update: bool,
 }
 
-/// Окно выгрузки: сколько пикселей на клетку.
+/// Окно выгрузки: сколько пикселей на клетку; в модуле ещё имя сцены и новая/последняя.
 struct ExportDialog {
     px: u32,
+    name: String,
+    update: bool,
 }
 
 /// Окно «Новая карта».
@@ -421,6 +425,8 @@ pub struct App {
     new_map: Option<NewMap>,
     export: Option<Export>,
     export_dialog: Option<ExportDialog>,
+    /// Под каким именем эта карта последний раз ушла на сцену (модуль).
+    scene_name: Option<String>,
     /// Выгрузка из командной строки: куда и с каким разрешением.
     export_args: Option<(PathBuf, u32)>,
     /// Сообщение в строке состояния: что сделано.
@@ -430,6 +436,9 @@ pub struct App {
 }
 
 pub fn default_data_dir() -> PathBuf {
+    #[cfg(target_arch = "wasm32")]
+    return PathBuf::from("/kartograf");
+    #[cfg(not(target_arch = "wasm32"))]
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Kartograf")
 }
 
@@ -569,6 +578,7 @@ impl App {
             new_map: None,
             export: None,
             export_dialog: None,
+            scene_name: None,
             export_args: args.export.map(|d| (d, args.px.unwrap_or(EXPORT_PX))),
             notice: None,
             confirm_close: false,
@@ -576,6 +586,9 @@ impl App {
         };
         if let Some(file) = args.file {
             app.open_path(&file);
+        } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && app.orphans.is_empty() {
+            // Запуск без карты — сразу спросить размер новой.
+            app.new_map = Some(NewMap { width: app.map.width, height: app.map.height });
         }
         // План строится, когда прочитаны паки: иначе план «из библиотеки» взял бы встроенное.
         app.pending_plan = args.plan;
@@ -1363,6 +1376,7 @@ impl App {
     // ----- файлы -----
 
     fn reset_doc(&mut self, mut map: Map, path: Option<PathBuf>) {
+        self.scene_name = None;
         let rest = std::mem::take(&mut map.levels);
         self.levels = std::iter::once(map.clone()).chain(rest).collect();
         self.level = 0;
@@ -1426,14 +1440,14 @@ impl App {
     }
 
     fn save_as(&mut self) {
-        let dialog = rfd::FileDialog::new().add_filter("Карта", &[map::EXT]).set_file_name(format!("{}.{}", self.name(), map::EXT));
+        let dialog = crate::plat::FileDialog::new().add_filter("Карта", &[map::EXT]).set_file_name(format!("{}.{}", self.name(), map::EXT));
         if let Some(path) = dialog.save_file() {
             self.save_to(&path);
         }
     }
 
     fn open(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("Карта", &[map::EXT]).pick_file() {
+        if let Some(path) = crate::plat::FileDialog::new().add_filter("Карта", &[map::EXT]).pick_file() {
             self.open_path(&path);
         }
     }
@@ -1659,16 +1673,45 @@ impl App {
                     self.save_settings();
                 }
                 ui.add_space(4.0);
-                ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt) и картинки створок, крыш и крон — их надо держать рядом со сценой. В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
-                ui.add_space(6.0);
-                go = ui.button("Выбрать место и выгрузить").clicked();
+                if cfg!(target_arch = "wasm32") {
+                    ui.horizontal(|ui| {
+                        ui.label("Название сцены:");
+                        ui.text_edit_singleline(&mut dlg.name);
+                    });
+                    let last = crate::plat::last_scene();
+                    if last.is_none() {
+                        dlg.update = false;
+                    }
+                    ui.radio_value(&mut dlg.update, false, "Создать новую сцену");
+                    ui.add_enabled_ui(last.is_some(), |ui| {
+                        let label = last.as_ref().map_or_else(|| "Обновить последнюю сцену".to_owned(), |n| format!("Обновить последнюю сцену («{n}»)"));
+                        ui.radio_value(&mut dlg.update, true, label).on_hover_text("Картинка, стены, свет и тайлы заменятся; токены, заметки и звуки останутся.");
+                    });
+                    ui.weak("Картинки лягут в данные Foundry, в kartograf/<название сцены>.");
+                    ui.add_space(6.0);
+                    go = ui.add_enabled(!dlg.name.trim().is_empty(), egui::Button::new("На сцену")).clicked();
+                } else {
+                    ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt) и картинки створок, крыш и крон — их надо держать рядом со сценой. В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
+                    ui.add_space(6.0);
+                    go = ui.button("Выбрать место и выгрузить").clicked();
+                }
             });
-            if go {
+            if go && cfg!(target_arch = "wasm32") {
+                // Своя папка на каждую выгрузку: прежние сцены не теряют картинок,
+                // а обновлённая не берёт старую картинку из кэша браузера.
+                let name: String = dlg.name.trim().chars().map(|c| if "/\\:*?\"<>|".contains(c) { '-' } else { c }).collect();
+                let stamp = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                self.start_export(PathBuf::from("kartograf").join(&name).join(stamp.to_string()), name.clone(), dlg.px, false);
+                if let Some(e) = &mut self.export {
+                    e.update = dlg.update;
+                }
+                self.scene_name = Some(name);
+            } else if go {
                 let dir = export::foundry_data_dir().map(|d| d.join("kartograf"));
                 if let Some(d) = &dir {
                     let _ = std::fs::create_dir_all(d);
                 }
-                let mut dialog = rfd::FileDialog::new().add_filter("Сцена Foundry", &["json"]).set_file_name(format!("{}.json", self.name()));
+                let mut dialog = crate::plat::FileDialog::new().add_filter("Сцена Foundry", &["json"]).set_file_name(format!("{}.json", self.name()));
                 if let Some(d) = dir {
                     dialog = dialog.set_directory(d);
                 }
@@ -1792,7 +1835,7 @@ impl App {
         if let Some(mut nm) = self.new_map.take() {
             let mut open = true;
             let mut go = false;
-            egui::Window::new("Новая карта").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("Новая карта").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut nm.width).range(4..=400).suffix(" кл."));
                     ui.label("×");
@@ -1986,16 +2029,16 @@ impl App {
                 }
                 ui.separator();
                 if item(ui, "Выгрузить для Foundry…", "") {
-                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX });
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false });
                 }
                 ui.separator();
                 if item(ui, "Папка с картинками…", "")
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    && let Some(dir) = crate::plat::FileDialog::new().pick_folder()
                 {
                     self.set_textures_dir(dir);
                 }
                 if item(ui, "Подключить пак Dungeondraft…", "")
-                    && let Some(files) = rfd::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
+                    && let Some(files) = crate::plat::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
                 {
                     for f in files {
                         self.add_pack(f);
@@ -2018,7 +2061,7 @@ impl App {
                 }
                 ui.separator();
                 if item(ui, "Построить из плана…", "")
-                    && let Some(path) = rfd::FileDialog::new().add_filter("План карты", &["json"]).pick_file()
+                    && let Some(path) = crate::plat::FileDialog::new().add_filter("План карты", &["json"]).pick_file()
                 {
                     self.build_from_file(&path);
                 }
@@ -2062,7 +2105,7 @@ impl App {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("В Foundry").clicked() {
-                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX });
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false });
                 }
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Вернуть")).clicked() {
                     self.redo();
@@ -2793,13 +2836,13 @@ impl App {
             ui.weak(format!("Найдено: {found}"));
             ui.menu_button("Источники", |ui| {
                 if ui.button("Папка с картинками…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    && let Some(dir) = crate::plat::FileDialog::new().pick_folder()
                 {
                     self.set_textures_dir(dir);
                     ui.close();
                 }
                 if ui.button("Подключить пак Dungeondraft…").clicked()
-                    && let Some(files) = rfd::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
+                    && let Some(files) = crate::plat::FileDialog::new().add_filter("Пак Dungeondraft", &["dungeondraft_pack"]).pick_files()
                 {
                     for f in files {
                         self.add_pack(f);
@@ -4689,6 +4732,7 @@ impl App {
             asked: false,
             quit,
             canopies: self.settings.export_canopies,
+            update: false,
             stumps,
         });
     }
@@ -4790,7 +4834,8 @@ impl App {
     /// Картинка, сцена Foundry и Universal VTT рядом друг с другом; у нескольких
     /// этажей — картинка и `.dd2vtt` на каждый, сцена одна, этажи в ней — уровни.
     fn write_export(&mut self, e: &Export) -> Result<String, String> {
-        std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
+        // Файлы копятся здесь: программа пишет их на диск, модуль отдаёт Foundry.
+        let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
         let n = e.done.len();
         let stem = |k: usize| if n == 1 { e.name.clone() } else { format!("{}_{}", e.name, k + 1) };
         let mut jpgs = Vec::new();
@@ -4803,7 +4848,7 @@ impl App {
             let big = img.width().max(img.height()) > export::WEBP_MAX_SIDE;
             let img_path = e.dir.join(format!("{}.{}", stem(k), if big { "jpg" } else { "webp" }));
             let bytes = if big { jpg.clone() } else { export::webp_bytes(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0) };
-            std::fs::write(&img_path, &bytes).map_err(|x| format!("{}: {x}", img_path.display()))?;
+            files.push((img_path.clone(), bytes));
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             layouts.push(export::layout(map, &map.room_edges()));
             srcs.push(export::foundry_src(&img_path));
@@ -4821,7 +4866,7 @@ impl App {
             let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&key)))?.fliph();
             let width = img.width();
             let file = e.dir.join(format!("{}_створка_{}.webp", e.name, leaves.len() + 1));
-            std::fs::write(&file, export::webp_bytes(&img.to_rgba8(), 90.0)).map_err(|x| format!("{}: {x}", file.display()))?;
+            files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
             leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
         }
         // Крыши — картинками по одной, рядом со сценой.
@@ -4844,7 +4889,7 @@ impl App {
                 let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
-                std::fs::write(&file, export::webp_bytes(&img, 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
+                files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true });
             }
@@ -4867,7 +4912,7 @@ impl App {
                     let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let file = e.dir.join(format!("{}_дерево_{}.webp", e.name, canopies.len() + 1));
-                    std::fs::write(&file, export::webp_bytes(&img.to_rgba8(), 88.0)).map_err(|x| format!("{}: {x}", file.display()))?;
+                    files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 88.0)));
                     canopies.insert(look.clone(), export::foundry_src(&file));
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
@@ -4882,17 +4927,31 @@ impl App {
             .collect();
         let scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
         let scene_path = e.dir.join(format!("{}.json", e.name));
-        std::fs::write(&scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default()).map_err(|x| x.to_string())?;
-        use base64::Engine;
-        for k in 0..n {
-            let map = if k == self.level { &self.map } else { &self.levels[k] };
-            let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpgs[k]), &layouts[k]);
-            std::fs::write(e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string()).map_err(|x| x.to_string())?;
+        files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
+        // Universal VTT — для других VTT; модулю он не нужен, сцена создаётся сразу.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use base64::Engine;
+            for k in 0..n {
+                let map = if k == self.level { &self.map } else { &self.levels[k] };
+                let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpgs[k]), &layouts[k]);
+                files.push((e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string().into_bytes()));
+            }
+            std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
+            for (path, bytes) in &files {
+                std::fs::write(path, bytes).map_err(|x| format!("{}: {x}", path.display()))?;
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &jpgs;
+            crate::plat::to_scene(&files, e.update)?;
         }
         let walls: usize = layouts.iter().flat_map(|l| l.walls.iter()).map(|l| l.len().saturating_sub(1)).sum();
         let (w, h) = (e.done[0].width(), e.done[0].height());
         Ok(format!(
-            "Выгружено в {}: {}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
+            "{} {}: {}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
+            if cfg!(target_arch = "wasm32") { "На сцену —" } else { "Выгружено в" },
             e.dir.display(),
             if n > 1 { format!("этажей {n}, ") } else { String::new() },
             layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
@@ -4941,6 +5000,13 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // В модуле выбранное в окне браузера приходит не сразу, а кадром позже.
+        #[cfg(target_arch = "wasm32")]
+        for f in crate::plat::take_picked() {
+            if f.extension().is_some_and(|e| e == "dungeondraft_pack") {
+                self.add_pack(f);
+            }
+        }
         self.frame_ui(ui);
     }
 

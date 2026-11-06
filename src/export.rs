@@ -246,6 +246,15 @@ pub const WEBP_MAX_SIDE: u32 = 16383;
 
 /// WebP со сжатием: картинка карты и прозрачные слои весят в разы меньше PNG.
 /// Встроенный кодировщик `image` умеет только без потерь, поэтому libwebp.
+#[cfg(target_arch = "wasm32")]
+pub fn webp_bytes(img: &image::RgbaImage, _quality: f32) -> Vec<u8> {
+    // В браузере libwebp нет: без потерь, зато тем же форматом.
+    let mut out = Vec::new();
+    let _ = image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn webp_bytes(img: &image::RgbaImage, quality: f32) -> Vec<u8> {
     webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(quality).to_vec()
 }
@@ -546,6 +555,10 @@ pub fn dd2vtt(map: &Map, px: u32, image_b64: &str, layout: &Layout) -> Value {
 /// выгрузка лежит в ней (Data узнаётся по соседям `worlds` и `modules`),
 /// иначе — одно имя файла.
 pub fn foundry_src(image: &std::path::Path) -> String {
+    // В модуле путь уже от корня данных Foundry.
+    if cfg!(target_arch = "wasm32") {
+        return image.to_string_lossy().replace('\\', "/");
+    }
     let mut dir = image.parent();
     while let Some(d) = dir {
         if d.join("worlds").is_dir() && d.join("modules").is_dir() {

@@ -568,6 +568,27 @@ pub struct Textures {
     done: Receiver<Done>,
     pub sources: Sources,
     frame: u64,
+    /// В браузере потоков нет: заказы ждут здесь, и кадр разбирает их сам.
+    #[cfg(target_arch = "wasm32")]
+    queue: Receiver<Job>,
+}
+
+/// Раскрыть заказанную картинку: тень, разнообразный пол или обычная.
+fn load_job(job: &Job, sources: &Sources) -> Result<(ColorImage, [u32; 2]), String> {
+    let shadow = job.key.strip_prefix(SHADOW).and_then(|rest| rest.split_once(':'));
+    if let Some((blur, inner)) = shadow {
+        let blur = blur.parse::<f32>().unwrap_or(3.0) / 10.0;
+        read_source(inner, sources).and_then(|bytes| shadow_image(&bytes, blur))
+    } else {
+        match job.key.strip_prefix(VARY) {
+            Some(inner) if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, sources).and_then(|bytes| decode(&bytes, FULL_SIDE)),
+            Some(inner) => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
+                let big = vary(&rgba, inner);
+                (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])
+            }),
+            None => read_source(&job.key, sources).and_then(|bytes| decode(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })),
+        }
+    }
 }
 
 impl Textures {
@@ -579,8 +600,15 @@ impl Textures {
     pub fn new(ctx: &egui::Context) -> Self {
         let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel::<Done>();
-        let job_rx = Arc::new(Mutex::new(job_rx));
         let sources: Sources = Arc::default();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (done_tx, ctx);
+            return Self { slots: HashMap::new(), jobs, done, sources, frame: 0, queue: job_rx };
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        #[cfg(not(target_arch = "wasm32"))]
         for _ in 0..WORKERS {
             let (rx, tx, sources, ctx) = (job_rx.clone(), done_tx.clone(), sources.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -592,20 +620,7 @@ impl Textures {
                         },
                         Err(_) => return,
                     };
-                    let shadow = job.key.strip_prefix(SHADOW).and_then(|rest| rest.split_once(':'));
-                    let result = if let Some((blur, inner)) = shadow {
-                        let blur = blur.parse::<f32>().unwrap_or(3.0) / 10.0;
-                        read_source(inner, &sources).and_then(|bytes| shadow_image(&bytes, blur))
-                    } else {
-                        match job.key.strip_prefix(VARY) {
-                        Some(inner) if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, &sources).and_then(|bytes| decode(&bytes, FULL_SIDE)),
-                        Some(inner) => read_source(inner, &sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
-                            let big = vary(&rgba, inner);
-                            (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])
-                        }),
-                        None => read_source(&job.key, &sources).and_then(|bytes| decode(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })),
-                        }
-                    };
+                    let result = load_job(&job, &sources);
                     if tx.send(Done { key: job.key, thumb: job.thumb, result }).is_err() {
                         return;
                     }
@@ -613,12 +628,31 @@ impl Textures {
                 }
             });
         }
+        #[cfg(not(target_arch = "wasm32"))]
         Self { slots: HashMap::new(), jobs, done, sources, frame: 0 }
     }
 
     /// Раз в кадр: забрать готовые картинки и выбросить лишние миниатюры.
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.frame += 1;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Не дольше ~12 мс за кадр, остальное — в следующих.
+            let started = crate::plat::Instant::now();
+            let mut busy = false;
+            while started.elapsed().as_millis() < 12 {
+                let Ok(job) = self.queue.try_recv() else { break };
+                busy = true;
+                let result = load_job(&job, &self.sources);
+                self.slots.insert((job.key.clone(), job.thumb), match result {
+                    Ok((image, size)) => Slot::Ready { tex: ctx.load_texture(&job.key, image, TEX_OPTIONS), size, used: self.frame },
+                    Err(_) => Slot::Failed,
+                });
+            }
+            if busy {
+                ctx.request_repaint();
+            }
+        }
         while let Ok(d) = self.done.try_recv() {
             let slot = match d.result {
                 Ok((image, size)) => Slot::Ready { tex: ctx.load_texture(&d.key, image, TEX_OPTIONS), size, used: self.frame },
@@ -845,7 +879,7 @@ impl Library {
         self.packs.push((file.clone(), Ok(0)));
         self.pending += 1;
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        crate::plat::spawn(move || {
             let r = pck::read_index(&file);
             let _ = tx.send((file, r));
         });

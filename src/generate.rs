@@ -121,7 +121,7 @@ impl Default for Options {
 }
 
 pub fn new_seed() -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let t = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{:x}", (t as u64) % 0xFFFFFF)
 }
 

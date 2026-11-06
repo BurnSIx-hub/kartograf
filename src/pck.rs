@@ -3,7 +3,6 @@
 //! Читается только оглавление; картинка достаётся по смещению, когда её попросят, — пак
 //! в несколько гигабайт не грузится в память целиком.
 
-use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -37,7 +36,7 @@ fn u64le(r: &mut impl Read) -> std::io::Result<u64> {
 /// Оглавление пака: только картинки из `textures/`.
 pub fn read_index(file: &Path) -> Result<Pack, String> {
     let err = |e: std::io::Error| format!("{}: {e}", file.display());
-    let mut r = BufReader::with_capacity(1 << 20, File::open(file).map_err(err)?);
+    let mut r = BufReader::with_capacity(1 << 20, crate::plat::open(file).map_err(err)?);
     let mut magic = [0; 4];
     r.read_exact(&mut magic).map_err(err)?;
     if &magic != b"GDPC" {
@@ -84,7 +83,7 @@ pub fn read_index(file: &Path) -> Result<Pack, String> {
 }
 
 pub fn read_bytes(file: &Path, offset: u64, size: u64) -> Result<Vec<u8>, String> {
-    let mut f = File::open(file).map_err(|e| e.to_string())?;
+    let mut f = crate::plat::open(file).map_err(|e| e.to_string())?;
     f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
     let mut buf = vec![0; size as usize];
     f.read_exact(&mut buf).map_err(|e| e.to_string())?;

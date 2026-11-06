@@ -1,6 +1,7 @@
 //! Картограф — редактор карт для настольных игр.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports, unused_variables, unused_mut))]
 
 mod app;
 mod blend;
@@ -12,16 +13,22 @@ mod mask;
 mod palette;
 mod pck;
 mod plan;
+mod plat;
 mod procgen;
 mod recovery;
 mod roofs;
 mod selftest;
+#[cfg(not(target_arch = "wasm32"))]
+mod update;
+#[cfg(target_arch = "wasm32")]
+#[path = "update_web.rs"]
 mod update;
 mod view;
 
 use eframe::egui;
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> app::Args {
     let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None };
     let mut it = std::env::args().skip(1);
@@ -45,6 +52,7 @@ fn parse_args() -> app::Args {
 
 /// `--packinfo пак…`: без окна — сколько в паке ассетов каждого вида, за сколько читается
 /// оглавление и раскрывается ли первая картинка каждого вида.
+#[cfg(not(target_arch = "wasm32"))]
 fn packinfo(files: &[PathBuf]) -> i32 {
     let mut code = 0;
     for f in files {
@@ -79,6 +87,7 @@ fn packinfo(files: &[PathBuf]) -> i32 {
     code
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let args = parse_args();
     // Самопроверке нужен один и тот же размер окна, иначе точки щелчков поплывут.
@@ -90,4 +99,24 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("kartograf", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
+}
+
+/// Модуль Foundry: окно рисуется на холсте `#kartograf-canvas`, который заводит обёртка модуля.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast;
+    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None };
+    wasm_bindgen_futures::spawn_local(async move {
+        let canvas = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("kartograf-canvas"))
+            .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            .expect("нет холста #kartograf-canvas");
+        let started = eframe::WebRunner::new()
+            .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
+            .await;
+        if let Err(e) = started {
+            web_sys::console::error_1(&e);
+        }
+    });
 }
