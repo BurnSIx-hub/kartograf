@@ -60,7 +60,7 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 7] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern, Kind::Arena];
 
-    /// Звук места в «Живой карте»; у леса он по времени года, у пещеры — по виду.
+    /// Звук места в «Wild Canvas»; у леса он по времени года, у пещеры — по виду.
     /// Дом и таверна стоят в лесу по тому же времени года: снаружи слышна округа.
     pub fn ambience(self, o: &crate::plan::Opts) -> &'static str {
         match self {

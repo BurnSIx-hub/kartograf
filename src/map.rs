@@ -34,7 +34,7 @@ pub struct Material {
     /// Плитка перемешивается против заметного повтора (`library::vary`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vary: bool,
-    /// Оживает ли в Foundry (модуль «Живая карта»): вода, лава, болото.
+    /// Оживает ли в Foundry (модуль «Wild Canvas»): вода, лава, болото.
     #[serde(default, skip_serializing_if = "Live::is_auto")]
     pub live: Live,
 }
@@ -103,7 +103,7 @@ impl Material {
 }
 
 impl Material {
-    /// По чему звучат шаги в «Живой карте»: буква поверхности или `None` — молчать.
+    /// По чему звучат шаги в «Wild Canvas»: буква поверхности или `None` — молчать.
     /// Вода и болото — от живого материала; остальное по имени картинки и материала.
     /// Порядок проверок важен: «песчаник» — камень, а не песок; «иней на траве» — снег.
     pub fn surface(&self) -> Option<char> {
@@ -948,17 +948,17 @@ pub struct Map {
     /// Сид, из которого карта сгенерирована; пусто — нарисована руками.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seed: String,
-    /// Частицы от крон в «Живой карте» (`leaves`, `fireflies`); пусто — без них.
+    /// Частицы от крон в «Wild Canvas» (`leaves`, `fireflies`); пусто — без них.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub particles: String,
     /// Погода сцены Foundry (`snow`); пусто — без погоды.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub weather: String,
-    /// Звук места в «Живой карте» (`forest-autumn`, `cave-1`…); пусто — без него.
+    /// Звук места в «Wild Canvas» (`forest-autumn`, `cave-1`…); пусто — без него.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ambience: String,
     /// Звук внутри комнат (`tavern`, `house`): при выгрузке комнаты обводятся областью
-    /// «Живой карты», внутри неё играет он, снаружи — `ambience`. Пусто — без неё.
+    /// «Wild Canvas», внутри неё играет он, снаружи — `ambience`. Пусто — без неё.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub indoor: String,
     pub width: u32,

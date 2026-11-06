@@ -332,7 +332,7 @@ impl River {
     }
 }
 
-/// Звуки мест «Живой карты»: ключ флага сцены `ambience` и подпись.
+/// Звуки мест «Wild Canvas»: ключ флага сцены `ambience` и подпись.
 /// Ключи — те же, что в `PLACES` модуля (`scripts/ambience.js`).
 pub const PLACES: [(&str, &str); 16] = [
     ("", "Без звука"),
@@ -415,7 +415,7 @@ impl Season {
         *self == Season::Summer
     }
 
-    /// Что «Живая карта» пускает от крон леса: листопад, светлячков.
+    /// Что «Wild Canvas» пускает от крон леса: листопад, светлячков.
     pub fn particles(self) -> &'static str {
         match self {
             Season::Autumn => "leaves",
@@ -424,7 +424,7 @@ impl Season {
         }
     }
 
-    /// Звук леса в «Живой карте».
+    /// Звук леса в «Wild Canvas».
     pub fn ambience(self) -> &'static str {
         match self {
             Season::Summer => "forest-summer",
@@ -478,7 +478,7 @@ impl CaveKind {
         *self == CaveKind::Stone
     }
 
-    /// Звук пещеры в «Живой карте»: у льда и болота капель, у грибной — жуть.
+    /// Звук пещеры в «Wild Canvas»: у льда и болота капель, у грибной — жуть.
     pub fn ambience(self) -> &'static str {
         match self {
             CaveKind::Ice | CaveKind::Swamp => "cave-3",
@@ -487,7 +487,7 @@ impl CaveKind {
         }
     }
 
-    /// Грибная светится спорами — светлячки «Живой карты».
+    /// Грибная светится спорами — светлячки «Wild Canvas».
     pub fn particles(self) -> &'static str {
         if self == CaveKind::Fungal { "fireflies" } else { "" }
     }

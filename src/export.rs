@@ -32,18 +32,18 @@ pub struct Zone {
 /// Модуль Foundry, который оживляет области.
 pub const LIVE_MODULE: &str = "burn-living-map";
 
-/// Флаги сцены: формат Картографа и звук места для «Живой карты».
+/// Флаги сцены: формат Картографа и звук места для «Wild Canvas».
 fn scene_flags(map: &Map) -> Value {
     let mut flags = json!({"kartograf": {"format": 1}});
     if !map.ambience.is_empty() {
         flags[LIVE_MODULE] = json!({"ambience": map.ambience});
-        // Под открытым небом — тени облаков «Живой карты».
+        // Под открытым небом — тени облаков «Wild Canvas».
         if map.ambience.starts_with("forest-") || map.ambience.starts_with("town-") {
             flags[LIVE_MODULE]["clouds"] = json!(0.6);
             flags[LIVE_MODULE]["cloudCover"] = json!(0.5);
         }
     }
-    // Зерно карты — рыбкам «Живой карты»: на каждой карте свои, у всех игроков те же.
+    // Зерно карты — рыбкам «Wild Canvas»: на каждой карте свои, у всех игроков те же.
     if !map.seed.is_empty() {
         if flags.get(LIVE_MODULE).is_none() {
             flags[LIVE_MODULE] = json!({});
@@ -60,7 +60,7 @@ fn scene_flags(map: &Map) -> Value {
     flags
 }
 
-/// Поверхности для шагов «Живой карты»: по букве на клетку, строки подряд,
+/// Поверхности для шагов «Wild Canvas»: по букве на клетку, строки подряд,
 /// `.` — не знаем, молчать. Берётся верхний слой в середине клетки: дорога поверх
 /// пола комнаты, пол комнаты поверх местности.
 pub fn surfaces(map: &Map) -> Option<Value> {
@@ -386,7 +386,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
-            // Крону качает ветер «Живой карты»; крыша стоит.
+            // Крону качает ветер «Wild Canvas»; крыша стоит.
             // Осенью с неё летят листья, в магическом лесу — светлячки.
             if !r.shelter {
                 tile["flags"] = json!({LIVE_MODULE: {"wind": 1}});
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(scene["_stats"]["coreVersion"], "14.355");
         assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));
         assert_eq!(t["levels"][0], lv[0]["_id"]);
-        // Крону качает ветер «Живой карты», крышу — нет.
+        // Крону качает ветер «Wild Canvas», крышу — нет.
         assert!(t.get("flags").is_none());
         let crown = &scene["tiles"][1];
         assert_eq!(crown["flags"][LIVE_MODULE]["wind"], 1);

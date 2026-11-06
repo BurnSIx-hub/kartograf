@@ -2074,7 +2074,7 @@ impl App {
         });
     }
 
-    /// Биом для «Живой карты»: звук сцены, что летит от крон, погода. Процедурная
+    /// Биом для «Wild Canvas»: звук сцены, что летит от крон, погода. Процедурная
     /// карта ставит их сама, нарисованной руками — отсюда. Выбор звука леса
     /// подставляет его листву и погоду, их можно сменить следом.
     fn biome_ui(&mut self, ui: &mut egui::Ui) {
@@ -2360,7 +2360,7 @@ impl App {
         let materials = self.map.materials.clone();
         if let Some(m) = materials.get(self.material).filter(|m| matches!(m.paint, Paint::Texture(_))) {
             ui.horizontal(|ui| {
-                ui.label("Живой:").on_hover_text("Залитое этим материалом в выгрузке станет областью сцены, и модуль «Живая карта» её оживит: рябь и рыбки, течение лавы, пузыри болота.");
+                ui.label("Живой:").on_hover_text("Залитое этим материалом в выгрузке станет областью сцены, и модуль «Wild Canvas» её оживит: рябь и рыбки, течение лавы, пузыри болота.");
                 let now = m.live;
                 let shown = if now == map::Live::Auto { format!("{} ({})", now.label(), m.live().label()) } else { now.label().to_owned() };
                 egui::ComboBox::from_id_salt("live").selected_text(shown).show_ui(ui, |ui| {
