@@ -250,11 +250,12 @@ const PARTS: &[&str] = &[
 ];
 
 /// Куда смотрит спина своего предмета, если не вверх, как у встроенных: камины FA
-/// нарисованы задней стенкой вправо. Поворот по часовой, который ставит её наверх.
+/// нарисованы задней стенкой (дымоход, глухая сторона топки) влево, деревянной
+/// полкой и устьем топки вправо. Поворот по часовой, который ставит спину наверх.
 fn turn_of(slot: &str, name: &str) -> f32 {
     let file = name.rsplit('/').next().unwrap_or(name);
     if slot == "fireplace" && file.starts_with("Fireplace_") {
-        270.0
+        90.0
     } else {
         0.0
     }
@@ -660,7 +661,7 @@ mod tests {
         assert!((0..10).all(|_| p.pick("bed").key == assets[1].key));
         assert_eq!(p.pick("bed_double").key, assets[3].key);
         let fire = p.pick("fireplace");
-        assert_eq!((fire.key.as_str(), fire.turn), (assets[4].key.as_str(), 270.0));
+        assert_eq!((fire.key.as_str(), fire.turn), (assets[4].key.as_str(), 90.0));
         // Малые подоконники FA стоят торчком и бывают без прозрачности.
         assert_eq!(p.pick("window_stone").key, assets[7].key);
     }
