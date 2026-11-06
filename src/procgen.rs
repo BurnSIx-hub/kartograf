@@ -50,6 +50,8 @@ include!("prop_bounds.rs");
 
 #[path = "arena.rs"]
 mod arena;
+#[path = "quarter.rs"]
+mod quarter;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -326,7 +328,7 @@ fn tree_slot(season: Season) -> &'static str {
 }
 
 fn drop_pick(m: &mut Map, p: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
-    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None });
+    m.props.push(Prop { asset: p.key.clone(), pos, size: p.size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
 }
 
 /// Объект в свободные клетки, `x`, `y` — левый верхний угол занятого места.
@@ -348,9 +350,18 @@ fn put_pick(m: &mut Map, sp: &mut Spots, p: &Pick, slot: &str, x: i32, y: i32, r
 
 /// Спиной вплотную к случайной стене комнаты; `corner` — ещё и боком к соседней.
 fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32, corner: bool) -> bool {
+    by_side(m, sp, rng, r, name, scale, corner, &[0, 1, 2, 3])
+}
+
+/// То же, но только у стен `sides` (0 — север, 1 — восток, 2 — юг, 3 — запад).
+#[allow(clippy::too_many_arguments)]
+fn by_side(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32, corner: bool, sides: &[i32]) -> bool {
     let p = asset(name);
+    if sides.is_empty() {
+        return false;
+    }
     for _ in 0..40 {
-        let side = rng.int(0, 3);
+        let side = sides[rng.int(0, sides.len() as i32 - 1) as usize];
         let rot = (side as f32 * 90.0 + p.turn) % 360.0;
         let [left, top, right, low] = bounds(&p, name, rot, scale);
         let (fw, fh) = (cells_of(right - left), cells_of(low - top));
@@ -822,7 +833,7 @@ fn portal(a: [f32; 2], b: [f32; 2], kind: PortalKind, wood: bool) -> Portal {
     let style = if wood { "wood" } else { "stone" };
     let len = ((b[0] - a[0]).abs() + (b[1] - a[1]).abs()).round() as i32;
     let asset = match kind {
-        PortalKind::Window => Some(asset(&format!("window_{style}")).key),
+        PortalKind::Window => Some(window(style, len)),
         PortalKind::Door | PortalKind::DoubleDoor => Some(asset("door_wood").key),
         PortalKind::Opening | PortalKind::Secret => None,
     };
@@ -832,6 +843,24 @@ fn portal(a: [f32; 2], b: [f32; 2], kind: PortalKind, wood: bool) -> Portal {
         _ => Some(key(&format!("frame_{style}_{}", len.clamp(1, 3)))),
     };
     Portal { a, b, kind, asset, frame }
+}
+
+/// Подоконник FA под ширину проёма: большой (`Large`) — на две клетки и шире, обычный —
+/// на одну. Иначе стекло к нему не находится и в проёме лежит голая доска. Своего нет —
+/// встроенное окно.
+fn window(style: &str, len: i32) -> String {
+    let slot = format!("window_{style}");
+    for _ in 0..16 {
+        let p = asset(&slot);
+        if !p.own {
+            return p.key;
+        }
+        let lower = p.key.to_lowercase();
+        if lower.contains("sill") && lower.contains("large") == (len >= 2) {
+            return p.key;
+        }
+    }
+    key(&slot)
 }
 
 fn opening(a: [f32; 2], b: [f32; 2]) -> Portal {
@@ -1520,91 +1549,6 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     trees.len()
 }
 
-/// Дом с крышей: комната, стены, дверь и окна на стороне `door` (0 — север, 1 — восток, 2 — юг, 3 — запад).
-/// `look` — стены и крыша по плану; без него — случайные из набора.
-fn house(m: &mut Map, rng: &mut Rng, sp: &mut Spots, r: Room, door: i32, look: Option<(&str, &str)>) {
-    const LOOKS: [(&str, &str, bool); 8] = [
-        ("wall_timber", "roof_clay_red", true),
-        ("wall_timber", "roof_thatch", true),
-        ("wall_wood", "roof_thatch", true),
-        ("wall_brick", "roof_clay_brown", true),
-        ("wall_stone_blocks", "roof_slate_blue", false),
-        ("wall_stone_blocks", "roof_slate_gray", false),
-        ("wall_fieldstone", "roof_shingle", false),
-        ("wall_wood", "roof_shingle", true),
-    ];
-    let (st, roof, wood) = match look {
-        Some((st, roof)) => (st, roof, !["stone", "brick", "cave", "dwarven", "drow", "metal"].iter().any(|s| st.contains(s))),
-        None => LOOKS[rng.int(0, LOOKS.len() as i32 - 1) as usize],
-    };
-    let planks = mat(m, "wood_planks");
-    m.paint_rect(Layer::Rooms, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1), Some(planks));
-    let (ax, ay, bx, by) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
-    sp.block(r.x, r.y, r.w, r.h);
-    let own: Vec<_> = m.room_edges().into_iter().filter(|s| [s.0, s.1].iter().all(|p| p[0] >= ax && p[0] <= bx && p[1] >= ay && p[1] <= by)).collect();
-    m.set_edge_look(&own, &wall(st));
-    m.roofs.push(Roof { a: [ax, ay], b: [bx, by], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(r.h > r.w), overhang: 0.3 });
-
-    let along = if door % 2 == 0 { r.w } else { r.h };
-    let at = rng.int(1, (along - 2).max(1));
-    let edge = |t: i32, len: i32| -> ([f32; 2], [f32; 2]) {
-        let t = t as f32;
-        let e = t + len as f32;
-        match door {
-            0 => ([ax + t, ay], [ax + e, ay]),
-            1 => ([bx, ay + t], [bx, ay + e]),
-            2 => ([ax + t, by], [ax + e, by]),
-            _ => ([ax, ay + t], [ax, ay + e]),
-        }
-    };
-    let (a, b) = edge(at, 1);
-    m.portals.push(portal(a, b, PortalKind::Door, wood));
-    for t in [at - 3, at + 2] {
-        if t >= 1 && t + 2 <= along - 1 {
-            let (a, b) = edge(t, 2);
-            m.portals.push(portal(a, b, PortalKind::Window, wood));
-        }
-    }
-    // Перед дверью свободно; рядом с домом — бочки и цветы.
-    let (dx, dy): (i32, i32) = [(0, -1), (1, 0), (0, 1), (-1, 0)][door as usize];
-    let front = [(a[0] + b[0]) / 2.0 + dx as f32 * 0.5, (a[1] + b[1]) / 2.0 + dy as f32 * 0.5];
-    let (fx, fy) = (front[0].floor() as i32, front[1].floor() as i32);
-    sp.block(fx, fy, 1, 1);
-    let (sx, sy) = (dy.abs(), dx.abs());
-    for s in [-2, 2, 3] {
-        if rng.chance(0.45) {
-            let n = pick(rng, &["planter", "barrel", "crate", "sacks"]);
-            put(m, sp, n, fx + sx * s, fy + sy * s, 0.0, 0.8 + rng.random() as f32 * 0.3);
-        }
-    }
-    // Задний двор за низким забором: не у каждого дома.
-    let (bdx, bdy) = (-dx, -dy);
-    let d = rng.int(2, 3);
-    if rng.chance(0.4) {
-        let (x0, y0, x1, y1) = if bdy != 0 {
-            let y = if bdy > 0 { r.y + r.h } else { r.y - d };
-            (r.x, y, r.w, d)
-        } else {
-            let x = if bdx > 0 { r.x + r.w } else { r.x - d };
-            (x, r.y, d, r.h)
-        };
-        if sp.free(x0, y0, x1, y1) {
-            let pts: Vec<[f32; 2]> = if bdy != 0 {
-                let (near, far) = if bdy > 0 { (by, by + d as f32) } else { (ay, ay - d as f32) };
-                vec![[ax, near], [ax, far], [bx, far], [bx, near]]
-            } else {
-                let (near, far) = if bdx > 0 { (bx, bx + d as f32) } else { (ax, ax - d as f32) };
-                vec![[near, ay], [far, ay], [far, by], [near, by]]
-            };
-            if pts.iter().all(|p| p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= m.width as f32 && p[1] <= m.height as f32) {
-                let style = WallStyle { width: 0.18, ..wall(if rng.chance(0.5) { "wall_wood" } else { "wall_hedge" }) };
-                m.walls.push(Wall { points: pts, closed: false, bends: Vec::new(), style: Some(style) });
-                sp.block(x0, y0, x1, y1);
-            }
-        }
-    }
-}
-
 /// Бордюр: стена-полоса вдоль контура мощёного; прямые стороны идут прямо, углы чуть скруглены.
 /// По краю карты бордюра нет.
 fn curbs(m: &mut Map, street: &Mask) {
@@ -1642,167 +1586,6 @@ fn push_curb(m: &mut Map, run: &mut Vec<[f32; 2]>, material: usize) {
         m.paths.push(Path { points: std::mem::take(run), material, width: 0.22, soft: 0.0, rough: 0.0, along: true });
     }
     run.clear();
-}
-
-fn town(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
-    let density = p.options.density;
-    let (w, h) = (m.width as i32, m.height as i32);
-    let season = p.options.season;
-    let (grass, wet) = town_grass(season);
-    ground(m, "dirt");
-    // Зимой снег лежит шире травы: пятна крупнее и чаще.
-    let (count, size) = if season == Season::Winter { (w * h / 50, (2.0, 4.5)) } else { (w * h / 90, (1.2, 3.0)) };
-    patches(m, rng, grass, count, size, 0.75);
-    patches(m, rng, wet, w * h / 160, (0.8, 2.0), 0.6);
-    patches(m, rng, "gravel", w * h / 200, (0.8, 1.6), 0.5);
-    // Кварталы: прямоугольник делится прямыми улицами разной ширины.
-    let mut todo = vec![Room { x: 0, y: 0, w, h }];
-    let mut blocks = Vec::new();
-    let mut streets: Vec<Room> = Vec::new();
-    let top = 12 + ((1.0 - density) * 8.0) as i32;
-    while let Some(b) = todo.pop() {
-        let wide = b.w >= b.h;
-        let long = if wide { b.w } else { b.h };
-        if long < top + rng.int(-1, 4) {
-            blocks.push(b);
-            continue;
-        }
-        let cut = rng.int(long * 3 / 10, long * 7 / 10);
-        let street = rng.int(2, 3);
-        streets.push(if wide { Room { x: b.x + cut, w: street, ..b } } else { Room { y: b.y + cut, h: street, ..b } });
-        if wide {
-            todo.push(Room { w: cut, ..b });
-            todo.push(Room { x: b.x + cut + street, w: b.w - cut - street, ..b });
-        } else {
-            todo.push(Room { h: cut, ..b });
-            todo.push(Room { y: b.y + cut + street, h: b.h - cut - street, ..b });
-        }
-    }
-    m.wall_style = wall("wall_timber");
-    let mut sp = Spots::new(m);
-    // Площадь — квартал ближе всех к середине, замощённый целиком.
-    let middle = blocks
-        .iter()
-        .copied()
-        .filter(|b| b.w >= 6 && b.h >= 6)
-        .min_by_key(|b| (b.x + b.w / 2 - w / 2).abs() + (b.y + b.h / 2 - h / 2).abs());
-    let (mw, mh) = (m.rooms.w, m.rooms.h);
-    let mut paved = Mask { w: mw, h: mh, data: vec![0; mw * mh] };
-    for r in streets.iter().chain(middle.iter()) {
-        for (i, _) in mask::cells(mw, mh, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1)) {
-            paved.data[i] = 255;
-        }
-    }
-    let cobble = mat(m, "cobblestone");
-    let weights: Vec<(usize, f32)> = paved.data.iter().enumerate().filter(|(_, v)| **v > 0).map(|(i, _)| (i, 1.0)).collect();
-    m.paint(Layer::Floor, cobble, &weights);
-    if let Some(b) = middle {
-        let paving = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or("flagstones"));
-        m.paint_rect(Layer::Floor, (b.x, b.y), (b.x + b.w - 1, b.y + b.h - 1), Some(paving));
-    }
-    // Улица грязная: земля наползает с краёв, местами брусчатка стёрта.
-    let dirt = mat(m, "dirt");
-    let mut worn = Vec::new();
-    for _ in 0..streets.iter().map(|r| r.w * r.h).sum::<i32>() / 12 {
-        let r = streets[rng.int(0, streets.len() as i32 - 1) as usize];
-        worn.push(([r.x as f32 + rng.random() as f32 * r.w as f32, r.y as f32 + rng.random() as f32 * r.h as f32], 0.6 + rng.random() as f32 * 0.9));
-    }
-    let weights = blobs(m, &worn, 0.1, 0.65);
-    m.paint(Layer::Floor, dirt, &weights);
-    curbs(m, &paved);
-
-    if let Some(b) = middle {
-        let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
-        let centre = if b.w >= 9 && b.h >= 9 { "fountain" } else { "well" };
-        let c = asset(centre);
-        let s = c.size[0] as i32;
-        let (ox, oy) = (rng.int(-1, 1), rng.int(-1, 1));
-        put_pick(m, &mut sp, &c, centre, cx - s / 2 + ox, cy - s / 2 + oy, 0.0, 1.0);
-        for _ in 0..(b.w * b.h / 24).clamp(2, 5) {
-            let n = pick(rng, &["market_stall", "market_stall_blue", "market_stall_ochre"]);
-            by_wall(m, &mut sp, rng, b, n, 1.0, false);
-        }
-        by_wall(m, &mut sp, rng, b, "notice_board", 1.0, false);
-        by_wall(m, &mut sp, rng, b, "cart", 1.0, false);
-        for _ in 0..3 {
-            let n = pick(rng, &["crate", "barrel", "sacks", "bench", "planter"]);
-            inside(m, &mut sp, rng, b, n, 1.0);
-        }
-        for (x, y) in [(b.x + 1, b.y + 1), (b.x + b.w - 2, b.y + b.h - 2)] {
-            put(m, &mut sp, "street_lamp", x, y, 0.0, 0.7);
-        }
-        wanted(m, &mut sp, rng, b, &p.objects, "площадь", warn);
-    } else if !p.objects.is_empty() {
-        warn.push("квартал: площади не вышло, объектам негде встать".into());
-    }
-    let look = match (p.style.walls.as_deref().and_then(plan::wall_id), p.style.roof.as_deref().and_then(plan::roof_id)) {
-        (None, None) => None,
-        (st, roof) => Some((st.unwrap_or("wall_timber"), roof.unwrap_or("roof_clay_red"))),
-    };
-    let mut count = 0;
-    for b in blocks.iter().copied().filter(|b| Some(*b) != middle) {
-        // Дома вдоль длинной стороны, лицом к улице; отступы и пустыри у всех разные.
-        let row = b.w >= b.h;
-        let (long, deep) = if row { (b.w, b.h) } else { (b.h, b.w) };
-        if long < 6 || deep < 5 {
-            continue;
-        }
-        let two = deep >= 12;
-        let depth = if two { (deep / 2 - 1).min(7) } else { (deep - 2).clamp(3, 7) };
-        for front in [true, false].into_iter().take(if two { 2 } else { 1 }) {
-            let mut t = rng.int(1, 2);
-            while t + 4 < long {
-                let len = rng.int(4, 9).min(long - t - 1);
-                if len < 4 {
-                    break;
-                }
-                if rng.chance(0.14) {
-                    // Пустырь или сад вместо дома.
-                    let c = if row { [(b.x + t) as f32 + len as f32 / 2.0, b.y as f32 + deep as f32 / 2.0] } else { [b.x as f32 + deep as f32 / 2.0, (b.y + t) as f32 + len as f32 / 2.0] };
-                    let tree = season_tree(rng, season);
-                    drop(m, tree, c, rng.int(0, 3) as f32 * 90.0, 0.8);
-                    t += len + 1;
-                    continue;
-                }
-                let d = rng.int((depth - 2).max(3), depth);
-                let set = rng.int(1, 2).min(deep - d - 1);
-                let v = if front { set } else { deep - d - set };
-                let r = if row { Room { x: b.x + t, y: b.y + v, w: len, h: d } } else { Room { x: b.x + v, y: b.y + t, w: d, h: len } };
-                // Если сторона блока лежит на краю карты, улицы там нет: дверь смотрит внутрь.
-                let edge = if row { if front { b.y == 0 } else { b.y + b.h == h } } else if front { b.x == 0 } else { b.x + b.w == w };
-                let outward = if row { if front { 0 } else { 2 } } else if front { 3 } else { 1 };
-                let door = if edge { (outward + 2) % 4 } else { outward };
-                // Ряды одного квартала могут сойтись: дом на занятое место не встаёт.
-                if sp.free(r.x - 1, r.y - 1, r.w + 2, r.h + 2) {
-                    house(m, rng, &mut sp, r, door, look);
-                    count += 1;
-                }
-                t += len + rng.int(1, 3);
-            }
-        }
-        if rng.chance(0.6) {
-            put(m, &mut sp, "street_lamp", b.x + rng.int(0, 1), b.y + rng.int(0, 1), 0.0, 0.7);
-        }
-        if rng.chance(0.4) {
-            put(m, &mut sp, "street_lamp", b.x + b.w - 1, b.y + b.h - 1, 0.0, 0.7);
-        }
-        for _ in 0..(b.w * b.h / 25) {
-            let n = pick(rng, &["bush", "bush", "crate", "barrel", "planter", "rubble", "sacks"]);
-            let n = if n == "bush" { season_bush(rng, season) } else { Some(n) };
-            if let Some(n) = n {
-                inside(m, &mut sp, rng, b, n, 0.9);
-            }
-        }
-    }
-    if p.mood == Mood::Abandoned {
-        let houses: Vec<Room> = m.roofs.iter().map(|r| Room { x: r.a[0] as i32, y: r.a[1] as i32, w: (r.b[0] - r.a[0]) as i32, h: (r.b[1] - r.a[1]) as i32 }).collect();
-        abandon(m, rng, &houses);
-    }
-    let edges = m.room_edges();
-    let looks = std::mem::take(&mut m.edge_looks);
-    m.sync_edge_looks(&edges);
-    m.edge_looks.extend(looks);
-    count
 }
 
 // ----- дом и таверна по плану -----
@@ -2754,7 +2537,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         Kind::Dungeon => dungeon(m, p, material, &mut rng, &mut warnings),
         Kind::Cave => cave(m, p, &mut rng, &mut warnings),
         Kind::Forest => forest(m, p, &mut rng, &mut warnings),
-        Kind::Town => town(m, p, &mut rng, &mut warnings),
+        Kind::Town => quarter::quarter(m, p, &mut rng, &mut warnings),
         Kind::House | Kind::Tavern => interior(m, p, &mut rng, &mut warnings),
         Kind::Arena => arena::arena(m, p, &mut rng, &mut warnings),
     };
@@ -2999,22 +2782,6 @@ mod tests {
         build(&mut dry, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(dry.paths.len(), 2);
         assert!(!dry.props.iter().any(|p| p.asset.ends_with("bridge")));
-    }
-
-    #[test]
-    fn props_stay_out_of_town_houses() {
-        let mut m = Map::new(48, 36);
-        random(&mut m, Kind::Town, "дома");
-        assert!(!m.roofs.is_empty());
-        assert!(m.paths.iter().any(|p| p.along), "нет бордюра");
-        for (i, a) in m.roofs.iter().enumerate() {
-            for b in &m.roofs[i + 1..] {
-                assert!(a.b[0] <= b.a[0] || b.b[0] <= a.a[0] || a.b[1] <= b.a[1] || b.b[1] <= a.a[1], "дома наехали");
-            }
-        }
-        for p in m.props.iter().filter(|p| p.asset.ends_with("bench") || p.asset.ends_with("barrel")) {
-            assert!(!m.roofs.iter().any(|r| p.pos[0] > r.a[0] && p.pos[0] < r.b[0] && p.pos[1] > r.a[1] && p.pos[1] < r.b[1]), "{p:?}");
-        }
     }
 
     #[test]

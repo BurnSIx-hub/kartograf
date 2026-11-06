@@ -95,7 +95,8 @@ const OBJECTS: &[Slot] = &[
     ("rug_round", &[&["rug", "round"], &["carpet", "round"], &["ковёр", "круглый"]], &[]),
     ("fireplace", &[&["fireplace"], &["hearth"], &["камин"]], &["accessories", "holder", "tool", "tools", "chimneyless"]),
     ("cauldron", &[&["cauldron"], &["pot", "cooking"], &["котёл"], &["котел"]], &["plant"]),
-    ("anvil", &[&["anvil"], &["наковальня"]], &[]),
+    // Подставка и сапожная наковальня — не то: на подставке FA одно бревно, рисованное мелко.
+    ("anvil", &[&["anvil"], &["наковальня"]], &["stand", "small", "cobbler"]),
     ("campfire", &[&["campfire"], &["bonfire"], &["костёр"], &["костер"]], &[]),
     ("brazier", &[&["brazier"], &["жаровня"]], &[]),
     ("weapon_rack", &[&["weapon", "rack"], &["sword", "rack"], &["стойка", "мечами"]], &["spear", "axe", "mace", "bow"]),
@@ -124,12 +125,22 @@ const OBJECTS: &[Slot] = &[
     ("tree_winter", &[&["pine", "green"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
     ("tree_magic", &[&["tree", "multicolor2"], &["tree", "multicolor3"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
     ("tree_bare", &[&["bare", "tree"]], &["shadow", "branch", "fallen"]),
-    ("fountain", &[&["fountain"], &["фонтан"]], &[]),
-    ("market_stall", &[&["stall"], &["market"], &["лавка"]], &[]),
+    // Фонтаны FA — части под сборку: половинки «Cut», настенные, струи. Целого нет,
+    // поэтому фонтан всегда встроенный.
+    ("fountain", &[&["fountain"], &["фонтан"]], &["cut", "wall", "arched", "feature", "spill", "spout", "water", "statue", "empty"]),
+    // Торговое место FA — навес с товаром под ним одной картинкой.
+    ("market_stall", &[&["stall"], &["market"], &["лавка"], &["tarps", "arranged"]], &["overlay"]),
+    // Бочка с чистой водой во двор (у FA колодец сверху — тёмная вода с мусором).
+    ("water_barrel", &[&["barrel", "water", "clear"]], &["rusty"]),
+    // Прилавок лавки: витрина с товаром; без паков — стойка.
+    ("shop_counter", &[&["display", "case", "filled"]], &["broken", "top"]),
     ("market_stall_blue", &[&["stall", "blue"], &["market", "blue"]], &[]),
     ("market_stall_ochre", &[&["stall", "yellow"], &["stall", "ochre"], &["market", "yellow"]], &[]),
     ("cart", &[&["cart"], &["wagon"], &["телега"]], &["broken"]),
-    ("street_lamp", &[&["lamp"], &["lantern"], &["streetlight"], &["фонарь"]], &["table", "oil", "hanging"]),
+    // Только уличный столб: у FA «Lamp» — и настольные, и ручные фонари, и бра.
+    // Только фонарный столб: «Lamp_Street» FA сверху — металлическая перекладина,
+    // на улице читается как кран; ручные лампы и бра — тем более.
+    ("street_lamp", &[&["lamp", "pillar"], &["lamp", "post"], &["streetlight"], &["фонарь"]], &["table", "oil", "hanging", "wall", "light", "double"]),
     ("notice_board", &[&["notice", "board"], &["board"], &["sign"], &["доска"]], &["chess", "cutting", "game"]),
     ("stocks", &[&["stocks"], &["pillory"], &["колодки"]], &[]),
     ("planter", &[&["planter"], &["flower", "box"], &["flowers"], &["цветы"]], &[]),
@@ -143,6 +154,11 @@ const OBJECTS: &[Slot] = &[
     ("hay", &[&["hay", "bale"]], &["bundle"]),
     ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &[]),
     ("trough", &[&["trough", "wood"]], &["wine"]),
+    // Квартал: горн кузни, печь пекарни, нужник во дворе, бельё на верёвке.
+    ("forge", &[&["forge", "lit"], &["forge"]], &["chimney", "tool", "accessor"]),
+    ("oven", &[&["oven", "brick"], &["oven"]], &["shovel"]),
+    ("privy", &[&["toilet", "wood"]], &["lid"]),
+    ("clothes_line", &[&["clothes", "line"]], &["colorable"]),
     // Колизей. Своих нет у встроенных — без библиотеки этого просто не будет.
     ("throne", &[&["throne", "leather", "red"]], &[]),
     ("arena_brazier", &[&["brazier", "orange", "lit"], &["brazier", "red", "lit"]], &[]),
@@ -197,7 +213,8 @@ const WALLS: &[Slot] = &[
 ];
 
 const PORTALS: &[Slot] = &[
-    ("door_wood", &[&["door"], &["дверь"]], &["frame", "double", "window", "arch", "gate", "secret", "trap", "trapdoor", "косяк"]),
+    // `Door_Large` — двустворчатая на две клетки: в одну створку она растягивалась.
+    ("door_wood", &[&["door"], &["дверь"]], &["frame", "double", "window", "arch", "gate", "secret", "trap", "trapdoor", "large", "косяк"]),
     ("door_wood_iron", &[&["door", "iron"], &["door", "reinforced"], &["дверь", "окованная"]], &["frame", "double"]),
     ("door_metal", &[&["door", "metal"], &["door", "steel"], &["дверь", "железная"]], &["frame", "double"]),
     // Малые подоконники FA нарисованы торчком, часть — на чёрном фоне.
@@ -443,7 +460,9 @@ impl Palette {
             .iter()
             .filter_map(|(key, n)| {
                 let f = file_words(n);
-                (f.last() == Some(size) && f.iter().any(|w| w == "large") == large).then(|| (f.iter().filter(|w| words.contains(w)).count(), key))
+                // Узкая рама `Small` — к форточке; наше стекло во весь проём, рама к нему обычная.
+                let small = f.iter().any(|w| w == "small");
+                (f.last() == Some(size) && f.iter().any(|w| w == "large") == large).then(|| (f.iter().filter(|w| words.contains(w)).count() as i32 - if small { 10 } else { 0 }, key))
             })
             .max_by_key(|(score, key)| (*score, std::cmp::Reverse(*key)))
             .map(|(_, key)| key.clone())

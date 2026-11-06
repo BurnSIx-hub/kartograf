@@ -12,6 +12,8 @@ const LEVEL_ID: &str = "defaultLevel0000";
 
 /// Что выгружается кроме картинки.
 pub struct Layout {
+    /// Стены пологов палаток: отрезок, внутренность палатки слева от него.
+    pub tents: Vec<([f32; 2], [f32; 2])>,
     /// Сплошные стены — ломаные в клетках.
     pub walls: Vec<Vec<[f32; 2]>>,
     /// Двери и окна — отрезок в клетках; пустые проёмы сюда не попадают.
@@ -222,6 +224,15 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         }).collect();
         zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new() });
     }
+    // Встроенный фонтан: эффект «Wild Canvas» по его трём чашам — струя, перелив, круги, журчание.
+    for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("fountain")) {
+        let r = 0.36 * p.size[0] * p.scale;
+        let round: Vec<[f32; 2]> = (0..=24).map(|i| {
+            let a = i as f32 / 24.0 * std::f32::consts::TAU;
+            [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
+        }).collect();
+        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new() });
+    }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
         let (hw, hh) = (p.size[0] * p.scale * 0.45, p.size[1] * p.scale * 0.42);
@@ -238,7 +249,106 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone() });
         }
     }
-    Layout { walls, portals, lights, zones }
+    // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
+    let tents = map.props.iter().filter(|p| map::awning_by_name(&p.asset)).flat_map(|p| tent_walls(p, None)).collect();
+    Layout { walls, portals, lights, zones, tents }
+}
+
+/// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
+/// картинки 0..1, не больше восьми углов. У палатки — полог вместе с товаром.
+pub fn alpha_hull(img: &image::RgbaImage) -> Vec<[f32; 2]> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let step = (w.max(h) / 256).max(1) as usize;
+    let solid = |x: u32, y: u32| img.get_pixel(x, y)[3] >= 160;
+    let mut pts = Vec::new();
+    for y in (0..h).step_by(step) {
+        let Some(l) = (0..w).find(|&x| solid(x, y)) else { continue };
+        let r = (0..w).rev().find(|&x| solid(x, y)).unwrap_or(l);
+        for yy in [y as f32, (y as f32 + step as f32).min(h as f32)] {
+            pts.push([l as f32 / w as f32, yy / h as f32]);
+            pts.push([(r + 1) as f32 / w as f32, yy / h as f32]);
+        }
+    }
+    let mut hull = convex_hull(pts);
+    // Лишние углы: срезаем тот, без которого площадь меньше всего меняется.
+    let tri = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0;
+    while hull.len() > 3 {
+        let n = hull.len();
+        let (i, area) = (0..n).map(|i| (i, tri(hull[(i + n - 1) % n], hull[i], hull[(i + 1) % n]))).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        if n > 8 || area < 0.002 {
+            hull.remove(i);
+        } else {
+            break;
+        }
+    }
+    hull
+}
+
+/// Выпуклая оболочка (монотонная цепь), обход по часовой на экране (y вниз).
+fn convex_hull(mut pts: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut out: Vec<[f32; 2]> = Vec::new();
+    for pass in 0..2 {
+        let start = out.len();
+        let iter: Box<dyn Iterator<Item = &[f32; 2]>> = if pass == 0 { Box::new(pts.iter()) } else { Box::new(pts.iter().rev()) };
+        for &p in iter {
+            while out.len() >= start + 2 && cross(out[out.len() - 2], out[out.len() - 1], p) <= 0.0 {
+                out.pop();
+            }
+            out.push(p);
+        }
+        out.pop();
+    }
+    out
+}
+
+/// Стены полога палатки: по контуру картинки (`hull`, доли картинки) или, если его
+/// нет, по её прямоугольнику чуть внутрь. Рёбра, что смотрят во вход (`open`), —
+/// без стен. Каждый отрезок — внутренность палатки слева от него.
+pub fn tent_walls(p: &map::Prop, hull: Option<&[[f32; 2]]>) -> Vec<([f32; 2], [f32; 2])> {
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let local: Vec<[f32; 2]> = match hull {
+        Some(hl) if hl.len() >= 3 => hl.iter().map(|v| [(v[0] - 0.5) * w, (v[1] - 0.5) * h]).collect(),
+        // Без контура — чуть внутрь: у картинки поля, а верёвки и колья — снаружи полога.
+        _ => [[-0.44, -0.44], [0.44, -0.44], [0.44, 0.44], [-0.44, 0.44]].iter().map(|v| [v[0] * w, v[1] * h]).collect(),
+    };
+    let n = local.len();
+    let c = local.iter().fold([0.0, 0.0], |s, v| [s[0] + v[0] / n as f32, s[1] + v[1] / n as f32]);
+    let door = [[0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]][p.open.unwrap_or(2) as usize % 4];
+    // Наружная нормаль ребра: перпендикуляр, повёрнутый от середины.
+    let facing: Vec<f32> = (0..n)
+        .map(|i| {
+            let (a, b) = (local[i], local[(i + 1) % n]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let mut nn = [dy / len, -dx / len];
+            let mid = [(a[0] + b[0]) / 2.0 - c[0], (a[1] + b[1]) / 2.0 - c[1]];
+            if nn[0] * mid[0] + nn[1] * mid[1] < 0.0 {
+                nn = [-nn[0], -nn[1]];
+            }
+            nn[0] * door[0] + nn[1] * door[1]
+        })
+        .collect();
+    let widest = (0..n).max_by(|&a, &b| facing[a].total_cmp(&facing[b])).unwrap_or(0);
+    let (s, co) = p.rot.to_radians().sin_cos();
+    let world = |v: [f32; 2]| [p.pos[0] + v[0] * co - v[1] * s, p.pos[1] + v[0] * s + v[1] * co];
+    let mid = world(c);
+    let mut out = Vec::new();
+    for i in (0..n).filter(|&i| i != widest && facing[i] <= 0.55) {
+        let (a, b) = (world(local[i]), world(local[(i + 1) % n]));
+        // Внутренность слева на экране (y вниз): середина палатки по ту сторону, где крест < 0.
+        let cross = (b[0] - a[0]) * (mid[1] - a[1]) - (b[1] - a[1]) * (mid[0] - a[0]);
+        out.push(if cross < 0.0 { (a, b) } else { (b, a) });
+    }
+    out
 }
 
 /// Предел формата по стороне: карта больше уходит в JPEG.
@@ -338,7 +448,7 @@ pub struct SceneLevel<'a> {
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
-    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true }
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false }
 }
 
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
@@ -351,6 +461,14 @@ pub struct RoofTile {
     pub shelter: bool,
     /// Гаснет над токеном. Голое дерево — нет: сквозь ветки и так видно.
     pub fade: bool,
+    /// С неё летят листья и светлячки сцены: с кроны и куста да, с белья нет.
+    pub leaves: bool,
+    /// На 10 футах, а не на 20: шатёр палатки.
+    pub low: bool,
+    /// Сила ветра «Wild Canvas»: 1 — крона, куст лишь колышется.
+    pub wind: f32,
+    /// Верёвка с бельём: концы стоят, колышется середина.
+    pub rope: bool,
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -391,15 +509,19 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             let [x, y, w, h] = r.rect;
             let mut tile = json!({
                 "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
-                "elevation": k as i64 * 10 + 20, "sort": tiles.len(), "rotation": r.rotation,
+                "elevation": k as i64 * 10 + if r.low { 10 } else { 20 }, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
             // Крону качает ветер «Wild Canvas»; крыша стоит.
             // Осенью с неё летят листья, в магическом лесу — светлячки.
             if !r.shelter {
-                tile["flags"] = json!({LIVE_MODULE: {"wind": 1}});
-                if !map.particles.is_empty() {
+                let wind = if (r.wind - 1.0).abs() < 1e-3 { json!(1) } else { json!((r.wind as f64 * 100.0).round() / 100.0) };
+                tile["flags"] = json!({LIVE_MODULE: {"wind": wind}});
+                if r.rope {
+                    tile["flags"][LIVE_MODULE]["rope"] = json!(true);
+                }
+                if !map.particles.is_empty() && r.leaves {
                     tile["flags"][LIVE_MODULE]["particles"] = json!(map.particles);
                 }
             }
@@ -472,6 +594,17 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
                 walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]]}));
             }
         }
+    }
+    // Полог палатки — две стены на ребре с ограничениями в разные стороны: изнутри
+    // наружу — как сквозь ткань (свет, зрение, звук «ограничено»), снаружи внутрь —
+    // глухо. Пройти нельзя ни так, ни так. Внутренность — слева от отрезка.
+    for &(a0, b0) in &layout.tents {
+        let (a, b) = (at(a0), at(b0));
+        if a == b {
+            continue;
+        }
+        walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]], "sight": 10, "light": 10, "sound": 10, "dir": 2}));
+        walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]], "dir": 1}));
     }
     for po in &layout.portals {
         let (a0, b0) = po.seg;
@@ -629,7 +762,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
@@ -722,9 +855,9 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
         // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
-        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None };
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None };
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
@@ -790,5 +923,31 @@ mod tests {
         assert_eq!(foundry_src(&root.join("kartograf/зал/зал.jpg")), "kartograf/зал/зал.jpg");
         assert_eq!(foundry_src(&std::env::temp_dir().join("x.jpg")), "x.jpg");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tent_walls_follow_drawing() {
+        // Ромб посреди пустой картинки: оболочка внутри него, не по краям картинки.
+        let mut img = image::RgbaImage::new(200, 100);
+        for y in 0..100u32 {
+            for x in 0..200u32 {
+                let (dx, dy) = ((x as f32 - 100.0).abs() / 80.0, (y as f32 - 50.0).abs() / 40.0);
+                if dx + dy <= 1.0 {
+                    img.put_pixel(x, y, image::Rgba([200, 200, 200, 255]));
+                }
+            }
+        }
+        let hull = alpha_hull(&img);
+        assert!((3..=8).contains(&hull.len()), "{hull:?}");
+        assert!(hull.iter().all(|v| v[0] >= 0.09 && v[0] <= 0.91 && v[1] >= 0.09 && v[1] <= 0.91), "{hull:?}");
+        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2) };
+        let walls = tent_walls(&p, Some(&hull));
+        assert!(!walls.is_empty() && walls.len() < hull.len());
+        for (a, b) in &walls {
+            // Внутренность слева (y вниз), и ни одно ребро не обращено вниз, ко входу.
+            let cross = (b[0] - a[0]) * (10.0 - a[1]) - (b[1] - a[1]) * (10.0 - a[0]);
+            assert!(cross < 0.0);
+            assert!((a[1] + b[1]) / 2.0 < 10.0 + 0.5 || (a[0] - b[0]).abs() < 0.2, "{a:?} {b:?}");
+        }
     }
 }

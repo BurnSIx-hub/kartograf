@@ -222,6 +222,9 @@ pub struct Settings {
     /// Выгрузка: кроны деревьев отдельными тайлами над токенами, в картинке пни.
     #[serde(default = "yes")]
     pub export_canopies: bool,
+    /// Крыши в редакторе: 0 — видно, 1 — сквозь, 2 — скрыть. Запоминается.
+    #[serde(default)]
+    pub roof_view: u8,
 }
 
 fn yes() -> bool {
@@ -230,7 +233,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false, export_canopies: true }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false, export_canopies: true, roof_view: 0 }
     }
 }
 
@@ -524,7 +527,11 @@ impl App {
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
             roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
-            roof_view: RoofView::Auto,
+            roof_view: match settings.roof_view {
+                1 => RoofView::Ghost,
+                2 => RoofView::Hidden,
+                _ => RoofView::Auto,
+            },
             roof_from: None,
             tap_from: None,
             groups: Vec::new(),
@@ -1055,7 +1062,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -1119,7 +1126,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -1181,7 +1188,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -2076,9 +2083,18 @@ impl App {
                 }
                 ui.separator();
                 ui.label("Крыши");
+                let before = self.roof_view;
                 ui.selectable_value(&mut self.roof_view, RoofView::Auto, "Видно");
                 ui.selectable_value(&mut self.roof_view, RoofView::Ghost, "Сквозь");
-                ui.selectable_value(&mut self.roof_view, RoofView::Hidden, "Скрыть");
+                ui.selectable_value(&mut self.roof_view, RoofView::Hidden, "Скрыть").on_hover_text("Только в редакторе: в Foundry крыши выгружаются всегда.");
+                if self.roof_view != before {
+                    self.settings.roof_view = match self.roof_view {
+                        RoofView::Auto => 0,
+                        RoofView::Ghost => 1,
+                        RoofView::Hidden => 2,
+                    };
+                    self.save_settings();
+                }
                 ui.separator();
                 self.shadows_ui(ui);
             });
@@ -3721,7 +3737,7 @@ impl App {
         if shadows.on {
             // Стена под крышей своей тени не даёт: её накрывает тень крыши, а вдвоём они
             // чернили двери и всё у стены на теневой стороне дома.
-            let roofs = if self.roof_view == RoofView::Hidden { Vec::new() } else { self.map.roofs.clone() };
+            let roofs = if self.roof_view == RoofView::Hidden && self.export.is_none() { Vec::new() } else { self.map.roofs.clone() };
             let open = |segs: &[Segment]| -> Vec<Segment> {
                 segs.iter().copied().filter(|s| !roofs.iter().any(|r| r.contains([(s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0]))).collect()
             };
@@ -3828,7 +3844,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -3868,7 +3884,8 @@ impl App {
         // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
         // они уходят в Foundry отдельными тайлами.
         let roof_alpha = if exporting { 0.0 } else { self.roof_alpha() };
-        if self.roof_view != RoofView::Hidden {
+        // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
+        if self.roof_view != RoofView::Hidden || exporting {
             let roofs = self.map.roofs.clone();
             if shadows.on {
                 for r in &roofs {
@@ -3985,6 +4002,31 @@ impl App {
         self.draw_across(painter, canvas, key, s, e, None)
     }
 
+    /// Как `draw_along`, но картинка отражена поперёк: та же сторона смотрит туда же.
+    fn draw_mirrored(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2]) -> bool {
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        let Some((_, px)) = self.textures.get(key, false) else { return false };
+        let half = len * px[1] as f32 / px[0].max(1) as f32 / 2.0;
+        let (nx, ny) = (-dy / len * half, dx / len * half);
+        let c = [[s[0] + nx, s[1] + ny], [e[0] + nx, e[1] + ny], [e[0] - nx, e[1] - ny], [s[0] - nx, s[1] - ny]];
+        let flipped = [pos2(0.0, 1.0), pos2(1.0, 1.0), pos2(1.0, 0.0), pos2(0.0, 0.0)];
+        self.quad(painter, canvas, key, c, flipped, Color32::WHITE)
+    }
+
+    /// Картинка, нарисованная стоя, вдоль отрезка: её высота идёт по отрезку.
+    fn draw_turned(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2], thick: f32) -> bool {
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len == 0.0 {
+            return false;
+        }
+        let (nx, ny) = (-dy / len * thick / 2.0, dx / len * thick / 2.0);
+        let c = [[s[0] + nx, s[1] + ny], [e[0] + nx, e[1] + ny], [e[0] - nx, e[1] - ny], [s[0] - nx, s[1] - ny]];
+        let turned = [pos2(0.0, 0.0), pos2(0.0, 1.0), pos2(1.0, 1.0), pos2(1.0, 0.0)];
+        self.quad(painter, canvas, key, c, turned, Color32::WHITE)
+    }
+
     /// То же, но толщина холста поперёк отрезка задана (`thick`, клетки).
     fn draw_across(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2], thick: Option<f32>) -> bool {
         let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
@@ -4032,7 +4074,14 @@ impl App {
                 let assets = &self.library.assets;
                 let glass = self.window_glass.entry((key.clone(), len >= 1.5)).or_insert_with(|| library::window_glass(assets, &key, len)).clone();
                 if let Some(g) = glass {
-                    self.draw_across(painter, canvas, &g, p.a, p.b, Some(thick));
+                    // Часть стёкол FA нарисована стоя: такое кладётся вдоль проёма
+                    // поворотом, иначе ложилось поперёк стены, ребром.
+                    let standing = self.textures.get(&g, false).is_some_and(|(_, px)| px[1] > px[0]);
+                    if standing {
+                        self.draw_turned(painter, canvas, &g, p.a, p.b, thick);
+                    } else {
+                        self.draw_across(painter, canvas, &g, p.a, p.b, Some(thick));
+                    }
                 }
             }
             return;
@@ -4040,7 +4089,10 @@ impl App {
         if let Some(f) = p.frame.clone() {
             let size = self.asset_size(&f);
             let (hx, hy) = (ux * size[0] / 2.0, uy * size[0] / 2.0);
-            self.draw_along(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy]);
+            // Косяк не толще стены: нарисован под толстые, у тонких фахверковых торчал.
+            let natural = self.textures.get(&f, false).map(|(_, px)| size[0] * px[1] as f32 / px[0].max(1) as f32);
+            let thick = natural.map(|t| t.min(wall_width * 1.5));
+            self.draw_across(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy], thick);
         }
         let rect_around = |half: f32| {
             let (nx, ny) = (-uy * half, ux * half);
@@ -4064,9 +4116,10 @@ impl App {
             }
             PortalKind::DoubleDoor => {
                 // Створки на петлях у краёв проёма, сходятся посередине.
+                // Вторая — отражение первой: поворот на 180° показывал её другой стороной.
                 let key = p.asset.clone().unwrap_or_else(|| library::DEFAULT_DOOR.into());
                 self.draw_along(painter, canvas, &key, mid, p.a);
-                self.draw_along(painter, canvas, &key, mid, p.b);
+                self.draw_mirrored(painter, canvas, &key, mid, p.b);
             }
             PortalKind::Window => {
                 let key = p.asset.clone();
@@ -4558,7 +4611,10 @@ impl App {
             if !bounds.intersects(view) {
                 continue;
             }
-            if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
+            let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
+            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset)) {
+                // Куст, навес и бельё уйдут в свой тайл целиком.
+            } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
@@ -4841,6 +4897,8 @@ impl App {
         let mut jpgs = Vec::new();
         let mut srcs = Vec::new();
         let mut layouts = Vec::new();
+        // Контуры палаток по картинке — один раз на картинку.
+        let mut hulls: std::collections::HashMap<String, Vec<[f32; 2]>> = std::collections::HashMap::new();
         for (k, img) in e.done.iter().enumerate() {
             // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
             let mut jpg = Vec::new();
@@ -4850,7 +4908,18 @@ impl App {
             let bytes = if big { jpg.clone() } else { export::webp_bytes(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0) };
             files.push((img_path.clone(), bytes));
             let map = if k == self.level { &self.map } else { &self.levels[k] };
-            layouts.push(export::layout(map, &map.room_edges()));
+            let mut lay = export::layout(map, &map.room_edges());
+            // Стены палаток — по нарисованному пологу, а не по полям картинки.
+            let mut tents = Vec::new();
+            for p in map.props.iter().filter(|p| map::awning_by_name(&p.asset)) {
+                if !hulls.contains_key(&p.asset) {
+                    let hull = self.textures.bytes(&p.asset).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| export::alpha_hull(&i.to_rgba8())).unwrap_or_default();
+                    hulls.insert(p.asset.clone(), hull);
+                }
+                tents.extend(export::tent_walls(p, Some(&hulls[&p.asset])));
+            }
+            lay.tents = tents;
+            layouts.push(lay);
             srcs.push(export::foundry_src(&img_path));
             jpgs.push(jpg);
         }
@@ -4891,10 +4960,10 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
-            for prop in map.props.iter().filter(|p| e.canopies && p.is_canopy()) {
+            for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
                 // Подкрашенная крона — свой файл: та же картинка в другом цвете.
                 let look = prop.tint.map_or_else(|| prop.asset.clone(), |t| format!("{}#{t:?}", prop.asset));
                 if !canopies.contains_key(&look) {
@@ -4918,6 +4987,19 @@ impl App {
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 let mut tile = export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px);
                 tile.fade = !map::is_bare_tree(&prop.asset);
+                // Навес не качается, но держит дождь; куст и крона — под ветром.
+                tile.shelter = !prop.is_canopy() && map::awning_by_name(&prop.asset);
+                tile.low = tile.shelter;
+                // Бельё колышется, но не гаснет: оно выше голов, и листья с него не летят.
+                if map::line_by_name(&prop.asset) {
+                    tile.fade = false;
+                    tile.leaves = false;
+                    tile.rope = true;
+                }
+                // Куст ниже кроны и жёстче: лишь колышется.
+                if map::bush_by_name(&prop.asset) {
+                    tile.wind = 0.35;
+                }
                 tiles.push(tile);
             }
             roof_tiles.push(tiles);
@@ -5439,7 +5521,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

@@ -195,11 +195,17 @@ pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
         return None;
     }
     let large = len >= 1.5;
-    const SKIP: [&str; 9] = ["sill", "frame", "curtain", "curtains", "broken", "stained", "wired", "shutter", "shutters"];
+    // `Small` — форточка посередине проёма, к ней своя узкая рама.
+    const SKIP: [&str; 10] = ["sill", "frame", "curtain", "curtains", "broken", "stained", "wired", "shutter", "shutters", "small"];
     let mut best: Vec<(usize, &str)> = Vec::new();
     for a in assets.iter().filter(|a| a.kind == Kind::Object) {
         let f = key_words(&a.key);
         if f.first().map(String::as_str) != Some("window") || f.iter().any(|w| SKIP.contains(&w.as_str())) || f.iter().any(|w| w == "large") != large {
+            continue;
+        }
+        // Стекло FA — варианты одной буквой (`_E_`); `_A1_`, `_B1_` у малых окон —
+        // брусок и доска-ставень, в проёме они лежали поперёк.
+        if !large && !f.iter().any(|w| w.len() == 1 && w.chars().all(|c| c.is_ascii_lowercase())) {
             continue;
         }
         let score = f.iter().filter(|w| words.contains(w)).count();
@@ -211,6 +217,14 @@ pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
     }
     if best.is_empty() {
         return None;
+    }
+    // У FA варианты A–B — с защёлками (смотрятся форточкой), G–N — с переплётами и
+    // подставками, O–P — решётка без стекла. Чистое стекло — C–F: его, если есть.
+    if !large {
+        let plain: Vec<(usize, &str)> = best.iter().copied().filter(|(_, k)| key_words(k).iter().any(|w| ["c", "d", "e", "f"].contains(&w.as_str()))).collect();
+        if !plain.is_empty() {
+            best = plain;
+        }
     }
     best.sort_by(|a, b| a.1.cmp(b.1));
     let h = sill.bytes().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
@@ -571,6 +585,9 @@ pub struct Textures {
     /// В браузере потоков нет: заказы ждут здесь, и кадр разбирает их сам.
     #[cfg(target_arch = "wasm32")]
     queue: Receiver<Job>,
+    /// Отложенные кадром заказы: миниатюры вперёд, крупные следом.
+    #[cfg(target_arch = "wasm32")]
+    backlog: (std::collections::VecDeque<Job>, std::collections::VecDeque<Job>),
 }
 
 /// Раскрыть заказанную картинку: тень, разнообразный пол или обычная.
@@ -604,7 +621,7 @@ impl Textures {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (done_tx, ctx);
-            return Self { slots: HashMap::new(), jobs, done, sources, frame: 0, queue: job_rx };
+            return Self { slots: HashMap::new(), jobs, done, sources, frame: 0, queue: job_rx, backlog: Default::default() };
         }
         #[cfg(not(target_arch = "wasm32"))]
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -637,11 +654,43 @@ impl Textures {
         self.frame += 1;
         #[cfg(target_arch = "wasm32")]
         {
+            // Картинку из пака раскрывает сам браузер (`createImageBitmap`, вне
+            // основного потока и в разы быстрее декодера в wasm) — она придёт позже.
+            // Остальное (тени, разнообразный пол, встроенные) — здесь, миниатюры первыми.
+            while let Ok(job) = self.queue.try_recv() {
+                if web_decode(&job, &self.sources) {
+                    continue;
+                }
+                if job.thumb { self.backlog.0.push_back(job) } else { self.backlog.1.push_back(job) }
+            }
+            let mut busy = false;
+            if let Ok(v) = crate::plat::web::call("kartografTakeDecoded", &[]) {
+                for item in js_sys::Array::from(&v).iter() {
+                    busy = true;
+                    let get = |k: &str| js_sys::Reflect::get(&item, &k.into()).ok();
+                    let key = get("key").and_then(|v| v.as_string()).unwrap_or_default();
+                    let thumb = get("thumb").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let num = |k: &str| get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as usize;
+                    let slot = match get("data").filter(|d| !d.is_undefined() && !d.is_null()) {
+                        Some(d) => {
+                            let px = js_sys::Uint8ClampedArray::new(&d).to_vec();
+                            let (w, h) = (num("w"), num("h"));
+                            if px.len() == w * h * 4 && w > 0 {
+                                let image = ColorImage::from_rgba_unmultiplied([w, h], &px);
+                                Slot::Ready { tex: ctx.load_texture(&key, image, TEX_OPTIONS), size: [num("ow") as u32, num("oh") as u32], used: self.frame }
+                            } else {
+                                Slot::Failed
+                            }
+                        }
+                        None => Slot::Failed,
+                    };
+                    self.slots.insert((key, thumb), slot);
+                }
+            }
             // Не дольше ~12 мс за кадр, остальное — в следующих.
             let started = crate::plat::Instant::now();
-            let mut busy = false;
             while started.elapsed().as_millis() < 12 {
-                let Ok(job) = self.queue.try_recv() else { break };
+                let Some(job) = self.backlog.0.pop_front().or_else(|| self.backlog.1.pop_front()) else { break };
                 busy = true;
                 let result = load_job(&job, &self.sources);
                 self.slots.insert((job.key.clone(), job.thumb), match result {
@@ -649,7 +698,8 @@ impl Textures {
                     Err(_) => Slot::Failed,
                 });
             }
-            if busy {
+            let waiting = crate::plat::web::call("kartografDecoding", &[]).ok().and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0;
+            if busy || waiting || !self.backlog.0.is_empty() || !self.backlog.1.is_empty() {
                 ctx.request_repaint();
             }
         }
@@ -692,6 +742,27 @@ impl Textures {
     pub fn idle(&self) -> bool {
         !self.slots.values().any(|s| matches!(s, Slot::Loading))
     }
+}
+
+/// Отдать браузеру обычную картинку из пака: кусок файла он раскроет сам.
+/// `false` — не из пака или особая (тень, разнообразие): раскрываем здесь.
+#[cfg(target_arch = "wasm32")]
+fn web_decode(job: &Job, sources: &Sources) -> bool {
+    use wasm_bindgen::JsValue;
+    if !job.key.starts_with("pack:") {
+        return false;
+    }
+    let Some((file, offset, size)) = sources.read().ok().and_then(|s| s.get(&job.key).cloned()) else { return false };
+    let side = if job.thumb { THUMB_SIDE } else { FULL_SIDE };
+    let args = [
+        JsValue::from_str(&job.key),
+        JsValue::from_bool(job.thumb),
+        JsValue::from_str(&file.to_string_lossy()),
+        JsValue::from_f64(offset as f64),
+        JsValue::from_f64(size as f64),
+        JsValue::from_f64(side as f64),
+    ];
+    crate::plat::web::call("kartografDecode", &args).is_ok()
 }
 
 fn decode(bytes: &[u8], max_side: u32) -> Result<(ColorImage, [u32; 2]), String> {

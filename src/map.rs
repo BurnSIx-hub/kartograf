@@ -380,6 +380,10 @@ pub struct Prop {
     /// Подкраска картинки (умножением): встроенное дерево осенью, зимой, в магическом лесу.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tint: Option<[u8; 3]>,
+    /// Палатка: с какой стороны картинки вход (0 — верх, 1 — право, 2 — низ, 3 — лево).
+    /// Нет — снизу, как у встроенных лавок. С остальных сторон в Foundry — стены полога.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<u8>,
 }
 
 /// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
@@ -488,6 +492,23 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
 pub fn is_bare_tree(key: &str) -> bool {
     let lower = key.to_lowercase();
     lower.contains("bare_tree") || lower.contains("tree_bare") || lower.ends_with("builtin:tree_bare")
+}
+
+/// Куст: в Foundry уходит тайлом, который качает ветер «Wild Canvas», как крону.
+pub fn bush_by_name(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    key == format!("{}bush", crate::library::BUILTIN) || (lower.contains("/bushes/") && !lower.contains("dead") && !lower.contains("shadow"))
+}
+
+/// Навес лавки: в Foundry — тайл над токенами, гаснет, когда под ним кто-то, и
+/// прячет от дождя.
+pub fn awning_by_name(key: &str) -> bool {
+    key.starts_with(&format!("{}market_stall", crate::library::BUILTIN)) || key.contains("/Arranged_Tarps/")
+}
+
+/// Верёвка с бельём: в Foundry — тайл, который колышет ветер.
+pub fn line_by_name(key: &str) -> bool {
+    key.contains("Clothes_Line")
 }
 
 pub fn canopy_by_name(key: &str) -> bool {
@@ -1649,7 +1670,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -1683,7 +1704,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();

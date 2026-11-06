@@ -28,6 +28,7 @@ export async function open() {
   if (!game.user.isGM) return;
   if (!root) build();
   root.style.display = "flex";
+  restore().catch((err) => console.warn(`${MODULE_ID} | паки не восстановились`, err));
   if (!started) {
     const status = root.querySelector("#kartograf-status");
     status.textContent = "загрузка…";
@@ -95,7 +96,85 @@ async function toScene(files, update) {
 const files = new Map();
 const picked = [];
 
+// Выбранные паки помнятся между запусками: окно `showOpenFilePicker` отдаёт ручку
+// файла, она хранится в IndexedDB, а при следующем открытии браузер лишь спрашивает
+// разрешение на чтение. Где этого окна нет — обычное, и паки выбирают заново.
+function db() {
+  return new Promise((ok, no) => {
+    const r = indexedDB.open(MODULE_ID, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("packs");
+    r.onsuccess = () => ok(r.result);
+    r.onerror = () => no(r.error);
+  });
+}
+
+async function keep(name, handle) {
+  const d = await db();
+  await new Promise((ok, no) => {
+    const t = d.transaction("packs", "readwrite");
+    t.objectStore("packs").put(handle, name);
+    t.oncomplete = ok;
+    t.onerror = () => no(t.error);
+  });
+}
+
+async function kept() {
+  const d = await db();
+  return new Promise((ok, no) => {
+    const out = [];
+    const c = d.transaction("packs").objectStore("packs").openCursor();
+    c.onsuccess = () => {
+      const cur = c.result;
+      if (!cur) return ok(out);
+      out.push([cur.key, cur.value]);
+      cur.continue();
+    };
+    c.onerror = () => no(c.error);
+  });
+}
+
+// Паки, выбранные раньше: зовётся из нажатия кнопки, чтобы браузер мог спросить разрешение.
+async function restore() {
+  if (!window.showOpenFilePicker) return;
+  for (const [name, h] of await kept()) {
+    if (files.has(name)) continue;
+    try {
+      let p = await h.queryPermission({ mode: "read" });
+      if (p === "prompt") p = await h.requestPermission({ mode: "read" });
+      if (p !== "granted") continue;
+      files.set(name, await h.getFile());
+      picked.push(name);
+    } catch (err) {
+      console.warn(`${MODULE_ID} | пак ${name} не открылся`, err);
+    }
+  }
+}
+
+async function pickHandles(accept, multiple) {
+  const types = [{ description: "Пак Dungeondraft", accept: { "application/octet-stream": accept.split(",") } }];
+  try {
+    return await window.showOpenFilePicker({ multiple, types });
+  } catch (err) {
+    // Длинное расширение браузер может не принять в фильтр — тогда без фильтра.
+    if (err.name === "TypeError") return window.showOpenFilePicker({ multiple });
+    throw err;
+  }
+}
+
 function pick(accept, multiple) {
+  if (window.showOpenFilePicker) {
+    pickHandles(accept, multiple)
+      .then(async (handles) => {
+        for (const h of handles) {
+          const f = await h.getFile();
+          files.set(f.name, f);
+          picked.push(f.name);
+          keep(f.name, h).catch((err) => console.warn(`${MODULE_ID} | пак не запомнился`, err));
+        }
+      })
+      .catch((err) => { if (err.name !== "AbortError") console.error(`${MODULE_ID} | выбор пака`, err); });
+    return;
+  }
   const input = document.createElement("input");
   input.type = "file";
   input.accept = accept;
@@ -127,7 +206,51 @@ function readSync(name, offset, size) {
   }
 }
 
+// Картинки из паков раскрывает браузер: `createImageBitmap` работает вне основного
+// потока и быстрее декодера в wasm. Миниатюры библиотеки — вперёд крупных картинок
+// карты, иначе на большой карте библиотека ждёт сотни раскрытий. Готовое забирает
+// кадр редактора (`kartografTakeDecoded`).
+const decodeQueue = { thumbs: [], full: [] };
+const decoded = [];
+let decoding = 0;
+const DECODE_AT_ONCE = 6;
+
+function pumpDecode() {
+  while (decoding < DECODE_AT_ONCE) {
+    const job = decodeQueue.thumbs.shift() ?? decodeQueue.full.shift();
+    if (!job) return;
+    decoding++;
+    decodeOne(job).finally(() => { decoding--; pumpDecode(); });
+  }
+}
+
+async function decodeOne({ key, thumb, name, offset, size, side }) {
+  try {
+    const f = files.get(name);
+    if (!f) throw new Error(`${name}: файл не выбран`);
+    const bmp = await createImageBitmap(f.slice(offset, offset + size), { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+    const ow = bmp.width, oh = bmp.height;
+    const k = Math.min(1, side / Math.max(ow, oh, 1));
+    const w = Math.max(1, Math.round(ow * k)), h = Math.max(1, Math.round(oh * k));
+    const canvas = new OffscreenCanvas(w, h);
+    const g = canvas.getContext("2d", { willReadFrequently: true });
+    g.imageSmoothingQuality = "high";
+    g.drawImage(bmp, 0, 0, w, h);
+    bmp.close();
+    decoded.push({ key, thumb, w, h, ow, oh, data: g.getImageData(0, 0, w, h).data });
+  } catch (err) {
+    console.warn(`${MODULE_ID} | картинка не раскрылась: ${key}`, err);
+    decoded.push({ key, thumb, data: null });
+  }
+}
+
 Hooks.once("init", () => {
+  window.kartografDecode = (key, thumb, name, offset, size, side) => {
+    (thumb ? decodeQueue.thumbs : decodeQueue.full).push({ key, thumb, name, offset, size, side });
+    pumpDecode();
+  };
+  window.kartografTakeDecoded = () => decoded.splice(0);
+  window.kartografDecoding = () => decoding + decodeQueue.thumbs.length + decodeQueue.full.length;
   window.kartografPick = pick;
   window.kartografTakePicked = () => picked.splice(0);
   window.kartografFileSize = (name) => files.get(name)?.size;
