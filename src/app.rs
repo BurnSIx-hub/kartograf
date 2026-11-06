@@ -4587,11 +4587,14 @@ impl App {
     /// Объекты слоёв из `layers`: сначала все их тени, потом сами.
     fn draw_props(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, exporting: bool, layers: std::ops::Range<i16>) {
         let cam = self.cam;
-        let order: Vec<usize> = self.prop_order().into_iter().filter(|&i| layers.contains(&self.map.props[i].layer())).collect();
+        let mut order: Vec<usize> = (0..self.map.props.len()).filter(|&i| layers.contains(&self.map.props[i].layer())).collect();
         if order.is_empty() {
             return;
         }
-        let props = self.map.props.clone();
+        order.sort_by_key(|&i| self.map.props[i].layer());
+        // Объекты на время рисования вынуты из карты, а не скопированы: рисованию
+        // нужен `&mut self` (картинки грузятся), а карту оно не читает.
+        let props = std::mem::take(&mut self.map.props);
         let shadows = self.map.shadows.clone();
         if shadows.on {
             for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow()) {
@@ -4635,6 +4638,7 @@ impl App {
                 painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
             }
         }
+        self.map.props = props;
     }
 
     fn draw_walls(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, segs: &[Segment]) {

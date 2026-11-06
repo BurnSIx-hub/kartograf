@@ -24,10 +24,30 @@ function build() {
   }
 }
 
+// Пока открыт Картограф, сцена Foundry под ним не видна, но рисуется дальше —
+// шейдеры, ветер, частицы делят с редактором процессор и видеокарту. Не
+// останавливаем её, а реже обновляем: игра, звук и связь идут как шли.
+const SCENE_FPS = 8;
+let sceneFps = null;
+
+function dimScene() {
+  const ticker = canvas?.app?.ticker;
+  if (!ticker || sceneFps !== null) return;
+  sceneFps = ticker.maxFPS;
+  ticker.maxFPS = SCENE_FPS;
+}
+
+function wakeScene() {
+  const ticker = canvas?.app?.ticker;
+  if (ticker && sceneFps !== null) ticker.maxFPS = sceneFps;
+  sceneFps = null;
+}
+
 export async function open() {
   if (!game.user.isGM) return;
   if (!root) build();
   root.style.display = "flex";
+  dimScene();
   restore().catch((err) => console.warn(`${MODULE_ID} | паки не восстановились`, err));
   if (!started) {
     const status = root.querySelector("#kartograf-status");
@@ -44,6 +64,7 @@ export async function open() {
 
 export function close() {
   if (root) root.style.display = "none";
+  wakeScene();
 }
 
 // Выгрузка из Картографа: картинки — в данные Foundry, `.json` — новой сценой
@@ -215,6 +236,21 @@ const decoded = [];
 let decoding = 0;
 const DECODE_AT_ONCE = 6;
 
+let blurs = null;
+/** Умеет ли холст браузера размывать (`ctx.filter`). */
+function canBlur() {
+  if (blurs === null) {
+    try {
+      const g = new OffscreenCanvas(1, 1).getContext("2d");
+      g.filter = "blur(2px)";
+      blurs = g.filter === "blur(2px)";
+    } catch {
+      blurs = false;
+    }
+  }
+  return blurs;
+}
+
 function pumpDecode() {
   while (decoding < DECODE_AT_ONCE) {
     const job = decodeQueue.thumbs.shift() ?? decodeQueue.full.shift();
@@ -224,7 +260,10 @@ function pumpDecode() {
   }
 }
 
-async function decodeOne({ key, thumb, name, offset, size, side }) {
+// Тень (`blur` > 0) — как `shadow_image` в Rust: силуэт картинки не крупнее `side`,
+// чёрный, размытый, с полями 3r+1. Три прохода ящика радиуса r — это почти Гаусс
+// с σ = √(r(r+1)). Вместо размера картинки отдаём [поле, ширина силуэта].
+async function decodeOne({ key, thumb, name, offset, size, side, blur, ppcBase }) {
   try {
     const f = files.get(name);
     if (!f) throw new Error(`${name}: файл не выбран`);
@@ -232,6 +271,19 @@ async function decodeOne({ key, thumb, name, offset, size, side }) {
     const ow = bmp.width, oh = bmp.height;
     const k = Math.min(1, side / Math.max(ow, oh, 1));
     const w = Math.max(1, Math.round(ow * k)), h = Math.max(1, Math.round(oh * k));
+    if (blur > 0) {
+      const ppc = w / Math.max(ow / ppcBase, 1e-3);
+      const r = Math.min(64, Math.max(1, Math.round((blur * ppc) / 2)));
+      const pad = 3 * r + 1;
+      const pw = w + 2 * pad, ph = h + 2 * pad;
+      const canvas = new OffscreenCanvas(pw, ph);
+      const g = canvas.getContext("2d", { willReadFrequently: true });
+      g.filter = `brightness(0) blur(${Math.sqrt(r * (r + 1)).toFixed(2)}px)`;
+      g.drawImage(bmp, pad, pad, w, h);
+      bmp.close();
+      decoded.push({ key, thumb, w: pw, h: ph, ow: pad, oh: w, data: g.getImageData(0, 0, pw, ph).data });
+      return;
+    }
     const canvas = new OffscreenCanvas(w, h);
     const g = canvas.getContext("2d", { willReadFrequently: true });
     g.imageSmoothingQuality = "high";
@@ -245,9 +297,11 @@ async function decodeOne({ key, thumb, name, offset, size, side }) {
 }
 
 Hooks.once("init", () => {
-  window.kartografDecode = (key, thumb, name, offset, size, side) => {
-    (thumb ? decodeQueue.thumbs : decodeQueue.full).push({ key, thumb, name, offset, size, side });
+  window.kartografDecode = (key, thumb, name, offset, size, side, blur = 0, ppcBase = 256) => {
+    if (blur > 0 && !canBlur()) return false;
+    (thumb ? decodeQueue.thumbs : decodeQueue.full).push({ key, thumb, name, offset, size, side, blur, ppcBase });
     pumpDecode();
+    return true;
   };
   window.kartografTakeDecoded = () => decoded.splice(0);
   window.kartografDecoding = () => decoding + decodeQueue.thumbs.length + decodeQueue.full.length;

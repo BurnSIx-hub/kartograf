@@ -310,6 +310,12 @@ const VARY_SIDE: u32 = 1024;
 const QUILTED: [&str; 13] = ["dirt", "wood_planks", "gravel", "forest_floor", "rocky_ground", "flagstones", "dungeon_flagstones", "dungeon_flagstones_moss", "stone_tiles", "sandstone", "marble", "brick_floor", "cobblestone"];
 /// Больше миниатюр в памяти не держим: давно не показанные выбрасываются.
 const THUMB_BUDGET: usize = 3000;
+/// Видеопамять под полные картинки, тени и разнообразный пол. Сверх неё давно не
+/// показанные выгружаются (сначала самые старые) — понадобятся, раскроются снова.
+/// Без этого каждый новый квартал добавлял картинки, а старые оставались.
+const FULL_BUDGET: usize = 1 << 30;
+/// Сколько кадров картинку не показывали, прежде чем её можно выгрузить.
+const FULL_IDLE: u64 = 300;
 const WORKERS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -715,6 +721,35 @@ impl Textures {
             let cutoff = self.frame.saturating_sub(120);
             self.slots.retain(|k, s| !k.1 || !matches!(s, Slot::Ready { used, .. } if *used < cutoff));
         }
+        self.evict_full();
+    }
+
+    /// Полные картинки сверх [`FULL_BUDGET`]: выгрузить давно не показанные.
+    fn evict_full(&mut self) {
+        // Мипмапы добавляют треть.
+        let bytes = |t: &TextureHandle| t.size()[0] * t.size()[1] * 4 * 4 / 3;
+        let mut total = 0;
+        let mut idle = Vec::new();
+        let cutoff = self.frame.saturating_sub(FULL_IDLE);
+        for (k, s) in &self.slots {
+            if let (false, Slot::Ready { tex, used, .. }) = (k.1, s) {
+                total += bytes(tex);
+                if *used < cutoff {
+                    idle.push((*used, bytes(tex), k.clone()));
+                }
+            }
+        }
+        if total <= FULL_BUDGET {
+            return;
+        }
+        idle.sort_by_key(|i| i.0);
+        for (_, b, k) in idle {
+            if total <= FULL_BUDGET {
+                break;
+            }
+            self.slots.remove(&k);
+            total -= b;
+        }
     }
 
     /// Картинка и её настоящий размер в пикселях. `None` — ещё грузится или не читается.
@@ -744,16 +779,20 @@ impl Textures {
     }
 }
 
-/// Отдать браузеру обычную картинку из пака: кусок файла он раскроет сам.
-/// `false` — не из пака или особая (тень, разнообразие): раскрываем здесь.
+/// Отдать браузеру картинку из пака: кусок файла он раскроет сам, тень — размоет
+/// (`ctx.filter`, то же размытие, что [`shadow_image`]). `false` — не из пака или
+/// разнообразный пол: раскрываем здесь.
 #[cfg(target_arch = "wasm32")]
 fn web_decode(job: &Job, sources: &Sources) -> bool {
     use wasm_bindgen::JsValue;
-    if !job.key.starts_with("pack:") {
+    let (inner, side, blur) = match job.key.strip_prefix(SHADOW).and_then(|rest| rest.split_once(':')) {
+        Some((blur, inner)) => (inner, SHADOW_SIDE, blur.parse::<f32>().unwrap_or(3.0) / 10.0),
+        None => (job.key.as_str(), if job.thumb { THUMB_SIDE } else { FULL_SIDE }, 0.0),
+    };
+    if !inner.starts_with("pack:") {
         return false;
     }
-    let Some((file, offset, size)) = sources.read().ok().and_then(|s| s.get(&job.key).cloned()) else { return false };
-    let side = if job.thumb { THUMB_SIDE } else { FULL_SIDE };
+    let Some((file, offset, size)) = sources.read().ok().and_then(|s| s.get(inner).cloned()) else { return false };
     let args = [
         JsValue::from_str(&job.key),
         JsValue::from_bool(job.thumb),
@@ -761,8 +800,11 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
         JsValue::from_f64(offset as f64),
         JsValue::from_f64(size as f64),
         JsValue::from_f64(side as f64),
+        JsValue::from_f64(blur as f64),
+        JsValue::from_f64(PX_PER_CELL as f64),
     ];
-    crate::plat::web::call("kartografDecode", &args).is_ok()
+    // Браузер без размытия на холсте вернёт `false` — тогда тень считаем сами.
+    crate::plat::web::call("kartografDecode", &args).is_ok_and(|v| v.as_bool() != Some(false))
 }
 
 fn decode(bytes: &[u8], max_side: u32) -> Result<(ColorImage, [u32; 2]), String> {
