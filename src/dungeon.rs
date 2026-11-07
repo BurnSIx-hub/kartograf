@@ -137,6 +137,8 @@ enum Part {
     Market,
     Hostel,
     Flat,
+    Bathroom,
+    Gym,
     /// Роль из плана.
     Plan(Role),
 }
@@ -181,6 +183,8 @@ impl Part {
             Part::Market => "Рынок",
             Part::Hostel => "Капсульный отель",
             Part::Flat => "Квартира",
+            Part::Bathroom => "Санузел",
+            Part::Gym => "Спортзал",
             Part::Plan(_) => "",
         }
     }
@@ -213,7 +217,7 @@ fn pool(kind: DungeonKind) -> &'static [Part] {
         DungeonKind::Prison => &[Part::Cells, Part::Guard, Part::Torture, Part::Cells, Part::Warden, Part::Store, Part::Cells],
         DungeonKind::Temple => &[Part::Shrine, Part::Pool, Part::Library, Part::Shrine, Part::Store, Part::Chapel],
         DungeonKind::Ruins => &[Part::Collapsed, Part::Lair, Part::Flooded, Part::Store, Part::Collapsed, Part::Ossuary],
-        DungeonKind::Cyber => &[Part::Bar, Part::Clinic, Part::Servers, Part::Lab, Part::Garage, Part::Office, Part::Market, Part::Store, Part::Hostel, Part::Flat],
+        DungeonKind::Cyber => &[Part::Bar, Part::Clinic, Part::Servers, Part::Lab, Part::Garage, Part::Office, Part::Market, Part::Store, Part::Hostel, Part::Flat, Part::Bathroom, Part::Gym],
     }
 }
 
@@ -1148,6 +1152,18 @@ fn iv_stands(m: &mut Map, sp: &mut Spots, c: &Chamber) {
     }
 }
 
+/// Дрон доставки — на только что поставленной площадке.
+fn drone_on_pad(m: &mut Map, c: &Chamber) -> bool {
+    let p = asset("cy_drone_delivery");
+    if let Some(pad) = m.props.iter().rev().find(|q| q.asset.contains("Drone_Pad")).cloned()
+        && p.own
+        && c.inside(pad.pos, 0.0)
+    {
+        drop_pick(m, &p, pad.pos, 0.0, 1.0);
+    }
+    true
+}
+
 /// Предмет внутри комнаты с пустой клеткой со всех сторон.
 fn roomy(m: &mut Map, sp: &mut Spots, rng: &mut Rng, c: &Chamber, slot: &str) -> bool {
     let r = c.r;
@@ -1224,6 +1240,9 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             // Турели в углах напротив входа, урна у двери.
             pair(m, sp, "cy_turret", &[far]);
             walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
+            if rng.chance(0.5) {
+                super::inside(m, sp, rng, r, "cy_barricade", 1.0);
+            }
         }
         Part::Climax => {
             // Клуб: стойка у боковой стены, диваны, автоматы, голограмма на танцполе.
@@ -1236,6 +1255,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             pair(m, sp, "cy_sofa", &sides);
             walls(m, sp, rng, "cy_arcade", 2, &all);
             walls(m, sp, rng, "cy_vending", 1, &all);
+            walls(m, sp, rng, "cy_jukebox", 1, &all);
             centre(m, sp, c, &asset("cy_holo"), "cy_holo", far, 1.0);
             for _ in 0..2 {
                 super::inside(m, sp, rng, r, "cy_cocktail", 1.0);
@@ -1248,6 +1268,8 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_vending", 1, &all);
             walls(m, sp, rng, "cy_speaker", 1, &all);
             walls(m, sp, rng, "cy_fridge", 1, &all);
+            walls(m, sp, rng, "cy_jukebox", 1, &all);
+            walls(m, sp, rng, "cy_kitchen", 1, &all);
             spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
             for _ in 0..rng.int(2, 3) {
                 super::inside(m, sp, rng, r, "cy_cocktail", 1.0);
@@ -1284,7 +1306,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         Part::Garage => {
             // Посередине — площадка дрона, манипулятор или остов меха.
             match rng.int(0, 2) {
-                0 => super::inside(m, sp, rng, r, "cy_drone_pad", 1.0),
+                0 => super::inside(m, sp, rng, r, "cy_drone_pad", 1.0) && drone_on_pad(m, c),
                 // Рука в Foundry поворачивается и выходит за свой квадрат — вокруг пусто.
                 1 => roomy(m, sp, rng, c, "cy_robot_arm") || super::inside(m, sp, rng, r, "cy_drone_pad", 1.0),
                 _ => super::inside(m, sp, rng, r, "cy_mech", 1.0),
@@ -1299,6 +1321,10 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_cables", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_generator", 1, &all);
+            walls(m, sp, rng, "cy_charger", 1, &all);
+            if rng.chance(0.5) {
+                super::inside(m, sp, rng, r, "cy_fan", 1.0);
+            }
             let wreck = if rng.chance(0.5) { "cy_drone" } else { "cy_android" };
             walls(m, sp, rng, wreck, 1, &all);
         }
@@ -1333,20 +1359,48 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_vending", 1, &all);
             walls(m, sp, rng, "cy_cooler", 1, &all);
             walls(m, sp, rng, "cy_trash", 1, &all);
+            walls(m, sp, rng, "cy_toilet", 1, &all);
         }
         Part::Flat => {
+            walls(m, sp, rng, "cy_kitchen", 1, &sides);
             walls(m, sp, rng, "cy_fridge", 1, &sides);
             walls(m, sp, rng, "cy_sofa", 1, &sides);
             desk_and_seat(m, sp, rng, c, "cy_desk", "cy_chair");
-            walls(m, sp, rng, "cy_arcade", 1, &all);
+            let fun = if rng.chance(0.5) { "cy_arcade" } else { "cy_treadmill" };
+            walls(m, sp, rng, fun, 1, &all);
             spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
             walls(m, sp, rng, "cy_trash", 1, &all);
+        }
+        Part::Bathroom => {
+            // Общий санузел: кабинки душа в углах дальней стены, унитазы вдоль боковых.
+            let shower = asset("cy_shower");
+            for _ in 0..2 {
+                by_side_pick(m, sp, rng, r, &shower, "cy_shower", 1.0, true, &[far]);
+            }
+            walls(m, sp, rng, "cy_toilet", 4, &sides);
+            walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
+            spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
+        }
+        Part::Gym => {
+            // Дорожки пультом к дальней стене, скамьи посередине.
+            // У скошенной дальней стены места нет — тогда у боковых.
+            walls(m, sp, rng, "cy_treadmill", 3, &[far]);
+            walls(m, sp, rng, "cy_treadmill", 2, &sides);
+            let benches = spread(m, sp, c, &asset("cy_weights"), "cy_weights", 2, &[c.entry, sides[0], sides[1]]);
+            for _ in benches..2 {
+                super::inside(m, sp, rng, r, "cy_weights", 1.0);
+            }
+            walls(m, sp, rng, "cy_lockers", 1, &sides);
+            walls(m, sp, rng, "cy_cooler", 1, &sides);
+            walls(m, sp, rng, "cy_jukebox", 1, &all);
         }
         Part::Treasure => {
             reactor_console(m, sp, c);
             pair(m, sp, "cy_coolant", &[far]);
             walls(m, sp, rng, "cy_cooling", 1, &sides);
             pair(m, sp, "cy_turret", &[c.entry]);
+            super::inside(m, sp, rng, r, "cy_fan", 1.0);
+            walls(m, sp, rng, "cy_ammo", 1, &all);
             walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_lockers", 1, &all);
@@ -1356,6 +1410,10 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_pallet", 3, &all);
             super::inside(m, sp, rng, r, "cy_forklift", 1.0);
             walls(m, sp, rng, "cy_generator", 1, &all);
+            walls(m, sp, rng, "cy_ammo", 2, &all);
+            if rng.chance(0.5) {
+                super::inside(m, sp, rng, r, "cy_fan", 1.0);
+            }
             walls(m, sp, rng, "cy_exosuit", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_weapons", 1, &all);
@@ -1877,7 +1935,7 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
             }
             webs(m, sp, rng, 2);
         }
-        Part::Bar | Part::Clinic | Part::Servers | Part::Lab | Part::Garage | Part::Office | Part::Market | Part::Hostel | Part::Flat => {}
+        Part::Bar | Part::Clinic | Part::Servers | Part::Lab | Part::Garage | Part::Office | Part::Market | Part::Hostel | Part::Flat | Part::Bathroom | Part::Gym => {}
         Part::Store => furnish(m, sp, rng, r, Role::Storage),
         Part::Plan(role) => furnish(m, sp, rng, r, role),
     }

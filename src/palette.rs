@@ -162,6 +162,17 @@ const OBJECTS: &[Slot] = &[
     ("cy_drone_pad", &[&["drone", "pad"]], &[]),
     ("cy_street_lamp", &[&["street", "lamp"]], &[]),
     ("cy_mech", &[&["mech", "wreck"]], &[]),
+    ("cy_kitchen", &[&["kitchen", "counter"]], &[]),
+    ("cy_toilet", &[&["toilet", "tech"]], &[]),
+    ("cy_shower", &[&["shower", "pod"]], &[]),
+    ("cy_treadmill", &[&["treadmill"]], &[]),
+    ("cy_weights", &[&["weight", "bench"]], &[]),
+    ("cy_jukebox", &[&["jukebox", "neon"]], &[]),
+    ("cy_barricade", &[&["barricade", "metal"]], &[]),
+    ("cy_ammo", &[&["ammo", "crate"]], &[]),
+    ("cy_fan", &[&["floor", "fan"]], &[]),
+    ("cy_charger", &[&["charging", "station"]], &[]),
+    ("cy_drone_delivery", &[&["drone", "delivery"]], &[]),
     // Сундук с сокровищем FA: у него есть открытый с монетами и пустой — в Foundry
     // он открывается (Item Piles).
     ("treasure_chest", &[&["treasure", "chest"]], &["coins", "empty", "false", "bottom", "open"]),
@@ -367,6 +378,9 @@ fn turn_of(slot: &str, name: &str) -> f32 {
     // Стойки FA для оружия нарисованы стоя: доской влево, крюками вправо.
     let standing = library::size_from_name(file).is_some_and(|s| s[1] > s[0]);
     if slot.starts_with("weapon_rack") && file.starts_with("Weapon_Rack") && standing {
+        90.0
+    } else if slot == "cy_toilet" && file.starts_with("Toilet_Tech") {
+        // Бачок нарисован слева — к стене.
         90.0
     } else if slot == "forge" && file.contains("SemiCircle") {
         180.0

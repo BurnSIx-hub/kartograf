@@ -526,7 +526,7 @@ pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
     if file.starts_with("Speaker_Stack") {
         return Some(("speaker", "on".into()));
     }
-    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
 }
 
 /// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.
@@ -832,7 +832,7 @@ impl Label {
 /// Плоское по имени: лежит на полу и тени не даёт.
 pub fn flat_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
-    ["rug", "carpet", "mat_", "drone_pad", "shadow", "puddle", "stain", "blood", "decal", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
+    ["rug", "carpet", "mat_", "drone_pad", "floor_fan", "shadow", "puddle", "stain", "blood", "decal", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
 }
 
 /// Падающие тени: свет с одной стороны, тень — смещённый размытый силуэт стен
