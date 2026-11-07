@@ -159,21 +159,74 @@ async function chests(scene) {
   await scene.deleteEmbeddedDocuments("Tile", done);
 }
 
-// Паутина — тайл с пометкой `web`: едва заметно колышется, у каждой своя фаза.
+// Паутина — тайл с пометкой `web`: нить между двумя стенами угла. Как бельё
+// у «Wild Canvas»: концы (по длинной стороне тайла) стоят — они прицеплены к
+// стенам, середина едва колышется, у каждой своя фаза.
+const WEB_FRAG = `
+varying vec2 vTextureCoord;
+uniform sampler2D uSampler;
+uniform vec4 inputSize;
+uniform vec4 outputFrame;
+uniform vec4 inputClamp;
+uniform vec2 uA, uB;
+uniform float uAmp, uTime, uPhase;
+void main() {
+  vec2 pos = vTextureCoord * inputSize.xy + outputFrame.xy;
+  vec2 ab = uB - uA;
+  float len2 = max(dot(ab, ab), 1.0);
+  float u = clamp(dot(pos - uA, ab) / len2, 0.0, 1.0);
+  vec2 n = vec2(-ab.y, ab.x) / sqrt(len2);
+  float bow = sin(3.14159265 * u);
+  float w = 0.75 * sin(uTime * 0.9 + uPhase - u * 1.6) + 0.25 * sin(uTime * 2.1 + u * 5.0 + uPhase * 2.0);
+  vec2 src = pos - n * uAmp * bow * w - normalize(ab) * uAmp * 0.3 * bow * sin(uTime * 0.7 + uPhase);
+  vec2 tc = (src - outputFrame.xy) * inputSize.zw;
+  float inside = step(inputClamp.x, tc.x) * step(tc.x, inputClamp.z) * step(inputClamp.y, tc.y) * step(tc.y, inputClamp.w);
+  gl_FragColor = texture2D(uSampler, tc) * inside;
+}`;
+// Размах — доля клетки на всю длину нити: на 10 % сильнее первой версии.
+const WEB_AMP = 0.022;
 const webs = new Map();
 let webTicking = false;
 
+function phaseOf(id) {
+  return [...id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1000, 7) / 1000 * Math.PI * 2;
+}
+
 function rebuildWebs() {
+  for (const w of webs.values()) unhook(w);
   webs.clear();
   for (const tile of canvas.tiles?.placeables ?? []) {
     if (!tile.document.flags?.[MODULE_ID]?.web) continue;
-    const phase = [...tile.id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1000, 7) / 1000 * Math.PI * 2;
-    webs.set(tile.id, { tile, phase });
+    webs.set(tile.id, { tile, phase: phaseOf(tile.id), filter: null });
   }
   if (webs.size && !webTicking) {
     canvas.app.ticker.add(breathe);
     webTicking = true;
   }
+}
+
+function unhook(w) {
+  const mesh = w.tile.mesh;
+  if (w.filter && mesh && !mesh.destroyed) mesh.filters = (mesh.filters ?? []).filter((f) => f !== w.filter);
+  w.filter = null;
+}
+
+/** Концы нити на экране: из пометки (доли холста от середины, их нашёл
+ *  Картограф по рисунку), иначе — вдоль длинной стороны тайла. */
+function webEnds(tile) {
+  const d = tile.document;
+  const s = d.shape ?? d;
+  const rad = ((s.rotation ?? d.rotation) * Math.PI) / 180;
+  const [c, sn] = [Math.cos(rad), Math.sin(rad)];
+  const flag = d.flags[MODULE_ID].web;
+  let e = Array.isArray(flag) ? flag : (d.width >= d.height ? [-0.5, 0, 0.5, 0] : [0, -0.5, 0, 0.5]);
+  const at = (fx, fy) => {
+    const [lx, ly] = [fx * d.width, fy * d.height];
+    return { x: s.x + lx * c - ly * sn, y: s.y + lx * sn + ly * c };
+  };
+  const [p, q] = [at(e[0], e[1]), at(e[2], e[3])];
+  const m = tile.mesh.parent.worldTransform;
+  return { a: m.apply(p), b: m.apply(q), len: Math.hypot(q.x - p.x, q.y - p.y) };
 }
 
 function breathe() {
@@ -183,10 +236,79 @@ function breathe() {
     return;
   }
   const t = performance.now() / 1000;
-  for (const { tile, phase } of webs.values()) {
-    const mesh = tile.mesh;
+  const grid = canvas.dimensions.size;
+  for (const w of webs.values()) {
+    const mesh = w.tile.mesh;
     if (!mesh || mesh.destroyed) continue;
-    mesh.skew.set(Math.sin(t * 0.8 + phase) * 0.018, Math.sin(t * 0.55 + phase * 1.7) * 0.014);
+    if (!w.filter) {
+      w.filter = new PIXI.Filter(undefined, WEB_FRAG, { uA: new Float32Array(2), uB: new Float32Array(2), uAmp: 0, uTime: 0, uPhase: w.phase });
+      w.filter.resolution = canvas.app.renderer.resolution;
+      mesh.filters = [...(mesh.filters ?? []), w.filter];
+    }
+    const { a, b, len } = webEnds(w.tile);
+    const zoom = mesh.parent.worldTransform.a;
+    const amp = WEB_AMP * Math.max(len, grid) * zoom;
+    const u = w.filter.uniforms;
+    u.uA[0] = a.x; u.uA[1] = a.y; u.uB[0] = b.x; u.uB[1] = b.y;
+    u.uAmp = amp;
+    u.uTime = t;
+    w.filter.padding = Math.ceil(amp * 1.6) + 2;
+  }
+}
+
+// Огонь — источник света с пометкой `toggle`: у него кнопка, как у двери.
+// Мастер гасит и зажигает сам, игрок — через Мастера (сокет): обновлять свет
+// игрокам Foundry не даёт. Кнопку игрок видит, только если видит само место.
+const SOCKET = `module.${MODULE_ID}`;
+let switches = null;
+
+function lightIcon(doc) {
+  return doc.hidden ? "icons/svg/light-off.svg" : "icons/svg/light.svg";
+}
+
+async function toggleLight(sceneId, lightId) {
+  const doc = game.scenes.get(sceneId)?.lights.get(lightId);
+  if (!doc?.flags?.[MODULE_ID]?.toggle) return;
+  await doc.update({ hidden: !doc.hidden });
+}
+
+function requestToggle(doc) {
+  if (game.user.isGM) return toggleLight(doc.parent.id, doc.id);
+  if (!game.users.activeGM) return ui.notifications.warn("Картограф: огонь переключит Мастер — его сейчас нет в игре");
+  game.socket.emit(SOCKET, { action: "light", scene: doc.parent.id, light: doc.id });
+}
+
+function rebuildSwitches() {
+  if (switches && !switches.destroyed) switches.destroy({ children: true });
+  switches = null;
+  if (!canvas.ready || !canvas.scene) return;
+  const lights = canvas.scene.lights.filter((l) => l.flags?.[MODULE_ID]?.toggle);
+  if (!lights.length) return;
+  switches = new PIXI.Container();
+  switches.sortableChildren = false;
+  const size = Math.round(canvas.dimensions.size * 0.4);
+  for (const doc of lights) {
+    const icon = PIXI.Sprite.from(lightIcon(doc));
+    icon.anchor.set(0.5);
+    icon.width = icon.height = size;
+    icon.position.set(doc.x, doc.y);
+    icon.alpha = doc.hidden ? 0.55 : 0.9;
+    icon.eventMode = "static";
+    icon.cursor = "pointer";
+    icon.lightDoc = doc;
+    icon.on("pointerdown", (e) => { e.stopPropagation(); requestToggle(doc); });
+    switches.addChild(icon);
+  }
+  canvas.controls.addChild(switches);
+  refreshSwitches();
+}
+
+/** Кнопки видны Мастеру всегда, игроку — там, где он видит. */
+function refreshSwitches() {
+  if (!switches || switches.destroyed) return;
+  for (const icon of switches.children) {
+    const d = icon.lightDoc;
+    icon.visible = game.user.isGM || canvas.visibility?.testVisibility({ x: d.x, y: d.y }, { tolerance: 2 }) === true;
   }
 }
 
@@ -393,11 +515,20 @@ Hooks.once("init", () => {
   window.kartografToScene = (files, update) => {
     toScene(files, update).catch((err) => { console.error(`${MODULE_ID} | на сцену`, err); ui.notifications.error("Картограф: сцена не создалась, подробности в консоли"); });
   };
-  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs };
+  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs, rebuildSwitches, toggleLight };
 });
 
 Hooks.on("canvasReady", rebuildWebs);
 for (const h of ["createTile", "updateTile", "deleteTile"]) Hooks.on(h, () => setTimeout(rebuildWebs, 0));
+Hooks.on("canvasReady", rebuildSwitches);
+for (const h of ["createAmbientLight", "updateAmbientLight", "deleteAmbientLight"]) Hooks.on(h, () => setTimeout(rebuildSwitches, 0));
+Hooks.on("sightRefresh", refreshSwitches);
+Hooks.once("ready", () => {
+  game.socket.on(SOCKET, (msg) => {
+    // Переключает один Мастер — активный, чтобы не дважды.
+    if (msg?.action === "light" && game.user === game.users.activeGM) toggleLight(msg.scene, msg.light);
+  });
+});
 
 Hooks.on("renderSceneDirectory", (app, html) => {
   if (!game.user.isGM) return;

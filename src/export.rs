@@ -450,7 +450,7 @@ pub struct SceneLevel<'a> {
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
-    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: false, chest: None }
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: None, chest: None }
 }
 
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
@@ -471,8 +471,9 @@ pub struct RoofTile {
     pub wind: f32,
     /// Верёвка с бельём: концы стоят, колышется середина.
     pub rope: bool,
-    /// Паутина: на полу под токенами, чуть покачивается.
-    pub web: bool,
+    /// Паутина: на полу под токенами, чуть покачивается; внутри — концы нити
+    /// (доли холста от середины), если их удалось найти.
+    pub web: Option<Option<[f32; 4]>>,
     /// Сундук: картинки открытого с добычей и пустого; модуль сделает его
     /// контейнером Item Piles.
     pub chest: Option<(String, String)>,
@@ -521,12 +522,15 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
             // Паутина и сундук лежат под токенами; их оживляет свой модуль.
-            if r.web || r.chest.is_some() {
+            if r.web.is_some() || r.chest.is_some() {
                 tile["elevation"] = json!(k as i64 * 10);
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = match &r.chest {
                     Some((open, empty)) => json!({OWN_MODULE: {"chest": {"open": open, "empty": empty}}}),
-                    None => json!({OWN_MODULE: {"web": true}}),
+                    None => match r.web.flatten() {
+                        Some(e) => json!({OWN_MODULE: {"web": e.map(|v| (v as f64 * 1000.0).round() / 1000.0)}}),
+                        None => json!({OWN_MODULE: {"web": true}}),
+                    },
                 };
             } else if !r.shelter {
                 // Крону качает ветер «Wild Canvas»; крыша стоит.
@@ -630,6 +634,7 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
             // Дверь закрыта и непрозрачна, пока её не откроют.
             PortalKind::Door | PortalKind::DoubleDoor => {
                 w["door"] = json!(1);
+                w["doorSound"] = json!(door_sound(po.leaf.as_deref()));
                 let double = po.kind == PortalKind::DoubleDoor;
                 if let Some(leaf) = po.leaf.as_ref().and_then(|k| leaves.get(k)) {
                     // Foundry растягивает створку на длину, а по толщине масштабирует
@@ -644,6 +649,7 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
             // Потайная дверь Foundry: игроки видят стену, пока ведущий не откроет.
             PortalKind::Secret => {
                 w["door"] = json!(2);
+                w["doorSound"] = json!("stoneBasic");
             }
             // Окно: сквозь него видно и светит, но не пройти.
             PortalKind::Window => {
@@ -660,8 +666,27 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
         lights_out.push(json!({
             "_id": doc_id('l', lights_out.len()), "x": x, "y": y,
             "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color, "alpha": 0.35,
-                       "animation": {"type": l.animation, "speed": 3, "intensity": 3}}
+                       "animation": {"type": l.animation, "speed": 3, "intensity": 3}},
+            // Модуль Картографа ставит у огня кнопку: гасить и зажигать может и игрок.
+            "flags": {OWN_MODULE: {"toggle": true}}
         }));
+    }
+}
+
+/// Звук двери Foundry (`CONFIG.Wall.doorSounds`) по картинке створки: решётка
+/// камеры — тюремная, железная — металл, окованная — тяжёлое дерево.
+fn door_sound(leaf: Option<&str>) -> &'static str {
+    let file = leaf.map(|k| k.rsplit(['/', '|']).next().unwrap_or(k).to_lowercase()).unwrap_or_default();
+    if file.starts_with("door_metal_gray_a_") {
+        "jail"
+    } else if ["metal", "iron", "steel"].iter().any(|w| file.contains(w)) && !file.contains("wood") {
+        "metal"
+    } else if file.contains("iron") || file.contains("reinforced") || file.contains("heavy") {
+        "woodHeavy"
+    } else if file.contains("stone") {
+        "stoneBasic"
+    } else {
+        "woodBasic"
     }
 }
 
@@ -777,7 +802,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: false, chest: None }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());

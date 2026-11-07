@@ -401,6 +401,36 @@ pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
     (r > l && b > t).then(|| [l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5])
 }
 
+/// Концы нити (паутина): крайние непрозрачные точки вдоль главной оси рисунка,
+/// доли холста от середины: `[x0, y0, x1, y1]`.
+pub fn strand_ends(sources: &Sources, key: &str) -> Option<[f32; 4]> {
+    let bytes = read_source(key, sources).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let step = (w.max(h) / 256).max(1);
+    let pts: Vec<(f32, f32)> = img.enumerate_pixels().filter(|(x, y, p)| p[3] > 40 && x % step == 0 && y % step == 0).map(|(x, y, _)| (x as f32 + 0.5, y as f32 + 0.5)).collect();
+    if pts.len() < 4 {
+        return None;
+    }
+    let n = pts.len() as f32;
+    let (mx, my) = (pts.iter().map(|p| p.0).sum::<f32>() / n, pts.iter().map(|p| p.1).sum::<f32>() / n);
+    let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+    for &(x, y) in &pts {
+        let (dx, dy) = (x - mx, y - my);
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    let a = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    let (c, s) = (a.cos(), a.sin());
+    let proj = |p: &&(f32, f32)| (p.0 - mx) * c + (p.1 - my) * s;
+    let lo = pts.iter().min_by(|p, q| proj(p).total_cmp(&proj(q)))?;
+    let hi = pts.iter().max_by(|p, q| proj(p).total_cmp(&proj(q)))?;
+    let f = |p: &(f32, f32)| [p.0 / w as f32 - 0.5, p.1 / h as f32 - 0.5];
+    let (a, b) = (f(lo), f(hi));
+    Some([a[0], a[1], b[0], b[1]])
+}
+
 /// Средняя непрозрачность картинки, 0..1 (каждая восьмая точка). У FA среди полов
 /// есть накладки — редкие доски на прозрачном (`Wood_Ashen_Flooring_H`, ~0,2 при
 /// ~0,8 у прочих досок): полом комнаты такая не годится, сквозь неё виден двор.

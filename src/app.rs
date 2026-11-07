@@ -1328,8 +1328,9 @@ impl App {
             self.material = procgen::dungeon_look(&mut self.map);
         }
         let palette = if plan.assets == crate::plan::Assets::Library {
-            let (sources, seen, dense) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
+            let (sources, seen, dense, strung) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
             Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
+                .with_ends(Box::new(move |key| library::strand_ends(&strung, key)))
                 .with_opacity(Box::new(move |key| library::opacity(&dense, key)))
         } else {
             Palette::builtin()
@@ -4955,7 +4956,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: false, chest: None });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
@@ -5026,7 +5027,7 @@ impl App {
                         let empty = save(&empty, &mut files).unwrap_or_else(|_| open.clone());
                         tile.chest = Some((open, empty));
                     }
-                    None => tile.web = true,
+                    None => tile.web = Some(library::strand_ends(&self.textures.sources, &prop.asset)),
                 }
                 tiles.push(tile);
             }

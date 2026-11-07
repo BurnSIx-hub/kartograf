@@ -514,14 +514,29 @@ pub fn web_by_name(key: &str) -> bool {
 
 /// Сундук с сокровищем FA (закрытый): в Foundry открывается. Открытый с монетами и
 /// пустой лежат рядом под тем же именем с хвостом `_Coins_Mixed` и `_Empty_A`.
+/// Простой сундук FA (`Chest_Medium_Wood_Red_A1`) открывается в `…_Open_A1` —
+/// без крышки, пустой. Встроенный — в свои открытый и пустой.
 pub fn chest_variants(key: &str) -> Option<(String, String)> {
-    let (dir, file) = key.rsplit_once('/')?;
-    if !file.starts_with("Treasure_Chest_") || ["Coins", "Empty", "False_Bottom"].iter().any(|w| file.contains(w)) {
-        return None;
+    let b = crate::library::BUILTIN;
+    if let Some(id) = key.strip_prefix(b) {
+        return (id == "chest").then(|| (format!("{b}chest_open"), format!("{b}chest_empty")));
     }
+    let (dir, file) = key.rsplit_once('/')?;
     let (stem, ext) = file.rsplit_once('.')?;
-    let (base, size) = stem.rsplit_once('_')?;
-    Some((format!("{dir}/{base}_Coins_Mixed_{size}.{ext}"), format!("{dir}/{base}_Empty_A_{size}.{ext}")))
+    if file.starts_with("Treasure_Chest_") {
+        if ["Coins", "Empty", "False_Bottom"].iter().any(|w| file.contains(w)) {
+            return None;
+        }
+        let (base, size) = stem.rsplit_once('_')?;
+        return Some((format!("{dir}/{base}_Coins_Mixed_{size}.{ext}"), format!("{dir}/{base}_Empty_A_{size}.{ext}")));
+    }
+    if file.starts_with("Chest_") && !stem.contains("_Open") {
+        let (rest, size) = stem.rsplit_once('_')?;
+        let (base, var) = rest.rsplit_once('_')?;
+        let open = format!("{dir}/{base}_Open_{var}_{size}.{ext}");
+        return Some((open.clone(), open));
+    }
+    None
 }
 
 /// Верёвка с бельём: в Foundry — тайл, который колышет ветер.

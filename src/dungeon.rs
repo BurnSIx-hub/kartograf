@@ -721,6 +721,11 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
             sp.block(r.x - 1, r.y, 1, r.h);
             sp.block(r.x + r.w, r.y, 1, r.h);
             let doors: Vec<Segment> = lay.halls.iter().filter(|hl| hl.a == i || hl.b == i).map(|hl| if hl.a == i { hl.door_a } else { hl.door_b }).collect();
+            // Спуск — первым: у стены напротив входа (в главном зале — у боковой),
+            // и место перед ним свободно.
+            if parts[i] == Part::Exit || (parts[i] == Part::Climax && !parts.contains(&Part::Exit)) {
+                stairs_down(m, &mut sp, rng, &kit, c, parts[i] == Part::Exit);
+            }
             // Главное в комнате — до прохода: саркофаг, алтарь, статуя встают на своё место.
             let at = centrepiece(m, &mut sp, &kit, kind, parts[i], c);
             // Путь между дверями свободен: проходная комната не перегорожена.
@@ -732,10 +737,6 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
             let jail = parts[i] == Part::Cells && doors.len() == 1 && jail_cells(m, &mut sp, rng, &kit, c, doors[0]);
             if !jail {
                 dress(m, &mut sp, rng, &kit, kind, parts[i], c, at);
-            }
-            // Нет комнаты спуска — лестница в главном зале.
-            if parts[i] == Part::Climax && !parts.contains(&Part::Exit) {
-                stairs_down(m, &mut sp, rng, &kit, c);
             }
             if p.mood == Mood::Abandoned {
                 furnish(m, &mut sp, rng, c.r, Role::Ruin);
@@ -883,33 +884,57 @@ fn water(m: &mut Map, rng: &mut Rng, c: &Chamber, pool: bool) {
     let (mw, mh) = (m.rooms.w, m.rooms.h);
     let wet = mat(m, "water_shallow");
     let r = c.r;
-    let mut cells = Vec::new();
-    if pool {
-        let (ix, iy) = ((r.w / 3).max(2), (r.h / 3).max(2));
-        for y in r.y + iy..r.y + r.h - iy {
-            for x in r.x + ix..r.x + r.w - ix {
-                if c.has(x, y) {
-                    cells.push((x, y));
-                }
-            }
-        }
+    // Вода — пятна, а не клетки: круги (у купели — овал посередине) с рваной
+    // шумом кромкой и мягким краем, по точкам маски.
+    let (rw, rh) = (r.w as f32, r.h as f32);
+    let blobs: Vec<([f32; 2], [f32; 2])> = if pool {
+        vec![([r.x as f32 + rw / 2.0, r.y as f32 + rh / 2.0], [(rw / 3.0).max(1.2), (rh / 3.0).max(1.2)])]
     } else {
-        for _ in 0..(r.w * r.h / 9).max(2) {
-            let (cx, cy) = (rng.int(r.x + 1, r.x + r.w - 2), rng.int(r.y + 1, r.y + r.h - 2));
-            let rad = rng.int(1, 2);
-            for y in cy - rad..=cy + rad {
-                for x in cx - rad..=cx + rad {
-                    if c.has(x, y) && (x - cx).abs() + (y - cy).abs() <= rad + 1 {
-                        cells.push((x, y));
-                    }
-                }
+        (0..(r.w * r.h / 12).max(2))
+            .map(|_| {
+                let at = [r.x as f32 + 1.0 + (rng.random() as f32) * (rw - 2.0), r.y as f32 + 1.0 + (rng.random() as f32) * (rh - 2.0)];
+                let rad = 0.9 + (rng.random() as f32) * 1.6;
+                (at, [rad * (0.8 + (rng.random() as f32) * 0.4), rad * (0.8 + (rng.random() as f32) * 0.4)])
+            })
+            .collect()
+    };
+    let seed = rng.int(0, 1 << 20) as u32;
+    let k = mask::RES as f32;
+    let mut weights = Vec::new();
+    for j in (r.y as usize * mask::RES)..((r.y + r.h) as usize * mask::RES).min(mh) {
+        for i in (r.x as usize * mask::RES)..((r.x + r.w) as usize * mask::RES).min(mw) {
+            let p = [(i as f32 + 0.5) / k, (j as f32 + 0.5) / k];
+            if !c.inside(p, 0.05) {
+                continue;
+            }
+            let f = blobs.iter().map(|(o, rad)| 1.0 - (((p[0] - o[0]) / rad[0]).powi(2) + ((p[1] - o[1]) / rad[1]).powi(2)).sqrt()).fold(f32::MIN, f32::max);
+            let f = f + (wobble(p[0] * 1.3, p[1] * 1.3, seed) - 0.5) * 0.55 + (wobble(p[0] * 3.1, p[1] * 3.1, seed ^ 0x9e37) - 0.5) * 0.2;
+            let w = ((f + 0.05) / 0.25).clamp(0.0, 1.0);
+            if w > 0.0 {
+                weights.push((j * mw + i, w * w * (3.0 - 2.0 * w)));
             }
         }
     }
-    let weights: Vec<(usize, f32)> = cells.iter().flat_map(|&c| mask::cells(mw, mh, c, c)).collect();
     if !weights.is_empty() {
         m.paint(Layer::Rooms, wet, &weights);
     }
+}
+
+/// Гладкий шум 0..1 по сетке целых точек: кромка воды.
+fn wobble(x: f32, y: f32, seed: u32) -> f32 {
+    let h = |i: i32, j: i32| -> f32 {
+        let mut v = (i as u32).wrapping_mul(0x8da6_b343) ^ (j as u32).wrapping_mul(0xd816_3841) ^ seed.wrapping_mul(0xcb1a_b31f);
+        v ^= v >> 13;
+        v = v.wrapping_mul(0x5bd1_e995);
+        v ^= v >> 15;
+        (v & 0xffff) as f32 / 65535.0
+    };
+    let (xi, yi) = (x.floor() as i32, y.floor() as i32);
+    let (fx, fy) = (x - xi as f32, y - yi as f32);
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let top = h(xi, yi) + (h(xi + 1, yi) - h(xi, yi)) * sx;
+    let low = h(xi, yi + 1) + (h(xi + 1, yi + 1) - h(xi, yi + 1)) * sx;
+    top + (low - top) * sy
 }
 
 // ----- обстановка -----
@@ -1296,11 +1321,9 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
     let far = (c.entry + 2) % 4;
     let all = [0, 1, 2, 3];
     // Паутина — по углам склепа и руин.
-    let webs = |m: &mut Map, sp: &mut Spots, rng: &mut Rng, n: i32| {
-        if matches!(kind, DungeonKind::Crypt | DungeonKind::Ruins) && !missing("cobweb") {
-            for _ in 0..n {
-                by_wall(m, sp, rng, r, "cobweb", 1.0, true);
-            }
+    let webs = |m: &mut Map, _sp: &mut Spots, rng: &mut Rng, n: i32| {
+        if matches!(kind, DungeonKind::Crypt | DungeonKind::Ruins) && !missing("cobweb") && c.shape == Shape::Rect {
+            cobwebs(m, rng, c, n);
         }
     };
     // В углу, а где угла нет (срезан, занят) — у той же стены.
@@ -1489,43 +1512,113 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
         Part::Store => furnish(m, sp, rng, r, Role::Storage),
         Part::Plan(role) => furnish(m, sp, rng, r, role),
     }
-    // Спуск — лестница у стены напротив входа (в главном зале — если нет своей комнаты).
-    if part == Part::Exit {
-        stairs_down(m, sp, rng, kit, c);
-    }
 }
 
 /// Спуск на нижний ярус — встроенная «Лестница вниз», у стены напротив входа: лестницы
 /// FA деревянные и ведут наверх, в подземелье они читаются как чужие.
-fn stairs_down(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, c: &Chamber) {
+fn stairs_down(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, c: &Chamber, far_wall: bool) {
     let p = kit.stairs.clone();
     let slot = if p.own { "stairs_down" } else { "stairs" };
-    if far_mid(m, sp, c, &p, slot, 1.0).is_none() && spread(m, sp, c, &p, slot, 1, &[0, 1, 2, 3]) == 0
-        && !by_side_pick(m, sp, rng, c.r, &p, slot, 0.7, false, &[0, 1, 2, 3])
-    {
+    // Ступени FA — полоса в клетку; пролёт из двух полос рядом, в две клетки
+    // шириной: место под него размечается по удвоенной ширине.
+    let mut place = p.clone();
+    if let Some(v) = place.visible.as_mut().filter(|_| p.own) {
+        v[1] = -1.0;
+        v[3] = 1.0;
+    }
+    let far = (c.entry + 2) % 4;
+    let sides = if far_wall { [far, (far + 1) % 4, (far + 3) % 4] } else { [(far + 1) % 4, (far + 3) % 4, far] };
+    let n0 = m.props.len();
+    let placed = (far_wall && far_mid(m, sp, c, &place, slot, 1.0).is_some()) || sides.iter().any(|&s| spread(m, sp, c, &place, slot, 1, &[s]) == 1);
+    if !placed && !by_side_pick(m, sp, rng, c.r, &p, slot, 0.7, false, &[0, 1, 2, 3]) {
         drop_pick(m, &p, [c.r.x as f32 + c.r.w as f32 / 2.0, c.r.y as f32 + c.r.h as f32 / 2.0], 0.0, 0.6);
     }
+    if !p.own || m.props.len() != n0 + 1 {
+        return;
+    }
+    let mut st = m.props.pop().unwrap_or_else(|| unreachable!());
     // Пролёт уходит под стену: нижняя ступень у её середины, а не в зазоре.
-    // Низ пролёта (к стене) темнеет — видно, что лестница ведёт вниз.
-    if let (true, Some(st)) = (p.own, m.props.last_mut()) {
-        let a = st.rot.to_radians();
-        let down = [-a.cos(), -a.sin()];
-        st.pos = [st.pos[0] + down[0] * WALL_GAP, st.pos[1] + down[1] * WALL_GAP];
-        let st = st.clone();
-        drop_pick(m, &Palette::builtin_pick("stairs_shade"), st.pos, st.rot, st.scale);
-        // Слой — как у ступеней, иначе «тень» по имени ложится под них.
+    let a = st.rot.to_radians();
+    let (up, across) = ([a.cos(), a.sin()], [-a.sin(), a.cos()]);
+    st.pos = [st.pos[0] - up[0] * WALL_GAP, st.pos[1] - up[1] * WALL_GAP];
+    let wide = place.visible.is_some();
+    let lanes: &[f32] = if wide { &[-0.5, 0.5] } else { &[0.0] };
+    let at = |k: f32| [st.pos[0] + across[0] * k * st.scale, st.pos[1] + across[1] * k * st.scale];
+    for &k in lanes {
+        m.props.push(crate::map::Prop { pos: at(k), ..st.clone() });
+    }
+    // Низ пролёта (к стене) темнеет — видно, что лестница ведёт вниз. Слой — как у
+    // ступеней, иначе «тень» по имени ложится под них.
+    for &k in lanes {
+        drop_pick(m, &Palette::builtin_pick("stairs_shade"), at(k), st.rot, st.scale);
         if let Some(shade) = m.props.last_mut() {
             shade.layer = Some(crate::map::LAYER_DEFAULT);
         }
     }
-    // Перила по обе длинные стороны пролёта: ступени FA шириной в клетку.
-    if let (true, Some(rail), Some(st)) = (p.own, kit.rail.as_ref(), m.props.last().cloned()) {
-        let a = st.rot.to_radians();
-        let half = 0.5 * st.scale;
-        let across = [-a.sin() * half, a.cos() * half];
-        for k in [-1.0, 1.0] {
-            drop_pick(m, rail, [st.pos[0] + across[0] * k, st.pos[1] + across[1] * k], st.rot, st.scale);
+    // Перила по обеим внешним сторонам.
+    if let Some(rail) = kit.rail.as_ref() {
+        let edge = lanes.iter().cloned().fold(0.0f32, f32::max) + 0.5;
+        for k in [-edge, edge] {
+            drop_pick(m, rail, at(k), st.rot, st.scale);
         }
+    }
+    // Перед пролётом две клетки свободны: костёр и мебель не встают на сход.
+    let half_len = 1.5 * st.scale;
+    for d in [0.5, 1.5] {
+        for &k in lanes {
+            for o in [-0.25, 0.25] {
+                let q = at(k + o);
+                let q = [q[0] + up[0] * (half_len + d), q[1] + up[1] * (half_len + d)];
+                sp.block(q[0].floor() as i32, q[1].floor() as i32, 1, 1);
+            }
+        }
+    }
+}
+
+/// Паутина натянута через угол: концы на двух стенах, под 45°. Берётся длинная
+/// паутина FA (1×2, 1×3) — нить между двумя концами; углы разные. В Foundry её
+/// концы стоят, а середина чуть колышется.
+fn cobwebs(m: &mut Map, rng: &mut Rng, c: &Chamber, n: i32) {
+    let r = c.r;
+    let mut free = vec![0, 1, 2, 3];
+    let mut left = n;
+    while left > 0 && !free.is_empty() {
+        let k = free.remove(rng.int(0, free.len() as i32 - 1) as usize);
+        // Белая: чёрная на тёмном камне не видна. Нить в картинках FA бывает
+        // наискось — концы берутся по самому рисунку.
+        let p = asset_toned("cobweb", "white");
+        let Some([x0, y0, x1, y1]) = strand_ends(&p) else { return };
+        let lv = (x1 - x0).hypot(y1 - y0);
+        if lv < 0.3 {
+            continue;
+        }
+        // Длина нити — от 1,5 до 3 клеток; концы на линиях стен, под их полосой.
+        let d = lv.clamp(1.5, 3.0f32.min(r.w.min(r.h) as f32 - 1.0).max(1.5));
+        let s = d / lv;
+        let e = d * std::f32::consts::FRAC_1_SQRT_2;
+        let (corner, sign) = match k {
+            0 => ([r.x as f32, r.y as f32], [1.0, 1.0]),
+            1 => ([(r.x + r.w) as f32, r.y as f32], [-1.0, 1.0]),
+            2 => ([(r.x + r.w) as f32, (r.y + r.h) as f32], [-1.0, -1.0]),
+            _ => ([r.x as f32, (r.y + r.h) as f32], [1.0, -1.0]),
+        };
+        let (p0, p1) = ([corner[0] + sign[0] * e, corner[1]], [corner[0], corner[1] + sign[1] * e]);
+        // За обоими концами — стена на всём пролёте от угла, а не устье коридора.
+        let rock = |q: [f32; 2]| m.rooms.get((q[0] * mask::RES as f32) as isize, (q[1] * mask::RES as f32) as isize) == 0;
+        let walled = (0..=6).all(|i| {
+            let t = i as f32 / 6.0 * (e + 0.2);
+            rock([corner[0] + sign[0] * t, corner[1] - sign[1] * 0.3]) && rock([corner[0] - sign[0] * 0.3, corner[1] + sign[1] * t])
+        });
+        if !walled {
+            continue;
+        }
+        let th = (p1[1] - p0[1]).atan2(p1[0] - p0[0]) - (y1 - y0).atan2(x1 - x0);
+        let (sn, cs) = th.sin_cos();
+        let mid = [(x0 + x1) / 2.0 * s, (y0 + y1) / 2.0 * s];
+        let pm = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0];
+        let centre = [pm[0] - (mid[0] * cs - mid[1] * sn), pm[1] - (mid[0] * sn + mid[1] * cs)];
+        drop_pick(m, &p, centre, th.to_degrees().rem_euclid(360.0), s);
+        left -= 1;
     }
 }
 

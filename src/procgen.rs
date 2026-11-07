@@ -44,6 +44,12 @@ fn asset_toned(slot: &str, tone: &str) -> Pick {
     })
 }
 
+/// Концы нити своего ассета в клетках от середины холста, без масштаба.
+fn strand_ends(p: &Pick) -> Option<[f32; 4]> {
+    let e = PALETTE.with(|pal| pal.borrow().as_ref().and_then(|pal| pal.ends(&p.key)))?;
+    Some([e[0] * p.size[0], e[1] * p.size[1], e[2] * p.size[0], e[3] * p.size[1]])
+}
+
 /// Ключ объекта — ассет этого слота (свой или встроенный).
 fn fits(slot: &str, asset: &str) -> bool {
     PALETTE.with(|p| match p.borrow().as_ref() {

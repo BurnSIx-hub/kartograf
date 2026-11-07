@@ -5,5 +5,6 @@
   "compatibility": { "minimum": "14", "verified": "14" },
   "description": "Редактор карт Картограф внутри Foundry: тот же код, что у программы, собранный в WebAssembly. Только у Мастера.",
   "authors": [{ "name": "Vyazn & Claude" }],
-  "esmodules": ["scripts/main.js"]
+  "esmodules": ["scripts/main.js"],
+  "socket": true
 }

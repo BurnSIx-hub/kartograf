@@ -433,6 +433,8 @@ pub struct Palette {
     /// Чем найти видимую часть картинки (доли от середины); нет — весь холст.
     visible: Option<Box<dyn Fn(&str) -> Option<[f32; 4]>>>,
     boxes: RefCell<HashMap<String, Option<[f32; 4]>>>,
+    /// Концы нити по картинке (паутина), доли холста от середины.
+    ends: Option<Box<dyn Fn(&str) -> Option<[f32; 4]>>>,
     /// Чем мерить непрозрачность текстуры пола; нет — не мерить.
     opacity: Option<Opacity>,
     alphas: RefCell<HashMap<String, Option<f32>>>,
@@ -454,7 +456,7 @@ fn table_of(kind: Kind) -> &'static [Slot] {
 impl Palette {
     /// Всё встроенное.
     pub fn builtin() -> Self {
-        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
+        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
     }
 
     /// Замены из библиотеки: только не встроенные ассеты. Слот крыши без своих
@@ -499,7 +501,7 @@ impl Palette {
             v.dedup();
         }
         frames.sort();
-        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
+        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
     }
 
     /// Рама под подоконник FA: того же размера (`1x1`, `2x1`, «large»), ближе всех
@@ -546,6 +548,16 @@ impl Palette {
     pub fn with_visible(mut self, f: Box<dyn Fn(&str) -> Option<[f32; 4]>>) -> Self {
         self.visible = Some(f);
         self
+    }
+
+    pub fn with_ends(mut self, f: Box<dyn Fn(&str) -> Option<[f32; 4]>>) -> Self {
+        self.ends = Some(f);
+        self
+    }
+
+    /// Концы нити своего ассета, доли холста от середины.
+    pub fn ends(&self, key: &str) -> Option<[f32; 4]> {
+        self.ends.as_ref().and_then(|f| f(key))
     }
 
     pub fn is_empty(&self) -> bool {
