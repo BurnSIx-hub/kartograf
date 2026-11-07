@@ -1069,7 +1069,18 @@ fn cyber_centre(m: &mut Map, sp: &mut Spots, part: Part, c: &Chamber) -> Option<
     let at = |m: &mut Map, sp: &mut Spots, slot: &str| far_mid(m, sp, c, &asset(slot), slot, 1.0);
     let mid = |m: &mut Map, sp: &mut Spots, slot: &str| centre(m, sp, c, &asset(slot), slot, far, 1.0);
     match part {
-        Part::Climax | Part::Bar => at(m, sp, "cy_bar"),
+        // Клуб: пульт диджея у дальней стены, вогнутой стороной к танцполу.
+        Part::Climax => {
+            // Посередине дальней стены бывает выход — тогда вдоль неё или у боковой.
+            let slot = or("cy_dj", "cy_bar");
+            let placed = at(m, sp, slot);
+            if placed.is_none() {
+                let p = asset(slot);
+                let _ = [far, (far + 1) % 4, (far + 3) % 4].iter().any(|&s| spread(m, sp, c, &p, slot, 1, &[s]) == 1);
+            }
+            placed
+        }
+        Part::Bar => at(m, sp, "cy_bar"),
         Part::Clinic => mid(m, sp, "cy_surgery"),
         Part::Lab => mid(m, sp, "cy_holo_table"),
         Part::Garage => mid(m, sp, "cy_hovercar"),
@@ -1101,7 +1112,10 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
         }
         Part::Climax => {
-            // Клуб: стойка у дальней стены, диваны по бокам, автоматы, голограмма.
+            // Клуб: стойка у боковой стены, диваны, автоматы, голограмма на танцполе.
+            if !missing("cy_dj") {
+                walls(m, sp, rng, "cy_bar", 1, &sides);
+            }
             pair(m, sp, "cy_sofa", &sides);
             walls(m, sp, rng, "cy_arcade", 2, &all);
             walls(m, sp, rng, "cy_vending", 1, &all);
@@ -1126,11 +1140,14 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         Part::Lab => {
             walls(m, sp, rng, "cy_workbench", 1, &all);
             walls(m, sp, rng, "cy_terminal", 2, &all);
+            walls(m, sp, rng, "cy_barrel", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_planter", 1, &all);
         }
         Part::Garage => {
             walls(m, sp, rng, "cy_moto", 2, &all);
+            walls(m, sp, rng, "cy_weapons", 1, &all);
+            walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_cables", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             let wreck = if rng.chance(0.5) { "cy_drone" } else { "cy_android" };
@@ -1143,16 +1160,20 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         }
         Part::Market => {
             walls(m, sp, rng, "cy_vending", 2, &all);
+            walls(m, sp, rng, "cy_kiosk", 2, &all);
             walls(m, sp, rng, "cy_trash", 2, &all);
             walls(m, sp, rng, "cy_planter", 2, &all);
         }
         Part::Treasure => {
             pair(m, sp, "cy_turret", &[c.entry]);
+            walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_lockers", 1, &all);
         }
         Part::Store => {
             walls(m, sp, rng, "cy_crate", 3, &all);
+            walls(m, sp, rng, "cy_weapons", 1, &all);
+            walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_lockers", 1, &all);
             walls(m, sp, rng, "cy_trash", 1, &all);
         }

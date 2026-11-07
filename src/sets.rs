@@ -1,7 +1,7 @@
 //! Встроенные наборы ассетов (киберпанк и др.). Файл собирает `tools/gen_sets.py`
 //! из `assets/sets/` — руками не править.
 
-pub const SET_FILES: [(&str, &[u8]); 36] = [
+pub const SET_FILES: [(&str, &[u8]); 40] = [
     ("cyberpunk/floors/Floor_Alloy_Dark_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Dark_A.webp")),
     ("cyberpunk/floors/Floor_Alloy_Grid_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Grid_A.webp")),
     ("cyberpunk/floors/Floor_Alloy_Panels_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Panels_A.webp")),
@@ -10,10 +10,12 @@ pub const SET_FILES: [(&str, &[u8]); 36] = [
     ("cyberpunk/objects/Android_Wreck_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Android_Wreck_A_1x1.webp")),
     ("cyberpunk/objects/Arcade_Cabinet_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Arcade_Cabinet_A_1x1.webp")),
     ("cyberpunk/objects/Bar_Counter_Neon_A_3x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Bar_Counter_Neon_A_3x1.webp")),
+    ("cyberpunk/objects/Barrel_Toxic_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Barrel_Toxic_A_1x1.webp")),
     ("cyberpunk/objects/Cables_Floor_A_3x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Cables_Floor_A_3x1.webp")),
     ("cyberpunk/objects/Chair_Office_Neon_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Chair_Office_Neon_A_1x1.webp")),
     ("cyberpunk/objects/Crate_Tech_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Crate_Tech_A_1x1.webp")),
     ("cyberpunk/objects/Cryo_Pod_A_1x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Cryo_Pod_A_1x2.webp")),
+    ("cyberpunk/objects/DJ_Booth_Neon_A_3x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/DJ_Booth_Neon_A_3x2.webp")),
     ("cyberpunk/objects/Desk_Glass_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Desk_Glass_A_2x1.webp")),
     ("cyberpunk/objects/Drone_Broken_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Drone_Broken_A_1x1.webp")),
     ("cyberpunk/objects/Floor_Hatch_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Floor_Hatch_A_1x1.webp")),
@@ -22,6 +24,7 @@ pub const SET_FILES: [(&str, &[u8]); 36] = [
     ("cyberpunk/objects/Holo_Projector_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Holo_Projector_A_1x1.webp")),
     ("cyberpunk/objects/Holo_Table_Round_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Holo_Table_Round_A_2x2.webp")),
     ("cyberpunk/objects/Hover_Car_A_2x4.webp", include_bytes!("../assets/sets/cyberpunk/objects/Hover_Car_A_2x4.webp")),
+    ("cyberpunk/objects/Kiosk_Street_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Kiosk_Street_A_1x1.webp")),
     ("cyberpunk/objects/Lockers_Row_A_3x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Lockers_Row_A_3x1.webp")),
     ("cyberpunk/objects/Medical_Bed_A_1x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Medical_Bed_A_1x2.webp")),
     ("cyberpunk/objects/Motorcycle_Neon_A_1x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Motorcycle_Neon_A_1x2.webp")),
@@ -37,5 +40,6 @@ pub const SET_FILES: [(&str, &[u8]); 36] = [
     ("cyberpunk/objects/Trash_Bin_Tech_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Trash_Bin_Tech_A_1x1.webp")),
     ("cyberpunk/objects/Turret_Security_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Turret_Security_A_1x1.webp")),
     ("cyberpunk/objects/Vending_Machine_Neon_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Vending_Machine_Neon_A_2x1.webp")),
+    ("cyberpunk/objects/Weapon_Rack_Tech_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Weapon_Rack_Tech_A_2x1.webp")),
     ("cyberpunk/objects/Workbench_Robotics_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Workbench_Robotics_A_2x1.webp")),
 ];
