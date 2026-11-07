@@ -55,6 +55,8 @@ const FLOORS: &[Slot] = &[
     ("dungeon_flagstones", &[&["dungeon"], &["flagstone", "dark"], &["подземелье"]], &["moss"]),
     // Пол подземелья по виду — только камень, в тёмных тонах (сланец, вулканический);
     // у храма мрамор и узорная плитка, у руин треснувшая и мшистая.
+    // Киберпанк: металлические плиты; сетка — под живой неон.
+    ("cy_floor", &[&["floor", "alloy", "grid"], &["floor", "alloy", "panels"], &["floor", "alloy", "dark"]], &[]),
     ("crypt_floor", &[&["large", "flagstone", "slate"], &["large", "flagstone", "volcanic"], &["flat", "stone", "floor", "slate"], &["flat", "stone", "floor", "volcanic"], &["stone", "square", "tiles", "slate"]], &["snowy", "dirt", "cracked", "rotated"]),
     ("prison_floor", &[&["rock", "tiles", "slate"], &["rock", "tiles", "volcanic"], &["cobblestone", "square", "slate"], &["cobblestone", "slate"], &["cobblestone", "volcanic"]], &["snowy", "mossy", "rotated", "dirt"]),
     ("temple_floor", &[&["marble", "tiles"], &["stone", "patterned", "tiles", "sandstone"], &["stone", "hexagonal", "tiles", "sandstone"], &["stone", "patterned", "tiles", "slate"]], &["cracked"]),
@@ -95,6 +97,37 @@ const OBJECTS: &[Slot] = &[
     ("wardrobe", &[&["wardrobe"], &["closet"], &["armoire"], &["шкаф"]], &["book"]),
     ("bookshelf", &[&["bookshelf"], &["bookcase"], &["book", "shelf"], &["shelf"], &["books"]], &[]),
     ("chest", &[&["chest"], &["сундук"]], &["open", "empty", "drawers", "открытый", "пустой"]),
+    // Киберпанк — только свой набор (имена из него).
+    ("cy_bar", &[&["bar", "counter", "neon"]], &[]),
+    ("cy_sofa", &[&["sofa", "neon"]], &[]),
+    ("cy_arcade", &[&["arcade", "cabinet"]], &[]),
+    ("cy_server", &[&["server", "rack"]], &[]),
+    ("cy_terminal", &[&["terminal", "console"]], &[]),
+    ("cy_holo_table", &[&["holo", "table"]], &[]),
+    ("cy_holo", &[&["holo", "projector"]], &[]),
+    ("cy_cryo", &[&["cryo", "pod"]], &[]),
+    ("cy_med_bed", &[&["medical", "bed"]], &[]),
+    ("cy_surgery", &[&["surgery", "chair", "cyber"]], &[]),
+    ("cy_workbench", &[&["workbench", "robotics"]], &[]),
+    ("cy_hovercar", &[&["hover", "car"]], &[]),
+    ("cy_moto", &[&["motorcycle", "neon"]], &[]),
+    ("cy_lockers", &[&["lockers", "row"]], &[]),
+    ("cy_desk", &[&["desk", "glass"]], &[]),
+    ("cy_chair", &[&["chair", "office", "neon"]], &[]),
+    ("cy_vending", &[&["vending", "machine", "neon"]], &[]),
+    ("cy_noodle", &[&["noodle", "stall"]], &[]),
+    ("cy_crate", &[&["crate", "tech"]], &[]),
+    ("cy_trash", &[&["trash", "bin", "tech"]], &[]),
+    ("cy_planter", &[&["planter", "hydroponic"]], &[]),
+    ("cy_reactor", &[&["reactor", "core"]], &[]),
+    ("cy_turret", &[&["turret", "security"]], &[]),
+    ("cy_drone", &[&["drone", "broken"]], &[]),
+    ("cy_android", &[&["android", "wreck"]], &[]),
+    ("cy_lamp", &[&["neon", "lamp"]], &[]),
+    ("cy_hatch", &[&["floor", "hatch"]], &[]),
+    ("cy_vent", &[&["floor", "vent"]], &[]),
+    ("cy_cables", &[&["cables", "floor"]], &[]),
+    ("cy_partition", &[&["glass", "partition"]], &[]),
     // Сундук с сокровищем FA: у него есть открытый с монетами и пустой — в Foundry
     // он открывается (Item Piles).
     ("treasure_chest", &[&["treasure", "chest"]], &["coins", "empty", "false", "bottom", "open"]),
@@ -241,6 +274,7 @@ const WALLS: &[Slot] = &[
     ("wall_cave_moss", &[&["cliff", "stone", "mossy"], &["cliff", "dirt"]], &["top"]),
     ("wall_cave_volcanic", &[&["cliff", "stone", "volcanic"]], &["top", "sand", "desert"]),
     ("wall_cave_purple", &[&["cliff", "stone", "purple"]], &["top"]),
+    ("cy_wall", &[&["alloy"]], &[]),
     ("wall_dwarven", &[&["dwarven"], &["dwarf"], &["гномья"]], &[]),
     ("wall_drow", &[&["drow"], &["obsidian"], &["обсидиан"]], &[]),
 ];
@@ -252,6 +286,9 @@ const PORTALS: &[Slot] = &[
     ("door_metal", &[&["door", "metal"], &["door", "steel"], &["дверь", "железная"]], &["frame", "double"]),
     // Решётка камеры: у FA это тонкая серая дверь `Door_Metal_Gray_A`.
     ("door_bars", &[&["door", "metal", "gray", "a"]], &["frame", "double"]),
+    // Железные косяки FA — для киберпанка.
+    ("frame_door_metal", &[&["door", "frame", "metal"]], &["double"]),
+    ("frame_double_metal", &[&["door", "frame", "double", "metal"]], &[]),
     // Каменные косяки FA в тон стены: на одну клетку и двойной на две.
     ("frame_door_stone", &[&["door", "frame", "stone"]], &["double"]),
     ("frame_double_stone", &[&["door", "frame", "double", "stone"]], &[]),
@@ -389,6 +426,11 @@ const NEAR: &[(&str, &str)] = &[
     ("sandstone", "sand"),
     ("chest_open", "chest"),
     ("treasure_chest", "chest"),
+    ("cy_bar", "bar_counter"),
+    ("cy_desk", "table"),
+    ("cy_chair", "chair"),
+    ("cy_crate", "crate"),
+    ("cy_floor", "flagstones"),
     ("chest_empty", "chest"),
     ("arena_sand", "sand"),
     ("arena_sand_rough", "sand"),

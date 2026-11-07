@@ -49,10 +49,12 @@ pub enum Live {
     Water,
     Lava,
     Swamp,
+    /// Неон по швам пола («Wild Canvas»): швы киберпанк-пола совпадают с сеткой.
+    Neon,
 }
 
 impl Live {
-    pub const CHOICES: [Live; 5] = [Live::Auto, Live::Off, Live::Water, Live::Lava, Live::Swamp];
+    pub const CHOICES: [Live; 6] = [Live::Auto, Live::Off, Live::Water, Live::Lava, Live::Swamp, Live::Neon];
 
     pub fn is_auto(&self) -> bool {
         *self == Live::Auto
@@ -65,6 +67,7 @@ impl Live {
             Live::Water => "вода",
             Live::Lava => "лава",
             Live::Swamp => "болото",
+            Live::Neon => "неон",
         }
     }
 
@@ -74,6 +77,7 @@ impl Live {
             Live::Water => Some("water"),
             Live::Lava => Some("lava"),
             Live::Swamp => Some("swamp"),
+            Live::Neon => Some("neon"),
             Live::Auto | Live::Off => None,
         }
     }
@@ -92,6 +96,8 @@ impl Material {
         let has = |ws: &[&str]| ws.iter().any(|w| key.contains(w));
         if has(&["lava", "magma", "лава", "магма"]) {
             Live::Lava
+        } else if has(&["alloy_grid", "neon", "неон"]) {
+            Live::Neon
         } else if has(&["swamp", "bog", "marsh", "болот", "топь"]) {
             Live::Swamp
         } else if has(&["water", "вода", "мелковод", "глубина", "river", "lake", "pond", "sea", "ocean"]) {

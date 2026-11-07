@@ -243,6 +243,25 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
         zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new() });
     }
+    // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
+    // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
+    let neon: Vec<mask::Mask> = map.materials.iter().enumerate().filter(|(_, m)| m.live() == map::Live::Neon).map(|(i, _)| map.material_mask(i)).collect();
+    if !neon.is_empty() {
+        let res = mask::RES as f32;
+        let on_neon = |q: [f32; 2]| neon.iter().any(|n| n.get((q[0] * res) as isize, (q[1] * res) as isize) > 0);
+        // Врезанное в пол (`Floor_Hatch`, `Floor_Vent_Grate`, `Cables_Floor`) — тоже плоское.
+        let inlaid = |k: &str| {
+            let f = k.rsplit(['/', '|']).next().unwrap_or(k).to_lowercase();
+            f.starts_with("floor_") || f.contains("_floor_")
+        };
+        for p in map.props.iter().filter(|p| on_neon(p.pos) && p.light().is_none() && !map::flat_by_name(&p.asset) && !map::web_by_name(&p.asset) && !inlaid(&p.asset)) {
+            let (hw, hh) = (p.size[0] * p.scale * 0.45, p.size[1] * p.scale * 0.45);
+            let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
+            let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
+            let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
+            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new() });
+        }
+    }
     // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
     if !map.indoor.is_empty() && !map.rooms.is_empty() {
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
@@ -559,8 +578,9 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             let (title, color) = match z.effect {
                 "lava" => ("Лава", "#ff6a1a"),
                 "swamp" => ("Болото", "#6a8f3a"),
+                "neon" => ("Неон", "#28e0ff"),
                 "fire" => ("Огонь", "#ff9a3c"),
-                "cut" => ("Мост", "#8a6a44"),
+                "cut" => ("Вырез", "#8a6a44"),
                 "place" => ("Звук внутри", "#c9a24a"),
                 _ => ("Вода", "#2a8fd6"),
             };
@@ -790,6 +810,31 @@ mod tests {
         assert_eq!(r["flags"][LIVE_MODULE]["effect"], "water");
         assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
         assert_eq!(r["shapes"][0]["type"], "polygon");
+    }
+
+    #[test]
+    fn neon_floor_gets_region_and_cuts_under_furniture() {
+        use crate::map::{Live, Material, Paint, Prop};
+        let mut m = Map::new(10, 8);
+        let key = "pack:cp|textures/terrain/cyberpunk/floors/Floor_Alloy_Grid_A.webp";
+        let floor = m.material_index(Material { name: "Floor_Alloy_Grid_A".into(), paint: Paint::Texture(key.into()), vary: false, live: Live::Auto }).unwrap();
+        assert_eq!(m.materials[floor].live(), Live::Neon);
+        let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (8, 6));
+        m.paint(crate::map::Layer::Rooms, floor, &all);
+        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        m.props.push(prop("pack:cp|textures/objects/Armchair_Neon_A_2x1.webp", [4.0, 4.0]));
+        m.props.push(prop("pack:cp|textures/objects/Neon_Lamp_Floor_A_1x1.webp", [6.0, 3.0]));
+        m.props.push(prop("pack:cp|textures/objects/Floor_Vent_Grate_A_1x1.webp", [3.0, 3.0]));
+        m.props.push(prop("pack:cp|textures/objects/Cables_Floor_A_3x1.webp", [5.0, 5.5]));
+        // Вне неонового пола — без выреза.
+        m.props.push(prop("pack:cp|textures/objects/Armchair_Neon_A_2x1.webp", [0.5, 0.5]));
+        let lay = layout(&m, &[]);
+        assert!(lay.zones.iter().any(|z| z.effect == "neon"));
+        let cuts: Vec<_> = lay.zones.iter().filter(|z| z.effect == "cut").collect();
+        assert_eq!(cuts.len(), 1, "вырез только под креслом на полу");
+        let xs: Vec<f32> = cuts[0].loops[0].0.iter().map(|v| v[0]).collect();
+        // Повёрнуто на 90°: поперёк по x — клетка, а не две.
+        assert!(xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min) < 1.0);
     }
 
     #[test]

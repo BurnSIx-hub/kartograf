@@ -127,6 +127,14 @@ enum Part {
     Lair,
     Flooded,
     Store,
+    // Киберпанк (главный зал — клуб).
+    Bar,
+    Clinic,
+    Servers,
+    Lab,
+    Garage,
+    Office,
+    Market,
     /// Роль из плана.
     Plan(Role),
 }
@@ -140,8 +148,11 @@ impl Part {
                 DungeonKind::Prison => "Яма",
                 DungeonKind::Temple => "Святилище",
                 DungeonKind::Ruins => "Логово",
+                DungeonKind::Cyber => "Клуб",
             },
+            Part::Treasure if kind == DungeonKind::Cyber => "Реакторная",
             Part::Treasure => "Тайник",
+            Part::Exit if kind == DungeonKind::Cyber => "Техлюк",
             Part::Exit => "Спуск",
             Part::Tomb => "Усыпальница",
             Part::Ossuary => "Оссуарий",
@@ -157,7 +168,15 @@ impl Part {
             Part::Collapsed => "Обвал",
             Part::Lair => "Лёжка",
             Part::Flooded => "Затопленный зал",
+            Part::Store if kind == DungeonKind::Cyber => "Склад",
             Part::Store => "Кладовая",
+            Part::Bar => "Бар",
+            Part::Clinic => "Клиника рипердока",
+            Part::Servers => "Серверная",
+            Part::Lab => "Лаборатория",
+            Part::Garage => "Гараж",
+            Part::Office => "Офис",
+            Part::Market => "Рынок",
             Part::Plan(_) => "",
         }
     }
@@ -170,6 +189,7 @@ pub(super) fn floor_slot(kind: DungeonKind) -> &'static str {
         DungeonKind::Prison => "prison_floor",
         DungeonKind::Temple => "temple_floor",
         DungeonKind::Ruins => "ruin_floor",
+        DungeonKind::Cyber => "cy_floor",
     }
 }
 
@@ -179,6 +199,7 @@ pub(super) fn wall_slot(kind: DungeonKind, rng: &mut Rng) -> &'static str {
         DungeonKind::Prison => pick(rng, &["wall_fieldstone", "wall_stone_blocks"]),
         DungeonKind::Temple => pick(rng, &["wall_sandstone", "wall_stone_blocks"]),
         DungeonKind::Ruins => pick(rng, &["wall_ruined_blocks", "wall_ruined"]),
+        DungeonKind::Cyber => "cy_wall",
     }
 }
 
@@ -188,6 +209,7 @@ fn pool(kind: DungeonKind) -> &'static [Part] {
         DungeonKind::Prison => &[Part::Cells, Part::Guard, Part::Torture, Part::Cells, Part::Warden, Part::Store, Part::Cells],
         DungeonKind::Temple => &[Part::Shrine, Part::Pool, Part::Library, Part::Shrine, Part::Store, Part::Chapel],
         DungeonKind::Ruins => &[Part::Collapsed, Part::Lair, Part::Flooded, Part::Store, Part::Collapsed, Part::Ossuary],
+        DungeonKind::Cyber => &[Part::Bar, Part::Clinic, Part::Servers, Part::Lab, Part::Garage, Part::Office, Part::Market, Part::Store],
     }
 }
 
@@ -585,7 +607,8 @@ fn bridge(g: &Grid, rooms: &[Chamber], a: usize, b: usize) -> Option<Hall> {
 
 pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
     let (w, h) = (m.width as i32, m.height as i32);
-    let kind = p.options.dungeon;
+    // Вкладка «Киберпанк» — тот же рост от входа со своими комнатами и набором.
+    let kind = if p.kind == Kind::Cyber { DungeonKind::Cyber } else { p.options.dungeon };
     let [lo, hi] = p.options.room_size;
     let (lo, hi) = ((lo as i32).max(4), (hi as i32).max(lo as i32 + 1).max(5));
     let n = p.rooms.len().max(1);
@@ -603,7 +626,7 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
         Some(own) => wall(own),
         None => wall_toned(walls, tone),
     };
-    let kit = Kit::new(tone);
+    let kit = Kit::new(kind, tone);
     ground(m, "rocky_ground");
     // Комнаты — по маске, мельче клетки: круглые и восьмиугольные с ровным краем,
     // а не лесенкой из клеток.
@@ -681,6 +704,7 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
                     DungeonKind::Crypt => 0.45,
                     DungeonKind::Temple => 0.4,
                     DungeonKind::Ruins => 0.15,
+                    DungeonKind::Cyber => 0.8,
                 };
                 (k == 1 || rng.chance(0.3)).then_some(()).filter(|_| rng.chance(doors)).map(|_| PortalKind::DoubleDoor)
             };
@@ -727,7 +751,7 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
                 stairs_down(m, &mut sp, rng, &kit, c, parts[i] == Part::Exit);
             }
             // Главное в комнате — до прохода: саркофаг, алтарь, статуя встают на своё место.
-            let at = centrepiece(m, &mut sp, &kit, kind, parts[i], c);
+            let at = if kind == DungeonKind::Cyber { cyber_centre(m, &mut sp, parts[i], c) } else { centrepiece(m, &mut sp, &kit, kind, parts[i], c) };
             // Путь между дверями свободен: проходная комната не перегорожена.
             let inner: Vec<[f32; 2]> = doors.iter().map(|d| inside(c, *d)).collect();
             for w in inner.windows(2) {
@@ -736,7 +760,11 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
             // Камеры — в тупике с одной дверью; иначе эта комната — пыточная.
             let jail = parts[i] == Part::Cells && doors.len() == 1 && jail_cells(m, &mut sp, rng, &kit, c, doors[0]);
             if !jail {
-                dress(m, &mut sp, rng, &kit, kind, parts[i], c, at);
+                if kind == DungeonKind::Cyber {
+                    cyber_dress(m, &mut sp, rng, &kit, parts[i], c);
+                } else {
+                    dress(m, &mut sp, rng, &kit, kind, parts[i], c, at);
+                }
             }
             if p.mood == Mood::Abandoned {
                 furnish(m, &mut sp, rng, c.r, Role::Ruin);
@@ -977,6 +1005,8 @@ struct Kit {
     door: Pick,
     /// Перила лестницы FA в тон, если есть.
     rail: Option<Pick>,
+    /// Слот спуска: лестница FA, у киберпанка — люк в полу.
+    descent: &'static str,
 }
 
 /// Тон камня — слово в именах FA: Slate, Volcanic, Sandstone, Earthy, Redrock.
@@ -986,13 +1016,29 @@ fn tone_of(kind: DungeonKind, rng: &mut Rng) -> &'static str {
         DungeonKind::Prison => pick(rng, &["volcanic", "slate"]),
         DungeonKind::Temple => "sandstone",
         DungeonKind::Ruins => pick(rng, &["earthy", "redrock"]),
+        DungeonKind::Cyber => "",
     }
 }
 
 impl Kit {
-    fn new(tone: &str) -> Self {
+    fn new(kind: DungeonKind, tone: &str) -> Self {
         let t = |slot: &str| asset_toned(slot, tone);
+        if kind == DungeonKind::Cyber {
+            // Железные двери и косяки FA, люк вместо лестницы, неоновые лампы и турели.
+            let mut k = Kit::new(DungeonKind::Crypt, tone);
+            k.stairs = asset("cy_hatch");
+            k.descent = "cy_hatch";
+            k.rail = None;
+            k.frame1 = asset("frame_door_metal");
+            k.frame2 = asset("frame_double_metal");
+            k.door = asset(or("door_metal", "door_wood"));
+            k.brazier = asset("cy_lamp");
+            k.statue = asset("cy_turret");
+            k.chest = asset("cy_crate");
+            return k;
+        }
         Kit {
+            descent: "stairs_down",
             stairs: if missing("stairs_down") { Palette::builtin_pick("stairs") } else { t("stairs_down") },
             frame1: t("frame_door_stone"),
             frame2: t("frame_double_stone"),
@@ -1013,6 +1059,112 @@ impl Kit {
             chest: asset(or("treasure_chest", "chest")),
             bench: asset("bench"),
             throne: asset(or("throne", "statue")),
+        }
+    }
+}
+
+/// Главное в комнате киберпанка — до прохода между дверями.
+fn cyber_centre(m: &mut Map, sp: &mut Spots, part: Part, c: &Chamber) -> Option<Room> {
+    let far = (c.entry + 2) % 4;
+    let at = |m: &mut Map, sp: &mut Spots, slot: &str| far_mid(m, sp, c, &asset(slot), slot, 1.0);
+    let mid = |m: &mut Map, sp: &mut Spots, slot: &str| centre(m, sp, c, &asset(slot), slot, far, 1.0);
+    match part {
+        Part::Climax | Part::Bar => at(m, sp, "cy_bar"),
+        Part::Clinic => mid(m, sp, "cy_surgery"),
+        Part::Lab => mid(m, sp, "cy_holo_table"),
+        Part::Garage => mid(m, sp, "cy_hovercar"),
+        Part::Market => mid(m, sp, "cy_noodle"),
+        Part::Treasure => mid(m, sp, "cy_reactor"),
+        Part::Servers => at(m, sp, "cy_terminal"),
+        _ => None,
+    }
+}
+
+/// Обстановка комнаты киберпанка: свой набор, неоновые лампы по углам.
+fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part, c: &Chamber) {
+    let r = c.r;
+    let far = (c.entry + 2) % 4;
+    let sides = [(far + 1) % 4, (far + 3) % 4];
+    let all = [0, 1, 2, 3];
+    let walls = |m: &mut Map, sp: &mut Spots, rng: &mut Rng, slot: &str, n: i32, at: &[i32]| {
+        for _ in 0..n {
+            by_side_pick(m, sp, rng, r, &asset(slot), slot, 1.0, false, at);
+        }
+    };
+    let pair = |m: &mut Map, sp: &mut Spots, slot: &str, at: &[i32]| {
+        spread(m, sp, c, &asset(slot), slot, 2, at);
+    };
+    match part {
+        Part::Entrance => {
+            // Турели в углах напротив входа, урна у двери.
+            pair(m, sp, "cy_turret", &[far]);
+            walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
+        }
+        Part::Climax => {
+            // Клуб: стойка у дальней стены, диваны по бокам, автоматы, голограмма.
+            pair(m, sp, "cy_sofa", &sides);
+            walls(m, sp, rng, "cy_arcade", 2, &all);
+            walls(m, sp, rng, "cy_vending", 1, &all);
+            centre(m, sp, c, &asset("cy_holo"), "cy_holo", far, 1.0);
+        }
+        Part::Bar => {
+            walls(m, sp, rng, "cy_sofa", 2, &sides);
+            walls(m, sp, rng, "cy_arcade", 1, &all);
+            walls(m, sp, rng, "cy_vending", 1, &all);
+        }
+        Part::Clinic => {
+            pair(m, sp, "cy_med_bed", &sides);
+            walls(m, sp, rng, "cy_cryo", 2, &[far]);
+            walls(m, sp, rng, "cy_terminal", 1, &all);
+        }
+        Part::Servers => {
+            if rows(m, sp, c, &asset("cy_server"), "cy_server", 1.0, 1, false) == 0 {
+                walls(m, sp, rng, "cy_server", 4, &all);
+            }
+            walls(m, sp, rng, "cy_cables", 1, &all);
+        }
+        Part::Lab => {
+            walls(m, sp, rng, "cy_workbench", 1, &all);
+            walls(m, sp, rng, "cy_terminal", 2, &all);
+            walls(m, sp, rng, "cy_crate", 2, &all);
+            walls(m, sp, rng, "cy_planter", 1, &all);
+        }
+        Part::Garage => {
+            walls(m, sp, rng, "cy_moto", 2, &all);
+            walls(m, sp, rng, "cy_cables", 1, &all);
+            walls(m, sp, rng, "cy_crate", 2, &all);
+            let wreck = if rng.chance(0.5) { "cy_drone" } else { "cy_android" };
+            walls(m, sp, rng, wreck, 1, &all);
+        }
+        Part::Office => {
+            desk_and_seat(m, sp, rng, c, "cy_desk", "cy_chair");
+            walls(m, sp, rng, "cy_lockers", 1, &sides);
+            walls(m, sp, rng, "cy_planter", 1, &all);
+        }
+        Part::Market => {
+            walls(m, sp, rng, "cy_vending", 2, &all);
+            walls(m, sp, rng, "cy_trash", 2, &all);
+            walls(m, sp, rng, "cy_planter", 2, &all);
+        }
+        Part::Treasure => {
+            pair(m, sp, "cy_turret", &[c.entry]);
+            walls(m, sp, rng, "cy_crate", 2, &all);
+            walls(m, sp, rng, "cy_lockers", 1, &all);
+        }
+        Part::Store => {
+            walls(m, sp, rng, "cy_crate", 3, &all);
+            walls(m, sp, rng, "cy_lockers", 1, &all);
+            walls(m, sp, rng, "cy_trash", 1, &all);
+        }
+        _ => {}
+    }
+    // Неоновые лампы — по углам у входа; люк вентиляции на полу через раз.
+    spread(m, sp, c, &kit.brazier, "cy_lamp", 2, &[c.entry]);
+    if rng.chance(0.4) {
+        let p = asset("cy_vent");
+        let (x, y) = (rng.int(r.x + 1, r.x + r.w - 2), rng.int(r.y + 1, r.y + r.h - 2));
+        if c.whole(x, y) {
+            put_pick(m, sp, &p, "cy_vent", x, y, 0.0, 1.0);
         }
     }
 }
@@ -1240,6 +1392,11 @@ fn flank(m: &mut Map, sp: &mut Spots, c: &Chamber, at: Room, p: &Pick, slot: &st
 
 /// Стол или конторка у стены напротив входа и стул перед ним, лицом к столу.
 fn desk_and_chair(m: &mut Map, sp: &mut Spots, rng: &mut Rng, c: &Chamber, desk: &str) {
+    desk_and_seat(m, sp, rng, c, desk, "chair");
+}
+
+/// То же со своим сиденьем (`chair` — слот).
+fn desk_and_seat(m: &mut Map, sp: &mut Spots, rng: &mut Rng, c: &Chamber, desk: &str, seat: &str) {
     let far = (c.entry + 2) % 4;
     let p = asset(desk);
     let placed = far_mid(m, sp, c, &p, desk, FURNITURE).is_some() || by_side_pick(m, sp, rng, c.r, &p, desk, FURNITURE, false, &[far]);
@@ -1247,7 +1404,7 @@ fn desk_and_chair(m: &mut Map, sp: &mut Spots, rng: &mut Rng, c: &Chamber, desk:
         return;
     }
     let Some(d) = m.props.last().cloned() else { return };
-    let chair = asset("chair");
+    let chair = asset(seat);
     let [l, t, r, u] = bounds(&p, desk, d.rot, FURNITURE);
     let depth = if far % 2 == 0 { u - t } else { r - l };
     // От стены в комнату.
@@ -1256,8 +1413,11 @@ fn desk_and_chair(m: &mut Map, sp: &mut Spots, rng: &mut Rng, c: &Chamber, desk:
     let at = [centre[0] + inward[0] * (depth / 2.0 + 0.45), centre[1] + inward[1] * (depth / 2.0 + 0.45)];
     // Сиденье спиной от стола: у северной стены стол — стул смотрит на север.
     let rot = (far as f32 * 90.0 + 180.0 + chair.turn) % 360.0;
-    let [cl, ct, cr, cu] = bounds(&chair, "chair", rot, FURNITURE);
+    let [cl, ct, cr, cu] = bounds(&chair, seat, rot, FURNITURE);
     drop_pick(m, &chair, [at[0] - (cl + cr) / 2.0, at[1] - (ct + cu) / 2.0], rot, FURNITURE);
+    // Стул задвинут под стол: рисуется до него, стол ложится сверху.
+    let n = m.props.len();
+    m.props.swap(n - 1, n - 2);
     sp.block(at[0].floor() as i32, at[1].floor() as i32, 1, 1);
 }
 
@@ -1386,6 +1546,7 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
                         by_side_pick(m, sp, rng, r, &kit.bones, "bones", 0.9, false, &all);
                     }
                 }
+                DungeonKind::Cyber => {}
             }
             corners(m, sp, rng, &kit.brazier, "brazier", 2, &[c.entry]);
             webs(m, sp, rng, 2);
@@ -1509,6 +1670,7 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
             }
             webs(m, sp, rng, 2);
         }
+        Part::Bar | Part::Clinic | Part::Servers | Part::Lab | Part::Garage | Part::Office | Part::Market => {}
         Part::Store => furnish(m, sp, rng, r, Role::Storage),
         Part::Plan(role) => furnish(m, sp, rng, r, role),
     }
@@ -1518,11 +1680,12 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, kind: DungeonKin
 /// FA деревянные и ведут наверх, в подземелье они читаются как чужие.
 fn stairs_down(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, c: &Chamber, far_wall: bool) {
     let p = kit.stairs.clone();
-    let slot = if p.own { "stairs_down" } else { "stairs" };
+    let slot = if p.own { kit.descent } else { "stairs" };
+    let flight = slot == "stairs_down";
     // Ступени FA — полоса в клетку; пролёт из двух полос рядом, в две клетки
     // шириной: место под него размечается по удвоенной ширине.
     let mut place = p.clone();
-    if let Some(v) = place.visible.as_mut().filter(|_| p.own) {
+    if let Some(v) = place.visible.as_mut().filter(|_| flight) {
         v[1] = -1.0;
         v[3] = 1.0;
     }
@@ -1533,7 +1696,7 @@ fn stairs_down(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, c: &Chambe
     if !placed && !by_side_pick(m, sp, rng, c.r, &p, slot, 0.7, false, &[0, 1, 2, 3]) {
         drop_pick(m, &p, [c.r.x as f32 + c.r.w as f32 / 2.0, c.r.y as f32 + c.r.h as f32 / 2.0], 0.0, 0.6);
     }
-    if !p.own || m.props.len() != n0 + 1 {
+    if !flight || m.props.len() != n0 + 1 {
         return;
     }
     let mut st = m.props.pop().unwrap_or_else(|| unreachable!());
@@ -1721,6 +1884,19 @@ mod tests {
                 assert!(m.labels.iter().any(|l| l.text.starts_with("1. Вход")), "{kind:?}: нет подписи входа");
             }
         }
+    }
+
+    #[test]
+    fn cyberpunk_tab_builds_its_own_rooms() {
+        let o = Options { kind: Kind::Cyber, seed: "неон".into(), rooms: 10, ..Options::default() };
+        let plan = Plan::random(&o, [50, 40]);
+        let mut m = Map::new(50, 40);
+        build(&mut m, &plan, 0, Palette::builtin()).unwrap();
+        assert!(m.labels.iter().any(|l| l.text.ends_with("Клуб")), "нет клуба");
+        assert!(m.labels.iter().all(|l| !l.text.contains("Гробница")));
+        // Набор встроен: его ассеты есть в библиотеке и помечены своим набором.
+        let lib = crate::library::Library::default();
+        assert!(lib.assets.iter().any(|a| crate::library::set_of(&a.key) == Some("cyberpunk") && a.key.contains("Sofa_Neon")));
     }
 
     #[test]

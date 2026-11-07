@@ -18,6 +18,7 @@ mod procgen;
 mod recovery;
 mod roofs;
 mod selftest;
+mod sets;
 #[cfg(not(target_arch = "wasm32"))]
 mod update;
 #[cfg(target_arch = "wasm32")]

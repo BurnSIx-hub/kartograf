@@ -586,8 +586,19 @@ pub fn label(key: &str) -> String {
 /// Где лежат байты картинки из пака.
 pub type Sources = Arc<RwLock<HashMap<String, (PathBuf, u64, u64)>>>;
 
+/// Ключ картинки встроенного набора: `set:cyberpunk/objects/Sofa_Neon_A_2x1.webp`.
+pub const SET: &str = "set:";
+
+/// Набор ассета (`cyberpunk`), если он из встроенного набора. Ассеты набора
+/// идут только в свой генератор, в обычные карты не попадают.
+pub fn set_of(key: &str) -> Option<&str> {
+    key.strip_prefix(SET)?.split('/').next()
+}
+
 fn read_source(key: &str, sources: &Sources) -> Result<Vec<u8>, String> {
-    if key.starts_with(BUILTIN) {
+    if let Some(rel) = key.strip_prefix(SET) {
+        crate::sets::SET_FILES.iter().find(|f| f.0 == rel).map(|f| f.1.to_vec()).ok_or_else(|| format!("нет картинки набора {key}"))
+    } else if key.starts_with(BUILTIN) {
         builtin(key).map(|t| t.1.to_vec()).ok_or_else(|| format!("нет встроенной картинки {key}"))
     } else if key.starts_with("pack:") {
         let src = sources.read().ok().and_then(|s| s.get(key).cloned());
@@ -1073,7 +1084,13 @@ impl Library {
         let walls = BUILTIN_WALLS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Wall));
         let portals = BUILTIN_PORTALS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Door));
         let roofs = BUILTIN_ROOFS.iter().map(|t| Asset::new(format!("{BUILTIN}{}", t.0), &format!("Встроенные/{}", t.1), Kind::Roof));
-        let builtin = textures.chain(objects).chain(walls).chain(portals).chain(roofs);
+        // Встроенные наборы — как своя папка: «Киберпанк/objects/…».
+        let sets = crate::sets::SET_FILES.iter().filter_map(|(rel, _)| {
+            let kind = kind_of(rel, false)?;
+            let shown = rel.strip_prefix("cyberpunk/").map_or_else(|| (*rel).to_owned(), |r| format!("Киберпанк/{r}"));
+            Some(Asset::new(format!("{SET}{rel}"), &shown, kind))
+        });
+        let builtin = textures.chain(objects).chain(walls).chain(portals).chain(roofs).chain(sets);
         self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
     }
 

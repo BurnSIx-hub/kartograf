@@ -55,10 +55,18 @@ pub enum Kind {
     Tavern,
     #[serde(alias = "арена", alias = "колизей", alias = "colosseum")]
     Arena,
+    /// Киберпанк: подземелье по росту от входа, но свой набор ассетов и комнаты.
+    #[serde(alias = "киберпанк", alias = "cyberpunk")]
+    Cyber,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern, Kind::Arena];
+    pub const ALL: [Kind; 8] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern, Kind::Arena, Kind::Cyber];
+
+    /// Растёт от входа комнатами и коридорами: подземелье и киберпанк.
+    pub fn grows(self) -> bool {
+        matches!(self, Kind::Dungeon | Kind::Cyber)
+    }
 
     /// Звук места в «Wild Canvas»; у леса он по времени года, у пещеры — по виду.
     /// Дом и таверна стоят в лесу по тому же времени года: снаружи слышна округа.
@@ -67,7 +75,7 @@ impl Kind {
             Kind::Dungeon => "dungeon-1",
             Kind::Cave => o.cave.ambience(),
             Kind::Forest | Kind::House | Kind::Tavern => o.season.ambience(),
-            Kind::Town | Kind::Arena => "town-1",
+            Kind::Town | Kind::Arena | Kind::Cyber => "town-1",
         }
     }
 
@@ -89,6 +97,7 @@ impl Kind {
             Kind::House => "Дом",
             Kind::Tavern => "Таверна",
             Kind::Arena => "Колизей",
+            Kind::Cyber => "Киберпанк",
         }
     }
 }

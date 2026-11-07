@@ -1327,9 +1327,24 @@ impl App {
         if fresh_look && plan.kind == generate::Kind::Dungeon {
             self.material = procgen::dungeon_look(&mut self.map);
         }
-        let palette = if plan.assets == crate::plan::Assets::Library {
+        // Встроенный набор (киберпанк) — только своей вкладке: в обычные карты его
+        // ассеты не попадают. Киберпанку свой набор есть всегда, а паки — лишь
+        // «Из библиотеки» (железные двери и косяки FA).
+        let cyber = plan.kind == generate::Kind::Cyber;
+        let library_mode = plan.assets == crate::plan::Assets::Library;
+        let palette = if library_mode || cyber {
+            let assets: Vec<library::Asset> = self
+                .library
+                .assets
+                .iter()
+                .filter(|a| match library::set_of(&a.key) {
+                    Some(set) => cyber && set == "cyberpunk",
+                    None => library_mode,
+                })
+                .cloned()
+                .collect();
             let (sources, seen, dense, strung) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
-            Palette::from_library(&self.library.assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
+            Palette::from_library(&assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
                 .with_ends(Box::new(move |key| library::strand_ends(&strung, key)))
                 .with_opacity(Box::new(move |key| library::opacity(&dense, key)))
         } else {
@@ -1375,7 +1390,7 @@ impl App {
         if self.notice.is_none() {
             let name = if plan.name.is_empty() { path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { plan.name.clone() };
             self.notice = Some(format!("Построено по плану «{name}»: {} {}", r.count, match plan.kind {
-                generate::Kind::Dungeon | generate::Kind::House | generate::Kind::Tavern => "комнат",
+                generate::Kind::Dungeon | generate::Kind::Cyber | generate::Kind::House | generate::Kind::Tavern => "комнат",
                 generate::Kind::Town => "домов",
                 generate::Kind::Forest => "деревьев",
                 generate::Kind::Cave => "клеток",
@@ -1740,7 +1755,7 @@ impl App {
         if let Some(mut opt) = self.generator.take() {
             let mut open = true;
             let mut go = false;
-            let dungeon = opt.kind == generate::Kind::Dungeon;
+            let dungeon = opt.kind.grows();
             let own_assets = self.library.assets.iter().any(|a| !a.is_builtin());
             let map_seed = self.map.seed.clone();
             egui::Window::new(opt.kind.label())
@@ -1806,13 +1821,16 @@ impl App {
                         return;
                     }
                     // Пол и стены — по виду подземелья, размеры комнат — свои у каждой.
-                    ui.label("Вид");
-                    ui.horizontal(|ui| {
-                        for d in crate::plan::DungeonKind::ALL {
-                            ui.selectable_value(&mut opt.dungeon, d, d.label());
-                        }
-                    });
-                    ui.end_row();
+                    // У киберпанка вид один, набор свой.
+                    if opt.kind == generate::Kind::Dungeon {
+                        ui.label("Вид");
+                        ui.horizontal(|ui| {
+                            for d in crate::plan::DungeonKind::ALL {
+                                ui.selectable_value(&mut opt.dungeon, d, d.label());
+                            }
+                        });
+                        ui.end_row();
+                    }
                     ui.label("Комнат");
                     ui.add(egui::Slider::new(&mut opt.rooms, 3..=30));
                     ui.end_row();
@@ -2076,8 +2094,8 @@ impl App {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
                         let mut o = Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, cave: self.gen_cave, district: self.gen_district, dungeon: self.gen_dungeon, ..Default::default() };
-                        // Подземелье растёт от входа: комнат побольше, колец заметно.
-                        if kind == generate::Kind::Dungeon {
+                        // Подземелье и киберпанк растут от входа: комнат побольше, колец заметно.
+                        if kind.grows() {
                             (o.rooms, o.loops) = (10, 0.4);
                         }
                         self.generator = Some(o);

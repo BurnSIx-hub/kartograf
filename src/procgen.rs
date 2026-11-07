@@ -2549,10 +2549,10 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
     }
     let mut warnings = p.unused();
     let _guard = PaletteGuard;
-    if p.assets == Assets::Library {
-        if palette.is_empty() {
+    if p.assets == Assets::Library || p.kind == Kind::Cyber {
+        if palette.is_empty() && p.assets == Assets::Library {
             warnings.push("в библиотеке нет своих ассетов: построено встроенными".into());
-        } else {
+        } else if !palette.is_empty() {
             palette.seed(&p.seed);
             PALETTE.with(|slot| *slot.borrow_mut() = Some(palette));
         }
@@ -2563,7 +2563,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         // Связи между комнатами задал план — комнаты ставятся под них; иначе подземелье
         // растёт от входа (`dungeon.rs`).
         Kind::Dungeon if p.links.iter().any(|l| !l.touches(OUTSIDE)) => dungeon(m, p, material, &mut rng, &mut warnings),
-        Kind::Dungeon => dungeon::dungeon(m, p, &mut rng, &mut warnings),
+        Kind::Dungeon | Kind::Cyber => dungeon::dungeon(m, p, &mut rng, &mut warnings),
         Kind::Cave => cave(m, p, &mut rng, &mut warnings),
         Kind::Forest => forest(m, p, &mut rng, &mut warnings),
         Kind::Town => quarter::quarter(m, p, &mut rng, &mut warnings),

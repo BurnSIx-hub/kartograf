@@ -510,6 +510,9 @@ pub enum DungeonKind {
     /// Руины: завалы, лужи, логово.
     #[serde(alias = "руины", alias = "развалины")]
     Ruins,
+    /// Киберпанк — для своей вкладки, в списке видов подземелья его нет.
+    #[serde(alias = "киберпанк")]
+    Cyber,
 }
 
 impl DungeonKind {
@@ -521,6 +524,7 @@ impl DungeonKind {
             DungeonKind::Prison => "Темница",
             DungeonKind::Temple => "Храм",
             DungeonKind::Ruins => "Руины",
+            DungeonKind::Cyber => "Киберпанк",
         }
     }
 
@@ -706,7 +710,7 @@ impl Plan {
         let lo = opt.min_size.clamp(2, least);
         plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave, district: opt.district, dungeon: opt.dungeon };
         match opt.kind {
-            Kind::Dungeon => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
+            Kind::Dungeon | Kind::Cyber => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
             Kind::House | Kind::Tavern => {
                 let tavern = opt.kind == Kind::Tavern;
                 let (bw, bh) = building_size(opt.kind, size[0], size[1]);
@@ -775,7 +779,7 @@ impl Plan {
         if !(4..=400).contains(&w) || !(4..=400).contains(&h) {
             errors.push(format!("размер карты {w}×{h}: сторона от 4 до 400 клеток"));
         }
-        let has_rooms = matches!(self.kind, Kind::Dungeon | Kind::House | Kind::Tavern);
+        let has_rooms = matches!(self.kind, Kind::Dungeon | Kind::Cyber | Kind::House | Kind::Tavern);
         if has_rooms && self.rooms.is_empty() {
             errors.push(format!("{}: нужна хотя бы одна комната", self.kind.label()));
         }
@@ -874,7 +878,7 @@ impl Plan {
                     errors.push(format!("комнаты не помещаются: им нужно около {need} клеток, а дом на карте {w}×{h} выходит {bw}×{bh} — {} клеток", bw * bh));
                 }
             }
-            Kind::Dungeon => {
+            Kind::Dungeon | Kind::Cyber => {
                 let [lo, hi] = self.options.room_size;
                 if lo < 2 || hi < lo {
                     errors.push(format!("размер комнат от {lo} до {hi}: от не меньше 2 и не больше до"));
@@ -930,7 +934,7 @@ impl Plan {
                     out.push(format!("{kind}: река не поддерживается"));
                 }
             }
-            Kind::Dungeon => {
+            Kind::Dungeon | Kind::Cyber => {
                 if self.style.roof.is_some() {
                     out.push("подземелье: крыша не нужна".into());
                 }
