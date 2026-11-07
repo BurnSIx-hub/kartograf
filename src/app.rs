@@ -4625,8 +4625,8 @@ impl App {
                 continue;
             }
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
-            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some()) {
-                // Куст, навес, бельё, паутина и сундук уйдут в свой тайл целиком.
+            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
+                // Куст, навес, бельё, паутина, сундук и колонка уйдут в свой тайл целиком.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
@@ -4974,7 +4974,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, speaker: false });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
@@ -5018,7 +5018,7 @@ impl App {
             }
             // Паутина и сундуки — тайлами на полу: паутину покачивает, сундук
             // открывается. Картинка — одна на ассет.
-            for prop in map.props.iter().filter(|p| e.canopies && (map::web_by_name(&p.asset) || map::chest_variants(&p.asset).is_some())) {
+            for prop in map.props.iter().filter(|p| e.canopies && (map::web_by_name(&p.asset) || map::chest_variants(&p.asset).is_some() || map::speaker_by_name(&p.asset))) {
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
                     if let Some(src) = canopies.get(key) {
                         return Ok(src.clone());
@@ -5038,6 +5038,11 @@ impl App {
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
                 tile.fade = false;
                 tile.leaves = false;
+                if map::speaker_by_name(&prop.asset) {
+                    tile.speaker = true;
+                    tiles.push(tile);
+                    continue;
+                }
                 match map::chest_variants(&prop.asset) {
                     // Нет открытого или пустого в библиотеке — тот же закрытый.
                     Some((open, empty)) => {

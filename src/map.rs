@@ -512,6 +512,12 @@ pub fn awning_by_name(key: &str) -> bool {
     key.starts_with(&format!("{}market_stall", crate::library::BUILTIN)) || key.contains("/Arranged_Tarps/")
 }
 
+/// Неоновая колонка киберпанка: в Foundry — свой тайл, «Wild Canvas» оживляет
+/// её под музыку.
+pub fn speaker_by_name(key: &str) -> bool {
+    key.contains("Speaker_Stack")
+}
+
 /// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.
 pub fn web_by_name(key: &str) -> bool {
     let lower = key.to_lowercase();
