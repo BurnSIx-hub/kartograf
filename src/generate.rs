@@ -112,11 +112,13 @@ pub struct Options {
     pub season: crate::plan::Season,
     /// Пещера: вид.
     pub cave: crate::plan::CaveKind,
+    /// Квартал: обычный, с таверной, торговый.
+    pub district: crate::plan::District,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone, district: crate::plan::District::Mixed }
     }
 }
 

@@ -545,8 +545,10 @@ fn hearth(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, sides: &[i32]) ->
         let (along, depth) = if side % 2 == 0 { (fr - fl, fu - ft) } else { (fu - ft, fr - fl) };
         // Полоса у стены: камин, ковёр, кресла — глубиной до 4,5 клетки, шириной 4.
         let zone_w = (along.ceil() as i32).max(4);
-        let zone_d = ((depth + 3.4).ceil() as i32).min(match side % 2 { 0 => r.h - 3, _ => r.w - 3 });
-        if zone_w + 2 > len || zone_d < 3 {
+        // Полоса целиком или никак: урезанная, она отпускала кресла за свой край, и
+        // на них ложились стол и диван — тогда у этой стены просто камин.
+        let zone_d = (depth + 3.4).ceil() as i32;
+        if zone_w + 2 > len || zone_d > match side % 2 { 0 => r.h - 3, _ => r.w - 3 } {
             continue;
         }
         // Из стенных координат (вдоль стены u, от стены v) — в клетки карты.

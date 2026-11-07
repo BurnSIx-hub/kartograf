@@ -80,7 +80,10 @@ const OBJECTS: &[Slot] = &[
     ("desk", &[&["desk"], &["writing", "table"]], &[]),
     ("sofa", &[&["sofa"], &["couch"], &["диван"]], &[]),
     ("armchair", &[&["armchair"], &["chair", "arm"], &["кресло"]], &[]),
-    ("bench", &[&["bench"], &["скамья"]], &["work", "workbench"]),
+    // Простая деревянная: обитые кожей, школьные, пристенные и прочие — не то.
+    ("bench", &[&["bench"], &["скамья"]], &["work", "workbench", "fancy", "ceremorph", "piano", "charpai", "school", "wall", "base", "stone", "metal", "snowy", "frosty"]),
+    // Каменная — для площади и улицы.
+    ("bench_stone", &[&["bench", "stone"]], &["wall", "base", "damaged", "fallen"]),
     ("bed", &[&["bed"], &["кровать"]], &["double", "large", "king", "bunk", "flower", "двуспальная"]),
     ("bed_double", &[&["bed", "double"], &["bed", "large"], &["bed", "king"], &["bed", "arranged"], &["кровать", "двуспальная"]], &[]),
     ("wardrobe", &[&["wardrobe"], &["closet"], &["armoire"], &["шкаф"]], &["book"]),
@@ -88,7 +91,8 @@ const OBJECTS: &[Slot] = &[
     ("chest", &[&["chest"], &["сундук"]], &["open", "empty", "drawers", "открытый", "пустой"]),
     ("chest_open", &[&["chest", "open"], &["сундук", "открытый"]], &["empty"]),
     ("chest_empty", &[&["chest", "empty"], &["сундук", "пустой"]], &[]),
-    ("barrel", &[&["barrel"], &["бочка"]], &["broken"]),
+    // Бочки с надписью «TNT» — не для таверны и не для улицы.
+    ("barrel", &[&["barrel"], &["бочка"]], &["broken", "tnt"]),
     ("crate", &[&["crate"], &["ящик"]], &["broken", "flower", "planter"]),
     ("sacks", &[&["sack"], &["sacks"], &["bag"], &["мешки"], &["мешок"]], &["sleeping"]),
     ("rug", &[&["rug"], &["carpet"], &["ковёр"], &["ковер"]], &["round", "круглый"]),
@@ -251,10 +255,13 @@ const PARTS: &[&str] = &[
 
 /// Куда смотрит спина своего предмета, если не вверх, как у встроенных: камины FA
 /// нарисованы задней стенкой (дымоход, глухая сторона топки) влево, деревянной
-/// полкой и устьем топки вправо. Поворот по часовой, который ставит спину наверх.
+/// полкой и устьем топки вправо; у полукруглого горна плоская сторона внизу.
+/// Поворот по часовой, который ставит спину наверх.
 fn turn_of(slot: &str, name: &str) -> f32 {
     let file = name.rsplit('/').next().unwrap_or(name);
-    if slot == "fireplace" && file.starts_with("Fireplace_") {
+    if slot == "forge" && file.contains("SemiCircle") {
+        180.0
+    } else if slot == "fireplace" && file.starts_with("Fireplace_") {
         90.0
     } else {
         0.0

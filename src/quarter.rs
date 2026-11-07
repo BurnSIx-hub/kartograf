@@ -18,8 +18,16 @@
 //!   квартал, кусты; у кузни телега и уголь, у таверны сено и поилка.
 //! - Улица живёт у фасадов: бочки, ящики, цветы у стен, фонари по тротуару.
 //!   Середина проезжей части свободна, у бордюра бывает телега.
+//! - Вид квартала ([`District`]). «С таверной» — постоялый двор, как английский
+//!   coaching inn: самый большой дом, лицом на площадь или главную улицу, за ним
+//!   двор с конюшней. «Торговый» — по улицам почти одни лавки (кто чем торгует —
+//!   [`Goods`]), у заднего проезда склады купцов, площадь рыночная, прилавков много.
+//! - Таверна внутри — как у старых трактиров и у картографов: общий зал со стойкой
+//!   у задней стены, за стойкой дверь кухни, рядом погреб с бочками; у широкой —
+//!   отдельная зала (parlour) с камином и комнаты постояльцев. См. [`tavern_hall`].
 
 use super::*;
+use crate::plan::District;
 
 /// Ранг проезда: главная улица, переулок, задний проезд.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -56,6 +64,31 @@ struct Plot {
     face: i32,
     trade: Trade,
     rank: Rank,
+    /// Чем торгует лавка; у прочих — `General`, не важно.
+    goods: Goods,
+}
+
+/// Товар лавки: от него полки и что на них. Встроенных картинок мало, своё из
+/// паков (полки с товаром, стойки оружия) берётся, если есть.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Goods {
+    /// Лавка всего понемногу: ящики, бочки, мешки.
+    General,
+    /// Оружейник: стойки с мечами, топорами, копьями.
+    Arms,
+    /// Книги и свитки: шкафы, конторка.
+    Books,
+    /// Травник, аптекарь: полки со склянками, котёл, стол с утварью.
+    Herbs,
+}
+
+fn goods(rng: &mut Rng) -> Goods {
+    match rng.int(0, 5) {
+        0..=2 => Goods::General,
+        3 => Goods::Arms,
+        4 => Goods::Books,
+        _ => Goods::Herbs,
+    }
 }
 
 /// Комната дома по назначению.
@@ -71,6 +104,12 @@ enum Use {
     Forge,
     Hall,
     Office,
+    /// Отдельная зала таверны — для чистой публики и для ужина: камин, один стол.
+    Parlour,
+    /// Погреб таверны: бочки, ящики; дверь — в кухню.
+    Cellar,
+    /// Комната постояльца: кровать, сундук.
+    Guest,
 }
 
 /// Ширина вдоль улицы и глубина дома по назначению, в клетках: от и до.
@@ -93,24 +132,49 @@ struct Tally {
     bakeries: i32,
 }
 
-fn choose(rank: Rank, corner: bool, depth: i32, t: &mut Tally, rng: &mut Rng) -> Trade {
-    if corner && !t.tavern && depth >= 9 && rank != Rank::Back && (rank == Rank::Main || rng.chance(0.5)) {
+/// Назначение участка. `corner_tavern` — можно ли таверну на углу: у квартала «с
+/// таверной» её место выбрано заранее ([`inn_site`]).
+fn choose(rank: Rank, corner: bool, depth: i32, t: &mut Tally, rng: &mut Rng, district: District, corner_tavern: bool) -> Trade {
+    if corner_tavern && corner && !t.tavern && depth >= 9 && rank != Rank::Back && (rank == Rank::Main || rng.chance(0.5)) {
         t.tavern = true;
         return Trade::Tavern;
     }
     let roll = rng.random();
-    let trade = match rank {
-        Rank::Main if roll < 0.36 => Trade::Shop,
-        Rank::Main if roll < 0.48 => Trade::Bakery,
-        Rank::Main if roll < 0.60 => Trade::Smith,
-        Rank::Lane if roll < 0.15 => Trade::Shop,
-        Rank::Lane if roll < 0.25 => Trade::Smith,
-        Rank::Back if roll < 0.35 => Trade::Store,
-        _ => Trade::Home,
+    let trade = if district == District::Market {
+        // Торговый: на улицах лавки, где-то пекарня и кузня; у заднего проезда —
+        // склады купцов. Жильё — в глубине переулков.
+        match rank {
+            Rank::Main if roll < 0.70 => Trade::Shop,
+            Rank::Main if roll < 0.82 => Trade::Bakery,
+            Rank::Main if roll < 0.90 => Trade::Smith,
+            Rank::Main => Trade::Store,
+            Rank::Lane if roll < 0.60 => Trade::Shop,
+            Rank::Lane if roll < 0.70 => Trade::Smith,
+            Rank::Lane if roll < 0.82 => Trade::Store,
+            Rank::Back if roll < 0.65 => Trade::Store,
+            _ => Trade::Home,
+        }
+    } else {
+        match rank {
+            Rank::Main if roll < 0.36 => Trade::Shop,
+            Rank::Main if roll < 0.48 => Trade::Bakery,
+            Rank::Main if roll < 0.60 => Trade::Smith,
+            Rank::Lane if roll < 0.15 => Trade::Shop,
+            Rank::Lane if roll < 0.25 => Trade::Smith,
+            Rank::Back if roll < 0.35 => Trade::Store,
+            _ => Trade::Home,
+        }
     };
+    let bakeries = if district == District::Market { 2 } else { 1 };
     match trade {
-        Trade::Smith if t.smiths >= 2 => Trade::Home,
-        Trade::Bakery if t.bakeries >= 1 => Trade::Shop,
+        Trade::Smith if t.smiths >= 2 => {
+            if district == District::Market {
+                Trade::Shop
+            } else {
+                Trade::Home
+            }
+        }
+        Trade::Bakery if t.bakeries >= bakeries => Trade::Shop,
         Trade::Smith => {
             t.smiths += 1;
             trade
@@ -175,7 +239,7 @@ struct Layout {
     horiz: bool,
 }
 
-fn layout(w: i32, h: i32, rng: &mut Rng, density: f32) -> Layout {
+fn layout(w: i32, h: i32, rng: &mut Rng, density: f32, market: bool) -> Layout {
     let horiz = w >= h;
     let (long, short) = if horiz { (w, h) } else { (h, w) };
     let main_w = if short >= 24 { 6 } else if short >= 14 { 5 } else { 4 };
@@ -227,8 +291,9 @@ fn layout(w: i32, h: i32, rng: &mut Rng, density: f32) -> Layout {
         }
     }
 
-    // Площадь у главной улицы, ближе к середине: на большой карте.
-    if long >= 34 && short >= 18 {
+    // Площадь у главной улицы, ближе к середине: на большой карте; у торгового
+    // квартала — и на карте поменьше, и шире: это рыночная площадь.
+    if (long >= 34 && short >= 18) || (market && long >= 26 && short >= 16) {
         let touches_main = |b: &Room| if horiz { b.y + b.h == main.y || b.y == main.y + main.h } else { b.x + b.w == main.x || b.x == main.x + main.w };
         let centre = long / 2;
         let mid = |b: &Room| if horiz { b.x + b.w / 2 } else { b.y + b.h / 2 };
@@ -238,7 +303,7 @@ fn layout(w: i32, h: i32, rng: &mut Rng, density: f32) -> Layout {
             let b = blocks.remove(i);
             let (bu, bv, bl, bd) = if horiz { (b.x, b.y, b.w, b.h) } else { (b.y, b.x, b.h, b.w) };
             let near_main = if horiz { b.y + b.h == main.y } else { b.x + b.w == main.x };
-            let mut sl = bl.min(rng.int(10, 13));
+            let mut sl = bl.min(if market { rng.int(13, 16) } else { rng.int(10, 13) });
             // Узкий остаток по бокам — голая полоса: пусть уж площадь шире.
             if (bl - sl) / 2 < 4 {
                 sl = bl;
@@ -261,20 +326,60 @@ fn layout(w: i32, h: i32, rng: &mut Rng, density: f32) -> Layout {
     Layout { streets, blocks, main, road, horiz }
 }
 
-/// Какой проезд за стороной `side` квартала: по клетке посередине стороны.
-fn facing(b: Room, side: i32, streets: &[Street]) -> Option<Rank> {
-    let (x, y) = match side {
+/// Клетка за серединой стороны `side` квартала.
+fn outside(b: Room, side: i32) -> (i32, i32) {
+    match side {
         0 => (b.x + b.w / 2, b.y - 1),
         1 => (b.x + b.w, b.y + b.h / 2),
         2 => (b.x + b.w / 2, b.y + b.h),
         _ => (b.x - 1, b.y + b.h / 2),
-    };
+    }
+}
+
+/// Какой проезд за стороной `side` квартала: по клетке посередине стороны.
+fn facing(b: Room, side: i32, streets: &[Street]) -> Option<Rank> {
+    let (x, y) = outside(b, side);
     streets.iter().filter(|s| contains(s.r, x, y)).map(|s| s.rank).min()
 }
 
+/// Где встанет постоялый двор: квартал и его сторона. Лучше всего — лицом на
+/// площадь, иначе на главную улицу ближе к середине карты. Вглубь лучше 12 клеток
+/// и больше: зал в 8 клеток (стойка с табуретами берёт четыре, остальное — столы)
+/// и кухня; на маленькой карте — сколько есть, от 9.
+fn inn_site(blocks: &[Room], streets: &[Street], w: i32, h: i32) -> Option<(usize, i32)> {
+    for (main_only, dmin) in [(true, 12), (false, 12), (true, 10), (false, 9)] {
+        let mut best: Option<((i32, i32, i32), usize, i32)> = None;
+        for (i, &b) in blocks.iter().enumerate() {
+            for side in 0..4 {
+                let Some(rank) = facing(b, side, streets) else { continue };
+                if rank == Rank::Back || (main_only && rank != Rank::Main) || along(b, side) < 12 {
+                    continue;
+                }
+                // Напротив тоже улица — участок только до середины квартала.
+                let d = if facing(b, (side + 2) % 4, streets).is_some() { deep(b, side) / 2 } else { deep(b, side) };
+                if d < dmin {
+                    continue;
+                }
+                let (x, y) = outside(b, side);
+                let square = streets.iter().any(|s| s.square && contains(s.r, x, y));
+                let (cx, cy) = b.center();
+                let key = (i32::from(square), i32::from(d >= 13), -((cx - w / 2).abs() + (cy - h / 2).abs()));
+                if best.as_ref().is_none_or(|(k, _, _)| key > *k) {
+                    best = Some((key, i, side));
+                }
+            }
+        }
+        if let Some((_, i, side)) = best {
+            return Some((i, side));
+        }
+    }
+    None
+}
+
 /// Участки квартала: ряды вдоль каждой стороны, что выходит на проезд, — от
-/// старшей улицы к младшей; угол достаётся старшей.
-fn plots(b: Room, streets: &[Street], rng: &mut Rng, tally: &mut Tally) -> Vec<Plot> {
+/// старшей улицы к младшей; угол достаётся старшей. `inn` — сторона, где встанет
+/// постоялый двор: он размечается первым, посередине стороны.
+fn plots(b: Room, streets: &[Street], rng: &mut Rng, tally: &mut Tally, district: District, corner_tavern: bool, inn: Option<i32>) -> Vec<Plot> {
     let mut faces: Vec<(i32, Rank)> = (0..4).filter_map(|s| facing(b, s, streets).map(|r| (s, r))).collect();
     faces.sort_by_key(|&(s, r)| (r, -along(b, s)));
     let mut owned = vec![false; (b.w * b.h) as usize];
@@ -297,6 +402,44 @@ fn plots(b: Room, streets: &[Street], rng: &mut Rng, tally: &mut Tally) -> Vec<P
             })
             .count() as i32
         };
+        // Постоялый двор — до прочих участков стороны: ближе к середине, где вглубь
+        // хватает места. Узкий остаток с краю не оставляется: двор тянется до угла.
+        if inn == Some(side) && !tally.tavern && len >= 11 {
+            let want = rng.int(13, 17).min(len);
+            let mid = (len - want) / 2;
+            let mut starts: Vec<i32> = (0..=len - want).collect();
+            starts.sort_by_key(|u| (u - mid).abs());
+            let site = starts.into_iter().find_map(|u0| {
+                let (mut u0, mut f) = (u0, want);
+                if (1..5).contains(&u0) {
+                    f += u0;
+                    u0 = 0;
+                }
+                let right = len - u0 - f;
+                if (1..5).contains(&right) {
+                    f += right;
+                }
+                let col = (u0..u0 + f).map(|q| free_depth(&owned, q)).min().unwrap_or(0);
+                (col >= 9).then_some((u0, f, col))
+            });
+            if let Some((u0, f, col)) = site {
+                let mut hd = if col >= 17 { rng.int(12, 14).min(col - 5) } else { rng.int(12, 14).min(col) };
+                if col > hd && col - hd < 3 {
+                    hd = col;
+                }
+                let house = sub(b, side, u0, 0, f, hd);
+                let yard = (col - hd >= 2).then(|| sub(b, side, u0, hd, f, col - hd));
+                for r in std::iter::once(house).chain(yard) {
+                    for y in r.y..r.y + r.h {
+                        for x in r.x..r.x + r.w {
+                            owned[((y - b.y) * b.w + (x - b.x)) as usize] = true;
+                        }
+                    }
+                }
+                tally.tavern = true;
+                out.push(Plot { house, yard, face: side, trade: Trade::Tavern, rank, goods: Goods::General });
+            }
+        }
         // С какого конца угол: у угла таверна или лавка побольше.
         let before = if side % 2 == 0 { 3 } else { 0 };
         let corner_lo = faces.iter().any(|&(s, _)| s == before);
@@ -312,7 +455,7 @@ fn plots(b: Room, streets: &[Street], rng: &mut Rng, tally: &mut Tally) -> Vec<P
                 continue;
             }
             let corner = u == 0 && corner_lo;
-            let trade = choose(rank, corner, pd, tally, rng);
+            let trade = choose(rank, corner, pd, tally, rng, district, corner_tavern);
             let (fmin, fmax, dmin, dmax) = dims(trade);
             let mut f = rng.int(fmin, fmax).min(run);
             // Остаток меньше дома — дом шире.
@@ -338,7 +481,8 @@ fn plots(b: Room, streets: &[Street], rng: &mut Rng, tally: &mut Tally) -> Vec<P
                     }
                 }
             }
-            out.push(Plot { house, yard, face: side, trade, rank });
+            let goods = if trade == Trade::Shop { goods(rng) } else { Goods::General };
+            out.push(Plot { house, yard, face: side, trade, rank, goods });
             u += f;
             // Щель между домами — проход во дворы.
             if yard.is_some() && u + 5 < len && rng.chance(0.12) {
@@ -423,10 +567,49 @@ fn rooms(plot: &Plot, rng: &mut Rng) -> Vec<(Room, Use)> {
             }
         }
         Trade::Tavern => {
-            let rear = 4.min(d - 5);
-            rows.push((d - rear, vec![(f, Use::Hall)]));
-            let k = (f * 3 / 5).max(4);
-            rows.push((rear, vec![(k, Use::Kitchen), (f - k, Use::Storage)]));
+            // Как у старых постоялых дворов: спереди общий зал; у широкой сбоку от
+            // него отдельная зала (parlour). Сзади кухня — под залом, прямо за
+            // стойкой; рядом погреб с бочками, дверь в него из кухни; под залой —
+            // комнаты постояльцев.
+            let rear = if d >= 10 { 4 } else { 4.min(d - 5) };
+            let wide = f >= 13 && rear >= 4;
+            let left = rng.chance(0.5);
+            let par = if wide { rng.int(5, 6) } else { 0 };
+            let front = if !wide {
+                vec![(f, Use::Hall)]
+            } else if left {
+                vec![(par, Use::Parlour), (f - par, Use::Hall)]
+            } else {
+                vec![(f - par, Use::Hall), (par, Use::Parlour)]
+            };
+            rows.push((d - rear, front));
+            let mut row = if wide {
+                let k = if f >= 16 { 6 } else { 5 };
+                let rest = f - k - 4;
+                let mut v = vec![(4, Use::Cellar), (k, Use::Kitchen)];
+                if rest >= 8 {
+                    v.insert(0, (rest - rest / 2, Use::Guest));
+                    v.insert(0, (rest / 2, Use::Guest));
+                } else if rest >= 3 {
+                    v.insert(0, (rest, Use::Guest));
+                } else {
+                    v[1].0 += rest;
+                }
+                // Кухня — у дальнего от залы края, под общим залом.
+                if !left {
+                    v.reverse();
+                }
+                v
+            } else {
+                let k = (f * 3 / 5).max(4);
+                let mut v = vec![(k, Use::Kitchen), (f - k, Use::Cellar)];
+                if rng.chance(0.5) {
+                    v.reverse();
+                }
+                v
+            };
+            row.retain(|(w, _)| *w > 0);
+            rows.push((rear, row));
         }
         Trade::Store => {
             if d >= 9 && f >= 7 {
@@ -456,6 +639,7 @@ fn floor_of(u: Use) -> &'static str {
         Use::Forge => "flagstones",
         Use::Bakehouse => "brick_floor",
         Use::Kitchen => "stone_tiles",
+        Use::Cellar => "flagstones",
         _ => "wood_planks",
     }
 }
@@ -525,21 +709,28 @@ fn build_house(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, st: &str
             _ => h.x + h.w - r.x - r.w,
         }
     };
-    for (i, &(b, _)) in parts.iter().enumerate() {
+    // Дверь кухни таверны: перед ней в зале встанет стойка.
+    let mut kitchen_door: Option<[f32; 2]> = None;
+    for (i, &(b, ub)) in parts.iter().enumerate() {
         if depth_of(b) == 0 {
             continue;
         }
-        let best = parts.iter().enumerate().filter(|(j, (a, _))| *j != i && depth_of(*a) < depth_of(b)).filter_map(|(_, (a, _))| shared(*a, b)).max_by_key(seg_len);
+        // Погреб открывается в кухню: бочки носят оттуда, а не через зал.
+        let via = (ub == Use::Cellar).then(|| parts.iter().find(|(_, u)| *u == Use::Kitchen).and_then(|(a, _)| shared(*a, b))).flatten();
+        let best = via.or_else(|| parts.iter().enumerate().filter(|(j, (a, _))| *j != i && depth_of(*a) < depth_of(b)).filter_map(|(_, (a, _))| shared(*a, b)).max_by_key(seg_len));
         if let Some(seg) = best
             && let Some(at) = spot(seg, 1, 1, taken, rng).or_else(|| spot(seg, 1, 0, taken, rng))
         {
             open(m, sp, taken, seg, at, PortalKind::Door, true);
+            if ub == Use::Kitchen {
+                kitchen_door = Some(door_mid(seg, at));
+            }
         }
     }
-    // Вход с улицы — в переднюю комнату; у лавок и складов дверь шире, у кузни
-    // ворота нараспашку.
+    // Вход с улицы — в переднюю комнату (у таверны — в общий зал); у лавок и
+    // складов дверь шире, у кузни ворота нараспашку.
     let fronts: Vec<(Room, Use)> = parts.iter().copied().filter(|(r, _)| depth_of(*r) == 0).collect();
-    let (entry, entry_use) = fronts[fronts.len() / 2];
+    let (entry, entry_use) = fronts.iter().copied().find(|(_, u)| *u == Use::Hall).unwrap_or(fronts[fronts.len() / 2]);
     let fseg = side_seg(entry, face);
     let f = seg_len(&fseg);
     let (width, kind) = match plot.trade {
@@ -548,8 +739,10 @@ fn build_house(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, st: &str
         Trade::Shop | Trade::Bakery if f >= 7 => (2, PortalKind::DoubleDoor),
         _ => (1, PortalKind::Door),
     };
+    let mut entry_door: Option<[f32; 2]> = None;
     if let Some(at) = spot(fseg, width, 1, taken, rng) {
         open(m, sp, taken, fseg, at, kind, wood);
+        entry_door = Some(door_mid(fseg, at));
     }
     // Окна на улицу: у каждой передней комнаты, сколько встанет через клетку; у лавки
     // и зала — по две клетки.
@@ -581,13 +774,20 @@ fn build_house(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, st: &str
         }
     }
     for &(r, u) in &parts {
-        dress(m, sp, rng, r, u, face, entry_use == u && r == entry);
+        let door = (entry_use == u && r == entry).then_some(entry_door).flatten();
+        dress(m, sp, rng, r, u, plot, door, kitchen_door);
     }
     let h = plot.house;
     let squareish = h.w.min(h.h) * 5 >= h.w.max(h.h) * 4 && h.w.min(h.h) >= 9;
     let shape = if squareish { RoofShape::Hip } else { RoofShape::Gable };
     m.roofs.push(Roof { a: [h.x as f32, h.y as f32], b: [(h.x + h.w) as f32, (h.y + h.h) as f32], shape, paint: key(roof), turn: u8::from(h.h > h.w), overhang: 0.3 });
     outer
+}
+
+/// Середина проёма `s..e` на стороне `seg`.
+fn door_mid(seg: Segment, (s, e): (i32, i32)) -> [f32; 2] {
+    let mid = (s + e) as f32 / 2.0;
+    if seg.0[0] == seg.1[0] { [seg.0[0], mid] } else { [mid, seg.0[1]] }
 }
 
 /// Комната касается задней стены дома.
@@ -600,8 +800,11 @@ fn on_back(r: Room, h: Room, back: i32) -> bool {
     }
 }
 
-/// Мебель по назначению. `face` — фасад дома: у него окна и вход, очаг туда не ставят.
-fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, u: Use, face: i32, _entry: bool) {
+/// Мебель по назначению. Фасад дома (`plot.face`) — окна и вход, очаг туда не
+/// ставят. `door` — вход с улицы, если он в этой комнате; `kitchen` — дверь кухни.
+#[allow(clippy::too_many_arguments)]
+fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, u: Use, plot: &Plot, door: Option<[f32; 2]>, kitchen: Option<[f32; 2]>) {
+    let face = plot.face;
     let f = FURNITURE;
     let back = (face + 2) % 4;
     let not_face: Vec<i32> = (0..4).filter(|s| *s != face).collect();
@@ -648,22 +851,74 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, u: Use, face: i32,
         Use::Shop => {
             // Прилавок поперёк, у дальней стены или сбоку; за ним полки и касса,
             // у входа место покупателю.
+            let before = m.props.len();
             let counter = if missing("shop_counter") { "bar_counter" } else { "shop_counter" };
             let tries = [(1.0, &[back][..]), (1.0, &sides[..]), (0.75, &[back][..]), (0.75, &sides[..])];
             tries.iter().any(|(s, at)| by_side(m, sp, rng, r, counter, *s, false, at));
             if counter == "shop_counter" {
                 by_side(m, sp, rng, r, counter, 1.0, false, &sides);
             }
-            for _ in 0..(r.w + r.h) / 4 {
-                by_side(m, sp, rng, r, shelf, 1.0, false, &sides);
+            match plot.goods {
+                Goods::General => {
+                    for _ in 0..(r.w + r.h) / 4 {
+                        by_side(m, sp, rng, r, shelf, 1.0, false, &sides);
+                    }
+                    by_side(m, sp, rng, r, "chest", f, true, &[back]);
+                    for _ in 0..3 {
+                        let n = pick(rng, &["crate", "barrel", "sacks"]);
+                        by_side(m, sp, rng, r, n, f, true, &not_face);
+                    }
+                    if !missing("table_clutter") {
+                        dining_free_table(m, sp, rng, r.x + r.w / 2 - 1, r.y + r.h / 2);
+                    }
+                }
+                Goods::Arms => {
+                    // Стойки вдоль боковых стен, товар напоказ; у задней — сундук.
+                    for _ in 0..(r.w + r.h) / 4 {
+                        let n = pick(rng, &["weapon_rack", "weapon_rack_axes", "weapon_rack_spears", "weapon_rack_maces", "weapon_rack_bows", "weapon_rack_mixed"]);
+                        if !by_side(m, sp, rng, r, n, 1.0, false, &sides) {
+                            by_side(m, sp, rng, r, n, 1.0, false, &not_face);
+                        }
+                    }
+                    by_side(m, sp, rng, r, "chest_open", f, true, &[back]);
+                    by_side(m, sp, rng, r, "crate", f, true, &not_face);
+                    by_side(m, sp, rng, r, "barrel", f, true, &not_face);
+                }
+                Goods::Books => {
+                    // Шкафы по стенам, посередине конторка писца.
+                    for _ in 0..(r.w + r.h) / 3 {
+                        by_side(m, sp, rng, r, "bookshelf", 1.0, false, &not_face);
+                    }
+                    let (x, y) = (r.x + r.w / 2 - 1, r.y + r.h / 2);
+                    if put(m, sp, "desk", x, y, 0.0, f) {
+                        put(m, sp, "chair", x + 1, y - 1, 0.0, f);
+                    }
+                    by_side(m, sp, rng, r, "chest", f, true, &[back]);
+                    by_wall(m, sp, rng, r, "plant_pot", f, true);
+                    by_wall(m, sp, rng, r, "crate", f, true);
+                }
+                Goods::Herbs => {
+                    // Полки со склянками, котёл для отваров, стол со ступками; мешки
+                    // трав и горшки с зеленью.
+                    for _ in 0..(r.w + r.h) / 4 {
+                        by_side(m, sp, rng, r, shelf, 1.0, false, &sides);
+                    }
+                    by_side(m, sp, rng, r, "cauldron", f, false, &not_face);
+                    if !dining_free_table(m, sp, rng, r.x + r.w / 2 - 1, r.y + r.h / 2) {
+                        inside(m, sp, rng, r, "table", f);
+                    }
+                    for n in ["sacks", "plant_pot", "plant_pot"] {
+                        by_side(m, sp, rng, r, n, f, true, &not_face);
+                    }
+                }
             }
-            by_side(m, sp, rng, r, "chest", f, true, &[back]);
-            for _ in 0..3 {
-                let n = pick(rng, &["crate", "barrel", "sacks"]);
-                by_side(m, sp, rng, r, n, f, true, &not_face);
-            }
-            if !missing("table_clutter") {
-                dining_free_table(m, sp, rng, r.x + r.w / 2 - 1, r.y + r.h / 2);
+            // В тесной лавке шкафы и прилавок не встают — тогда товар в ящиках и бочках.
+            for _ in 0..6 {
+                if m.props.len() - before >= 4 {
+                    break;
+                }
+                let n = pick(rng, &["crate", "barrel", "sacks", "crate"]);
+                by_wall(m, sp, rng, r, n, f, true);
             }
         }
         Use::Bakehouse => {
@@ -705,41 +960,232 @@ fn dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, u: Use, face: i32,
             } else {
                 by_side(m, sp, rng, r, "table", f, false, &sides);
             }
+            // Наковальня одна; в большой кузне — ещё стойка и бочка с водой для закалки.
             if r.w * r.h >= 36 {
                 let n = pick(rng, &["weapon_rack_maces", "weapon_rack_bows", "weapon_rack"]);
                 by_side(m, sp, rng, r, n, 1.0, false, &[back]);
-                inside(m, sp, rng, r, "anvil", f);
+                let water = if missing("water_barrel") { "barrel" } else { "water_barrel" };
+                by_side(m, sp, rng, r, water, if water == "barrel" { f } else { 1.0 }, true, &not_face);
             }
         }
-        Use::Hall => {
-            // Стойка у дальней стены, за ней бочки; очаг сбоку; столы рядами по залу.
-            if !by_side(m, sp, rng, r, "bar_counter", 1.0, false, &[back]) {
-                by_side(m, sp, rng, r, "bar_counter", 1.0, false, &sides);
+        Use::Hall => tavern_hall(m, sp, rng, r, face, door, kitchen),
+        Use::Parlour => {
+            // Отдельная зала: свой камин с креслами, обеденный стол посередине,
+            // полка, цветы. Сюда подают ужин, сюда же ведут гостей почище.
+            if !hearth(m, sp, rng, r, &not_face) {
+                by_side(m, sp, rng, r, "fireplace", 1.0, false, &not_face);
             }
-            for _ in 0..2 {
-                by_side(m, sp, rng, r, "barrel", f, true, &[back]);
-            }
-            if !hearth(m, sp, rng, r, &sides) {
-                by_side(m, sp, rng, r, "fireplace", 1.0, false, &sides);
-            }
-            // Ряды столов: готовый набор FA, а если не влез — свой круглый с табуретами.
             let (cw, ch) = dining_cell();
-            let (cw, ch) = (cw.max(3), ch.max(3));
-            let mut y = r.y + 1;
-            while y + ch < r.y + r.h {
-                let mut x = r.x + 1;
-                while x + cw < r.x + r.w {
-                    if !dining(m, sp, rng, x, y) {
-                        seat_table(m, sp, rng, x, y);
-                    }
-                    x += cw + 1;
-                }
-                y += ch + 1;
+            let (cx, cy) = (r.x + (r.w - cw) / 2, r.y + (r.h - ch) / 2);
+            let mut spots: Vec<(i32, i32)> = (r.y..=r.y + r.h - ch).flat_map(|y| (r.x..=r.x + r.w - cw).map(move |x| (x, y))).collect();
+            spots.sort_by_key(|&(x, y)| (x - cx).abs() + (y - cy).abs());
+            if !spots.into_iter().any(|(x, y)| dining(m, sp, rng, x, y)) {
+                inside(m, sp, rng, r, "table_round", 1.0);
             }
-            for _ in 0..2 {
-                by_side(m, sp, rng, r, "bench", f, false, &sides);
+            by_side(m, sp, rng, r, shelf, 1.0, false, &not_face);
+            by_wall(m, sp, rng, r, "plant_pot", f, true);
+            if rng.chance(0.5) {
+                by_side(m, sp, rng, r, "sofa", f, false, &not_face);
             }
         }
+        Use::Cellar => {
+            // Бочки рядами вдоль стен, между ними ящики и мешки.
+            let piles = !missing("storage_pile");
+            // Груда FA — одна: их картинки шире своих клеток и ложатся друг на друга.
+            let mut pile = piles;
+            for _ in 0..(r.w * r.h / 3).clamp(4, 14) {
+                let n = if pile { "storage_pile" } else { pick(rng, &["barrel", "barrel", "barrel", "barrel", "crate", "sacks"]) };
+                pile = false;
+                by_wall(m, sp, rng, r, n, if n == "storage_pile" { 1.0 } else { f }, false);
+            }
+        }
+        Use::Guest => {
+            // Комната внаём: кровать в углу, сундук, табурет; побольше — и шкаф.
+            by_wall(m, sp, rng, r, "bed", f, true);
+            by_wall(m, sp, rng, r, "chest", f, true);
+            by_wall(m, sp, rng, r, "stool", f, false);
+            if r.w * r.h >= 24 && rng.chance(0.6) {
+                by_wall(m, sp, rng, r, "wardrobe", f, true);
+            }
+        }
+    }
+}
+
+/// Зал таверны — как у старых трактиров и у картографов (FA, 2-Minute Tabletop):
+///
+/// - стойка вдоль задней стены, и дверь кухни — за её краем: хозяин выходит из
+///   кухни прямо к прилавку; между стойкой и стеной бочки и полки, перед ней табуреты;
+/// - очаг с креслами у боковой стены;
+/// - от входа к стойке свободный проход; столы по бокам — длинные со скамьями,
+///   как козлы-столы старых трактиров, и малые со стульями;
+/// - в большом зале — лестница наверх, к комнатам постояльцев, и помост для
+///   музыканта в переднем углу;
+/// - вдоль стен скамьи, бочки, полки.
+fn tavern_hall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, face: i32, door: Option<[f32; 2]>, kitchen: Option<[f32; 2]>) {
+    let back = (face + 2) % 4;
+    let (len, depth) = (along(r, back), deep(r, back));
+    // Рамка задней стены: `u` вдоль неё, `v` от неё в зал.
+    let to_world = |u: f32, v: f32| -> [f32; 2] {
+        match back {
+            0 => [r.x as f32 + u, r.y as f32 + v],
+            1 => [(r.x + r.w) as f32 - v, r.y as f32 + u],
+            2 => [r.x as f32 + u, (r.y + r.h) as f32 - v],
+            _ => [r.x as f32 + v, r.y as f32 + u],
+        }
+    };
+    let cells = |u0: i32, v0: i32, du: i32, dv: i32| -> Room {
+        match back {
+            0 => Room { x: r.x + u0, y: r.y + v0, w: du, h: dv },
+            1 => Room { x: r.x + r.w - v0 - dv, y: r.y + u0, w: dv, h: du },
+            2 => Room { x: r.x + u0, y: r.y + r.h - v0 - dv, w: du, h: dv },
+            _ => Room { x: r.x + v0, y: r.y + u0, w: dv, h: du },
+        }
+    };
+    let u_of = |p: [f32; 2]| if back % 2 == 0 { p[0] - r.x as f32 } else { p[1] - r.y as f32 };
+    // Предмет спиной к задней стене, серединой в точку рамки.
+    let at_wall = |m: &mut Map, p: &Pick, slot: &str, u: f32, v: f32, scale: f32| {
+        let rot = (back as f32 * 90.0 + p.turn) % 360.0;
+        let [l, t, rr, uu] = bounds(p, slot, rot, scale);
+        let c = to_world(u, v);
+        drop_pick(m, p, [c[0] - (l + rr) / 2.0, c[1] - (t + uu) / 2.0], rot, scale);
+    };
+    let extent = |b: [f32; 4]| if back % 2 == 0 { (b[2] - b[0], b[3] - b[1]) } else { (b[3] - b[1], b[2] - b[0]) };
+
+    // Стойка — не длиннее половины стены.
+    let bar = asset("bar_counter");
+    let rot = (back as f32 * 90.0 + bar.turn) % 360.0;
+    let (len1, _) = extent(bounds(&bar, "bar_counter", rot, 1.0));
+    let scale = (len as f32 * 0.55 / len1).clamp(0.5, 1.0);
+    let (blen, bdep) = extent(bounds(&bar, "bar_counter", rot, scale));
+    let ku = kitchen.map(u_of).filter(|k| *k > 0.0 && *k < len as f32);
+    let hi = (len as f32 - blen - 1.0).max(1.0);
+    let ustart = match ku {
+        Some(k) => (k - 1.0).clamp(1.0, hi),
+        None if rng.chance(0.5) => 1.0,
+        None => hi,
+    };
+    let v0 = if depth >= 9 { 1.8 } else { 1.5 };
+    at_wall(m, &bar, "bar_counter", ustart + blen / 2.0, v0 + bdep / 2.0, scale);
+    let zone = cells(ustart.floor() as i32 - 1, 0, blen.ceil() as i32 + 2, (v0 + bdep + 1.2).ceil() as i32);
+    sp.block(zone.x, zone.y, zone.w, zone.h);
+    // За стойкой: бочки и полки вдоль стены, кроме места у двери кухни.
+    for k in 0..(blen / 1.6) as i32 {
+        let pu = ustart + 0.8 + k as f32 * 1.6;
+        if ku.is_some_and(|d| (pu - d).abs() < 1.4) {
+            continue;
+        }
+        let n = if !missing("shelf_full") && k % 2 == 1 { "shelf_full" } else { pick(rng, &["barrel", "barrel", "crate"]) };
+        let p = asset(n);
+        let s = if n == "shelf_full" { 1.0 } else { FURNITURE * 0.8 };
+        let (_, d) = extent(bounds(&p, n, (back as f32 * 90.0 + p.turn) % 360.0, s));
+        at_wall(m, &p, n, pu, WALL_GAP + d.min(v0 - 0.3) / 2.0, s);
+    }
+    // Табуреты перед стойкой.
+    let stool = asset("stool");
+    for k in 0..(blen as i32 + 1) / 2 {
+        at_wall(m, &stool, "stool", ustart + 0.9 + k as f32 * 2.0, v0 + bdep + 0.55, FURNITURE * 0.85);
+    }
+    // Проход от входа к стойке.
+    if let Some(d) = door {
+        let inward: [f32; 2] = [[0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [1.0, 0.0]][face as usize];
+        let gate = [d[0] + inward[0] * 0.5, d[1] + inward[1] * 0.5];
+        walkway(sp, gate, to_world(ustart + blen / 2.0, v0 + bdep + 1.5), r);
+    }
+    // Очаг — у боковой стены.
+    let lateral: Vec<i32> = (0..4).filter(|s| s % 2 != face % 2).collect();
+    if !hearth(m, sp, rng, r, &lateral) {
+        by_side(m, sp, rng, r, "fireplace", 1.0, false, &lateral);
+    }
+    let big = len * depth >= 90;
+    // Лестница наверх — к комнатам постояльцев, в углу у боковой стены.
+    if big && !by_side(m, sp, rng, r, "stairs", 1.0, true, &lateral) {
+        by_side(m, sp, rng, r, "stairs", 0.7, true, &lateral);
+    }
+    // Помост для музыканта: ковёр и табурет в переднем углу, подальше от двери.
+    if big && rng.chance(0.75) {
+        let fl = along(r, face);
+        let corners = [sub(r, face, 1, 1, 3, 3), sub(r, face, fl - 4, 1, 3, 3)];
+        let dist = |c: &Room| door.map_or(0.0, |d| (c.x as f32 + 1.5 - d[0]).abs() + (c.y as f32 + 1.5 - d[1]).abs());
+        let stage = if dist(&corners[0]) >= dist(&corners[1]) { corners[0] } else { corners[1] };
+        if sp.free(stage.x, stage.y, stage.w, stage.h) {
+            sp.block(stage.x, stage.y, stage.w, stage.h);
+            let c = [stage.x as f32 + 1.5, stage.y as f32 + 1.5];
+            let rug = asset("rug_round");
+            let [l, t, rr, uu] = bounds(&rug, "rug_round", 0.0, 1.0);
+            let s = (2.8 / (rr - l).max(uu - t)).min(1.5);
+            drop_pick(m, &rug, c, 0.0, s);
+            drop(m, "stool", c, (back as f32 * 90.0) % 360.0, FURNITURE * 0.85);
+        }
+    }
+    // Столы: по рядам, клетка прохода между соседями.
+    let (cw, ch) = dining_cell();
+    let horiz = rng.chance(0.5);
+    let (tw, th) = if horiz { (4, 3) } else { (3, 4) };
+    // В большинстве залов — длинные столы, малые между ними; иногда наоборот.
+    let long_first = rng.chance(0.75);
+    // Своё место свободно; клетка прохода справа и снизу занимается после — проход
+    // к стойке и полоса у камина сами служат проходом.
+    let fits = |sp: &Spots, x: i32, y: i32, w: i32, h: i32| x + w < r.x + r.w && y + h < r.y + r.h && sp.free(x, y, w, h);
+    for y in r.y + 1..r.y + r.h - 1 {
+        for x in r.x + 1..r.x + r.w - 1 {
+            let long = long_first || rng.chance(0.3);
+            let (w, h) = if long && fits(sp, x, y, tw, th) {
+                trestle(m, rng, x, y, horiz);
+                (tw, th)
+            } else if long && fits(sp, x, y, th, tw) {
+                trestle(m, rng, x, y, !horiz);
+                (th, tw)
+            } else if fits(sp, x, y, cw, ch) && dining(m, sp, rng, x, y) {
+                (cw, ch)
+            } else if fits(sp, x, y, 3, 3) && seat_table(m, sp, rng, x, y) {
+                (3, 3)
+            } else {
+                continue;
+            };
+            sp.block(x, y, w + 1, h + 1);
+        }
+    }
+    dress_walls(m, sp, rng, r);
+}
+
+/// Длинный стол со скамьями по обе стороны — как козлы-столы старых трактиров:
+/// два стола торцом к торцу, по скамье с каждой стороны. Место — 4×3 клетки от
+/// `x`, `y` (`horiz`) или 3×4.
+fn trestle(m: &mut Map, rng: &mut Rng, x: i32, y: i32, horiz: bool) {
+    let (w, h) = if horiz { (4.0, 3.0) } else { (3.0, 4.0) };
+    let c = [x as f32 + w / 2.0, y as f32 + h / 2.0];
+    let rot: f32 = if horiz { 0.0 } else { 90.0 };
+    // Вдоль стола `a`, поперёк `b` — в клетки карты.
+    let at = |a: f32, b: f32| if horiz { [c[0] + a, c[1] + b] } else { [c[0] - b, c[1] + a] };
+    let table = asset("table");
+    let [l, t, r, u] = bounds(&table, "table", 0.0, 1.0);
+    let ts = (1.8 / (r - l)).min(0.95 / (u - t));
+    let half = (u - t) * ts / 2.0;
+    let bench = asset("bench");
+    let [bl, bt, br, bu] = bounds(&bench, "bench", 0.0, 1.0);
+    let bs = (1.8 / (br - bl)).min(0.7 / (bu - bt));
+    let off = half + (bu - bt) * bs * 0.45;
+    for (k, side) in [(0.0f32, -1.0f32), (1.0, 1.0)] {
+        let brot = (rot + 180.0 * k) % 360.0;
+        let [bl2, bt2, br2, bu2] = bounds(&bench, "bench", brot, bs);
+        for a in [-0.9f32, 0.9] {
+            if rng.chance(0.9) {
+                let p = at(a, side * off);
+                drop_pick(m, &bench, [p[0] - (bl2 + br2) / 2.0, p[1] - (bt2 + bu2) / 2.0], brot, bs);
+            }
+        }
+    }
+    let [tl, tt, tr, tu] = bounds(&table, "table", rot, ts);
+    for a in [-0.9f32, 0.9] {
+        let p = at(a, 0.0);
+        drop_pick(m, &table, [p[0] - (tl + tr) / 2.0, p[1] - (tt + tu) / 2.0], rot, ts);
+    }
+    if !missing("table_clutter") && rng.chance(0.7) {
+        let stuff = asset("table_clutter");
+        let [sl, st, sr, su] = bounds(&stuff, "table_clutter", rot, 1.0);
+        let fit = (1.7 / (sr - sl).max(su - st)).min(1.0);
+        let p = at(if rng.chance(0.5) { -0.9 } else { 0.9 }, 0.0);
+        drop_pick(m, &stuff, [p[0] - (sl + sr) / 2.0 * fit, p[1] - (st + su) / 2.0 * fit], rot, fit);
     }
 }
 
@@ -773,7 +1219,8 @@ fn outbuilding(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &mut Plot, take
     let y = plot.yard?;
     let face = plot.face;
     let (f, d) = (along(y, face), deep(y, face));
-    if d < 7 || f < 4 || !rng.chance(0.55) {
+    // У постоялого двора конюшня есть всегда: гости приезжают верхом и в каретах.
+    if d < 7 || f < 4 || (plot.trade != Trade::Tavern && !rng.chance(0.55)) {
         return None;
     }
     let od = rng.int(3, 4).min(d - 3);
@@ -801,9 +1248,9 @@ fn outbuilding(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &mut Plot, take
         }
         // Дровяник и уголь.
         Trade::Smith | Trade::Bakery => {
-            for n in ["firewood_pile", "firewood_pile", "sacks", "sacks"] {
+            for n in ["firewood_pile", "firewood_pile", "sacks", "sacks", "barrel", "crate"] {
                 if !missing(n) {
-                    by_wall(m, sp, rng, shed, n, if n == "sacks" { fr } else { 1.0 }, true);
+                    by_wall(m, sp, rng, shed, n, if n == "firewood_pile" { 1.0 } else { fr }, true);
                 }
             }
         }
@@ -1006,7 +1453,8 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     patches(m, rng, grass, count, size, 0.75);
     patches(m, rng, wet, w * h / 160, (0.8, 2.0), 0.6);
 
-    let lay = layout(w, h, rng, p.options.density);
+    let district = p.options.district;
+    let lay = layout(w, h, rng, p.options.density, district == District::Market);
     let horiz = lay.horiz;
     // Мостовая: проезжая часть и переулки — брусчатка, тротуары и площадь — плиты,
     // задний проезд — утоптанная земля с гравием.
@@ -1060,8 +1508,11 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     // Участки и дома.
     let mut tally = Tally::default();
     let mut all: Vec<Plot> = Vec::new();
-    for &b in &lay.blocks {
-        all.extend(plots(b, &lay.streets, rng, &mut tally));
+    let inn_at = if district == District::Inn { inn_site(&lay.blocks, &lay.streets, w, h) } else { None };
+    let corner_tavern = district != District::Inn || inn_at.is_none();
+    for (i, &b) in lay.blocks.iter().enumerate() {
+        let inn = inn_at.filter(|(j, _)| *j == i).map(|(_, s)| s);
+        all.extend(plots(b, &lay.streets, rng, &mut tally, district, corner_tavern, inn));
     }
     m.wall_style = wall("wall_timber");
     let mut sp = Spots::new(m);
@@ -1156,6 +1607,7 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     for plot in &all {
         let front = sub(plot.house, plot.face, 0, -1, along(plot.house, plot.face), 1);
         let n = match plot.trade {
+            Trade::Shop | Trade::Bakery if district == District::Market => 3,
             Trade::Shop | Trade::Bakery | Trade::Smith | Trade::Store => 2,
             Trade::Tavern => 3,
             Trade::Home => i32::from(rng.chance(0.4)),
@@ -1212,7 +1664,8 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
         let c = asset(centre);
         let s = c.size[0] as i32;
         put_pick(m, &mut sp, &c, centre, cx - s / 2, cy - s / 2, 0.0, 1.0);
-        for _ in 0..(b.w * b.h / 20).clamp(2, 5) {
+        let stalls = if district == District::Market { (b.w * b.h / 12).clamp(4, 9) } else { (b.w * b.h / 20).clamp(2, 5) };
+        for _ in 0..stalls {
             let n = pick(rng, &["market_stall", "market_stall_blue", "market_stall_ochre"]);
             if by_wall(m, &mut sp, rng, b, n, 1.0, false)
                 && let Some(p) = m.props.last_mut()
@@ -1222,7 +1675,8 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
         }
         by_wall(m, &mut sp, rng, b, "notice_board", 1.0, false);
         for _ in 0..2 {
-            by_wall(m, &mut sp, rng, b, "bench", 1.0, false);
+            let bench = if missing("bench_stone") { "bench" } else { "bench_stone" };
+            by_wall(m, &mut sp, rng, b, bench, 1.0, false);
         }
         for (x, y) in [(b.x, b.y), (b.x + b.w - 1, b.y + b.h - 1)] {
             put(m, &mut sp, "street_lamp", x, y, 0.0, 0.7);
@@ -1313,9 +1767,46 @@ mod tests {
             let doors = m.portals.iter().filter(|p| p.kind != PortalKind::Window && on_edge(p.center())).count();
             assert!(doors >= 1, "дом без входа {a:?}–{b:?}");
             let inside = m.props.iter().filter(|p| p.pos[0] > a[0] && p.pos[0] < b[0] && p.pos[1] > a[1] && p.pos[1] < b[1]).count();
-            assert!(inside >= 3, "пустой дом {a:?}–{b:?}: {inside}");
+            let names: Vec<&str> = m.props.iter().filter(|p| p.pos[0] > a[0] && p.pos[0] < b[0] && p.pos[1] > a[1] && p.pos[1] < b[1]).map(|p| p.asset.as_str()).collect();
+            assert!(inside >= 3, "пустой дом {a:?}–{b:?}: {names:?}");
         }
         assert!(m.props.iter().any(|p| p.asset.ends_with("bed") || p.asset.ends_with("bed_double")), "негде спать");
+    }
+
+    fn town_of(w: u32, h: u32, seed: &str, district: District) -> (Map, Report) {
+        let o = Options { kind: Kind::Town, seed: seed.into(), district, ..Options::default() };
+        let plan = Plan::random(&o, [w, h]);
+        let mut m = Map::new(w, h);
+        let r = build(&mut m, &plan, 0, Palette::builtin()).unwrap();
+        (m, r)
+    }
+
+    #[test]
+    fn inn_quarter_has_a_big_inn_with_bar_kitchen_and_cellar() {
+        for seed in ["а", "б", "в", "г", "д", "е"] {
+            let (m, _) = town_of(48, 36, seed, District::Inn);
+            // Самый большой дом квартала — постоялый двор, не меньше 13×9.
+            let area = |r: &Roof| ((r.b[0] - r.a[0]) * (r.b[1] - r.a[1])) as i32;
+            let inn = m.roofs.iter().max_by_key(|r| area(r)).unwrap();
+            assert!(area(inn) >= 13 * 9, "{seed}: самый большой дом {}", area(inn));
+            let (a, b) = (inn.a, inn.b);
+            let inside = |p: &Prop| p.pos[0] > a[0] && p.pos[0] < b[0] && p.pos[1] > a[1] && p.pos[1] < b[1];
+            assert!(m.props.iter().any(|p| inside(p) && p.asset.ends_with("bar_counter")), "{seed}: стойка не в постоялом дворе");
+            assert!(m.props.iter().filter(|p| inside(p) && p.asset.ends_with("fireplace")).count() >= 2, "{seed}: очагов меньше двух");
+            assert!(m.props.iter().filter(|p| inside(p) && p.asset.ends_with("barrel")).count() >= 4, "{seed}: погреб пуст");
+        }
+    }
+
+    #[test]
+    fn market_streets_are_lined_with_shops() {
+        let mut rng = Rng::new("рынок");
+        let mut t = Tally::default();
+        let n = 400;
+        let shops = (0..n).filter(|_| matches!(choose(Rank::Main, false, 9, &mut t, &mut rng, District::Market, true), Trade::Shop | Trade::Bakery)).count();
+        assert!(shops * 10 >= n * 8, "лавок {shops} из {n}");
+        let (m, _) = town_of(40, 28, "рынок", District::Market);
+        let stalls = m.props.iter().filter(|p| p.asset.contains("market_stall")).count();
+        assert!(stalls >= 4, "прилавков {stalls}");
     }
 
     #[test]

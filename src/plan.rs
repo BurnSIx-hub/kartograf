@@ -493,6 +493,41 @@ impl CaveKind {
     }
 }
 
+/// Городской квартал: что стоит вдоль улиц.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum District {
+    /// Как в старом городе: лавки и мастерские на главной, жильё в переулках,
+    /// на углу бывает таверна.
+    #[default]
+    #[serde(alias = "обычный", alias = "жилой")]
+    Mixed,
+    /// Постоялый двор — самый большой дом квартала, лицом на площадь или главную
+    /// улицу, с конюшней во дворе; вокруг обычный квартал.
+    #[serde(alias = "таверна", alias = "постоялый двор", alias = "трактир")]
+    Inn,
+    /// Торговый: по улицам почти одни лавки разного товара, склады у заднего
+    /// проезда, рыночная площадь со многими прилавками.
+    #[serde(alias = "торговый", alias = "рынок", alias = "рыночный")]
+    Market,
+}
+
+impl District {
+    pub const ALL: [District; 3] = [District::Mixed, District::Inn, District::Market];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            District::Mixed => "Обычный",
+            District::Inn => "С таверной",
+            District::Market => "Торговый",
+        }
+    }
+
+    pub fn is_mixed(&self) -> bool {
+        *self == District::Mixed
+    }
+}
+
 /// Настройки генератора; у каждого вида карты свои значимые.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Opts {
@@ -514,6 +549,9 @@ pub struct Opts {
     /// Пещера: каменная, ледяная, песчаная…
     #[serde(default, skip_serializing_if = "CaveKind::is_stone")]
     pub cave: CaveKind,
+    /// Квартал: обычный, с таверной, торговый.
+    #[serde(default, skip_serializing_if = "District::is_mixed")]
+    pub district: District,
 }
 
 fn half() -> f32 {
@@ -534,7 +572,7 @@ fn room_size() -> [u32; 2] {
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer, cave: CaveKind::Stone }
+        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer, cave: CaveKind::Stone, district: District::Mixed }
     }
 }
 
@@ -627,7 +665,7 @@ impl Plan {
         plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
-        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave };
+        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave, district: opt.district };
         match opt.kind {
             Kind::Dungeon => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
             Kind::House | Kind::Tavern => {
