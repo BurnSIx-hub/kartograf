@@ -32,8 +32,14 @@ impl Drop for PaletteGuard {
 
 /// Ассет под слот: свой из библиотеки или встроенный.
 fn asset(slot: &str) -> Pick {
+    asset_toned(slot, "")
+}
+
+/// Ассет слота в тоне `tone` (слово имени файла), если такие есть.
+fn asset_toned(slot: &str, tone: &str) -> Pick {
     PALETTE.with(|p| match p.borrow().as_ref() {
-        Some(pal) => pal.pick(slot),
+        Some(pal) if tone.is_empty() => pal.pick(slot),
+        Some(pal) => pal.pick_toned(slot, tone),
         None => Palette::builtin_pick(slot),
     })
 }
@@ -52,6 +58,8 @@ include!("prop_bounds.rs");
 mod arena;
 #[path = "quarter.rs"]
 mod quarter;
+#[path = "dungeon.rs"]
+mod dungeon;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -80,7 +88,12 @@ fn mat(m: &mut Map, name: &str) -> usize {
 
 /// Стена слота: картинка своя или встроенная, толщина — встроенной полосы.
 fn wall(name: &str) -> WallStyle {
-    let pick = asset(name);
+    wall_toned(name, "")
+}
+
+/// Стена слота в тоне камня `tone` (слово имени файла), если такие есть.
+fn wall_toned(name: &str, tone: &str) -> WallStyle {
+    let pick = asset_toned(name, tone);
     // Скала FA толщиной в свою картинку (`size` — точки / 256), прочие свои — 0,35.
     let width = library::builtin_wall_width(&pick.key).unwrap_or(if library::is_cliff(&pick.key) { pick.size[1] } else { 0.35 });
     WallStyle { paint: Paint::Texture(pick.key), width }
@@ -356,14 +369,19 @@ fn by_wall(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scal
 /// То же, но только у стен `sides` (0 — север, 1 — восток, 2 — юг, 3 — запад).
 #[allow(clippy::too_many_arguments)]
 fn by_side(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scale: f32, corner: bool, sides: &[i32]) -> bool {
-    let p = asset(name);
+    by_side_pick(m, sp, rng, r, &asset(name), name, scale, corner, sides)
+}
+
+/// То же для уже выбранного ассета: подземелье ставит один вариант везде.
+#[allow(clippy::too_many_arguments)]
+fn by_side_pick(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, p: &Pick, name: &str, scale: f32, corner: bool, sides: &[i32]) -> bool {
     if sides.is_empty() {
         return false;
     }
     for _ in 0..40 {
         let side = sides[rng.int(0, sides.len() as i32 - 1) as usize];
         let rot = (side as f32 * 90.0 + p.turn) % 360.0;
-        let [left, top, right, low] = bounds(&p, name, rot, scale);
+        let [left, top, right, low] = bounds(p, name, rot, scale);
         let (fw, fh) = (cells_of(right - left), cells_of(low - top));
         if fw > r.w || fh > r.h {
             continue;
@@ -394,7 +412,7 @@ fn by_side(m: &mut Map, sp: &mut Spots, rng: &mut Rng, r: Room, name: &str, scal
         if y == hi_y && (side == 2 || corner) {
             pos[1] = (r.y + r.h) as f32 - WALL_GAP - low;
         }
-        drop_pick(m, &p, pos, rot, scale);
+        drop_pick(m, p, pos, rot, scale);
         return true;
     }
     false
@@ -910,10 +928,10 @@ fn dungeon(m: &mut Map, p: &Plan, material: usize, rng: &mut Rng, warn: &mut Vec
     let sizes: Vec<_> = p.rooms.iter().map(|r| dungeon_room_size(r.size, lo, hi)).collect();
     let links: Vec<(usize, usize)> = p.inner_links().filter_map(|l| Some((p.room_index(&l.from)?, p.room_index(&l.to)?))).collect();
     let (mut cells, rooms, corridors) = generate::dungeon_with(m.width, m.height, &sizes, (!p.links.is_empty()).then_some(&links[..]), p.options.loops, &mut Rng::new(&p.seed));
-    let material = p.style.floor.as_deref().and_then(plan::texture_id).map_or(material, |t| mat(m, t));
-    if let Some(st) = p.style.walls.as_deref().and_then(plan::wall_id) {
-        m.wall_style = wall(st);
-    }
+    // Пол и стены — по виду подземелья, если план не сказал своё.
+    let _ = material;
+    let material = mat(m, p.style.floor.as_deref().and_then(plan::texture_id).unwrap_or(dungeon::floor_slot(p.options.dungeon)));
+    m.wall_style = wall(p.style.walls.as_deref().and_then(plan::wall_id).unwrap_or(dungeon::wall_slot(p.options.dungeon, rng)));
     ground(m, "rocky_ground");
     // Безликая комната без связей — пожелание о числе комнат, а не требование.
     for spec in p.rooms[rooms.len()..].iter().filter(|r| r.role != Role::Auto || !r.name.is_empty() || !r.objects.is_empty() || p.links.iter().any(|l| l.touches(&r.id))) {
@@ -2536,7 +2554,10 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
     let mut rng = Rng::new(&format!("{}/{:?}", p.seed, p.kind));
     clear(m);
     let count = match p.kind {
-        Kind::Dungeon => dungeon(m, p, material, &mut rng, &mut warnings),
+        // Связи между комнатами задал план — комнаты ставятся под них; иначе подземелье
+        // растёт от входа (`dungeon.rs`).
+        Kind::Dungeon if p.links.iter().any(|l| !l.touches(OUTSIDE)) => dungeon(m, p, material, &mut rng, &mut warnings),
+        Kind::Dungeon => dungeon::dungeon(m, p, &mut rng, &mut warnings),
         Kind::Cave => cave(m, p, &mut rng, &mut warnings),
         Kind::Forest => forest(m, p, &mut rng, &mut warnings),
         Kind::Town => quarter::quarter(m, p, &mut rng, &mut warnings),

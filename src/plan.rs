@@ -493,6 +493,42 @@ impl CaveKind {
     }
 }
 
+/// Подземелье: из чего сложено и что в комнатах. Пол и стены — по виду.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DungeonKind {
+    /// Склеп: усыпальницы, оссуарии, катакомбы с нишами, часовня.
+    #[default]
+    #[serde(alias = "склеп", alias = "гробница", alias = "катакомбы")]
+    Crypt,
+    /// Темница: камеры, караульная, пыточная.
+    #[serde(alias = "темница", alias = "тюрьма", alias = "подземелье замка")]
+    Prison,
+    /// Храм: святилище с колоннадой, молельни, купель.
+    #[serde(alias = "храм", alias = "святилище")]
+    Temple,
+    /// Руины: завалы, лужи, логово.
+    #[serde(alias = "руины", alias = "развалины")]
+    Ruins,
+}
+
+impl DungeonKind {
+    pub const ALL: [DungeonKind; 4] = [DungeonKind::Crypt, DungeonKind::Prison, DungeonKind::Temple, DungeonKind::Ruins];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DungeonKind::Crypt => "Склеп",
+            DungeonKind::Prison => "Темница",
+            DungeonKind::Temple => "Храм",
+            DungeonKind::Ruins => "Руины",
+        }
+    }
+
+    pub fn is_crypt(&self) -> bool {
+        *self == DungeonKind::Crypt
+    }
+}
+
 /// Городской квартал: что стоит вдоль улиц.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -552,6 +588,9 @@ pub struct Opts {
     /// Квартал: обычный, с таверной, торговый.
     #[serde(default, skip_serializing_if = "District::is_mixed")]
     pub district: District,
+    /// Подземелье: склеп, темница, храм, руины.
+    #[serde(default, skip_serializing_if = "DungeonKind::is_crypt")]
+    pub dungeon: DungeonKind,
 }
 
 fn half() -> f32 {
@@ -572,7 +611,7 @@ fn room_size() -> [u32; 2] {
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer, cave: CaveKind::Stone, district: District::Mixed }
+        Self { density: 0.5, loops: 0.1, fill: true, room_size: [5, 10], season: Season::Summer, cave: CaveKind::Stone, district: District::Mixed, dungeon: DungeonKind::Crypt }
     }
 }
 
@@ -665,7 +704,7 @@ impl Plan {
         plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
-        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave, district: opt.district };
+        plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave, district: opt.district, dungeon: opt.dungeon };
         match opt.kind {
             Kind::Dungeon => plan.rooms = (1..=opt.rooms.max(1)).map(|i| RoomSpec::new(format!("r{i}"), Role::Auto)).collect(),
             Kind::House | Kind::Tavern => {

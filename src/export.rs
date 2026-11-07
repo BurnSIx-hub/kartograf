@@ -33,6 +33,8 @@ pub struct Zone {
 
 /// Модуль Foundry, который оживляет области.
 pub const LIVE_MODULE: &str = "burn-living-map";
+/// Свой модуль Foundry: его пометки на тайлах (паутина, сундук).
+pub const OWN_MODULE: &str = "burn-kartograf";
 
 /// Флаги сцены: формат Картографа и звук места для «Wild Canvas».
 fn scene_flags(map: &Map) -> Value {
@@ -448,7 +450,7 @@ pub struct SceneLevel<'a> {
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
-    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false }
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: false, chest: None }
 }
 
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
@@ -469,6 +471,11 @@ pub struct RoofTile {
     pub wind: f32,
     /// Верёвка с бельём: концы стоят, колышется середина.
     pub rope: bool,
+    /// Паутина: на полу под токенами, чуть покачивается.
+    pub web: bool,
+    /// Сундук: картинки открытого с добычей и пустого; модуль сделает его
+    /// контейнером Item Piles.
+    pub chest: Option<(String, String)>,
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -513,9 +520,17 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
-            // Крону качает ветер «Wild Canvas»; крыша стоит.
-            // Осенью с неё летят листья, в магическом лесу — светлячки.
-            if !r.shelter {
+            // Паутина и сундук лежат под токенами; их оживляет свой модуль.
+            if r.web || r.chest.is_some() {
+                tile["elevation"] = json!(k as i64 * 10);
+                tile["occlusion"]["modes"] = json!([]);
+                tile["flags"] = match &r.chest {
+                    Some((open, empty)) => json!({OWN_MODULE: {"chest": {"open": open, "empty": empty}}}),
+                    None => json!({OWN_MODULE: {"web": true}}),
+                };
+            } else if !r.shelter {
+                // Крону качает ветер «Wild Canvas»; крыша стоит.
+                // Осенью с неё летят листья, в магическом лесу — светлячки.
                 let wind = if (r.wind - 1.0).abs() < 1e-3 { json!(1) } else { json!((r.wind as f64 * 100.0).round() / 100.0) };
                 tile["flags"] = json!({LIVE_MODULE: {"wind": wind}});
                 if r.rope {
@@ -762,7 +777,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: false, chest: None }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());

@@ -108,7 +108,86 @@ async function toScene(files, update) {
     ui.notifications.info(`Картограф: сцена «${doc.name}» создана`);
   }
   await game.settings.set(MODULE_ID, "lastScene", doc.id);
+  await chests(doc).catch((err) => console.error(`${MODULE_ID} | сундуки`, err));
   return doc;
+}
+
+// Сундук с сокровищем приходит тайлом с пометкой `chest` (картинки открытого и
+// пустого). С Item Piles он становится контейнером, как в Map Forge: щелчок
+// открывает, внутрь Мастер кладёт добычу. Без Item Piles остаётся картинкой.
+// Сундук, уже стоящий на том же месте (сцену обновили), не трогается — с добычей.
+const CHEST_SFX_OPEN = `modules/${MODULE_ID}/sounds/chest-open.mp3`;
+const CHEST_SFX_CLOSE = `modules/${MODULE_ID}/sounds/chest-close.mp3`;
+
+async function chests(scene) {
+  const marked = scene.tiles.filter((t) => t.flags?.[MODULE_ID]?.chest);
+  if (!marked.length) return;
+  const api = game.modules.get("item-piles")?.active ? game.itempiles?.API : null;
+  if (!api?.createItemPile) {
+    ui.notifications.info("Картограф: сундуки откроются, если включить модуль Item Piles");
+    return;
+  }
+  const grid = scene.grid.size;
+  const done = [];
+  for (const t of marked) {
+    const { open, empty } = t.flags[MODULE_ID].chest;
+    const x = Math.round(t.x - t.width / 2), y = Math.round(t.y - t.height / 2);
+    const there = scene.tokens.some((k) => k.flags?.[MODULE_ID]?.chest && Math.abs(k.x - x) < 2 && Math.abs(k.y - y) < 2);
+    if (!there) {
+      await api.createItemPile({
+        sceneId: scene.id,
+        position: { x, y },
+        createActor: true,
+        actorOverrides: { name: "Сундук" },
+        tokenOverrides: {
+          name: "Сундук",
+          displayName: CONST.TOKEN_DISPLAY_MODES.OWNER,
+          width: t.width / grid, height: t.height / grid,
+          rotation: t.rotation ?? 0,
+          texture: { src: t.texture.src },
+          flags: { [MODULE_ID]: { chest: true } }
+        },
+        itemPileFlags: {
+          type: "container", closed: true,
+          closedImage: t.texture.src, openedImage: open, emptyImage: empty, lockedImage: t.texture.src,
+          openSound: CHEST_SFX_OPEN, closeSound: CHEST_SFX_CLOSE
+        }
+      });
+    }
+    done.push(t.id);
+  }
+  await scene.deleteEmbeddedDocuments("Tile", done);
+}
+
+// Паутина — тайл с пометкой `web`: едва заметно колышется, у каждой своя фаза.
+const webs = new Map();
+let webTicking = false;
+
+function rebuildWebs() {
+  webs.clear();
+  for (const tile of canvas.tiles?.placeables ?? []) {
+    if (!tile.document.flags?.[MODULE_ID]?.web) continue;
+    const phase = [...tile.id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1000, 7) / 1000 * Math.PI * 2;
+    webs.set(tile.id, { tile, phase });
+  }
+  if (webs.size && !webTicking) {
+    canvas.app.ticker.add(breathe);
+    webTicking = true;
+  }
+}
+
+function breathe() {
+  if (!webs.size || !canvas.ready) {
+    canvas.app?.ticker.remove(breathe);
+    webTicking = false;
+    return;
+  }
+  const t = performance.now() / 1000;
+  for (const { tile, phase } of webs.values()) {
+    const mesh = tile.mesh;
+    if (!mesh || mesh.destroyed) continue;
+    mesh.skew.set(Math.sin(t * 0.8 + phase) * 0.018, Math.sin(t * 0.55 + phase * 1.7) * 0.014);
+  }
 }
 
 // Файлы с диска Мастера (паки Dungeondraft) — через окно браузера. Rust читает их
@@ -314,8 +393,11 @@ Hooks.once("init", () => {
   window.kartografToScene = (files, update) => {
     toScene(files, update).catch((err) => { console.error(`${MODULE_ID} | на сцену`, err); ui.notifications.error("Картограф: сцена не создалась, подробности в консоли"); });
   };
-  game.modules.get(MODULE_ID).api = { open, close };
+  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs };
 });
+
+Hooks.on("canvasReady", rebuildWebs);
+for (const h of ["createTile", "updateTile", "deleteTile"]) Hooks.on(h, () => setTimeout(rebuildWebs, 0));
 
 Hooks.on("renderSceneDirectory", (app, html) => {
   if (!game.user.isGM) return;

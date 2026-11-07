@@ -414,6 +414,7 @@ pub struct App {
     gen_season: crate::plan::Season,
     gen_cave: crate::plan::CaveKind,
     gen_district: crate::plan::District,
+    gen_dungeon: crate::plan::DungeonKind,
     pub door_asset: Option<String>,
     pub door_kind: PortalKind,
     pub door_width: f32,
@@ -571,6 +572,7 @@ impl App {
             gen_season: crate::plan::Season::Summer,
             gen_cave: crate::plan::CaveKind::Stone,
             gen_district: crate::plan::District::Mixed,
+            gen_dungeon: crate::plan::DungeonKind::Crypt,
             first_thumb: Rect::NOTHING,
             pending_plan: None,
             drawer_area: Rect::NOTHING,
@@ -1802,23 +1804,19 @@ impl App {
                         seed_rows(ui, &mut opt.seed, &map_seed);
                         return;
                     }
+                    // Пол и стены — по виду подземелья, размеры комнат — свои у каждой.
+                    ui.label("Вид");
+                    ui.horizontal(|ui| {
+                        for d in crate::plan::DungeonKind::ALL {
+                            ui.selectable_value(&mut opt.dungeon, d, d.label());
+                        }
+                    });
+                    ui.end_row();
                     ui.label("Комнат");
-                    ui.add(egui::Slider::new(&mut opt.rooms, 2..=40));
-                    ui.end_row();
-                    ui.label("Комната от");
-                    ui.add(egui::Slider::new(&mut opt.min_size, 2..=20).suffix(" кл."));
-                    ui.end_row();
-                    ui.label("до");
-                    ui.add(egui::Slider::new(&mut opt.max_size, opt.min_size..=30).suffix(" кл."));
+                    ui.add(egui::Slider::new(&mut opt.rooms, 3..=30));
                     ui.end_row();
                     ui.label("Кольца");
-                    ui.add(egui::Slider::new(&mut opt.loops, 0.0..=1.0));
-                    ui.end_row();
-                    ui.label("Пол");
-                    ui.horizontal(|ui| self.material_combo(ui));
-                    ui.end_row();
-                    ui.label("Стены");
-                    self.wall_combo(ui);
+                    ui.add(egui::Slider::new(&mut opt.loops, 0.0..=1.0)).on_hover_text("Сколько обходных путей: дальние по ходу комнаты соединены напрямую, часть ходов тайные");
                     ui.end_row();
                     seed_rows(ui, &mut opt.seed, &map_seed);
                 });
@@ -1842,6 +1840,7 @@ impl App {
                 self.gen_season = opt.season;
                 self.gen_cave = opt.cave;
                 self.gen_district = opt.district;
+                self.gen_dungeon = opt.dungeon;
                 self.generate(&opt);
                 // Карта построена — окно уходит; откроют снова — с новым сидом.
                 open = false;
@@ -2075,7 +2074,12 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        self.generator = Some(Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, cave: self.gen_cave, district: self.gen_district, ..Default::default() });
+                        let mut o = Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, cave: self.gen_cave, district: self.gen_district, dungeon: self.gen_dungeon, ..Default::default() };
+                        // Подземелье растёт от входа: комнат побольше, колец заметно.
+                        if kind == generate::Kind::Dungeon {
+                            (o.rooms, o.loops) = (10, 0.4);
+                        }
+                        self.generator = Some(o);
                     }
                 }
                 ui.separator();
@@ -2384,45 +2388,6 @@ impl App {
                 });
             }
         });
-    }
-
-    /// Вид новых стен списком — для окна случайного подземелья.
-    fn wall_combo(&mut self, ui: &mut egui::Ui) {
-        let keys: Vec<(String, String)> = self.library.filter(Kind::Wall, "").into_iter().map(|i| (self.library.assets[i].key.clone(), self.library.assets[i].name.clone())).collect();
-        let now = self.map.wall_style.paint.clone();
-        let shown = match &now {
-            Paint::Texture(k) => library::label(k),
-            Paint::Color(_) => "цвет".to_owned(),
-        };
-        let mut picked = None;
-        ui.horizontal(|ui| {
-            self.swatch(ui, &now, 18.0);
-            egui::ComboBox::from_id_salt("gen-walls").selected_text(shown).width(120.0).show_ui(ui, |ui| {
-                for (key, name) in &keys {
-                    ui.horizontal(|ui| {
-                        let paint = Paint::Texture(key.clone());
-                        let resp = self.swatch(ui, &paint, 18.0);
-                        let label = ui.selectable_label(now == paint, name);
-                        if resp.clicked() || label.clicked() {
-                            picked = Some(key.clone());
-                        }
-                    });
-                }
-            });
-        });
-        if let Some(key) = picked {
-            self.sel = None;
-            let mut st = self.map.wall_style.clone();
-            if let Some(width) = library::builtin_wall_width(&key) {
-                st.width = width;
-            } else if library::is_cliff(&key)
-                && let Some(px) = library::dimensions(&self.textures.sources, &key)
-            {
-                st.width = library::cliff_width(px);
-            }
-            st.paint = Paint::Texture(key);
-            self.set_wall_style(st);
-        }
     }
 
     /// Выбор пола для кисти и дороги.
@@ -4054,9 +4019,13 @@ impl App {
     /// Толщина холста подоконника поперёк стены: видимая доска — чуть толще стены,
     /// как в Dungeondraft. Нарисована FA под свои стены, у нас они тоньше.
     fn sill_thick(&mut self, key: &str, wall_width: f32) -> f32 {
+        wall_width * 1.1 / self.band(key)
+    }
+
+    /// Доля холста поперёк, занятая рисунком (подоконник, косяк, полоса стены).
+    fn band(&mut self, key: &str) -> f32 {
         let sources = &self.textures.sources;
-        let band = *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or(1.0, |[_, t, _, b]| (b - t).max(0.05)));
-        wall_width * 1.1 / band
+        *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or(1.0, |[_, t, _, b]| (b - t).max(0.05)))
     }
 
     /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
@@ -4100,10 +4069,20 @@ impl App {
         }
         if let Some(f) = p.frame.clone() {
             let size = self.asset_size(&f);
-            let (hx, hy) = (ux * size[0] / 2.0, uy * size[0] / 2.0);
-            // Косяк не толще стены: нарисован под толстые, у тонких фахверковых торчал.
-            let natural = self.textures.get(&f, false).map(|(_, px)| size[0] * px[1] as f32 / px[0].max(1) as f32);
-            let thick = natural.map(|t| t.min(wall_width * 1.5));
+            // Косяк подобран под целую ширину; проём уже или шире — стойки те же,
+            // меняется просвет между ними.
+            let along = (size[0] + len - len.round()).max(len);
+            let (hx, hy) = (ux * along / 2.0, uy * along / 2.0);
+            // Стойки косяка ровно в толщину стены. Рисунок занимает не весь холст
+            // поперёк (у FA — две пятых), и холст растягивается так, чтобы в стену
+            // попала видимая часть: иначе стойки выходили тоньше стены и она торчала.
+            // У стен FA камень тоже не во всю полосу — стойка по видимой стене.
+            let band = self.band(&f);
+            let seen = match self.map.wall_style.paint.clone() {
+                Paint::Texture(w) => self.band(&w),
+                Paint::Color(_) => 1.0,
+            };
+            let thick = Some(wall_width * seen / band);
             self.draw_across(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy], thick);
         }
         let rect_around = |half: f32| {
@@ -4627,8 +4606,8 @@ impl App {
                 continue;
             }
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
-            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset)) {
-                // Куст, навес и бельё уйдут в свой тайл целиком.
+            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some()) {
+                // Куст, навес, бельё, паутина и сундук уйдут в свой тайл целиком.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
@@ -4976,7 +4955,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: false, chest: None });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
@@ -5015,6 +4994,39 @@ impl App {
                 // Куст ниже кроны и жёстче: лишь колышется.
                 if map::bush_by_name(&prop.asset) {
                     tile.wind = 0.35;
+                }
+                tiles.push(tile);
+            }
+            // Паутина и сундуки — тайлами на полу: паутину покачивает, сундук
+            // открывается. Картинка — одна на ассет.
+            for prop in map.props.iter().filter(|p| e.canopies && (map::web_by_name(&p.asset) || map::chest_variants(&p.asset).is_some())) {
+                let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
+                    if let Some(src) = canopies.get(key) {
+                        return Ok(src.clone());
+                    }
+                    let bytes = self.textures.bytes(key)?;
+                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(key)))?;
+                    let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
+                    let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
+                    let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
+                    files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
+                    let src = export::foundry_src(&file);
+                    canopies.insert(key.to_owned(), src.clone());
+                    Ok(src)
+                };
+                let src = save(&prop.asset, &mut files)?;
+                let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
+                let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                tile.fade = false;
+                tile.leaves = false;
+                match map::chest_variants(&prop.asset) {
+                    // Нет открытого или пустого в библиотеке — тот же закрытый.
+                    Some((open, empty)) => {
+                        let open = save(&open, &mut files).unwrap_or_else(|_| src.clone());
+                        let empty = save(&empty, &mut files).unwrap_or_else(|_| open.clone());
+                        tile.chest = Some((open, empty));
+                    }
+                    None => tile.web = true,
                 }
                 tiles.push(tile);
             }

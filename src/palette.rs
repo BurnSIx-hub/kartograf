@@ -53,6 +53,12 @@ const FLOORS: &[Slot] = &[
     ("ash", &[&["ash"], &["пепел"]], &["tree"]),
     ("lava", &[&["lava"], &["magma"], &["лава"]], &[]),
     ("dungeon_flagstones", &[&["dungeon"], &["flagstone", "dark"], &["подземелье"]], &["moss"]),
+    // Пол подземелья по виду — только камень, в тёмных тонах (сланец, вулканический);
+    // у храма мрамор и узорная плитка, у руин треснувшая и мшистая.
+    ("crypt_floor", &[&["large", "flagstone", "slate"], &["large", "flagstone", "volcanic"], &["flat", "stone", "floor", "slate"], &["flat", "stone", "floor", "volcanic"], &["stone", "square", "tiles", "slate"]], &["snowy", "dirt", "cracked", "rotated"]),
+    ("prison_floor", &[&["rock", "tiles", "slate"], &["rock", "tiles", "volcanic"], &["cobblestone", "square", "slate"], &["cobblestone", "slate"], &["cobblestone", "volcanic"]], &["snowy", "mossy", "rotated", "dirt"]),
+    ("temple_floor", &[&["marble", "tiles"], &["stone", "patterned", "tiles", "sandstone"], &["stone", "hexagonal", "tiles", "sandstone"], &["stone", "patterned", "tiles", "slate"]], &["cracked"]),
+    ("ruin_floor", &[&["stone", "tiles", "cracked", "slate"], &["stone", "tiles", "cracked", "earthy"], &["rock", "tiles", "mossy"]], &["snowy"]),
     ("dungeon_flagstones_moss", &[&["flagstone", "moss"], &["dungeon", "moss"], &["мох", "плиты"]], &[]),
     ("cobblestone", &[&["cobblestone"], &["cobble"], &["cobbles"], &["брусчатка"]], &["wall"]),
     ("brick_floor", &[&["brick"], &["bricks"], &["кирпич"]], &["wall"]),
@@ -70,7 +76,7 @@ const FLOORS: &[Slot] = &[
 ];
 
 /// Полы комнат: сквозь них не должно быть видно двора (см. [`Palette::solid`]).
-const INDOOR_FLOORS: &[&str] = &["wood_planks", "flagstones", "stone_tiles", "dungeon_flagstones", "dungeon_flagstones_moss", "cobblestone", "brick_floor", "sandstone", "marble"];
+const INDOOR_FLOORS: &[&str] = &["wood_planks", "flagstones", "stone_tiles", "dungeon_flagstones", "dungeon_flagstones_moss", "cobblestone", "brick_floor", "sandstone", "marble", "crypt_floor", "prison_floor", "temple_floor", "ruin_floor"];
 
 const OBJECTS: &[Slot] = &[
     ("chair", &[&["chair"], &["стул"]], &["arm", "armchair"]),
@@ -89,6 +95,9 @@ const OBJECTS: &[Slot] = &[
     ("wardrobe", &[&["wardrobe"], &["closet"], &["armoire"], &["шкаф"]], &["book"]),
     ("bookshelf", &[&["bookshelf"], &["bookcase"], &["book", "shelf"], &["shelf"], &["books"]], &[]),
     ("chest", &[&["chest"], &["сундук"]], &["open", "empty", "drawers", "открытый", "пустой"]),
+    // Сундук с сокровищем FA: у него есть открытый с монетами и пустой — в Foundry
+    // он открывается (Item Piles).
+    ("treasure_chest", &[&["treasure", "chest"]], &["coins", "empty", "false", "bottom", "open"]),
     ("chest_open", &[&["chest", "open"], &["сундук", "открытый"]], &["empty"]),
     ("chest_empty", &[&["chest", "empty"], &["сундук", "пустой"]], &[]),
     // Бочки с надписью «TNT» — не для таверны и не для улицы.
@@ -101,8 +110,23 @@ const OBJECTS: &[Slot] = &[
     ("cauldron", &[&["cauldron"], &["pot", "cooking"], &["котёл"], &["котел"]], &["plant"]),
     // Подставка и сапожная наковальня — не то: на подставке FA одно бревно, рисованное мелко.
     ("anvil", &[&["anvil"], &["наковальня"]], &["stand", "small", "cobbler"]),
+    // Подземелье. Встроенных нет: без библиотеки ставится запасное.
+    // Закрытые крышкой, целые; открытая коробка без крышки читается как ящик.
+    ("sarcophagus", &[&["sarcophagus", "lid"]], &["steps", "base", "dwarven", "double", "broken", "side"]),
+    ("coffin", &[&["coffin"]], &["lid"]),
+    // Груды костей 2×2; скелеты и черепа FA в разном масштабе — не берутся.
+    ("bones", &[&["bones", "arranged"]], &["beast", "bloody", "tarrasque"]),
+    // Самостоятельная статуя-фигура: без крыльев (это насадки), бюстов, статуэток и шаров.
+    ("statue_figure", &[&["statue", "hooded", "figure"], &["statue", "standing"], &["statue", "death"], &["statue", "sitting", "lion"]], &["wings", "bust", "pointing", "fallen", "broken"]),
+    ("cobweb", &[&["cobweb"]], &[]),
+    ("candles", &[&["candles", "arranged"]], &[]),
+    ("chains", &[&["hanging", "chain"]], &["sign", "pet"]),
+    ("cage", &[&["cage", "metal"]], &["bird", "door", "top", "bed", "ceremorph", "small", "chain"]),
+    ("pillar_stone", &[&["pillar", "stone"], &["pillar", "solid"], &["pillar", "marble"]], &["broken", "wood", "lamp", "railing", "torment", "drow", "dwarven", "palisade", "awning", "overlay", "metal", "brickwood", "stonewood", "blue", "green", "purple", "red", "white", "yellow"]),
+    ("pillar_broken", &[&["pillar", "broken"]], &[]),
     ("campfire", &[&["campfire"], &["bonfire"], &["костёр"], &["костер"]], &[]),
-    ("brazier", &[&["brazier"], &["жаровня"]], &[]),
+    // Волшебная «повелевающая элементалями» и упавшие — не для обстановки.
+    ("brazier", &[&["brazier"], &["жаровня"]], &["commanding", "elementals", "fallen"]),
     ("weapon_rack", &[&["weapon", "rack"], &["sword", "rack"], &["стойка", "мечами"]], &["spear", "axe", "mace", "bow"]),
     ("weapon_rack_spears", &[&["spear", "rack"], &["spears", "rack"], &["копьями"]], &[]),
     ("weapon_rack_axes", &[&["axe", "rack"], &["axes", "rack"], &["топорами"]], &[]),
@@ -179,7 +203,12 @@ const OBJECTS: &[Slot] = &[
     // Цельный бревенчатый мост FA (`Log_Bridge_*_11x4`): без концов, пролётов,
     // верёвочных, подъёмных и мостков в доску.
     ("bridge", &[&["bridge"], &["log", "bridge"], &["мост"]], &["straight", "rope", "draw", "track", "plank"]),
-    ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral"]),
+    // Накладки FA (`Stairs_Overlay`) прозрачны — лестницы на карте не видно.
+    ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral", "overlay", "railing", "rolling", "library", "pillar", "path"]),
+    // Каменные ступени FA — «дорожка» в разделе paths: пролёт 3×1 в тон камня.
+    ("stairs_down", &[&["stairs", "stone", "path"]], &["railing"]),
+    // Перила к ним: тонкая полоса той же длины.
+    ("stair_rail", &[&["stairs", "railing", "stone", "path"]], &[]),
     ("stump", &[&["stump"], &["пень"]], &[]),
     ("stalagmite_ice", &[&["arctic", "stalagmite", "ice"], &["stalagmite", "ice"], &["сосулька"]], &[]),
     ("crystal", &[&["underdark", "crystal"], &["crystal", "rock"], &["кристалл"]], &[]),
@@ -221,6 +250,11 @@ const PORTALS: &[Slot] = &[
     ("door_wood", &[&["door"], &["дверь"]], &["frame", "double", "window", "arch", "gate", "secret", "trap", "trapdoor", "large", "косяк"]),
     ("door_wood_iron", &[&["door", "iron"], &["door", "reinforced"], &["дверь", "окованная"]], &["frame", "double"]),
     ("door_metal", &[&["door", "metal"], &["door", "steel"], &["дверь", "железная"]], &["frame", "double"]),
+    // Решётка камеры: у FA это тонкая серая дверь `Door_Metal_Gray_A`.
+    ("door_bars", &[&["door", "metal", "gray", "a"]], &["frame", "double"]),
+    // Каменные косяки FA в тон стены: на одну клетку и двойной на две.
+    ("frame_door_stone", &[&["door", "frame", "stone"]], &["double"]),
+    ("frame_double_stone", &[&["door", "frame", "double", "stone"]], &[]),
     // Малые подоконники FA нарисованы торчком, часть — на чёрном фоне.
     ("window_stone", &[&["window", "stone"], &["window"], &["окно"]], &["frame", "glass", "stained", "broken", "small"]),
     ("window_wood", &[&["window", "wood"], &["window", "wooden"], &["window"]], &["frame", "glass", "stained", "broken", "small"]),
@@ -259,9 +293,16 @@ const PARTS: &[&str] = &[
 /// Поворот по часовой, который ставит спину наверх.
 fn turn_of(slot: &str, name: &str) -> f32 {
     let file = name.rsplit('/').next().unwrap_or(name);
-    if slot == "forge" && file.contains("SemiCircle") {
+    // Стойки FA для оружия нарисованы стоя: доской влево, крюками вправо.
+    let standing = library::size_from_name(file).is_some_and(|s| s[1] > s[0]);
+    if slot.starts_with("weapon_rack") && file.starts_with("Weapon_Rack") && standing {
+        90.0
+    } else if slot == "forge" && file.contains("SemiCircle") {
         180.0
     } else if slot == "fireplace" && file.starts_with("Fireplace_") {
+        90.0
+    } else if (slot == "stairs_down" || slot == "stair_rail") && file.starts_with("Stairs_") {
+        // Пролёт нарисован лёжа: ступени поперёк длинной стороны.
         90.0
     } else {
         0.0
@@ -310,6 +351,13 @@ const NEAR: &[(&str, &str)] = &[
     ("water_deep", "water_shallow"),
     ("stone_tiles", "flagstones"),
     ("dungeon_flagstones", "flagstones"),
+    ("crypt_floor", "dungeon_flagstones"),
+    ("prison_floor", "flagstones"),
+    ("temple_floor", "marble"),
+    ("ruin_floor", "dungeon_flagstones_moss"),
+    ("pillar_stone", "pillar"),
+    ("statue_figure", "statue"),
+    ("pillar_broken", "rubble"),
     ("dungeon_flagstones_moss", "flagstones"),
     ("rug_round", "rug"),
     ("wall_timber", "wall_wood"),
@@ -340,6 +388,7 @@ const NEAR: &[(&str, &str)] = &[
     ("market_stall_ochre", "market_stall"),
     ("sandstone", "sand"),
     ("chest_open", "chest"),
+    ("treasure_chest", "chest"),
     ("chest_empty", "chest"),
     ("arena_sand", "sand"),
     ("arena_sand_rough", "sand"),
@@ -425,7 +474,7 @@ impl Palette {
             for (slot, alternatives, none) in table_of(a.kind) {
                 let named = alternatives.iter().any(|alt| alt[0] == head && alt[1..].iter().all(|w| in_file(w)));
                 let part = a.kind == Kind::Object && PARTS.iter().any(|w| in_file(w)) && !alternatives.iter().any(|alt| alt.iter().any(|w| PARTS.contains(w)));
-                if named && !part && !NEVER.iter().any(|w| in_file(w)) && !none.iter().any(|w| in_file(w) || words.contains(w)) && fits_size(slot, &a.name) {
+                if named && !part && !NEVER.iter().any(|w| in_file(w) && !(["stairs_down", "stair_rail"].contains(slot) && *w == "path")) && !none.iter().any(|w| in_file(w) || words.contains(w)) && fits_size(slot, &a.name) {
                     slots.entry(slot).or_default().push((a.key.clone(), a.name.clone()));
                 }
             }
@@ -525,11 +574,23 @@ impl Palette {
     /// Ассет под слот: свой, если нашёлся; нет — свой у близкого слота (сухая трава —
     /// просто трава: встроенное пятно на чужой траве режет глаз); иначе встроенный.
     pub fn pick(&self, slot: &str) -> Pick {
+        self.pick_toned(slot, "")
+    }
+
+    /// Как [`Palette::pick`], но из своих — только те, в имени которых есть слово
+    /// `tone` (камень: `slate`, `sandstone`…): так подземелье держит один камень.
+    /// Таких нет — из всех.
+    pub fn pick_toned(&self, slot: &str, tone: &str) -> Pick {
         let near = NEAR.iter().find(|n| n.0 == slot).map(|n| n.1);
         let indoor = INDOOR_FLOORS.contains(&slot);
         let own = |s: &str| self.slots.get(s).filter(|v| !v.is_empty());
         let far = near.and_then(|n| NEAR.iter().find(|f| f.0 == n)).map(|f| f.1);
-        let Some(found) = own(slot).or_else(|| near.and_then(own)).or_else(|| far.and_then(own)) else { return Self::builtin_pick(slot) };
+        let Some(all) = own(slot).or_else(|| near.and_then(own)).or_else(|| far.and_then(own)) else { return Self::builtin_pick(slot) };
+        let tone = tone.to_lowercase();
+        // У части FA красный камень зовётся `Red`, а не `Redrock` (ступени).
+        let alias = if tone == "redrock" { "red".to_string() } else { tone.clone() };
+        let toned: Vec<(String, String)> = if tone.is_empty() { Vec::new() } else { all.iter().filter(|(_, n)| { let w = file_words(n); w.contains(&tone) || w.contains(&alias) }).cloned().collect() };
+        let found = if toned.is_empty() { all } else { &toned };
         let mut i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
         // Выпала накладка — следующий по списку: мерить все варианты долго (секунды).
         if indoor && let Some(k) = (0..found.len()).map(|step| (i + step) % found.len()).find(|&k| self.solid(&found[k].0)) {

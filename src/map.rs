@@ -506,6 +506,24 @@ pub fn awning_by_name(key: &str) -> bool {
     key.starts_with(&format!("{}market_stall", crate::library::BUILTIN)) || key.contains("/Arranged_Tarps/")
 }
 
+/// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.
+pub fn web_by_name(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("cobweb") || lower.contains("spider_web")
+}
+
+/// Сундук с сокровищем FA (закрытый): в Foundry открывается. Открытый с монетами и
+/// пустой лежат рядом под тем же именем с хвостом `_Coins_Mixed` и `_Empty_A`.
+pub fn chest_variants(key: &str) -> Option<(String, String)> {
+    let (dir, file) = key.rsplit_once('/')?;
+    if !file.starts_with("Treasure_Chest_") || ["Coins", "Empty", "False_Bottom"].iter().any(|w| file.contains(w)) {
+        return None;
+    }
+    let (stem, ext) = file.rsplit_once('.')?;
+    let (base, size) = stem.rsplit_once('_')?;
+    Some((format!("{dir}/{base}_Coins_Mixed_{size}.{ext}"), format!("{dir}/{base}_Empty_A_{size}.{ext}")))
+}
+
 /// Верёвка с бельём: в Foundry — тайл, который колышет ветер.
 pub fn line_by_name(key: &str) -> bool {
     key.contains("Clothes_Line")

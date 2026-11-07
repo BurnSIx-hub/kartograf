@@ -59,7 +59,7 @@ pub const BUILTIN_TEXTURES: [(&str, &str, bool, &[u8]); 27] = [
 
 /// Объекты, зашитые в программу: имя, подпись, размер в клетках, байты. Картинка —
 /// 256 точек на клетку с прозрачным полем и тенью (`tools/cutout.py`).
-pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 53] = [
+pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 54] = [
     ("chair", "Стул", [1.0, 1.0], include_bytes!("../assets/builtin/objects/chair.webp")),
     ("stool", "Табурет", [1.0, 1.0], include_bytes!("../assets/builtin/objects/stool.webp")),
     ("table", "Стол", [2.0, 1.0], include_bytes!("../assets/builtin/objects/table.webp")),
@@ -112,6 +112,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 53] = [
     ("bar_counter", "Барная стойка", [7.0, 2.0], include_bytes!("../assets/builtin/objects/bar_counter.webp")),
     ("bridge", "Мост", [6.0, 4.0], include_bytes!("../assets/builtin/objects/bridge.webp")),
     ("stairs", "Лестница вниз", [3.0, 3.0], include_bytes!("../assets/builtin/objects/stairs.webp")),
+    ("stairs_shade", "Тень спуска", [3.0, 1.0], include_bytes!("../assets/builtin/objects/stairs_shade.webp")),
     ("stump", "Пень", [3.0, 3.0], include_bytes!("../assets/builtin/objects/stump.webp")),
 ];
 
@@ -494,6 +495,8 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
             // Скалы FA — дорожки Dungeondraft (`paths/…Cliff…`): полоса вдоль линии,
             // как стена. Тень под скалой (`Under_Cliff`) — не стена.
             "paths" if is_cliff_path(&lower) => Some(Kind::Wall),
+            // Каменные ступени FA — тоже дорожка, но ставятся пролётом, как предмет.
+            "paths" if lower.contains("/stairs_stone_") || lower.contains("/stairs_railing_stone_") => Some(Kind::Object),
             "portals" => Some(Kind::Door),
             "objects" => Some(Kind::Object),
             _ => None,

@@ -82,7 +82,7 @@ impl Kind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Kind::Dungeon => "Случайное подземелье",
+            Kind::Dungeon => "Подземелье",
             Kind::Cave => "Пещера",
             Kind::Forest => "Лес",
             Kind::Town => "Городской квартал",
@@ -114,11 +114,13 @@ pub struct Options {
     pub cave: crate::plan::CaveKind,
     /// Квартал: обычный, с таверной, торговый.
     pub district: crate::plan::District,
+    /// Подземелье: склеп, темница, храм, руины.
+    pub dungeon: crate::plan::DungeonKind,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone, district: crate::plan::District::Mixed }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone, district: crate::plan::District::Mixed, dungeon: crate::plan::DungeonKind::Crypt }
     }
 }
 
