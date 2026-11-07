@@ -1094,6 +1094,56 @@ fn bar_stools(m: &mut Map, sp: &mut Spots, c: &Chamber) {
     }
 }
 
+/// Пульт управления перед реактором, оператором (перед картинки) ко входу.
+fn reactor_console(m: &mut Map, sp: &mut Spots, c: &Chamber) {
+    let r = c.r;
+    let Some(core) = m.props.iter().find(|p| p.asset.contains("Reactor_Core") && p.pos[0] >= r.x as f32 && p.pos[0] <= (r.x + r.w) as f32 && p.pos[1] >= r.y as f32 && p.pos[1] <= (r.y + r.h) as f32).cloned() else { return };
+    let p = asset("cy_reactor_console");
+    if !p.own {
+        return;
+    }
+    let to_entry: [f32; 2] = [[0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]][c.entry as usize];
+    let rot = [180.0, 270.0, 0.0, 90.0][c.entry as usize];
+    let reach = core.size[1].max(core.size[0]) * core.scale / 2.0 + 1.0;
+    let q = [core.pos[0] + to_entry[0] * reach, core.pos[1] + to_entry[1] * reach];
+    let [l, t, rr, u] = bounds(&p, "cy_reactor_console", rot, 1.0);
+    let (fw, fh) = (cells_of(rr - l), cells_of(u - t));
+    let (x, y) = ((q[0] - fw as f32 / 2.0).round() as i32, (q[1] - fh as f32 / 2.0).round() as i32);
+    if (0..fw).all(|i| (0..fh).all(|j| c.whole(x + i, y + j))) && sp.free(x, y, fw, fh) {
+        sp.block(x, y, fw, fh);
+        drop_pick(m, &p, [x as f32 + fw as f32 / 2.0 - (l + rr) / 2.0, y as f32 + fh as f32 / 2.0 - (t + u) / 2.0], rot, 1.0);
+    }
+}
+
+/// Капельница у изголовья медкровати и криокапсулы (изголовье — верх картинки).
+fn iv_stands(m: &mut Map, sp: &mut Spots, c: &Chamber) {
+    let r = c.r;
+    let p = asset("cy_iv");
+    if !p.own {
+        return;
+    }
+    let beds: Vec<crate::map::Prop> = m
+        .props
+        .iter()
+        .filter(|b| (b.asset.contains("Medical_Bed") || b.asset.contains("Cryo_Pod")) && b.pos[0] >= r.x as f32 && b.pos[0] <= (r.x + r.w) as f32 && b.pos[1] >= r.y as f32 && b.pos[1] <= (r.y + r.h) as f32)
+        .cloned()
+        .collect();
+    for b in beds {
+        let a = b.rot.to_radians();
+        let (head, side) = ([a.sin(), -a.cos()], [a.cos(), a.sin()]);
+        let (w, h) = (b.size[0] * b.scale, b.size[1] * b.scale);
+        for s in [1.0, -1.0] {
+            let q = [b.pos[0] + head[0] * (h / 2.0 - 0.5) + side[0] * s * (w / 2.0 + 0.5), b.pos[1] + head[1] * (h / 2.0 - 0.5) + side[1] * s * (w / 2.0 + 0.5)];
+            let (x, y) = (q[0].floor() as i32, q[1].floor() as i32);
+            if c.whole(x, y) && sp.free(x, y, 1, 1) {
+                sp.block(x, y, 1, 1);
+                drop_pick(m, &p, [x as f32 + 0.5, y as f32 + 0.5], b.rot, 1.0);
+                break;
+            }
+        }
+    }
+}
+
 /// Главное в комнате киберпанка — до прохода между дверями.
 fn cyber_centre(m: &mut Map, sp: &mut Spots, part: Part, c: &Chamber) -> Option<Room> {
     let far = (c.entry + 2) % 4;
@@ -1164,6 +1214,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_arcade", 1, &all);
             walls(m, sp, rng, "cy_vending", 1, &all);
             walls(m, sp, rng, "cy_speaker", 1, &all);
+            spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
             for _ in 0..rng.int(2, 3) {
                 super::inside(m, sp, rng, r, "cy_cocktail", 1.0);
             }
@@ -1171,6 +1222,8 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         Part::Clinic => {
             pair(m, sp, "cy_med_bed", &sides);
             walls(m, sp, rng, "cy_cryo", 2, &[far]);
+            iv_stands(m, sp, c);
+            spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
             walls(m, sp, rng, "cy_biotank", 2, &all);
             walls(m, sp, rng, "cy_chem", 1, &all);
             walls(m, sp, rng, "cy_terminal", 1, &all);
@@ -1179,6 +1232,9 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             if rows(m, sp, c, &asset("cy_server"), "cy_server", 1.0, 1, false) == 0 {
                 walls(m, sp, rng, "cy_server", 4, &all);
             }
+            // У стен — ещё стойки, вперемешку чёрные и белые.
+            walls(m, sp, rng, "cy_server", 3, &all);
+            walls(m, sp, rng, "cy_cooling", 1, &all);
             walls(m, sp, rng, "cy_cables", 1, &all);
         }
         Part::Lab => {
@@ -1193,6 +1249,8 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         Part::Garage => {
             walls(m, sp, rng, "cy_moto", 2, &all);
             walls(m, sp, rng, "cy_tools", 2, &all);
+            walls(m, sp, rng, "cy_exosuit", 1, &all);
+            spread(m, sp, c, &asset("cy_tires"), "cy_tires", 2, &all);
             walls(m, sp, rng, "cy_pallet", 1, &all);
             walls(m, sp, rng, "cy_weapons", 1, &all);
             walls(m, sp, rng, "cy_barrel", 2, &all);
@@ -1208,17 +1266,22 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             }
             desk_and_seat(m, sp, rng, c, "cy_desk", "cy_chair");
             walls(m, sp, rng, "cy_lockers", 1, &sides);
-            walls(m, sp, rng, "cy_planter", 1, &all);
+            walls(m, sp, rng, "cy_cooler", 1, &all);
+            pair(m, sp, "cy_plant", &[c.entry]);
         }
         Part::Market => {
             walls(m, sp, rng, "cy_stall", 1, &all);
             walls(m, sp, rng, "cy_vending", 2, &all);
             walls(m, sp, rng, "cy_kiosk", 2, &all);
             walls(m, sp, rng, "cy_pallet", 1, &all);
+            walls(m, sp, rng, "cy_bench", 2, &all);
             walls(m, sp, rng, "cy_trash", 2, &all);
             walls(m, sp, rng, "cy_planter", 2, &all);
         }
         Part::Treasure => {
+            reactor_console(m, sp, c);
+            pair(m, sp, "cy_coolant", &[far]);
+            walls(m, sp, rng, "cy_cooling", 1, &sides);
             pair(m, sp, "cy_turret", &[c.entry]);
             walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
@@ -1227,6 +1290,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
         Part::Store => {
             walls(m, sp, rng, "cy_pallet", 3, &all);
             super::inside(m, sp, rng, r, "cy_forklift", 1.0);
+            walls(m, sp, rng, "cy_exosuit", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_weapons", 1, &all);
             walls(m, sp, rng, "cy_barrel", 2, &all);

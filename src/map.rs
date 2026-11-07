@@ -515,7 +515,18 @@ pub fn awning_by_name(key: &str) -> bool {
 /// Неоновая колонка киберпанка: в Foundry — свой тайл, «Wild Canvas» оживляет
 /// её под музыку.
 pub fn speaker_by_name(key: &str) -> bool {
-    key.contains("Speaker_Stack")
+    living_by_name(key).is_some()
+}
+
+/// Живой предмет набора и его пометка для «Wild Canvas» (ключ, значение):
+/// колонка играет, у охладителя крутятся вентиляторы, у стоек мигают огни.
+/// Картинка при выгрузке переименовывается, поэтому вид — в пометке.
+pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
+    let file = crate::library::label(key);
+    if file.starts_with("Speaker_Stack") {
+        return Some(("speaker", "on".into()));
+    }
+    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
 }
 
 /// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.

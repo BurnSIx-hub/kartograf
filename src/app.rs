@@ -4974,7 +4974,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, speaker: false });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
@@ -5038,8 +5038,8 @@ impl App {
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
                 tile.fade = false;
                 tile.leaves = false;
-                if map::speaker_by_name(&prop.asset) {
-                    tile.speaker = true;
+                if let Some(living) = map::living_by_name(&prop.asset) {
+                    tile.living = Some(living);
                     tiles.push(tile);
                     continue;
                 }
