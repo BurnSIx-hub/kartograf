@@ -173,6 +173,14 @@ const OBJECTS: &[Slot] = &[
     ("cy_fan", &[&["floor", "fan"]], &[]),
     ("cy_charger", &[&["charging", "station"]], &[]),
     ("cy_drone_delivery", &[&["drone", "delivery"]], &[]),
+    ("cy_corner_sofa", &[&["sofa", "corner"]], &[]),
+    ("cy_coffee", &[&["coffee", "table", "holo"]], &[]),
+    ("cy_bunk", &[&["bunk", "bed"]], &[]),
+    ("cy_hacker", &[&["hacker", "desk"]], &[]),
+    ("cy_water_tank", &[&["water", "tank"]], &[]),
+    ("cy_ac", &[&["ac", "unit"]], &[]),
+    ("cy_dumpster", &[&["dumpster"]], &[]),
+    ("cy_pipes", &[&["pipe", "valves"]], &[]),
     // Сундук с сокровищем FA: у него есть открытый с монетами и пустой — в Foundry
     // он открывается (Item Piles).
     ("treasure_chest", &[&["treasure", "chest"]], &["coins", "empty", "false", "bottom", "open"]),
