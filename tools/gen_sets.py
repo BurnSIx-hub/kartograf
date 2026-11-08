@@ -1,4 +1,4 @@
-"""Встроенные наборы ассетов: assets/sets/<набор>/<floors|walls|objects>/*.webp
+"""Встроенные наборы ассетов: assets/sets/<набор>/<floors|walls|objects|roofs>/*.webp
 -> src/sets.rs (таблица с include_bytes!). Запускать после пополнения набора:
     python -I tools/gen_sets.py
 """
@@ -7,7 +7,7 @@ root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 base = os.path.join(root, 'assets', 'sets')
 rows = []
 for set_name in sorted(os.listdir(base)):
-    for kind in ('floors', 'walls', 'objects'):
+    for kind in ('floors', 'walls', 'objects', 'roofs'):
         d = os.path.join(base, set_name, kind)
         if not os.path.isdir(d):
             continue

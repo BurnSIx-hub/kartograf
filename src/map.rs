@@ -201,6 +201,12 @@ pub struct Wall {
 pub type Segment = ([f32; 2], [f32; 2]);
 
 impl Wall {
+    /// Труба по полу (полоса `Pipe_…`): рисуется как стена, но движение и
+    /// свет в VTT не держит.
+    pub fn is_decor(&self) -> bool {
+        matches!(&self.style, Some(WallStyle { paint: Paint::Texture(k), .. }) if crate::library::label(k).starts_with("Pipe_"))
+    }
+
     /// Отрезки между вершинами, без изгиба.
     pub fn chords(&self) -> impl Iterator<Item = Segment> + '_ {
         let n = self.points.len();
@@ -725,6 +731,46 @@ impl Roof {
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
         convex_depth(&self.outline(), p) >= 0.0
+    }
+
+    /// Парапет по краю: у плоской крыши с покрытием из набора «Киберпанк» —
+    /// стальной отлив (полоса 2 × 0,25 клетки).
+    pub fn parapet(&self) -> Option<&'static str> {
+        (self.shape == RoofShape::Flat && crate::library::set_of(&self.paint) == Some("cyberpunk")).then_some("set:cyberpunk/walls/Roof_Parapet_Steel_A.webp")
+    }
+
+    /// Сливы и воронки крыши с парапетом: картинка, середина, поворот. Слив
+    /// (1×1) — на длинных сторонах, на трети длины от разных концов, носиком
+    /// наружу: полоса картинки 0,375..0,625 ложится на парапет, так что середина —
+    /// в 0,125 клетки от края внутрь. Воронки — по средней линии, одна или две.
+    pub fn fixtures(&self) -> Vec<(&'static str, [f32; 2], f32)> {
+        const SCUPPER: &str = "set:cyberpunk/objects/Roof_Scupper_A_1x1.webp";
+        const DRAIN: &str = "set:cyberpunk/objects/Roof_Drain_A_1x1.webp";
+        if self.parapet().is_none() {
+            return Vec::new();
+        }
+        let (lo, hi) = self.outer();
+        let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+        let mut out = Vec::new();
+        let edge = 0.125;
+        if w >= h && w >= 2.25 {
+            out.push((SCUPPER, [lo[0] + w / 3.0, lo[1] + edge], 0.0));
+            out.push((SCUPPER, [lo[0] + w * 2.0 / 3.0, hi[1] - edge], 180.0));
+        } else if h > w && h >= 2.25 {
+            out.push((SCUPPER, [hi[0] - edge, lo[1] + h / 3.0], 90.0));
+            out.push((SCUPPER, [lo[0] + edge, lo[1] + h * 2.0 / 3.0], 270.0));
+        }
+        let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+        if w.min(h) >= 2.0 {
+            if w.max(h) >= 5.0 {
+                let (a, b) = if w >= h { ([lo[0] + w / 3.0, c[1]], [lo[0] + w * 2.0 / 3.0, c[1]]) } else { ([c[0], lo[1] + h / 3.0], [c[0], lo[1] + h * 2.0 / 3.0]) };
+                out.push((DRAIN, a, 0.0));
+                out.push((DRAIN, b, 0.0));
+            } else {
+                out.push((DRAIN, c, 0.0));
+            }
+        }
+        out
     }
 
     /// Конёк вдоль x: по длинной стороне, `turn` — поперёк.

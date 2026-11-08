@@ -44,6 +44,15 @@ fn asset_toned(slot: &str, tone: &str) -> Pick {
     })
 }
 
+/// Видимая рамка стоящего предмета в клетках карты: лево, верх, право, низ.
+fn prop_box(q: &crate::map::Prop) -> [f32; 4] {
+    let seen = PALETTE.with(|pal| pal.borrow().as_ref().and_then(|pal| pal.seen(&q.asset)));
+    let visible = seen.map(|[l, t, r, b]| [l * q.size[0], t * q.size[1], r * q.size[0], b * q.size[1]]);
+    let p = Pick { key: q.asset.clone(), size: q.size, own: true, visible, turn: 0.0 };
+    let [l, t, r, u] = bounds(&p, "", q.rot, q.scale);
+    [q.pos[0] + l, q.pos[1] + t, q.pos[0] + r, q.pos[1] + u]
+}
+
 /// Концы нити своего ассета в клетках от середины холста, без масштаба.
 fn strand_ends(p: &Pick) -> Option<[f32; 4]> {
     let e = PALETTE.with(|pal| pal.borrow().as_ref().and_then(|pal| pal.ends(&p.key)))?;

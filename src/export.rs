@@ -185,7 +185,8 @@ pub struct Light {
 /// ломаные и упрощённые — Foundry медленнеет от тысяч мелких отрезков.
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     let mut segs: Vec<Segment> = room_edges.to_vec();
-    for w in &map.walls {
+    // Трубы по полу — рисунок, не стена.
+    for w in map.walls.iter().filter(|w| !w.is_decor()) {
         segs.extend(w.segments());
     }
     let cut = map::cut_portals(&segs, &map.portals);
@@ -469,7 +470,7 @@ pub struct SceneLevel<'a> {
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
-    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None }
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: Vec::new() }
 }
 
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
@@ -498,6 +499,9 @@ pub struct RoofTile {
     pub chest: Option<(String, String)>,
     /// Живой предмет «Wild Canvas»: пометка (ключ, значение) — колонка, машины.
     pub living: Option<(&'static str, String)>,
+    /// Сливы на крыше (вшиты в картинку): середина в точках сцены и поворот —
+    /// «Wild Canvas» пускает по ним воду в дождь.
+    pub scuppers: Vec<[f32; 3]>,
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -569,6 +573,11 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 if !map.particles.is_empty() && r.leaves {
                     tile["flags"][LIVE_MODULE]["particles"] = json!(map.particles);
                 }
+            }
+            if !r.scuppers.is_empty() {
+                // Сливы крыши: середина и поворот; размер — клетка сцены.
+                let s: Vec<Value> = r.scuppers.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();
+                tile["flags"] = json!({LIVE_MODULE: {"scuppers": s, "scupperSize": px}});
             }
             tiles.push(tag(tile));
         }
@@ -854,7 +863,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]] }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
@@ -876,8 +885,9 @@ mod tests {
         assert_eq!(scene["_stats"]["coreVersion"], "14.355");
         assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));
         assert_eq!(t["levels"][0], lv[0]["_id"]);
-        // Крону качает ветер «Wild Canvas», крышу — нет.
-        assert!(t.get("flags").is_none());
+        // Крону качает ветер «Wild Canvas», крышу — нет; у крыши лишь сливы для дождя.
+        assert!(t["flags"][LIVE_MODULE].get("wind").is_none());
+        assert_eq!(t["flags"][LIVE_MODULE]["scuppers"][0], json!([100, 50, 0]));
         let crown = &scene["tiles"][1];
         assert_eq!(crown["flags"][LIVE_MODULE]["wind"], 1);
         assert!(crown["flags"][LIVE_MODULE].get("particles").is_none());
@@ -886,7 +896,7 @@ mod tests {
         autumn.particles = "leaves".into();
         let scene = foundry_levels(&autumn, "Дом", &levels, 100, &Default::default());
         assert_eq!(scene["tiles"][1]["flags"][LIVE_MODULE]["particles"], "leaves");
-        assert!(scene["tiles"][0].get("flags").is_none());
+        assert!(scene["tiles"][0]["flags"][LIVE_MODULE].get("particles").is_none());
         assert_eq!(scene["weather"], "");
         autumn.weather = "snow".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["weather"], "snow");

@@ -1,12 +1,16 @@
 //! Встроенные наборы ассетов (киберпанк и др.). Файл собирает `tools/gen_sets.py`
 //! из `assets/sets/` — руками не править.
 
-pub const SET_FILES: [(&str, &[u8]); 90] = [
+pub const SET_FILES: [(&str, &[u8]); 100] = [
     ("cyberpunk/floors/Floor_Alloy_Dark_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Dark_A.webp")),
     ("cyberpunk/floors/Floor_Alloy_Grid_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Grid_A.webp")),
     ("cyberpunk/floors/Floor_Alloy_Panels_A.webp", include_bytes!("../assets/sets/cyberpunk/floors/Floor_Alloy_Panels_A.webp")),
+    ("cyberpunk/walls/Pipe_Double_Steel_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Pipe_Double_Steel_A.webp")),
+    ("cyberpunk/walls/Pipe_Single_Steel_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Pipe_Single_Steel_A.webp")),
+    ("cyberpunk/walls/Roof_Parapet_Steel_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Roof_Parapet_Steel_A.webp")),
     ("cyberpunk/walls/Wall_Alloy_Black_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Wall_Alloy_Black_A.webp")),
     ("cyberpunk/walls/Wall_Alloy_White_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Wall_Alloy_White_A.webp")),
+    ("cyberpunk/walls/Wall_Pipes_Steel_A.webp", include_bytes!("../assets/sets/cyberpunk/walls/Wall_Pipes_Steel_A.webp")),
     ("cyberpunk/objects/AC_Unit_Rooftop_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/AC_Unit_Rooftop_A_2x2.webp")),
     ("cyberpunk/objects/Ammo_Crate_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Ammo_Crate_A_1x1.webp")),
     ("cyberpunk/objects/Android_Wreck_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Android_Wreck_A_1x1.webp")),
@@ -67,6 +71,8 @@ pub const SET_FILES: [(&str, &[u8]); 90] = [
     ("cyberpunk/objects/Planter_Hydroponic_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Planter_Hydroponic_A_1x1.webp")),
     ("cyberpunk/objects/Reactor_Core_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Reactor_Core_A_2x2.webp")),
     ("cyberpunk/objects/Robot_Arm_Industrial_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Robot_Arm_Industrial_A_2x2.webp")),
+    ("cyberpunk/objects/Roof_Drain_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Roof_Drain_A_1x1.webp")),
+    ("cyberpunk/objects/Roof_Scupper_A_1x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Roof_Scupper_A_1x1.webp")),
     ("cyberpunk/objects/Satellite_Dish_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Satellite_Dish_A_2x2.webp")),
     ("cyberpunk/objects/Server_Rack_A_1x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Server_Rack_A_1x2.webp")),
     ("cyberpunk/objects/Server_Rack_B_1x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Server_Rack_B_1x2.webp")),
@@ -92,4 +98,8 @@ pub const SET_FILES: [(&str, &[u8]); 90] = [
     ("cyberpunk/objects/Weapon_Rack_Tech_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Weapon_Rack_Tech_A_2x1.webp")),
     ("cyberpunk/objects/Weight_Bench_A_2x2.webp", include_bytes!("../assets/sets/cyberpunk/objects/Weight_Bench_A_2x2.webp")),
     ("cyberpunk/objects/Workbench_Robotics_A_2x1.webp", include_bytes!("../assets/sets/cyberpunk/objects/Workbench_Robotics_A_2x1.webp")),
+    ("cyberpunk/roofs/Roof_Flat_Membrane_A.webp", include_bytes!("../assets/sets/cyberpunk/roofs/Roof_Flat_Membrane_A.webp")),
+    ("cyberpunk/roofs/Roof_Metal_Seam_Dark_A.webp", include_bytes!("../assets/sets/cyberpunk/roofs/Roof_Metal_Seam_Dark_A.webp")),
+    ("cyberpunk/roofs/Roof_Metal_Seam_Neon_A.webp", include_bytes!("../assets/sets/cyberpunk/roofs/Roof_Metal_Seam_Neon_A.webp")),
+    ("cyberpunk/roofs/Roof_Solar_Panels_A.webp", include_bytes!("../assets/sets/cyberpunk/roofs/Roof_Solar_Panels_A.webp")),
 ];

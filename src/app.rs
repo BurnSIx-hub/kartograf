@@ -4367,6 +4367,51 @@ impl App {
             edges.push([quad[3], quad[2]]);
         }
         painter.add(Shape::mesh(mesh));
+        // Парапет плоской крыши: тень на кровлю, потом сам отлив.
+        if let Some(pk) = roof.parapet() {
+            let (lo, hi) = (roof.outline()[0], roof.outline()[2]);
+            let w = roofs::PARAPET;
+            let mut shade = egui::Mesh::default();
+            let dim = Color32::from_rgba_premultiplied(0, 0, 0, (alpha * (1.0 - roofs::PARAPET_SHADE) * 255.0) as u8);
+            for (poly, ..) in roofs::parapet_sides([lo[0] + w, lo[1] + w], [hi[0] - w, hi[1] - w], roofs::PARAPET_SHADOW) {
+                let base = shade.vertices.len() as u32;
+                for (k, p) in poly.iter().enumerate() {
+                    shade.colored_vertex(cam.to_screen(canvas, *p), if k < 2 { dim } else { Color32::TRANSPARENT });
+                }
+                shade.add_triangle(base, base + 1, base + 2);
+                shade.add_triangle(base, base + 2, base + 3);
+            }
+            painter.add(Shape::mesh(shade));
+            if let Some((t, _)) = self.textures.get(pk, false) {
+                let mut band = egui::Mesh::with_texture(t.id());
+                let color = tint(1.0);
+                for (poly, o, along, down) in roofs::parapet_sides(lo, hi, w) {
+                    let base = band.vertices.len() as u32;
+                    for p in poly {
+                        let d = [p[0] - o[0], p[1] - o[1]];
+                        let uv = pos2((d[0] * along[0] + d[1] * along[1]) / roofs::PARAPET_TILE, (d[0] * down[0] + d[1] * down[1]) / w);
+                        band.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv, color });
+                    }
+                    band.add_triangle(base, base + 1, base + 2);
+                    band.add_triangle(base, base + 2, base + 3);
+                }
+                painter.add(Shape::mesh(band));
+            }
+            // Сливы и воронки — поверх, клеткой с поворотом.
+            for (key, at, rot) in roof.fixtures() {
+                let Some((t, _)) = self.textures.get(key, false) else { continue };
+                let mut item = egui::Mesh::with_texture(t.id());
+                let (s, c) = rot.to_radians().sin_cos();
+                let color = Color32::from_white_alpha((alpha * 255.0) as u8);
+                for (l, uv) in [([-0.5f32, -0.5f32], pos2(0.0, 0.0)), ([0.5, -0.5], pos2(1.0, 0.0)), ([0.5, 0.5], pos2(1.0, 1.0)), ([-0.5, 0.5], pos2(0.0, 1.0))] {
+                    let p = [at[0] + c * l[0] - s * l[1], at[1] + s * l[0] + c * l[1]];
+                    item.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv, color });
+                }
+                item.add_triangle(0, 1, 2);
+                item.add_triangle(0, 2, 3);
+                painter.add(Shape::mesh(item));
+            }
+        }
         for [a, b] in edges {
             painter.line_segment([cam.to_screen(canvas, a), cam.to_screen(canvas, b)], Stroke::new(1.0, dark));
         }
@@ -4968,13 +5013,23 @@ impl App {
                     let tile = roofs::tile_cells([img.width(), img.height()]);
                     covers.insert(r.paint.clone(), (img, tile));
                 }
+                let fixtures = r.fixtures();
+                for pk in r.parapet().into_iter().chain(fixtures.iter().map(|f| f.0)) {
+                    if !covers.contains_key(pk) {
+                        let bytes = self.textures.bytes(pk)?;
+                        let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(pk)))?.to_rgba8();
+                        covers.insert(pk.to_owned(), (img, [roofs::PARAPET_TILE, roofs::PARAPET]));
+                    }
+                }
                 let (tex, tile) = &covers[&r.paint];
-                let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light);
+                let parapet = r.parapet().map(|pk| &covers[pk].0);
+                let items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2)).collect();
+                let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light, parapet, &items);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect() });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {

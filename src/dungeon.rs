@@ -679,6 +679,9 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     }
     let edges = m.room_edges();
     m.sync_edge_looks(&edges);
+    if kind == DungeonKind::Cyber {
+        pipe_walls(m, rooms, &parts, &edges);
+    }
     dark_outside(m, if p.mood == Mood::Gloomy { 0.95 } else { 0.85 });
 
     // Ворота, второй вход, двери коридоров.
@@ -770,6 +773,7 @@ pub(super) fn dungeon(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
             if !jail {
                 if kind == DungeonKind::Cyber {
                     cyber_dress(m, &mut sp, rng, &kit, parts[i], c);
+                    pipe_runs(m, c);
                 } else {
                     dress(m, &mut sp, rng, &kit, kind, parts[i], c, at);
                 }
@@ -1183,6 +1187,158 @@ fn corner_sofa(m: &mut Map, sp: &mut Spots, c: &Chamber) -> bool {
         return true;
     }
     false
+}
+
+/// Стены техзон киберпанка — стальные трубы: реакторная, серверная, склад, гараж.
+fn pipe_walls(m: &mut Map, rooms: &[Chamber], parts: &[Part], edges: &[Segment]) {
+    let p = asset("cy_wall_pipes");
+    if !p.own {
+        return;
+    }
+    // Полоса 0,4 клетки, повтор ~0,9 — бесшовная.
+    let style = WallStyle { paint: Paint::Texture(p.key.clone()), width: 0.4 };
+    for (c, part) in rooms.iter().zip(parts) {
+        if !matches!(part, Part::Treasure | Part::Servers | Part::Store | Part::Garage) {
+            continue;
+        }
+        let r = c.r;
+        let (x0, y0, x1, y1) = (r.x as f32 - 0.05, r.y as f32 - 0.05, (r.x + r.w) as f32 + 0.05, (r.y + r.h) as f32 + 0.05);
+        let own: Vec<Segment> = edges
+            .iter()
+            .filter(|s| {
+                let (mx, my) = ((s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0);
+                mx >= x0 && mx <= x1 && my >= y0 && my <= y1
+            })
+            .copied()
+            .collect();
+        m.set_edge_look(&own, &style);
+    }
+}
+
+/// Трубы по полу от приборов к ближней стене: начало прячется под прибором,
+/// конец — под стеной. Путь не идёт под другой мебелью; нет такого — без трубы.
+fn pipe_runs(m: &mut Map, c: &Chamber) {
+    const BIG: [&str; 3] = ["Reactor_Core", "Coolant_Tank", "Cooling_Unit"];
+    const SMALL: [&str; 5] = ["Generator_Portable", "Pipe_Valves", "Water_Tank", "AC_Unit", "Data_Core"];
+    let (single, double) = (asset("cy_pipe"), asset("cy_pipe2"));
+    if !single.own {
+        return;
+    }
+    let r = c.r;
+    let within = |q: &crate::map::Prop| q.pos[0] >= r.x as f32 && q.pos[0] <= (r.x + r.w) as f32 && q.pos[1] >= r.y as f32 && q.pos[1] <= (r.y + r.h) as f32;
+    let devices: Vec<(usize, bool)> = m
+        .props
+        .iter()
+        .enumerate()
+        .filter(|(_, q)| within(q))
+        .filter_map(|(i, q)| {
+            let l = crate::library::label(&q.asset);
+            if BIG.iter().any(|n| l.starts_with(n)) {
+                Some((i, true))
+            } else if SMALL.iter().any(|n| l.starts_with(n)) {
+                Some((i, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Чем занят пол: прямоугольники мебели (плоское не мешает).
+    let boxes: Vec<(usize, [f32; 4])> = m
+        .props
+        .iter()
+        .enumerate()
+        .filter(|(_, q)| within(q) && !crate::map::flat_by_name(&q.asset))
+        .map(|(i, q)| (i, prop_box(q)))
+        .collect();
+    let walls = m.room_edges();
+    for (i, big) in devices {
+        let d = m.props[i].clone();
+        let (p, width) = if big && double.own { (&double, 0.47) } else { (&single, 0.27) };
+        let Some(b) = boxes.iter().find(|(k, _)| *k == i).map(|b| b.1) else { continue };
+        let mid = [(d.pos[0] * 2.0).round() / 2.0, (d.pos[1] * 2.0).round() / 2.0];
+        const DIRS: [[f32; 2]; 4] = [[0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]];
+        // Трубы ложатся поверх предметов: начало — на видимом краю прибора.
+        // Прямо от прибора к стене напротив…
+        let mut tries: Vec<([f32; 2], usize)> = vec![([mid[0], b[1] + 0.02], 0), ([b[2] - 0.02, mid[1]], 1), ([mid[0], b[3] - 0.02], 2), ([b[0] + 0.02, mid[1]], 3)];
+        // …или, если прибор у стены, вдоль неё до угла.
+        let off = width / 2.0 + 0.12;
+        let (wl, wt, wr, wb) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
+        if b[1] - wt < 0.45 {
+            tries.extend([([b[0] + 0.02, wt + off], 3), ([b[2] - 0.02, wt + off], 1)]);
+        }
+        if wb - b[3] < 0.45 {
+            tries.extend([([b[0] + 0.02, wb - off], 3), ([b[2] - 0.02, wb - off], 1)]);
+        }
+        if b[0] - wl < 0.45 {
+            tries.extend([([wl + off, b[1] + 0.02], 0), ([wl + off, b[3] - 0.02], 2)]);
+        }
+        if wr - b[2] < 0.45 {
+            tries.extend([([wr - off, b[1] + 0.02], 0), ([wr - off, b[3] - 0.02], 2)]);
+        }
+        // Шаг по полклетки вдоль `dir`: пол комнаты и не под чужой мебелью.
+        let free = |q: [f32; 2], dir: [f32; 2]| -> Option<bool> {
+            let cells = [[q[0] - 0.01 * dir[1].abs(), q[1] - 0.01 * dir[0].abs()], [q[0] + 0.01 * dir[1].abs(), q[1] + 0.01 * dir[0].abs()]];
+            if !cells.iter().all(|p| c.whole(p[0].floor() as i32, p[1].floor() as i32)) {
+                return Some(false);
+            }
+            (!boxes.iter().any(|(j, o)| *j != i && q[0] > o[0] - 0.1 && q[0] < o[2] + 0.1 && q[1] > o[1] - 0.1 && q[1] < o[3] + 0.1)).then_some(true)
+        };
+        // До стены: конец — на краю последней клетки пола, в стене, не в проёме.
+        let march = |s: [f32; 2], k: usize| -> Option<([f32; 2], f32)> {
+            let dir = DIRS[k];
+            let mut t = 0.0f32;
+            while free([s[0] + dir[0] * (t + 0.25), s[1] + dir[1] * (t + 0.25)], dir)? {
+                t += 0.5;
+                if t > 6.0 {
+                    return None;
+                }
+            }
+            let mut e = [s[0] + dir[0] * t, s[1] + dir[1] * t];
+            if dir[0] != 0.0 {
+                e[0] = if dir[0] > 0.0 { e[0].ceil() } else { e[0].floor() };
+            } else {
+                e[1] = if dir[1] > 0.0 { e[1].ceil() } else { e[1].floor() };
+            }
+            let len = (e[0] - s[0]).abs() + (e[1] - s[1]).abs();
+            let walled = walls.iter().any(|(a, b)| near_seg(e, *a, *b) < 0.05) && !m.portals.iter().any(|d| near_seg(e, d.a, d.b) < 0.3);
+            (len > 0.3 && walled).then_some((e, len))
+        };
+        let mut best: Option<(Vec<[f32; 2]>, f32)> = None;
+        let mut keep = |pts: Vec<[f32; 2]>, score: f32| {
+            if score <= 5.0 && best.as_ref().is_none_or(|b| score < b.1) {
+                best = Some((pts, score));
+            }
+        };
+        for &(s, k) in &tries {
+            if let Some((e, len)) = march(s, k) {
+                keep(vec![s, e], len);
+            }
+            // С поворотом: отойти от прибора и свернуть к стене (буква Г).
+            let dir = DIRS[k];
+            for step in 1..=4 {
+                let a = step as f32 * 0.5;
+                if !(0..step).all(|n| free([s[0] + dir[0] * (n as f32 * 0.5 + 0.25), s[1] + dir[1] * (n as f32 * 0.5 + 0.25)], dir) == Some(true)) {
+                    break;
+                }
+                let turn = [s[0] + dir[0] * a, s[1] + dir[1] * a];
+                for k2 in [(k + 1) % 4, (k + 3) % 4] {
+                    if let Some((e, len)) = march(turn, k2) {
+                        keep(vec![s, turn, e], a + len + 1.0);
+                    }
+                }
+            }
+        }
+        let Some((points, _)) = best else { continue };
+        m.walls.push(crate::map::Wall { points, closed: false, bends: Vec::new(), style: Some(WallStyle { paint: Paint::Texture(p.key.clone()), width }) });
+    }
+}
+
+/// Расстояние от точки до отрезка.
+fn near_seg(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l2 = (dx * dx + dy * dy).max(1e-6);
+    let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0);
+    (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
 }
 
 /// Дрон доставки — на только что поставленной площадке.

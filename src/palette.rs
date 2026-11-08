@@ -328,6 +328,10 @@ const WALLS: &[Slot] = &[
     ("wall_cave_volcanic", &[&["cliff", "stone", "volcanic"]], &["top", "sand", "desert"]),
     ("wall_cave_purple", &[&["cliff", "stone", "purple"]], &["top"]),
     ("cy_wall", &[&["alloy"]], &[]),
+    ("cy_wall_pipes", &[&["pipes", "steel"]], &[]),
+    // Трубы по полу от приборов: полосы с прозрачным фоном.
+    ("cy_pipe", &[&["pipe", "single"]], &[]),
+    ("cy_pipe2", &[&["pipe", "double"]], &[]),
     ("wall_dwarven", &[&["dwarven"], &["dwarf"], &["гномья"]], &[]),
     ("wall_drow", &[&["drow"], &["obsidian"], &["обсидиан"]], &[]),
 ];
@@ -716,6 +720,11 @@ impl Palette {
         let visible = *self.boxes.borrow_mut().entry(key.clone()).or_insert_with(|| self.visible.as_ref().and_then(|f| f(key)));
         let visible = visible.map(|[l, t, r, b]| [l * size[0], t * size[1], r * size[0], b * size[1]]);
         Pick { key: key.clone(), size, own: true, visible, turn: turn_of(slot, name) }
+    }
+
+    /// Видимая часть своей картинки, доли холста от середины (кэш).
+    pub fn seen(&self, key: &str) -> Option<[f32; 4]> {
+        *self.boxes.borrow_mut().entry(key.to_owned()).or_insert_with(|| self.visible.as_ref().and_then(|f| f(key)))
     }
 
     /// Все свои ассеты слота, по алфавиту ключей; пусто — своих нет.
