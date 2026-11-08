@@ -1829,12 +1829,12 @@ mod fa_slots {
         for f in ["FA_Objects_A_v3.52.dungeondraft_pack", "FA_Objects_B_v3.82.dungeondraft_pack"] {
             assets.extend(library::pack_assets(&dir.join(f)).unwrap());
         }
-        let pal = Palette::from_library(&assets, Box::new(|_| Some([256, 256])));
+        let pal = Palette::from_library(&assets, Box::new(crate::palette::fake_measure));
         if let Ok(seed) = std::env::var("WINDOWS") {
             let mut plan = Plan::random(&crate::generate::Options { kind: Kind::Town, seed: seed.clone(), library: true, ..Default::default() }, [34, 46]);
             plan.assets = Assets::Library;
             let mut m = Map::new(34, 46);
-            build(&mut m, &plan, 0, Palette::from_library(&assets, Box::new(|_| Some([256, 256])))).unwrap();
+            build(&mut m, &plan, 0, Palette::from_library(&assets, Box::new(crate::palette::fake_measure))).unwrap();
             let name = |k: &str| k.rsplit('/').next().unwrap_or(k).to_owned();
             for p in m.portals.iter().filter(|p| p.kind == PortalKind::Window) {
                 let len = (p.b[0] - p.a[0]).abs() + (p.b[1] - p.a[1]).abs();

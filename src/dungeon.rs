@@ -2463,7 +2463,7 @@ mod fa_props {
             plan.options.room_size = [5, 9];
             plan.options.loops = 0.4;
             let mut m = Map::new(50, 40);
-            build(&mut m, &plan, 0, Palette::from_library(&assets, Box::new(|_| Some([256, 256])))).unwrap();
+            build(&mut m, &plan, 0, Palette::from_library(&assets, Box::new(crate::palette::fake_measure))).unwrap();
             println!("==== {kind:?}");
             for l in &m.labels {
                 println!("  [{}] at {:?}", l.text, l.pos);

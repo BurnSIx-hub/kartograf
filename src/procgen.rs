@@ -75,6 +75,8 @@ mod arena;
 mod quarter;
 #[path = "dungeon.rs"]
 mod dungeon;
+#[path = "church.rs"]
+mod church;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -1148,7 +1150,7 @@ fn clear(m: &mut Map) {
     m.labels.clear();
     m.roofs.clear();
     m.shade = None;
-    m.shadows = Shadows { on: true, angle: 45.0, dist: 0.7, blur: 0.3, opacity: 0.6, fade: 0.7 };
+    m.shadows = Shadows { on: true, angle: 45.0, dist: 0.7, blur: 0.3, opacity: 0.6, fade: 0.7, ..Shadows::default() };
 }
 
 /// Разом все круги одним мазком: `Map::paint` копирует маску, по кругу на вызов дорого.
@@ -2578,6 +2580,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         Kind::Town => quarter::quarter(m, p, &mut rng, &mut warnings),
         Kind::House | Kind::Tavern => interior(m, p, &mut rng, &mut warnings),
         Kind::Arena => arena::arena(m, p, &mut rng, &mut warnings),
+        Kind::Church => church::church(m, p, &mut rng, &mut warnings),
     };
     mood(m, p);
     Ok(Report { count, warnings })
@@ -2608,7 +2611,7 @@ mod tests {
             a("Walls/Wall_Timber_A.webp", K::Wall),
             a("Portals/Door_Wooden_A_1x1.webp", K::Door),
         ];
-        Palette::from_library(&assets, Box::new(|_| Some([256, 256])))
+        Palette::from_library(&assets, Box::new(crate::palette::fake_measure))
     }
 
     #[test]

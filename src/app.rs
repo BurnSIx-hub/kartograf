@@ -1355,7 +1355,7 @@ impl App {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
                 // Время года — у всего, что под открытым небом, кроме пещеры и подземелья.
-                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena);
+                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church);
                 self.map.particles = match plan.kind {
                     _ if outdoor => plan.options.season.particles(),
                     generate::Kind::Cave => plan.options.cave.particles(),
@@ -1395,6 +1395,7 @@ impl App {
                 generate::Kind::Forest => "деревьев",
                 generate::Kind::Cave => "клеток",
                 generate::Kind::Arena => "рядов",
+                generate::Kind::Church => "частей",
             }));
         }
         true
@@ -1786,7 +1787,7 @@ impl App {
                             }
                         });
                         ui.end_row();
-                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena) {
+                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church) {
                         ui.label("Время года");
                         ui.horizontal(|ui| {
                             for s in crate::plan::Season::ALL {
@@ -2777,6 +2778,7 @@ impl App {
             rs.push(ui.add(egui::Slider::new(&mut sh.blur, 0.1..=1.0).text("размытие, кл.")));
             rs.push(ui.add(egui::Slider::new(&mut sh.opacity, 0.05..=1.0).text("темнота")));
             rs.push(ui.add(egui::Slider::new(&mut sh.fade, 0.0..=1.0).text("затухание")));
+            rs.push(ui.add(egui::Slider::new(&mut sh.ao, 0.0..=1.0).text("у подножия стен")));
         }
         if on.changed() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) {
             self.checkpoint();
@@ -3735,7 +3737,18 @@ impl App {
             // чернили двери и всё у стены на теневой стороне дома.
             let roofs = if self.roof_view == RoofView::Hidden && self.export.is_none() { Vec::new() } else { self.map.roofs.clone() };
             let open = |segs: &[Segment]| -> Vec<Segment> {
-                segs.iter().copied().filter(|s| !roofs.iter().any(|r| r.contains([(s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0]))).collect()
+                // Середина — чуть в обе стороны от стены: стена на стыке двух крыш
+                // (перегородка) тоже под крышей, хоть ни одна её не накрывает целиком.
+                segs.iter()
+                    .copied()
+                    .filter(|s| {
+                        let m = [(s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0];
+                        let (dx, dy) = (s.1[0] - s.0[0], s.1[1] - s.0[1]);
+                        let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+                        let n = [-dy / l * 0.1, dx / l * 0.1];
+                        !roofs.iter().any(|r| r.contains(m) || r.contains([m[0] + n[0], m[1] + n[1]]) || r.contains([m[0] - n[0], m[1] - n[1]]))
+                    })
+                    .collect()
             };
             for sh in shadows.layers() {
                 for (st, edges) in &looks {
@@ -3744,6 +3757,20 @@ impl App {
                 for w in self.map.walls.clone() {
                     let width = w.style.as_ref().map_or(style.width, |s| s.width);
                     self.draw_wall_shadow(painter, canvas, &open(&map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0)), width, &sh);
+                }
+            }
+            // У подножия — с обеих сторон и под крышей тоже: два слоя, узкий
+            // потемнее и широкий посветлее, — край тает мягко.
+            if shadows.ao > 0.0 {
+                for (blur, part) in [(0.45, 0.55), (1.1, 0.45)] {
+                    let sh = map::Shadows { dist: 0.0, blur, opacity: shadows.ao * part, fade: 0.0, ..shadows.clone() };
+                    for (st, edges) in &looks {
+                        self.draw_wall_shadow(painter, canvas, edges, st.width, &sh);
+                    }
+                    for w in self.map.walls.clone() {
+                        let width = w.style.as_ref().map_or(style.width, |s| s.width);
+                        self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &sh);
+                    }
                 }
             }
         }
@@ -3884,8 +3911,8 @@ impl App {
         if self.roof_view != RoofView::Hidden || exporting {
             let roofs = self.map.roofs.clone();
             if shadows.on {
-                for r in &roofs {
-                    self.draw_roof_shadow(painter, canvas, r, &shadows);
+                for (i, r) in roofs.iter().enumerate() {
+                    self.draw_roof_shadow(painter, canvas, r, &shadows, &roofs, i);
                 }
             }
             if roof_alpha > 0.0 {
@@ -4420,7 +4447,10 @@ impl App {
     }
 
     /// Тень крыши на земле: сдвинутый контур, залитый, с мягким краем.
-    fn draw_roof_shadow(&self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, sh: &map::Shadows) {
+    /// Тень крыши — только на землю: куда накрывает соседняя крыша (неф и
+    /// боковые нефы, башня над средокрестием), тени нет, иначе она запекается
+    /// в пол под крышей и читается как ступень.
+    fn draw_roof_shadow(&self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, sh: &map::Shadows, all: &[map::Roof], me: usize) {
         let cam = self.cam;
         // От стен, а не от края свеса: без крыши на земле не остаётся резкой полосы.
         let (lo, hi) = ([roof.a[0].min(roof.b[0]), roof.a[1].min(roof.b[1])], [roof.a[0].max(roof.b[0]), roof.a[1].max(roof.b[1])]);
@@ -4433,6 +4463,13 @@ impl App {
             return;
         }
         let along = [o[0] / len * sh.blur, o[1] / len * sh.blur];
+        let unit = [o[0] / len, o[1] / len];
+        let under = |p: [f32; 2]| {
+            let q = [p[0] + unit[0] * 0.15, p[1] + unit[1] * 0.15];
+            all.iter().enumerate().any(|(j, r)| {
+                j != me && q[0] > r.a[0].min(r.b[0]) && q[0] < r.a[0].max(r.b[0]) && q[1] > r.a[1].min(r.b[1]) && q[1] < r.a[1].max(r.b[1])
+            })
+        };
         let shift = |p: [f32; 2], d: [f32; 2]| [p[0] + d[0], p[1] + d[1]];
         let dark = Color32::from_black_alpha((sh.opacity * 255.0).round() as u8);
         let far = Color32::from_black_alpha((sh.opacity * (1.0 - sh.fade) * 255.0).round() as u8);
@@ -4455,15 +4492,31 @@ impl App {
             (nx * o[0] + ny * o[1]) * side > 0.0
         };
         for k in 0..n {
-            let (p, q) = (pts[k], pts[(k + 1) % n]);
+            let (p0, q0) = (pts[k], pts[(k + 1) % n]);
             if shaded(k) {
-                quad([(p, dark), (q, dark), (shift(q, o), far), (shift(p, o), far)]);
-                quad([(shift(p, o), far), (shift(q, o), far), (shift(shift(q, o), along), Color32::TRANSPARENT), (shift(shift(p, o), along), Color32::TRANSPARENT)]);
+                // Кусками по четверти клетки: под соседней крышей кусок пропускается.
+                let l = ((q0[0] - p0[0]).powi(2) + (q0[1] - p0[1]).powi(2)).sqrt();
+                let parts = ((l / 0.25).ceil() as usize).max(1);
+                for s in 0..parts {
+                    let lerp = |t: f32| [p0[0] + (q0[0] - p0[0]) * t, p0[1] + (q0[1] - p0[1]) * t];
+                    let (p, q) = (lerp(s as f32 / parts as f32), lerp((s + 1) as f32 / parts as f32));
+                    // Ни у края, ни у дальнего конца тени — не под соседней крышей.
+                    let mid = lerp((s as f32 + 0.5) / parts as f32);
+                    if under(mid) || under(shift(mid, o)) {
+                        continue;
+                    }
+                    quad([(p, dark), (q, dark), (shift(q, o), far), (shift(p, o), far)]);
+                    quad([(shift(p, o), far), (shift(q, o), far), (shift(shift(q, o), along), Color32::TRANSPARENT), (shift(shift(p, o), along), Color32::TRANSPARENT)]);
+                }
             }
-            if shaded(k) != shaded((k + 1) % n) {
+            let q = q0;
+            if shaded(k) != shaded((k + 1) % n) && !under(q) {
                 let mut s = [-along[1], along[0]];
                 if s[0] * (q[0] - c[0]) + s[1] * (q[1] - c[1]) < 0.0 {
                     s = [-s[0], -s[1]];
+                }
+                if under(shift(shift(q, s), [o[0] * 0.5, o[1] * 0.5])) || under(shift(q, o)) {
+                    continue;
                 }
                 quad([(q, dark), (shift(q, o), far), (shift(shift(q, o), s), Color32::TRANSPARENT), (shift(q, s), Color32::TRANSPARENT)]);
             }

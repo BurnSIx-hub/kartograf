@@ -604,7 +604,9 @@ impl Prop {
     /// Кроме крон, кустов, навесов и белья (у них свой тайл) и плоского на полу
     /// (ковры, лужи, готовые тени — их полупрозрачность в фоне не мешает).
     pub fn own_tile(&self) -> bool {
-        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !flat_by_name(&self.asset)
+        // Тень спуска лежит поверх ступеней: в фоне её накрыл бы тайл лестницы.
+        let over_stairs = self.asset.ends_with("stairs_shade");
+        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs)
     }
 
     pub fn layer(&self) -> i16 {
@@ -904,16 +906,25 @@ pub struct Shadows {
     /// Затухание: 0 — тень ровная до края, 1 — тает от самой стены до конца.
     #[serde(default)]
     pub fade: f32,
+    /// Темнота у подножия стен с обеих сторон — не от солнца, а от того, что
+    /// в угол между полом и стеной свет не доходит. Под крышей тени от солнца
+    /// нет, и без неё комнаты плоские.
+    #[serde(default = "Shadows::ao_default")]
+    pub ao: f32,
 }
 
 impl Default for Shadows {
     /// Карты, нарисованные до теней, открываются без них.
     fn default() -> Self {
-        Self { on: false, angle: 45.0, dist: 0.2, blur: 0.3, opacity: 0.55, fade: 0.0 }
+        Self { on: false, angle: 45.0, dist: 0.2, blur: 0.3, opacity: 0.55, fade: 0.0, ao: Self::ao_default() }
     }
 }
 
 impl Shadows {
+    fn ao_default() -> f32 {
+        0.5
+    }
+
     pub fn offset(&self) -> [f32; 2] {
         let (s, c) = self.angle.to_radians().sin_cos();
         [c * self.dist, s * self.dist]

@@ -237,6 +237,21 @@ const OBJECTS: &[Slot] = &[
     ("weapon_rack_bows", &[&["bow", "rack"], &["bows", "rack"], &["луками"]], &[]),
     ("weapon_rack_mixed", &[&["weapon", "rack"], &["weapons", "rack"]], &[]),
     ("altar", &[&["altar"], &["алтарь"]], &[]),
+    // Церковь.
+    ("altar_cloth", &[&["altar", "stone", "runner"]], &[]),
+    ("pew", &[&["pew"], &["скамья", "церковная"]], &[]),
+    // Трубы органа FA — отдельные куски, не инструмент.
+    ("organ", &[&["organ", "wood"], &["орган"]], &["pipes", "pile"]),
+    ("lectern", &[&["bookstand"], &["book", "stand"], &["lectern"], &["кафедра"]], &["fallen"]),
+    // Золотые и серебряные — настольные, нарисованы сбоку.
+    ("candelabra", &[&["candelabra"], &["канделябр"]], &["handheld", "gold", "silver"]),
+    ("font_base", &[&["basin", "base", "marble", "white", "small", "octagon"], &["basin", "base", "stone", "small", "octagon"]], &["tiled"]),
+    ("font_water", &[&["basin", "water", "small", "octagon"]], &[]),
+    ("tombstone", &[&["tombstone"], &["надгробие"]], &["broken", "fallen"]),
+    ("grave_kerb", &[&["grave", "stone"]], &["double", "hole", "pile"]),
+    ("grave_mound", &[&["rock", "pile", "grave"]], &[]),
+    ("grave_open", &[&["grave", "hole", "dirt"]], &[]),
+    ("ladder", &[&["ladder"], &["стремянка"]], &["fallen", "broken", "metal"]),
     ("statue", &[&["statue"], &["статуя"]], &["broken"]),
     ("pillar", &[&["pillar"], &["column"], &["колонна"]], &["broken", "ruined"]),
     ("rubble", &[&["rubble", "pile"], &["rubble"], &["debris"], &["обломки"]], &["wall"]),
@@ -474,6 +489,8 @@ const NEAR: &[(&str, &str)] = &[
     ("ruin_floor", "dungeon_flagstones_moss"),
     ("pillar_stone", "pillar"),
     ("statue_figure", "statue"),
+    ("pew", "bench"),
+    ("altar_cloth", "altar"),
     ("pillar_broken", "rubble"),
     ("dungeon_flagstones_moss", "flagstones"),
     ("rug_round", "rug"),
@@ -732,10 +749,17 @@ impl Palette {
         }
         let (key, name) = &found[i];
         let size = *self.sizes.borrow_mut().entry(key.clone()).or_insert_with(|| {
-            library::size_from_name(name)
-                .filter(|s| s[0] > 0.0 && s[1] > 0.0)
-                .or_else(|| (self.measure)(key).map(|px| [(px[0] as f32 / PX_PER_CELL).max(0.25), (px[1] as f32 / PX_PER_CELL).max(0.25)]))
-                .unwrap_or([1.0, 1.0])
+            let named = library::size_from_name(name).filter(|s| s[0] > 0.0 && s[1] > 0.0);
+            let px = (self.measure)(key).map(|px| [(px[0] as f32 / PX_PER_CELL).max(0.25), (px[1] as f32 / PX_PER_CELL).max(0.25)]);
+            match (named, px) {
+                // Картинка FA обрезана по рисунку (канделябр 180×90 при «1x1», надгробие
+                // 180×48): в клетки из имени её растянуло бы. Меньше места из имени и
+                // другой формы — берётся как есть, 256 точек на клетку.
+                (Some(n), Some(p)) if p[0] <= n[0] + 0.01 && p[1] <= n[1] + 0.01 && ((p[0] / p[1]) / (n[0] / n[1]) - 1.0).abs() > 0.1 => p,
+                (Some(n), _) => n,
+                (None, Some(p)) => p,
+                (None, None) => [1.0, 1.0],
+            }
         });
         let visible = *self.boxes.borrow_mut().entry(key.clone()).or_insert_with(|| self.visible.as_ref().and_then(|f| f(key)));
         let visible = visible.map(|[l, t, r, b]| [l * size[0], t * size[1], r * size[0], b * size[1]]);
@@ -926,4 +950,11 @@ mod tests {
         let p = Palette::from_library(&assets, Box::new(|_| Some([512, 256])));
         assert_eq!(p.pick("chair").size, [2.0, 1.0]);
     }
+}
+
+/// Замер для проверок: картинка во столько клеток, сколько в имени (как у FA).
+#[cfg(test)]
+pub fn fake_measure(key: &str) -> Option<[u32; 2]> {
+    let stem = key.rsplit_once('.').map_or(key, |(s, _)| s);
+    Some(library::size_from_name(stem).map_or([256, 256], |s| [(s[0] * 256.0) as u32, (s[1] * 256.0) as u32]))
 }
