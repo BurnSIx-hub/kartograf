@@ -43,7 +43,40 @@ fn fixture_uv(f: &Fixture, p: [f32; 2]) -> Option<(f32, f32)> {
     ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then_some((u, v))
 }
 
-pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, light: [f32; 2], parapet: Option<&image::RgbaImage>, fixtures: &[Fixture]) -> (image::RgbaImage, [f32; 2]) {
+/// Снег на крыше: цвет; сквозь ровный покров чуть видны ряды покрытия.
+const SNOW: [f32; 3] = [236.0, 241.0, 248.0];
+const SNOW_DEPTH: f32 = 0.86;
+
+/// Гладкий шум на плоскости, 0..1: по узлам сетки — хеш, между ними — плавно.
+fn noise2(x: f32, y: f32, seed: u32) -> f32 {
+    let h = |i: i32, j: i32| {
+        let mut v = (i as u32).wrapping_mul(0x9E37_79B1) ^ (j as u32).wrapping_mul(0x85EB_CA77) ^ seed.wrapping_mul(0xC2B2_AE3D);
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x2C1B_3C6D);
+        v ^= v >> 12;
+        (v & 0xFFFF) as f32 / 65535.0
+    };
+    let (i, j) = (x.floor(), y.floor());
+    let (tx, ty) = (x - i, y - j);
+    let (tx, ty) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+    let (i, j) = (i as i32, j as i32);
+    let top = h(i, j) * (1.0 - tx) + h(i + 1, j) * tx;
+    let low = h(i, j + 1) * (1.0 - tx) + h(i + 1, j + 1) * tx;
+    top * (1.0 - ty) + low * ty
+}
+
+/// Сколько снега лежит в точке крыши `p` (клетки карты), 0..1. `edge` — сколько
+/// клеток до края: у свеса снег тоньше, сквозь него видно покрытие.
+pub fn snow_cover(p: [f32; 2], edge: f32) -> f32 {
+    // Ровный покров с лёгкой рябью; изредка — проталина, где снег тоньше.
+    let ripple = 0.92 + 0.08 * noise2(p[0] * 3.1, p[1] * 3.1, 11);
+    let thaw = noise2(p[0] * 0.45 + 3.0, p[1] * 0.45, 7);
+    let thaw = if thaw < 0.2 { 0.55 + 0.45 * (thaw / 0.2) } else { 1.0 };
+    SNOW_DEPTH * ripple * thaw * (edge / 0.3).clamp(0.45, 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, light: [f32; 2], parapet: Option<&image::RgbaImage>, fixtures: &[Fixture], snow: bool) -> (image::RgbaImage, [f32; 2]) {
     let out = roof.outline();
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for p in &out {
@@ -140,6 +173,14 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
                     c = c.map(|v| v * k);
                 }
             }
+            // Зимой — снег пятнами поверх покрытия; скат темнит и его.
+            if snow && !flat {
+                // На коньке ветер сдувает — снега меньше.
+                let ridge = lines.iter().map(|&(a, b)| segment_distance(p, a, b)).fold(f32::MAX, f32::min);
+                let k = snow_cover(p, depth / ppc) * if ridge < CAP / 2.0 { 0.55 } else { 1.0 };
+                let s = roof_shade(pl.down, light, flat);
+                c = std::array::from_fn(|i| c[i] * (1.0 - k) + SNOW[i] * (0.55 + 0.45 * s) * k);
+            }
             if depth < RIM_PX {
                 c = c.map(|k| k * 0.4);
             }
@@ -172,8 +213,8 @@ mod tests {
         let roof = Roof { overhang: 0.0, ..Roof::new([0.0, 0.0], [6.0, 4.0], RoofShape::Flat, "set:cyberpunk/roofs/Roof_Flat_Membrane_A.webp".into()) };
         assert!(roof.parapet().is_some());
         let tile = tile_cells([tex.width(), tex.height()]);
-        let (img, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &[]);
-        let (plain, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &[]);
+        let (img, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &[], false);
+        let (plain, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &[], false);
         // По краю — отлив, а не мембрана; посередине — та же кровля.
         assert_ne!(img.get_pixel(150, 8).0, plain.get_pixel(150, 8).0);
         assert_eq!(img.get_pixel(192, 128).0, plain.get_pixel(192, 128).0);
@@ -183,7 +224,7 @@ mod tests {
         assert!(fx.iter().any(|f| f.0.contains("Drain")));
         let imgs: Vec<image::RgbaImage> = fx.iter().map(|f| load(f.0.trim_start_matches("set:"))).collect();
         let items: Vec<Fixture> = fx.iter().zip(&imgs).map(|(f, i)| (i, f.1, f.2)).collect();
-        let (full, origin) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &items);
+        let (full, origin) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &items, false);
         assert!(origin[1] < 0.0 && full.height() > img.height());
         if let Ok(out) = std::env::var("KARTOGRAF_PARAPET_PNG") {
             full.save(out).unwrap();
@@ -204,7 +245,7 @@ mod tests {
         let tex = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 100, 80, 255]));
         let roof = Roof { overhang: 0.0, ..Roof::new([0.0, 0.0], [4.0, 2.0], RoofShape::Gable, String::new()) };
         // Свет сверху: северный скат светлее южного.
-        let (img, origin) = render(&roof, &tex, [1.0, 1.0], 50.0, [0.0, -1.0], None, &[]);
+        let (img, origin) = render(&roof, &tex, [1.0, 1.0], 50.0, [0.0, -1.0], None, &[], false);
         assert_eq!(origin, [0.0, 0.0]);
         assert!(img.width() >= 200 && img.height() >= 100);
         let (n, s) = (img.get_pixel(100, 20).0, img.get_pixel(100, 80).0);

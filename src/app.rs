@@ -4371,6 +4371,40 @@ impl App {
                 mesh.add_triangle(base, base + k, base + k + 1);
             }
         }
+        // Снег в редакторе — сеткой в четверть клетки поверх скатов, той же
+        // россыпью, что в выгрузке; клетки сетки у края — только внутри ската.
+        let mut snow_layer = None;
+        if self.map.weather == "snow" && !flat {
+            let mut snow = egui::Mesh::default();
+            let outline = roof.outline();
+            let step = 0.25;
+            for pl in &planes {
+                let s = map::roof_shade(pl.down, light, flat);
+                let (lo, hi) = pl.poly.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), p| ([l[0].min(p[0]), l[1].min(p[1])], [h[0].max(p[0]), h[1].max(p[1])]));
+                let color = |p: [f32; 2]| {
+                    let k = roofs::snow_cover(p, map::convex_depth(&outline, p).max(0.0)) * alpha;
+                    let v = (s * 0.45 + 0.55) * 244.0 * k;
+                    Color32::from_rgba_premultiplied(v as u8, (v * 1.01).min(255.0) as u8, (v * 1.02).min(255.0) as u8, (k * 255.0) as u8)
+                };
+                let mut y = (lo[1] / step).floor() * step;
+                while y < hi[1] {
+                    let mut x = (lo[0] / step).floor() * step;
+                    while x < hi[0] {
+                        if pl.inside([x + step / 2.0, y + step / 2.0]) > 0.0 {
+                            let base = snow.vertices.len() as u32;
+                            for p in [[x, y], [x + step, y], [x + step, y + step], [x, y + step]] {
+                                snow.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv: egui::epaint::WHITE_UV, color: color(p) });
+                            }
+                            snow.add_triangle(base, base + 1, base + 2);
+                            snow.add_triangle(base, base + 2, base + 3);
+                        }
+                        x += step;
+                    }
+                    y += step;
+                }
+            }
+            snow_layer = Some(snow);
+        }
         // Гребни поверх скатов.
         let dark = Color32::from_rgba_premultiplied(0, 0, 0, (alpha * 150.0) as u8);
         let mut edges = Vec::new();
@@ -4394,6 +4428,9 @@ impl App {
             edges.push([quad[3], quad[2]]);
         }
         painter.add(Shape::mesh(mesh));
+        if let Some(s) = snow_layer {
+            painter.add(Shape::mesh(s));
+        }
         // Парапет плоской крыши: тень на кровлю, потом сам отлив.
         if let Some(pk) = roof.parapet() {
             let (lo, hi) = (roof.outline()[0], roof.outline()[2]);
@@ -5081,7 +5118,7 @@ impl App {
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
                 let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &items);
+                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &items, map.weather == "snow");
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));

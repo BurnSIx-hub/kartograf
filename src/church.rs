@@ -822,7 +822,10 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
 fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng, season: Season) {
     let (w, h) = (m.width as i32, m.height as i32);
     let b = lay.bbox();
-    let stone = mat(m, "cobblestone");
+    let winter = season == Season::Winter;
+    // Зимой дорожки — заснеженной брусчаткой, по краям снег утоптан.
+    let stone = mat(m, if winter && !missing("cobblestone_snowy") { "cobblestone_snowy" } else { "cobblestone" });
+    let trampled = (winter && !missing("snow_trampled")).then(|| mat(m, "snow_trampled"));
     let fenced = b.x >= 3 && b.y >= 3 && w - (b.x + b.w) >= 3 && h - (b.y + b.h) >= 3;
     let mut sp = Spots::new(m);
     sp.block(b.x - 1, b.y - 1, b.w + 2, b.h + 2);
@@ -842,6 +845,12 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
             [door[0] + (to[0] - door[0]) * t, door[1] + (to[1] - door[1]) * t]
         }).collect();
         lanes.push(Path { points, material: stone, width: 2.0, soft: 0.25, rough: 0.15, along: false });
+    }
+    // Утоптанный снег — шире дорожки и под ней, неровным краем.
+    if let Some(t) = trampled {
+        for l in &lanes {
+            m.paths.push(Path { material: t, width: 3.4, soft: 0.7, rough: 0.6, ..l.clone() });
+        }
     }
     // Ограда: низкая каменная, разрывы под воротами, по столбу с каждой стороны.
     if fenced {
@@ -887,6 +896,39 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
     }
     let on_lane = |q: [f32; 2]| lanes.iter().any(|l| l.distance(q) < 1.8);
 
+    // Зимой: сугробы у северных стен церкви и в углах ограды, у ризницы — поленница.
+    if winter && !missing("snow_pile") {
+        let pile = |m: &mut Map, rng: &mut Rng, q: [f32; 2], size: f32| {
+            let p = asset("snow_pile");
+            let rot = if p.size[0] >= p.size[1] { 0.0 } else { 90.0 };
+            let s = size / p.size[0].max(p.size[1]);
+            drop_pick(m, &p, q, rot + if rng.chance(0.5) { 180.0 } else { 0.0 }, s);
+        };
+        for &(_, r) in &lay.pieces {
+            let mut x = r.x;
+            while x < r.x + r.w {
+                let q = [x as f32 + 1.0, r.y as f32 - 0.55];
+                if !lay.covers(x, r.y - 1) && !lay.covers(x + 1, r.y - 1) && !on_lane(q) && rng.chance(0.4) {
+                    pile(m, rng, q, 1.6);
+                }
+                x += 2;
+            }
+        }
+        if fenced {
+            for q in [[2.2, 2.2], [w as f32 - 2.2, 2.2], [2.2, h as f32 - 2.2], [w as f32 - 2.2, h as f32 - 2.2]] {
+                if !on_lane(q) {
+                    pile(m, rng, q, 2.2);
+                    sp.block(q[0] as i32 - 1, q[1] as i32 - 1, 3, 3);
+                }
+            }
+        }
+        if let Some(v) = lay.get(Part::Vestry)
+            && !missing("firewood_snowy")
+        {
+            drop(m, "firewood_snowy", [(v.x + v.w) as f32 + 0.55, (v.y + v.h / 2) as f32], 90.0, 1.0);
+            sp.block(v.x + v.w, v.y, 2, v.h);
+        }
+    }
     // Деревья по краям погоста.
     let trees = ((w + h) / 14).max(1);
     for _ in 0..trees * 3 {
@@ -902,7 +944,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
     if let Some(&(door, _)) = entries.iter().find(|e| e.1 == 2) {
         let q = [door[0] + 2.2, door[1] + 3.0];
         if sp.free(q[0] as i32 - 1, q[1] as i32, 2, 1) && !on_lane(q) {
-            drop(m, "bench", q, 270.0, 1.0);
+            drop(m, if winter && !missing("bench_snowy") { "bench_snowy" } else { "bench" }, q, 270.0, 1.0);
             sp.block(q[0] as i32 - 1, q[1] as i32, 2, 1);
         }
     }
@@ -921,7 +963,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
             let chance = if south || eastw { 0.8 } else if north { 0.3 } else { 0.55 };
             if sp.free(gx, gy, 2, 1) && !on_lane(q) && rng.chance(chance) {
                 sp.block(gx, gy, 3, 2);
-                grave(m, rng, q, library, dirt);
+                grave(m, rng, q, library, dirt, winter && !missing("snow_pile"));
             }
             gx += 3;
         }
@@ -930,7 +972,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
 }
 
 /// Одна могила с серединой в `q` (2 клетки вдоль, 1 поперёк), изголовье — на западе.
-fn grave(m: &mut Map, rng: &mut Rng, q: [f32; 2], library: bool, dirt: usize) {
+fn grave(m: &mut Map, rng: &mut Rng, q: [f32; 2], library: bool, dirt: usize, snow: bool) {
     let jitter = |rng: &mut Rng| (rng.random() as f32 - 0.5) * 0.2;
     let head = [q[0] - 0.85 + jitter(rng), q[1] + jitter(rng)];
     if !library {
@@ -942,7 +984,15 @@ fn grave(m: &mut Map, rng: &mut Rng, q: [f32; 2], library: bool, dirt: usize) {
     let roll = rng.random();
     let tilt = rng.int(-6, 6) as f32;
     if roll < 0.45 {
-        drop(m, "grave_mound", [q[0] + 0.15, q[1]], 90.0, 0.8);
+        if snow {
+            // Холмик под снегом: сугроб, ужатый в могилу.
+            let p = asset("snow_pile");
+            let (lw, sw) = (p.size[0].max(p.size[1]), p.size[0].min(p.size[1]));
+            let rot = if p.size[0] >= p.size[1] { 0.0 } else { 90.0 };
+            drop_pick(m, &p, [q[0] + 0.15, q[1]], rot, (1.7 / lw).min(0.95 / sw));
+        } else {
+            drop(m, "grave_mound", [q[0] + 0.15, q[1]], 90.0, 0.8);
+        }
         drop(m, "tombstone", head, 90.0 + tilt, 1.0);
     } else if roll < 0.75 {
         drop(m, "grave_kerb", [q[0] + 0.1, q[1]], 90.0, 0.6);
