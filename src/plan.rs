@@ -725,7 +725,7 @@ impl Plan {
                     plan.rooms.push(RoomSpec::new(format!("{}{}", role_id(role), k + 1), role));
                 }
             }
-            Kind::Cave | Kind::Forest | Kind::Town | Kind::Arena | Kind::Church => {}
+            Kind::Cave | Kind::Forest | Kind::Town | Kind::Walls | Kind::Arena | Kind::Church => {}
         }
         // На крошечной карте столько комнат не поместится: лишние отпадают с конца.
         while plan.rooms.len() > 1 && plan.validate(size).is_err() {
@@ -904,7 +904,7 @@ impl Plan {
                     errors.push(format!("комнаты не помещаются: им нужно хотя бы {need} клеток, на карте {w}×{h} их {}", w * h));
                 }
             }
-            Kind::Cave | Kind::Forest | Kind::Town | Kind::Arena | Kind::Church => {}
+            Kind::Cave | Kind::Forest | Kind::Town | Kind::Walls | Kind::Arena | Kind::Church => {}
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
     }
@@ -914,17 +914,17 @@ impl Plan {
         let mut out = Vec::new();
         let kind = self.kind.label();
         match self.kind {
-            Kind::Cave | Kind::Forest | Kind::Town | Kind::Arena | Kind::Church => {
+            Kind::Cave | Kind::Forest | Kind::Town | Kind::Walls | Kind::Arena | Kind::Church => {
                 if !self.rooms.is_empty() {
                     out.push(format!("{kind}: комнаты не используются ({} шт. пропущено)", self.rooms.len()));
                 }
                 if !self.links.is_empty() {
                     out.push(format!("{kind}: связи не используются"));
                 }
-                if self.style.walls.is_some() && !matches!(self.kind, Kind::Town | Kind::Arena | Kind::Church) {
+                if self.style.walls.is_some() && !matches!(self.kind, Kind::Town | Kind::Walls | Kind::Arena | Kind::Church) {
                     out.push(format!("{kind}: стены из стиля не используются"));
                 }
-                if self.style.roof.is_some() && !matches!(self.kind, Kind::Town | Kind::Church) {
+                if self.style.roof.is_some() && !matches!(self.kind, Kind::Town | Kind::Walls | Kind::Church) {
                     out.push(format!("{kind}: крыша из стиля не используется"));
                 }
                 if self.kind == Kind::Forest && matches!(self.river, River::North | River::South) {

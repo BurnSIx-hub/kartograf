@@ -326,6 +326,7 @@ const OBJECTS: &[Slot] = &[
     ("arena_weapon", &[&["shield", "metal"], &["broken", "spear"], &["trident"], &["shortsword"], &["broken", "shield", "wood"]], &["bloody"]),
     // Цельный бревенчатый мост FA (`Log_Bridge_*_11x4`): без концов, пролётов,
     // верёвочных, подъёмных и мостков в доску.
+    ("ballista", &[&["ballista", "wood"], &["баллиста"]], &["base", "bolt"]),
     ("bridge", &[&["bridge"], &["log", "bridge"], &["мост"]], &["straight", "rope", "draw", "track", "plank"]),
     // Накладки FA (`Stairs_Overlay`) прозрачны — лестницы на карте не видно.
     ("stairs", &[&["stairs"], &["staircase"], &["stair"], &["лестница"]], &["spiral", "overlay", "railing", "rolling", "library", "pillar", "path"]),

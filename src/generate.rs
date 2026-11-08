@@ -61,10 +61,13 @@ pub enum Kind {
     /// Церковь с погостом.
     #[serde(alias = "церковь", alias = "часовня", alias = "chapel")]
     Church,
+    /// Городская стена с воротами, за ней — квартал.
+    #[serde(alias = "стена", alias = "стены", alias = "ворота", alias = "town_wall", alias = "gate")]
+    Walls,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::House, Kind::Tavern, Kind::Church, Kind::Arena, Kind::Cyber];
+    pub const ALL: [Kind; 10] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::Walls, Kind::House, Kind::Tavern, Kind::Church, Kind::Arena, Kind::Cyber];
 
     /// Растёт от входа комнатами и коридорами: подземелье и киберпанк.
     pub fn grows(self) -> bool {
@@ -78,7 +81,7 @@ impl Kind {
             Kind::Dungeon => "dungeon-1",
             Kind::Cave => o.cave.ambience(),
             Kind::Forest | Kind::House | Kind::Tavern | Kind::Church => o.season.ambience(),
-            Kind::Town | Kind::Arena | Kind::Cyber => "town-1",
+            Kind::Town | Kind::Walls | Kind::Arena | Kind::Cyber => "town-1",
         }
     }
 
@@ -102,6 +105,7 @@ impl Kind {
             Kind::Arena => "Колизей",
             Kind::Cyber => "Киберпанк",
             Kind::Church => "Церковь",
+            Kind::Walls => "Городская стена",
         }
     }
 }

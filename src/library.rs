@@ -119,7 +119,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 54] = [
 /// Стены, зашитые в программу: имя, подпись, толщина в клетках, байты. Картинка —
 /// полоса гребня стены, бесшовная по длине, высотой «толщина × 256» с обводкой
 /// по краям, как в паках FA (`tools/walls.py`).
-pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 15] = [
+pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 16] = [
     ("wall_stone_blocks", "Каменные блоки", 0.45, include_bytes!("../assets/builtin/walls/stone_blocks.webp")),
     ("wall_sandstone", "Песчаник", 0.45, include_bytes!("../assets/builtin/walls/sandstone.webp")),
     ("wall_brick", "Кирпич", 0.35, include_bytes!("../assets/builtin/walls/brick.webp")),
@@ -136,6 +136,8 @@ pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 15] = [
     // Из каменных блоков, `tools/races.py`.
     ("wall_dwarven", "Гномья кладка", 0.45, include_bytes!("../assets/builtin/walls/dwarven.webp")),
     ("wall_drow", "Обсидиан дроу", 0.45, include_bytes!("../assets/builtin/walls/drow.webp")),
+    // Зубцы парапета из каменных блоков, `tools/crenels.py`: мерлон ~1 клетка, бойница ~0,45.
+    ("wall_crenels", "Зубцы", 0.5, include_bytes!("../assets/builtin/walls/crenels.webp")),
 ];
 
 /// Встроенные двери, косяки и окна (`tools/portals.py`): ключ, подпись, размер холста

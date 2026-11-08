@@ -375,7 +375,7 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
     let axis = lay.get(Part::Nave).map_or(h / 2, |n| n.y + n.h / 2);
     let mut doors: Vec<[f32; 2]> = Vec::new();
     let inner_wall = |m: &mut Map, a: [f32; 2], b: [f32; 2]| {
-        m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(inner.clone()) });
+        m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), low: false, style: Some(inner.clone()) });
     };
     let door = |m: &mut Map, doors: &mut Vec<[f32; 2]>, a: [f32; 2], b: [f32; 2], kind: PortalKind| {
         m.portals.push(portal(a, b, kind, true));
@@ -437,7 +437,7 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
     let (a, b) = seg(true, sx, sy0 as f32, sy1 as f32);
     // Деревянная, как настоящая алтарная преграда: тонкий камень FA на ней —
     // блоки с выступами.
-    m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(WallStyle { paint: Paint::Texture(key("wall_wood")), width: 0.2 }) });
+    m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), low: false, style: Some(WallStyle { paint: Paint::Texture(key("wall_wood")), width: 0.2 }) });
     // Проход — чистый проём: косяки двери шире тонкой преграды и торчат из неё.
     let (a, b) = seg(true, sx, axis as f32 - 1.0, axis as f32 + 1.0);
     m.portals.push(opening(a, b));
@@ -873,7 +873,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
                 let gl = g - 1.5;
                 if gl > s {
                     let (a, bb) = seg(vertical, c, s, gl);
-                    m.walls.push(Wall { points: vec![a, bb], closed: false, bends: Vec::new(), style: Some(st.clone()) });
+                    m.walls.push(Wall { points: vec![a, bb], closed: false, bends: Vec::new(), low: false, style: Some(st.clone()) });
                 }
                 for e in [gl, gl + 3.0] {
                     let q = if vertical { [c as f32, e] } else { [e, c as f32] };
@@ -883,7 +883,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
             }
             if (hi as f32) > s {
                 let (a, bb) = seg(vertical, c, s, hi as f32);
-                m.walls.push(Wall { points: vec![a, bb], closed: false, bends: Vec::new(), style: Some(st.clone()) });
+                m.walls.push(Wall { points: vec![a, bb], closed: false, bends: Vec::new(), low: false, style: Some(st.clone()) });
             }
         }
         sp.block(0, 0, w, 2);

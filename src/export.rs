@@ -16,6 +16,8 @@ pub struct Layout {
     pub tents: Vec<([f32; 2], [f32; 2])>,
     /// Сплошные стены — ломаные в клетках.
     pub walls: Vec<Vec<[f32; 2]>>,
+    /// Низкие стены (`Wall::low`): шаг держат, зрение и свет — ограниченно.
+    pub low: Vec<Vec<[f32; 2]>>,
     /// Двери и окна — отрезок в клетках; пустые проёмы сюда не попадают.
     pub portals: Vec<PortalOut>,
     /// Свет: середина в клетках, радиус яркого и тусклого в клетках, цвет.
@@ -186,18 +188,26 @@ pub struct Light {
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     let mut segs: Vec<Segment> = room_edges.to_vec();
     // Трубы по полу — рисунок, не стена.
+    let mut low_segs: Vec<Segment> = Vec::new();
     for w in map.walls.iter().filter(|w| !w.is_decor()) {
-        segs.extend(w.segments());
+        if w.low {
+            low_segs.extend(w.segments());
+        } else {
+            segs.extend(w.segments());
+        }
     }
-    let cut = map::cut_portals(&segs, &map.portals);
-    let walls = mask::join(cut)
-        .into_iter()
-        .map(|line| {
-            let closed = line.len() > 3 && line[0] == line[line.len() - 1];
-            simplify(&line, closed, 0.03)
-        })
-        .filter(|l| l.len() >= 2)
-        .collect();
+    let lines = |segs: &[Segment]| -> Vec<Vec<[f32; 2]>> {
+        mask::join(map::cut_portals(segs, &map.portals))
+            .into_iter()
+            .map(|line| {
+                let closed = line.len() > 3 && line[0] == line[line.len() - 1];
+                simplify(&line, closed, 0.03)
+            })
+            .filter(|l| l.len() >= 2)
+            .collect()
+    };
+    let walls = lines(&segs);
+    let low = lines(&low_segs);
     let portals = map
         .portals
         .iter()
@@ -273,7 +283,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
     let tents = map.props.iter().filter(|p| map::awning_by_name(&p.asset)).flat_map(|p| tent_walls(p, None)).collect();
-    Layout { walls, portals, lights, zones, tents }
+    Layout { walls, low, portals, lights, zones, tents }
 }
 
 /// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
@@ -702,6 +712,15 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
             }
         }
     }
+    // Низкая стена: не пройти; видно и светит поверх одной, сквозь две — нет.
+    for line in &layout.low {
+        for w in line.windows(2) {
+            let (a, b) = (at(w[0]), at(w[1]));
+            if a != b {
+                walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]], "sight": 10, "light": 10, "sound": 10}));
+            }
+        }
+    }
     // Полог палатки — две стены на ребре с ограничениями в разные стороны: изнутри
     // наружу — как сквозь ткань (свет, зрение, звук «ограничено»), снаружи внутрь —
     // глухо. Пройти нельзя ни так, ни так. Внутренность — слева от отрезка.
@@ -912,7 +931,7 @@ mod tests {
         a.paint(crate::map::Layer::Rooms, 0, &w);
         let b = a.new_level();
         let mut b2 = b.clone();
-        b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
+        b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
             SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]], ..Default::default() }] },
@@ -1003,7 +1022,7 @@ mod tests {
     fn scene_has_walls_doors_windows_and_fire_light() {
         let mut m = Map::new(8, 6);
         m.paint_rect(Layer::Rooms, (1, 1), (4, 3), Some(0));
-        m.walls.push(Wall { points: vec![[6.0, 0.0], [6.0, 6.0]], closed: false, bends: Vec::new(), style: None });
+        m.walls.push(Wall { points: vec![[6.0, 0.0], [6.0, 6.0]], closed: false, bends: Vec::new(), low: false, style: None });
         m.portals.push(Portal { a: [2.0, 1.0], b: [3.0, 1.0], kind: PortalKind::Door, asset: None, frame: None });
         m.portals.push(Portal { a: [6.0, 2.0], b: [6.0, 3.0], kind: PortalKind::Window, asset: None, frame: None });
         // Двойная дверь в нижней стене и пустой проём в левой.

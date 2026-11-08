@@ -77,6 +77,8 @@ mod quarter;
 mod dungeon;
 #[path = "church.rs"]
 mod church;
+#[path = "walls.rs"]
+mod walls;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -2148,7 +2150,7 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         }
         for (s, e) in merged {
             let (a, b) = if vertical { ([c as f32, s as f32], [c as f32, e as f32]) } else { ([s as f32, c as f32], [e as f32, c as f32]) };
-            m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(inner.clone()) });
+            m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), low: false, style: Some(inner.clone()) });
         }
     }
 
@@ -2581,6 +2583,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         Kind::House | Kind::Tavern => interior(m, p, &mut rng, &mut warnings),
         Kind::Arena => arena::arena(m, p, &mut rng, &mut warnings),
         Kind::Church => church::church(m, p, &mut rng, &mut warnings),
+        Kind::Walls => walls::town_wall(m, p, &mut rng, &mut warnings),
     };
     mood(m, p);
     Ok(Report { count, warnings })

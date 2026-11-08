@@ -559,7 +559,7 @@ impl SelfTest {
                 app.brush.shape = Tip::Cells;
                 app.material = 0;
                 app.paint((2, 2), (8, 6));
-                app.map.walls.push(map::Wall { points: vec![[12.0, 3.0], [18.0, 3.0]], closed: false, bends: Vec::new(), style: None });
+                app.map.walls.push(map::Wall { points: vec![[12.0, 3.0], [18.0, 3.0]], closed: false, bends: Vec::new(), low: false, style: None });
                 let c = app.canvas;
                 app.cam.fit(c, 20, 12);
                 self.area = app.map.rooms.area();

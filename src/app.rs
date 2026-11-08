@@ -904,7 +904,7 @@ impl App {
         let points = std::mem::take(&mut self.draft);
         if points.len() >= 2 {
             self.checkpoint();
-            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), style: None });
+            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), low: false, style: None });
             self.sel = Some(Sel::Wall(self.map.walls.len() - 1));
         }
     }
@@ -1355,7 +1355,7 @@ impl App {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
                 // Время года — у всего, что под открытым небом, кроме пещеры и подземелья.
-                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church);
+                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church);
                 self.map.particles = match plan.kind {
                     _ if outdoor => plan.options.season.particles(),
                     generate::Kind::Cave => plan.options.cave.particles(),
@@ -1396,6 +1396,7 @@ impl App {
                 generate::Kind::Cave => "клеток",
                 generate::Kind::Arena => "рядов",
                 generate::Kind::Church => "частей",
+                generate::Kind::Walls => "построек",
             }));
         }
         true
@@ -1787,7 +1788,7 @@ impl App {
                             }
                         });
                         ui.end_row();
-                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church) {
+                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church) {
                         ui.label("Время года");
                         ui.horizontal(|ui| {
                             for s in crate::plan::Season::ALL {
@@ -4615,6 +4616,10 @@ impl App {
 
     /// Тень стен: лента шире стены на размытие, сдвинутая от света; края тают.
     fn draw_wall_shadow(&mut self, painter: &egui::Painter, canvas: Rect, segs: &[Segment], width: f32, sh: &map::Shadows) {
+        // Стена нулевой толщины — невидимая (перила пролёта для VTT): и тени нет.
+        if width <= 0.0 {
+            return;
+        }
         let cam = self.cam;
         let o = sh.offset();
         let (outer_hw, inner_hw) = (width / 2.0 + sh.blur / 2.0, (width / 2.0 - sh.blur / 2.0).max(0.01));
@@ -4787,6 +4792,9 @@ impl App {
     }
 
     fn draw_walls(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, segs: &[Segment]) {
+        if style.width <= 0.0 {
+            return;
+        }
         let cam = self.cam;
         let hw = style.width / 2.0;
         let edge = Stroke::new(1.5, Color32::from_rgb(20, 16, 13));

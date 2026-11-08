@@ -403,7 +403,7 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
     let back = |s: f32, t: f32| half_w / ((bowl.a + s).powi(2) * t.sin().powi(2) + (bowl.b + s).powi(2) * t.cos().powi(2)).sqrt().max(0.1);
     let piece = |m: &mut Map, s: f32, t0: f32, t1: f32, stops: &[f32]| {
         if t1 - t0 > 1e-3 {
-            m.walls.push(Wall { points: ring_line(&bowl, s, t0, t1, &[], stops), closed: false, bends: Vec::new(), style: Some(style.clone()) });
+            m.walls.push(Wall { points: ring_line(&bowl, s, t0, t1, &[], stops), closed: false, bends: Vec::new(), low: false, style: Some(style.clone()) });
         }
     };
     if pit {
@@ -454,7 +454,7 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
         }
         // Стены проходов: от ворот до площади.
         for (t_in, t_out) in [(-g0, -g_out), (g0, g_out), (PI - g0, PI - g_out), (PI + g0, PI + g_out)] {
-            m.walls.push(Wall { points: vec![bowl.ring(0.0, t_in), bowl.ring(s_out, t_out)], closed: false, bends: Vec::new(), style: Some(style.clone()) });
+            m.walls.push(Wall { points: vec![bowl.ring(0.0, t_in), bowl.ring(s_out, t_out)], closed: false, bends: Vec::new(), low: false, style: Some(style.clone()) });
         }
         // Загон: две стены вглубь и задняя по кольцу.
         let depth = bowl.box_depth();
@@ -462,7 +462,7 @@ pub(super) fn arena(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>
         let mut pen = vec![bowl.ring(0.0, FRAC_PI_2 - pen0)];
         pen.extend(ring_line(&bowl, depth, FRAC_PI_2 - pen1, FRAC_PI_2 + pen1, &[], &[]));
         pen.push(bowl.ring(0.0, FRAC_PI_2 + pen0));
-        m.walls.push(Wall { points: pen, closed: false, bends: Vec::new(), style: Some(style.clone()) });
+        m.walls.push(Wall { points: pen, closed: false, bends: Vec::new(), low: false, style: Some(style.clone()) });
     }
     m.wall_style = style;
 

@@ -193,6 +193,11 @@ pub struct Wall {
     /// плюс — влево по ходу стены. Пусто или 0 — прямой отрезок.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bends: Vec<f32>,
+    /// Низкая: парапет, зубцы, край хода по стене. В VTT держит шаг, а зрение и
+    /// свет — «ограниченно»: поверх одной видно, сквозь две — нет (со стены видно
+    /// и поле, и город, а с поля через всю стену в город — нет).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub low: bool,
     /// Свой вид; без него — как у всей карты.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<WallStyle>,
@@ -1762,7 +1767,7 @@ mod tests {
 
     #[test]
     fn closed_wall_has_a_segment_back_to_the_start() {
-        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: true, bends: Vec::new(), style: None };
+        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: true, bends: Vec::new(), low: false, style: None };
         assert_eq!(w.segments().count(), 3);
         assert!((w.distance([1.0, 2.0]) - 1.0).abs() < 0.01, "ближе всего обратный отрезок");
         let open = Wall { closed: false, ..w };
@@ -1841,7 +1846,7 @@ mod tests {
         let n = builtin_materials().len();
         assert_eq!(i, n);
         assert_eq!(m.material_index(Material { name: "другое имя".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false, live: Live::Auto }), Some(n));
-        m.walls.push(Wall { points: vec![[1.0, 1.0], [3.0, 1.0]], closed: false, bends: Vec::new(), style: None });
+        m.walls.push(Wall { points: vec![[1.0, 1.0], [3.0, 1.0]], closed: false, bends: Vec::new(), low: false, style: None });
         assert_eq!(Map::from_json(&m.to_json()).unwrap(), m);
         let broken = m.to_json().replace("\"width\": 6", "\"width\": 7");
         assert!(Map::from_json(&broken).is_err());
@@ -1866,7 +1871,7 @@ mod tests {
         assert!((apex + 1.0).abs() < 0.01, "вершина дуги {apex}");
         assert!(pts.iter().all(|p| p[1] <= 1e-4), "дуга вся по одну сторону");
         assert_eq!(arc_points([0.0, 0.0], [4.0, 0.0], 0.0).len(), 2);
-        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: false, bends: vec![1.0], style: None };
+        let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: false, bends: vec![1.0], low: false, style: None };
         assert!(w.segments().count() > 4 && w.distance([2.0, -1.0]) < 0.02);
     }
 

@@ -239,8 +239,8 @@ struct Layout {
     horiz: bool,
 }
 
-fn layout(w: i32, h: i32, rng: &mut Rng, density: f32, market: bool) -> Layout {
-    let horiz = w >= h;
+fn layout(w: i32, h: i32, rng: &mut Rng, density: f32, market: bool, horiz: Option<bool>) -> Layout {
+    let horiz = horiz.unwrap_or(w >= h);
     let (long, short) = if horiz { (w, h) } else { (h, w) };
     let main_w = if short >= 24 { 6 } else if short >= 14 { 5 } else { 4 };
     let walk = i32::from(main_w >= 5);
@@ -696,7 +696,7 @@ fn build_house(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, st: &str
     for (i, &(a, _)) in parts.iter().enumerate() {
         for &(b, _) in &parts[i + 1..] {
             if let Some(seg) = shared(a, b) {
-                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), style: Some(inner.clone()) });
+                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), low: false, style: Some(inner.clone()) });
             }
         }
     }
@@ -1320,7 +1320,7 @@ fn build_yard(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, houses: &
             let sides: Vec<i32> = (0..4).filter(|k| *k != house_side).collect();
             for k in sides {
                 let seg = s(k);
-                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), style: Some(style.clone()) });
+                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), low: false, style: Some(style.clone()) });
             }
             let c = [shed.x as f32 + 1.0, shed.y as f32 + 1.0];
             drop(m, "privy", c, (far as f32 * 90.0 + asset("privy").turn) % 360.0, 1.0);
@@ -1410,7 +1410,7 @@ fn emit_fence(m: &mut Map, fence: &Fence, style: &WallStyle) {
                 i += 1;
             }
             let (a, b) = if vertical { ([line as f32, s as f32], [line as f32, e as f32]) } else { ([s as f32, line as f32], [e as f32, line as f32]) };
-            m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(style.clone()) });
+            m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), low: false, style: Some(style.clone()) });
             i += 1;
         }
     }
@@ -1445,6 +1445,12 @@ fn rect_mask(m: &Map, rects: &[Room]) -> Mask {
 }
 
 pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
+    quarter_in(m, p, rng, warn, None).0
+}
+
+/// Квартал; `horiz` — главная улица вдоль x (иначе — вдоль y; без него — по
+/// длинной стороне). Ещё отдаёт проезжую часть главной улицы.
+pub(super) fn quarter_in(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>, horiz: Option<bool>) -> (usize, Room) {
     let (w, h) = (m.width as i32, m.height as i32);
     let season = p.options.season;
     let (grass, wet) = town_grass(season);
@@ -1454,7 +1460,7 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     patches(m, rng, wet, w * h / 160, (0.8, 2.0), 0.6);
 
     let district = p.options.district;
-    let lay = layout(w, h, rng, p.options.density, district == District::Market);
+    let lay = layout(w, h, rng, p.options.density, district == District::Market, horiz);
     let horiz = lay.horiz;
     // Мостовая: проезжая часть и переулки — брусчатка, тротуары и площадь — плиты,
     // задний проезд — утоптанная земля с гравием.
@@ -1560,7 +1566,7 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     for (i, a) in houses.iter().enumerate() {
         for b in &houses[i + 1..] {
             if let Some(seg) = shared(*a, *b) {
-                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), style: Some(styles[i].clone()) });
+                m.walls.push(Wall { points: vec![seg.0, seg.1], closed: false, bends: Vec::new(), low: false, style: Some(styles[i].clone()) });
             }
         }
     }
@@ -1694,7 +1700,7 @@ pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Strin
     let looks = std::mem::take(&mut m.edge_looks);
     m.sync_edge_looks(&edges);
     m.edge_looks.extend(looks);
-    all.len()
+    (all.len(), lay.road)
 }
 
 /// Сторона картинки (0 — верх, 1 — право, 2 — низ, 3 — лево), что смотрит на точку `to`.

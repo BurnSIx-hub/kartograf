@@ -1335,7 +1335,7 @@ fn pipe_runs(m: &mut Map, c: &Chamber) {
             }
         }
         let Some((points, _)) = best else { continue };
-        m.walls.push(crate::map::Wall { points, closed: false, bends: Vec::new(), style: Some(WallStyle { paint: Paint::Texture(p.key.clone()), width }) });
+        m.walls.push(crate::map::Wall { points, closed: false, bends: Vec::new(), low: false, style: Some(WallStyle { paint: Paint::Texture(p.key.clone()), width }) });
     }
 }
 
@@ -2325,7 +2325,7 @@ fn jail_cells(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, c: &Chamber
         if along_x { (r.x + u, r.y + v) } else { (r.x + v, r.y + u) }
     };
     let bars = WallStyle { width: 0.16, ..wall("wall_metal") };
-    let line = |m: &mut Map, a: [f32; 2], b: [f32; 2]| m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), style: Some(bars.clone()) });
+    let line = |m: &mut Map, a: [f32; 2], b: [f32; 2]| m.walls.push(Wall { points: vec![a, b], closed: false, bends: Vec::new(), low: false, style: Some(bars.clone()) });
     let cw = if len >= 9 { 3 } else { 2 };
     // У входа две клетки свободны — дверь не упирается в решётку.
     let start = 2;
