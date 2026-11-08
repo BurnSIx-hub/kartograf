@@ -470,10 +470,11 @@ pub struct SceneLevel<'a> {
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
-    RoofTile { src, rect: [x, y, w, h], rotation: rot, shelter: false, fade: true, leaves: true, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: Vec::new() }
+    RoofTile { src, rect: [x, y, w, h], rotation: rot, fade: true, leaves: true, wind: 1.0, ..Default::default() }
 }
 
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
+#[derive(Default)]
 pub struct RoofTile {
     pub src: String,
     pub rect: [i64; 4],
@@ -502,6 +503,47 @@ pub struct RoofTile {
     /// Сливы на крыше (вшиты в картинку): середина в точках сцены и поворот —
     /// «Wild Canvas» пускает по ним воду в дождь.
     pub scuppers: Vec<[f32; 3]>,
+    /// Предмет карты своим тайлом: на полу под токенами, закреплён; `above` —
+    /// над крышами (слой «над крышами»).
+    pub item: bool,
+    pub above: bool,
+    /// Подкраска картинки (умножением).
+    pub tint: Option<[u8; 3]>,
+}
+
+/// Впечатать предмет в картинку (для Universal VTT, где тайлов нет): середина
+/// и размер в точках картинки, поворот по часовой, подкраска умножением.
+pub fn stamp(dst: &mut image::RgbImage, src: &image::RgbaImage, center: [f32; 2], size: [f32; 2], rot: f32, tint: Option<[u8; 3]>) {
+    let (s, c) = rot.to_radians().sin_cos();
+    let r = (size[0].hypot(size[1]) / 2.0).ceil() + 1.0;
+    let (x0, y0) = ((center[0] - r).floor().max(0.0) as u32, (center[1] - r).floor().max(0.0) as u32);
+    let (x1, y1) = (((center[0] + r).ceil() as u32).min(dst.width()), ((center[1] + r).ceil() as u32).min(dst.height()));
+    let (sw, sh) = (src.width() as f32, src.height() as f32);
+    let t = tint.map_or([1.0; 3], |t| t.map(|v| v as f32 / 255.0));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (dx, dy) = (x as f32 + 0.5 - center[0], y as f32 + 0.5 - center[1]);
+            let (u, v) = ((c * dx + s * dy) / size[0] + 0.5, (-s * dx + c * dy) / size[1] + 0.5);
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            // Билинейно: картинка предмета обычно крупнее места в фоне.
+            let (fx, fy) = (u * sw - 0.5, v * sh - 0.5);
+            let (ix, iy) = (fx.floor(), fy.floor());
+            let (ax, ay) = (fx - ix, fy - iy);
+            let at = |xx: f32, yy: f32| src.get_pixel(xx.clamp(0.0, sw - 1.0) as u32, yy.clamp(0.0, sh - 1.0) as u32).0.map(|k| k as f32);
+            let (p, q, r2, w) = (at(ix, iy), at(ix + 1.0, iy), at(ix, iy + 1.0), at(ix + 1.0, iy + 1.0));
+            let px: [f32; 4] = std::array::from_fn(|k| (p[k] * (1.0 - ax) + q[k] * ax) * (1.0 - ay) + (r2[k] * (1.0 - ax) + w[k] * ax) * ay);
+            let a = px[3] / 255.0;
+            if a <= 0.0 {
+                continue;
+            }
+            let d = dst.get_pixel_mut(x, y);
+            for k in 0..3 {
+                d[k] = (px[k] * t[k] * a + d[k] as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }
 
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
@@ -546,8 +588,18 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
-            // Паутина и сундук лежат под токенами; их оживляет свой модуль.
-            if let Some((key, value)) = &r.living {
+            // Предметы карты, паутина и сундук лежат под токенами и закреплены.
+            if r.item || r.living.is_some() || r.web.is_some() || r.chest.is_some() {
+                tile["locked"] = json!(true);
+                if let Some([cr, cg, cb]) = r.tint {
+                    tile["texture"]["tint"] = json!(format!("#{cr:02x}{cg:02x}{cb:02x}"));
+                }
+            }
+            if r.item && r.living.is_none() && r.web.is_none() && r.chest.is_none() {
+                // Над крышами — выше крыши этажа, иначе на полу.
+                tile["elevation"] = json!(k as i64 * 10 + if r.above { 25 } else { 0 });
+                tile["occlusion"]["modes"] = json!([]);
+            } else if let Some((key, value)) = &r.living {
                 // Живой предмет на полу, под токенами: колонка играет сразу.
                 tile["elevation"] = json!(k as i64 * 10);
                 tile["occlusion"]["modes"] = json!([]);
@@ -863,7 +915,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]] }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]], ..Default::default() }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());

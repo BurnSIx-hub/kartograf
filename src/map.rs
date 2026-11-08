@@ -599,6 +599,14 @@ impl Prop {
         self.canopy.unwrap_or_else(|| canopy_by_name(&self.asset))
     }
 
+    /// В Foundry — своим тайлом в родном разрешении картинки, а не в фоне:
+    /// в фоне масштаба сцены (часто 100 точек на клетку) предмет мылится.
+    /// Кроме крон, кустов, навесов и белья (у них свой тайл) и плоского на полу
+    /// (ковры, лужи, готовые тени — их полупрозрачность в фоне не мешает).
+    pub fn own_tile(&self) -> bool {
+        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !flat_by_name(&self.asset)
+    }
+
     pub fn layer(&self) -> i16 {
         self.layer.unwrap_or_else(|| layer_by_name(&self.asset))
     }
@@ -878,7 +886,7 @@ impl Label {
 /// Плоское по имени: лежит на полу и тени не даёт.
 pub fn flat_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
-    ["rug", "carpet", "mat_", "drone_pad", "floor_fan", "shadow", "puddle", "stain", "blood", "decal", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
+    ["rug", "carpet", "mat_", "drone_pad", "floor_fan", "manhole", "shadow", "puddle", "stain", "blood", "decal", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
 }
 
 /// Падающие тени: свет с одной стороны, тень — смещённый размытый силуэт стен

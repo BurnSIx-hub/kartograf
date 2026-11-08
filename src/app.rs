@@ -449,7 +449,7 @@ pub fn default_data_dir() -> PathBuf {
 
 /// Пикселей на клетку в выгрузке по умолчанию: столько у Foundry по умолчанию
 /// не бывает (там 100), но карта с мелкими предметами при 100 мылится.
-const EXPORT_PX: u32 = 140;
+const EXPORT_PX: u32 = 256;
 const EXPORT_PX_CHOICES: [u32; 4] = [100, 140, 200, 256];
 
 fn snap_half(v: f32) -> f32 {
@@ -4670,8 +4670,8 @@ impl App {
                 continue;
             }
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
-            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
-                // Куст, навес, бельё, паутина, сундук и колонка уйдут в свой тайл целиком.
+            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || prop.own_tile()) {
+                // Куст, навес, бельё и всякий предмет уйдут в свой тайл целиком; тень — в фоне.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
@@ -5024,12 +5024,16 @@ impl App {
                 let (tex, tile) = &covers[&r.paint];
                 let parapet = r.parapet().map(|pk| &covers[pk].0);
                 let items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2)).collect();
-                let (img, origin) = roofs::render(r, tex, *tile, e.px as f32, light, parapet, &items);
+                // Крыша — в родном разрешении покрытия (256 на клетку), не в мелком
+                // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
+                let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
+                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
+                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &items);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, img.width() as i64, img.height() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect() });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), ..Default::default() });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
@@ -5047,7 +5051,7 @@ impl App {
                         }
                         img = image::DynamicImage::ImageRgba8(rgba);
                     }
-                    let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
+                    let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let file = e.dir.join(format!("{}_дерево_{}.webp", e.name, canopies.len() + 1));
                     files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 88.0)));
@@ -5073,14 +5077,18 @@ impl App {
             }
             // Паутина и сундуки — тайлами на полу: паутину покачивает, сундук
             // открывается. Картинка — одна на ассет.
-            for prop in map.props.iter().filter(|p| e.canopies && (map::web_by_name(&p.asset) || map::chest_variants(&p.asset).is_some() || map::speaker_by_name(&p.asset))) {
+            // Остальные предметы — тоже тайлами, в родном разрешении картинки,
+            // по слою: кто выше, тот позже.
+            let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile()).collect();
+            items.sort_by_key(|p| p.layer());
+            for prop in items {
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
                     if let Some(src) = canopies.get(key) {
                         return Ok(src.clone());
                     }
                     let bytes = self.textures.bytes(key)?;
                     let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(key)))?;
-                    let side = (prop.size[0].max(prop.size[1]) * e.px as f32 * 1.5).round() as u32;
+                    let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
                     files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
@@ -5093,6 +5101,13 @@ impl App {
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
                 tile.fade = false;
                 tile.leaves = false;
+                tile.item = true;
+                tile.above = prop.layer() >= map::ABOVE_ROOFS;
+                tile.tint = prop.tint;
+                if !(map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
+                    tiles.push(tile);
+                    continue;
+                }
                 if let Some(living) = map::living_by_name(&prop.asset) {
                     tile.living = Some(living);
                     tiles.push(tile);
@@ -5121,9 +5136,24 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use base64::Engine;
+            // В Universal VTT тайлов нет: предметы, ушедшие в тайлы, впечатываются
+            // в его картинку.
+            let mut pics: std::collections::HashMap<String, Option<image::RgbaImage>> = std::collections::HashMap::new();
             for k in 0..n {
                 let map = if k == self.level { &self.map } else { &self.levels[k] };
-                let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpgs[k]), &layouts[k]);
+                let mut flat = e.done[k].clone();
+                let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile()).collect();
+                items.sort_by_key(|p| p.layer());
+                let p = e.px as f32;
+                for prop in items {
+                    let pic = pics.entry(prop.asset.clone()).or_insert_with(|| self.textures.bytes(&prop.asset).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8()));
+                    if let Some(pic) = pic {
+                        export::stamp(&mut flat, pic, [prop.pos[0] * p, prop.pos[1] * p], [prop.size[0] * prop.scale * p, prop.size[1] * prop.scale * p], prop.rot, prop.tint);
+                    }
+                }
+                let mut jpg = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&flat).map_err(|x| x.to_string())?;
+                let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpg), &layouts[k]);
                 files.push((e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string().into_bytes()));
             }
             std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;

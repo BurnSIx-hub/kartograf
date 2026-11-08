@@ -1157,11 +1157,16 @@ fn iv_stands(m: &mut Map, sp: &mut Spots, c: &Chamber) {
 }
 
 /// Угловой диван (буква Г: длинная сторона вверху, короткая слева) в угол
-/// комнаты спинками к стенам, в его изгибе — журнальный столик. Сперва углы
-/// дальше от входа.
+/// комнаты спинками к стенам, в его изгибе — журнальный столик.
 fn corner_sofa(m: &mut Map, sp: &mut Spots, c: &Chamber) -> bool {
+    corner_piece(m, sp, c, "cy_corner_sofa", Some("cy_coffee"))
+}
+
+/// Предмет буквой Г (длинная сторона вверху картинки, короткая слева) — в угол
+/// комнаты, обеими сторонами к стенам; в изгибе — `inner`. Сперва углы дальше от входа.
+fn corner_piece(m: &mut Map, sp: &mut Spots, c: &Chamber, slot: &str, inner: Option<&str>) -> bool {
     let r = c.r;
-    let p = asset("cy_corner_sofa");
+    let p = asset(slot);
     if !p.own {
         return false;
     }
@@ -1170,14 +1175,15 @@ fn corner_sofa(m: &mut Map, sp: &mut Spots, c: &Chamber) -> bool {
     let mut order: Vec<_> = corners.iter().collect();
     order.sort_by_key(|(w, _)| w.contains(&c.entry));
     for (w, rot) in order {
-        let [l, t, rr, u] = bounds(&p, "cy_corner_sofa", *rot, 1.0);
+        let [l, t, rr, u] = bounds(&p, slot, *rot, 1.0);
         let (fw, fh) = (cells_of(rr - l), cells_of(u - t));
         let x = if w.contains(&3) { r.x } else { r.x + r.w - fw };
         let y = if w.contains(&0) { r.y } else { r.y + r.h - fh };
-        if !(0..fw).all(|i| (0..fh).all(|j| c.whole(x + i, y + j))) || !put_pick(m, sp, &p, "cy_corner_sofa", x, y, *rot, 1.0) {
+        if !(0..fw).all(|i| (0..fh).all(|j| c.whole(x + i, y + j))) || !put_pick(m, sp, &p, slot, x, y, *rot, 1.0) {
             continue;
         }
-        let table = asset("cy_coffee");
+        let Some(inner) = inner else { return true };
+        let table = asset(inner);
         if table.own {
             // Изгиб — нижний правый угол картинки, повёрнутый вместе с диваном.
             let (s, co) = rot.to_radians().sin_cos();
@@ -1429,6 +1435,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             // Турели в углах напротив входа, урна у двери.
             pair(m, sp, "cy_turret", &[far]);
             walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
+            walls(m, sp, rng, "cy_utility", 1, &all);
             if rng.chance(0.5) {
                 super::inside(m, sp, rng, r, "cy_barricade", 1.0);
             }
@@ -1473,6 +1480,8 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_biotank", 2, &all);
             walls(m, sp, rng, "cy_chem", 1, &all);
             walls(m, sp, rng, "cy_terminal", 1, &all);
+            walls(m, sp, rng, "cy_med_crate", 2, &all);
+            walls(m, sp, rng, "cy_sink", 1, &all);
         }
         Part::Servers => {
             if rows(m, sp, c, &asset("cy_server"), "cy_server", 1.0, 1, false) == 0 {
@@ -1493,6 +1502,8 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_barrel", 1, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
             walls(m, sp, rng, "cy_planter", 1, &all);
+            walls(m, sp, rng, "cy_shelf", 1, &all);
+            walls(m, sp, rng, "cy_gas", 1, &all);
         }
         Part::Garage => {
             // Посередине — площадка дрона, манипулятор или остов меха.
@@ -1504,6 +1515,9 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             };
             walls(m, sp, rng, "cy_moto", 2, &all);
             walls(m, sp, rng, "cy_tools", 2, &all);
+            walls(m, sp, rng, "cy_scooter", 1, &all);
+            walls(m, sp, rng, "cy_shelf", 1, &all);
+            walls(m, sp, rng, "cy_gas", 1, &all);
             walls(m, sp, rng, "cy_exosuit", 1, &all);
             spread(m, sp, c, &asset("cy_tires"), "cy_tires", 2, &all);
             walls(m, sp, rng, "cy_pallet", 1, &all);
@@ -1527,12 +1541,24 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             desk_and_seat(m, sp, rng, c, "cy_desk", "cy_chair");
             walls(m, sp, rng, "cy_lockers", 1, &sides);
             walls(m, sp, rng, "cy_cooler", 1, &all);
+            corner_piece(m, sp, c, "cy_corner_desk", None);
+            walls(m, sp, rng, "cy_bookcase", 1, &all);
+            walls(m, sp, rng, "cy_armchair", 1, &all);
             pair(m, sp, "cy_plant", &[c.entry]);
         }
         Part::Market => {
             walls(m, sp, rng, "cy_stall", 1, &all);
             walls(m, sp, rng, "cy_vending", 2, &all);
             walls(m, sp, rng, "cy_kiosk", 2, &all);
+            super::inside(m, sp, rng, r, "cy_ad", 1.0);
+            walls(m, sp, rng, "cy_bags", 2, &all);
+            walls(m, sp, rng, "cy_utility", 1, &all);
+            walls(m, sp, rng, "cy_scooter", 1, &all);
+            super::inside(m, sp, rng, r, "cy_manhole", 1.0);
+            // Укрытие бездомного — у стены, с краю рынка.
+            if rng.chance(0.5) {
+                walls(m, sp, rng, "cy_tarp", 1, &[c.entry, sides[0], sides[1]]);
+            }
             walls(m, sp, rng, "cy_pallet", 1, &all);
             walls(m, sp, rng, "cy_bench", 2, &all);
             walls(m, sp, rng, "cy_street_lamp", 2, &all);
@@ -1557,6 +1583,7 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_cooler", 1, &all);
             walls(m, sp, rng, "cy_trash", 1, &all);
             walls(m, sp, rng, "cy_toilet", 1, &all);
+            walls(m, sp, rng, "cy_washer", 2, &all);
         }
         Part::Flat => {
             if !corner_sofa(m, sp, c) {
@@ -1564,6 +1591,15 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             }
             walls(m, sp, rng, "cy_kitchen", 1, &sides);
             walls(m, sp, rng, "cy_fridge", 1, &sides);
+            walls(m, sp, rng, "cy_sink", 1, &sides);
+            walls(m, sp, rng, "cy_wardrobe", 1, &all);
+            if rng.chance(0.5) {
+                walls(m, sp, rng, "cy_bookcase", 1, &all);
+            }
+            walls(m, sp, rng, "cy_armchair", 1, &all);
+            if rng.chance(0.5) {
+                super::inside(m, sp, rng, r, "cy_dining", 1.0);
+            }
             let desk = if rng.chance(0.5) { "cy_hacker" } else { "cy_desk" };
             desk_and_seat(m, sp, rng, c, desk, "cy_chair");
             let fun = if rng.chance(0.5) { "cy_arcade" } else { "cy_treadmill" };
@@ -1572,12 +1608,17 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
             walls(m, sp, rng, "cy_trash", 1, &all);
         }
         Part::Bathroom => {
-            // Общий санузел: кабинки душа в углах дальней стены, унитазы вдоль боковых.
+            // Общий санузел: ванна в углу у боковой стены, кабинки душа в углах
+            // дальней, унитазы вдоль боковых.
+            let tub = asset("cy_bathtub");
+            by_side_pick(m, sp, rng, r, &tub, "cy_bathtub", 1.0, true, &sides);
             let shower = asset("cy_shower");
             for _ in 0..2 {
                 by_side_pick(m, sp, rng, r, &shower, "cy_shower", 1.0, true, &[far]);
             }
             walls(m, sp, rng, "cy_toilet", 4, &sides);
+            walls(m, sp, rng, "cy_sink", 2, &all);
+            walls(m, sp, rng, "cy_washer", 1, &all);
             walls(m, sp, rng, "cy_trash", 1, &[c.entry]);
             spread(m, sp, c, &asset("cy_plant"), "cy_plant", 1, &[c.entry]);
         }
@@ -1620,11 +1661,14 @@ fn cyber_dress(m: &mut Map, sp: &mut Spots, rng: &mut Rng, kit: &Kit, part: Part
                 super::inside(m, sp, rng, r, "cy_fan", 1.0);
             }
             walls(m, sp, rng, "cy_exosuit", 1, &all);
+            walls(m, sp, rng, "cy_shelf", 2, &all);
             walls(m, sp, rng, "cy_crate", 2, &all);
+            walls(m, sp, rng, "cy_med_crate", 1, &all);
             walls(m, sp, rng, "cy_weapons", 1, &all);
             walls(m, sp, rng, "cy_barrel", 2, &all);
             walls(m, sp, rng, "cy_lockers", 1, &all);
             walls(m, sp, rng, "cy_trash", 1, &all);
+            walls(m, sp, rng, "cy_bags", 1, &all);
         }
         _ => {}
     }

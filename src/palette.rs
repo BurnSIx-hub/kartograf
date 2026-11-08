@@ -181,6 +181,23 @@ const OBJECTS: &[Slot] = &[
     ("cy_ac", &[&["ac", "unit"]], &[]),
     ("cy_dumpster", &[&["dumpster"]], &[]),
     ("cy_pipes", &[&["pipe", "valves"]], &[]),
+    ("cy_armchair", &[&["armchair", "neon"]], &[]),
+    ("cy_wardrobe", &[&["wardrobe", "tech"]], &[]),
+    ("cy_sink", &[&["sink", "tech"]], &[]),
+    ("cy_shelf", &[&["shelf", "storage"]], &[]),
+    ("cy_bags", &[&["garbage", "bags"]], &[]),
+    ("cy_utility", &[&["utility", "box"]], &[]),
+    ("cy_dining", &[&["dining", "table"]], &[]),
+    ("cy_ad", &[&["ad", "pillar"]], &[]),
+    ("cy_med_crate", &[&["crate", "medical"]], &[]),
+    ("cy_bathtub", &[&["bathtub", "tech"]], &[]),
+    ("cy_gas", &[&["gas", "cylinders"]], &[]),
+    ("cy_corner_desk", &[&["office", "desk", "corner"]], &[]),
+    ("cy_scooter", &[&["scooter", "electric"]], &[]),
+    ("cy_tarp", &[&["tarp", "shelter"]], &[]),
+    ("cy_washer", &[&["washing", "machine"]], &[]),
+    ("cy_manhole", &[&["manhole", "cover"]], &[]),
+    ("cy_bookcase", &[&["bookcase", "alloy"]], &[]),
     // Сундук с сокровищем FA: у него есть открытый с монетами и пустой — в Foundry
     // он открывается (Item Piles).
     ("treasure_chest", &[&["treasure", "chest"]], &["coins", "empty", "false", "bottom", "open"]),
@@ -390,6 +407,9 @@ fn turn_of(slot: &str, name: &str) -> f32 {
     // Стойки FA для оружия нарисованы стоя: доской влево, крюками вправо.
     let standing = library::size_from_name(file).is_some_and(|s| s[1] > s[0]);
     if slot.starts_with("weapon_rack") && file.starts_with("Weapon_Rack") && standing {
+        90.0
+    } else if slot == "cy_bathtub" && file.starts_with("Bathtub_Tech") {
+        // Ванна — длинной стороной вдоль стены.
         90.0
     } else if slot == "cy_toilet" && file.starts_with("Toilet_Tech") {
         // Бачок нарисован слева — к стене.
