@@ -6,5 +6,8 @@
   "description": "Редактор карт Картограф внутри Foundry: тот же код, что у программы, собранный в WebAssembly. Только у Мастера.",
   "authors": [{ "name": "Vyazn & Claude" }],
   "esmodules": ["scripts/main.js"],
-  "socket": true
+  "socket": true,
+  "relationships": {
+    "requires": [{ "id": "burn-living-map", "type": "module", "manifest": "https://github.com/BurnSIx-hub/burn-living-map/releases/latest/download/module.json", "compatibility": { "minimum": "0.23.0" } }]
+  }
 }
