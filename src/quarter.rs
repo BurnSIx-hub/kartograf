@@ -1267,7 +1267,7 @@ type Fence = BTreeMap<(bool, i32), Vec<i32>>;
 /// Двор: забор по краям (кроме стены своего дома и края карты), калитка на
 /// проезд, хозяйство по назначению.
 #[allow(clippy::too_many_arguments)]
-fn build_yard(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, houses: &[Room], streets: &[Street], fence: &mut Fence, well: &mut bool, season: Season) {
+fn build_yard(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, houses: &[Room], streets: &[Street], fence: &mut Fence, well: &mut bool, season: Season, fence_top: bool) {
     let Some(y) = plot.yard else { return };
     let (w, h) = (m.width as i32, m.height as i32);
     let is_house = |x: i32, yy: i32| houses.iter().any(|r| contains(*r, x, yy));
@@ -1278,7 +1278,8 @@ fn build_yard(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, houses: &
         for cx in y.x..y.x + y.w {
             for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
                 let (nx, ny) = (cx + dx, cy + dy);
-                if contains(y, nx, ny) || nx < 0 || ny < 0 || nx >= w || ny >= h || is_house(nx, ny) {
+                // По краю карты забора нет; верх квартала, вклеенного под стену, — не край.
+                if contains(y, nx, ny) || nx < 0 || (ny < 0 && !fence_top) || nx >= w || ny >= h || is_house(nx, ny) {
                     continue;
                 }
                 // Калитка — одна клетка на проезд, посередине стороны.
@@ -1445,12 +1446,13 @@ fn rect_mask(m: &Map, rects: &[Room]) -> Mask {
 }
 
 pub(super) fn quarter(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
-    quarter_in(m, p, rng, warn, None).0
+    quarter_in(m, p, rng, warn, None, false).0
 }
 
 /// Квартал; `horiz` — главная улица вдоль x (иначе — вдоль y; без него — по
-/// длинной стороне). Ещё отдаёт проезжую часть главной улицы.
-pub(super) fn quarter_in(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>, horiz: Option<bool>) -> (usize, Room) {
+/// длинной стороне); `fence_top` — верхний край не край карты, дворы у него
+/// огораживаются. Ещё отдаёт проезжую часть главной улицы.
+pub(super) fn quarter_in(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>, horiz: Option<bool>, fence_top: bool) -> (usize, Room) {
     let (w, h) = (m.width as i32, m.height as i32);
     let season = p.options.season;
     let (grass, wet) = town_grass(season);
@@ -1582,7 +1584,7 @@ pub(super) fn quarter_in(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<St
     for &b in &lay.blocks {
         let mut well = wells >= 2;
         for plot in all.iter().filter(|p| contains(b, p.house.x, p.house.y)) {
-            build_yard(m, &mut sp, rng, plot, &houses, &lay.streets, &mut fence, &mut well, season);
+            build_yard(m, &mut sp, rng, plot, &houses, &lay.streets, &mut fence, &mut well, season, fence_top);
         }
         if well && wells < 2 {
             wells += 1;

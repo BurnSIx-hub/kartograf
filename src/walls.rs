@@ -86,7 +86,7 @@ pub(super) fn town_wall(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Str
         let mut sub = Map::new(w as u32, h_in as u32);
         sub.shadows = m.shadows.clone();
         let mut sub_rng = Rng::new(&format!("{}/town", p.seed));
-        let (n, road) = quarter::quarter_in(&mut sub, p, &mut sub_rng, warn, Some(false));
+        let (n, road) = quarter::quarter_in(&mut sub, p, &mut sub_rng, warn, Some(false), true);
         houses = n;
         street = Room { x: road.x, y: y_in, w: road.w, h: h_in };
         paste(m, &sub, y_in);

@@ -3797,8 +3797,18 @@ impl App {
         }
 
         let portals = self.map.portals.clone();
+        // Проём меряется по своей стене: у городской стены карты камень, а у домов
+        // за ней фахверк — по общему виду косяки и подоконники домов раздувало.
+        let edges = self.room_edges().to_vec();
         for (i, portal) in portals.iter().enumerate() {
-            self.draw_portal(painter, canvas, portal, style.width);
+            let c = portal.center();
+            let own = walls
+                .iter()
+                .find(|w| !w.low && w.distance(c) < 0.06)
+                .map(|w| w.style.clone().unwrap_or_else(|| style.clone()))
+                .or_else(|| edges.iter().find(|s| map::segment_distance(c, s.0, s.1) < 0.06).map(|s| self.map.edge_look(map::edge_key(s))))
+                .unwrap_or_else(|| style.clone());
+            self.draw_portal(painter, canvas, portal, &own);
             if self.sel == Some(Sel::Portal(i)) {
                 painter.line_segment([cam.to_screen(canvas, portal.a), cam.to_screen(canvas, portal.b)], Stroke::new(3.0, Color32::from_rgb(120, 180, 255)));
             }
@@ -4077,7 +4087,8 @@ impl App {
 
     /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
     /// В выгрузке створок нет — они уходят в Foundry отдельной картинкой.
-    fn draw_portal(&mut self, painter: &egui::Painter, canvas: Rect, p: &Portal, wall_width: f32) {
+    fn draw_portal(&mut self, painter: &egui::Painter, canvas: Rect, p: &Portal, wall: &map::WallStyle) {
+        let wall_width = wall.width;
         let (dx, dy) = (p.b[0] - p.a[0], p.b[1] - p.a[1]);
         let len = (dx * dx + dy * dy).sqrt();
         if len == 0.0 {
@@ -4125,7 +4136,7 @@ impl App {
             // попала видимая часть: иначе стойки выходили тоньше стены и она торчала.
             // У стен FA камень тоже не во всю полосу — стойка по видимой стене.
             let band = self.band(&f);
-            let seen = match self.map.wall_style.paint.clone() {
+            let seen = match wall.paint.clone() {
                 Paint::Texture(w) => self.band(&w),
                 Paint::Color(_) => 1.0,
             };
