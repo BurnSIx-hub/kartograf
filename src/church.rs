@@ -82,7 +82,7 @@ const DAIS: i32 = 2;
 const LEDGE_REACH: f32 = 0.6;
 const LEDGE_DARK: f32 = 0.5;
 /// Бордюр по краю уступа — как в квартале у мостовой.
-const CURB: f32 = 0.22;
+pub(super) const CURB: f32 = 0.22;
 /// Насколько колонна аркады отступает от края уступа на возвышенность.
 const PIER: f32 = 0.6;
 
@@ -285,7 +285,7 @@ fn seg(vertical: bool, c: i32, s: f32, e: f32) -> ([f32; 2], [f32; 2]) {
 /// Ступень: край верхнего пола по линии сетки (`vertical` — `x = c`, от `s` до
 /// `e`), нижний пол — в сторону `low` (±1). На нижнем полу у края — тень,
 /// она и показывает, что там уступ.
-fn ledge(m: &mut Map, vertical: bool, c: f32, s: f32, e: f32, low: f32) {
+pub(super) fn ledge(m: &mut Map, vertical: bool, c: f32, s: f32, e: f32, low: f32) {
     let res = mask::RES as f32;
     let (mw, mh) = (m.rooms.w, m.rooms.h);
     let mut out = Vec::new();
@@ -309,7 +309,7 @@ fn ledge(m: &mut Map, vertical: bool, c: f32, s: f32, e: f32, low: f32) {
 /// поворотом той же полосы, а не стыком двух. Концы, что упираются в стену,
 /// заходят под неё. Камень встроенный: у стен FA блоки с просветами, полоса
 /// из них рвётся.
-fn curb(m: &mut Map, corners: &[[f32; 2]]) {
+pub(super) fn curb(m: &mut Map, corners: &[[f32; 2]]) {
     let k = key("wall_stone_blocks");
     let stone = m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto }).unwrap_or(0);
     // Частыми точками: дорога из пары точек тает целиком, а у углов точки

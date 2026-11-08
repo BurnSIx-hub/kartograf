@@ -64,10 +64,13 @@ pub enum Kind {
     /// Городская стена с воротами, за ней — квартал.
     #[serde(alias = "стена", alias = "стены", alias = "ворота", alias = "town_wall", alias = "gate")]
     Walls,
+    /// Покои ярла: длинный дом с залом, очагом и троном.
+    #[serde(alias = "ярл", alias = "покои", alias = "покои_ярла", alias = "longhouse", alias = "длинный_дом")]
+    Jarl,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::Walls, Kind::House, Kind::Tavern, Kind::Church, Kind::Arena, Kind::Cyber];
+    pub const ALL: [Kind; 11] = [Kind::Dungeon, Kind::Cave, Kind::Forest, Kind::Town, Kind::Walls, Kind::House, Kind::Tavern, Kind::Jarl, Kind::Church, Kind::Arena, Kind::Cyber];
 
     /// Растёт от входа комнатами и коридорами: подземелье и киберпанк.
     pub fn grows(self) -> bool {
@@ -80,7 +83,7 @@ impl Kind {
         match self {
             Kind::Dungeon => "dungeon-1",
             Kind::Cave => o.cave.ambience(),
-            Kind::Forest | Kind::House | Kind::Tavern | Kind::Church => o.season.ambience(),
+            Kind::Forest | Kind::House | Kind::Tavern | Kind::Church | Kind::Jarl => o.season.ambience(),
             Kind::Town | Kind::Walls | Kind::Arena | Kind::Cyber => "town-1",
         }
     }
@@ -88,7 +91,7 @@ impl Kind {
     /// Звук внутри комнат: таверна, дом с камином; у прочих — нет.
     pub fn indoor(self) -> &'static str {
         match self {
-            Kind::House => "house",
+            Kind::House | Kind::Jarl => "house",
             Kind::Tavern => "tavern",
             _ => "",
         }
@@ -106,6 +109,7 @@ impl Kind {
             Kind::Cyber => "Киберпанк",
             Kind::Church => "Церковь",
             Kind::Walls => "Городская стена",
+            Kind::Jarl => "Покои ярла",
         }
     }
 }

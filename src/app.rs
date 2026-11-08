@@ -1355,7 +1355,7 @@ impl App {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
                 self.map.seed = plan.seed.clone();
                 // Время года — у всего, что под открытым небом, кроме пещеры и подземелья.
-                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church);
+                let outdoor = matches!(plan.kind, generate::Kind::Forest | generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church | generate::Kind::Jarl);
                 self.map.particles = match plan.kind {
                     _ if outdoor => plan.options.season.particles(),
                     generate::Kind::Cave => plan.options.cave.particles(),
@@ -1397,6 +1397,7 @@ impl App {
                 generate::Kind::Arena => "рядов",
                 generate::Kind::Church => "частей",
                 generate::Kind::Walls => "построек",
+                generate::Kind::Jarl => "комнат",
             }));
         }
         true
@@ -1788,7 +1789,7 @@ impl App {
                             }
                         });
                         ui.end_row();
-                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church) {
+                    } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church | generate::Kind::Jarl) {
                         ui.label("Время года");
                         ui.horizontal(|ui| {
                             for s in crate::plan::Season::ALL {

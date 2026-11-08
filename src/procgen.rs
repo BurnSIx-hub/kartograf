@@ -79,6 +79,8 @@ mod dungeon;
 mod church;
 #[path = "walls.rs"]
 mod walls;
+#[path = "jarl.rs"]
+mod jarl;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -2584,6 +2586,7 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
         Kind::Arena => arena::arena(m, p, &mut rng, &mut warnings),
         Kind::Church => church::church(m, p, &mut rng, &mut warnings),
         Kind::Walls => walls::town_wall(m, p, &mut rng, &mut warnings),
+        Kind::Jarl => jarl::jarl(m, p, &mut rng, &mut warnings),
     };
     mood(m, p);
     Ok(Report { count, warnings })

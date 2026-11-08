@@ -313,6 +313,15 @@ const OBJECTS: &[Slot] = &[
     ("clothes_line", &[&["clothes", "line"]], &["colorable"]),
     // Колизей. Своих нет у встроенных — без библиотеки этого просто не будет.
     ("throne", &[&["throne", "leather", "red"]], &[]),
+    // Покои ярла: трон любого цвета (цвет — тоном), меха, стяги, головы на стену,
+    // карта мира, кострище.
+    ("throne_any", &[&["throne", "leather"]], &[]),
+    ("fur_pelt", &[&["fur", "pelt"]], &["folded", "pile", "stack", "hanging", "rolled"]),
+    ("banner", &[&["flag", "banner", "fabric"]], &["top", "ripped", "rail", "pole", "angled", "colorable", "multicolor"]),
+    ("banner_large", &[&["flag", "banner", "fabric", "large"]], &["top", "ripped", "rail", "pole", "angled", "colorable", "multicolor"]),
+    ("trophy", &[&["trophy", "wall"], &["wall", "trophy"]], &["frame"]),
+    ("world_map", &[&["map", "world"]], &[]),
+    ("firepit", &[&["firepit", "lit"]], &[]),
     ("arena_brazier", &[&["brazier", "orange", "lit"], &["brazier", "red", "lit"]], &[]),
     ("arena_statue", &[&["statue", "sitting", "lion"]], &["volcanic"]),
     ("arena_rug", &[&["rug", "red"]], &["round", "circle", "oval", "runner", "1x1", "1x2", "2x1"]),
@@ -452,6 +461,10 @@ fn turn_of(slot: &str, name: &str) -> f32 {
 /// размечено заранее (стол со стульями — 3×4 клетки), и стол 5×2 налезает на соседей,
 /// а столик 1×1 оставляет стулья в воздухе. Прочее ставится по своему размеру.
 fn fits_size(slot: &str, name: &str) -> bool {
+    // Шкура на пол — во весь рост: мелкие и узкие у FA лежат полоской.
+    if slot == "fur_pelt" {
+        return library::size_from_name(name).is_none_or(|s| s[0].min(s[1]) >= 2.0);
+    }
     let beds = ["bed", "bed_double"].contains(&slot);
     if !beds && !["table", "table_round", "chair", "stool", "bar_counter"].contains(&slot) {
         return true;
