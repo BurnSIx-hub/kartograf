@@ -399,9 +399,16 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
                 let mid = ((lo + hi) / 2.0).floor();
                 let (a, b) = seg(vertical, c, mid - 1.0, mid + 1.0);
                 door(m, &mut doors, a, b, PortalKind::Opening);
-            } else if pair(Part::Vestry) && pair(Part::Chancel) {
+            } else if pair(Part::Vestry) && (pair(Part::Aisle(true)) || pair(Part::Transept(true))) && hi - lo >= 2.0 {
+                // Есть северный неф или придел — вход в ризницу оттуда: стена алтарной
+                // части целиком под хоры.
                 let mid = ((lo + hi) / 2.0).floor();
                 let (a, b) = seg(vertical, c, mid, mid + 1.0);
+                door(m, &mut doors, a, b, PortalKind::Door);
+            } else if pair(Part::Vestry) && pair(Part::Chancel) && lay.get(Part::Aisle(true)).is_none() && lay.get(Part::Transept(true)).is_none() {
+                // Иначе из алтарной части, у восточного конца: западнее — хоры.
+                let at = (hi.floor() - 2.0).max(lo);
+                let (a, b) = seg(vertical, c, at, at + 1.0);
                 door(m, &mut doors, a, b, PortalKind::Door);
             } else if pair(Part::Confession) {
                 // По двери в каждую кабинку.
@@ -460,9 +467,10 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
     }
     if let Some(r) = lay.get(Part::Chancel)
         && lay.ty != Type::Cross
-        && !lay.covers(r.x + 2, r.y + r.h)
+        && !lay.covers(r.x + r.w - 3, r.y + r.h)
     {
-        let x = (r.x + 2) as f32;
+        // Дверь священника — у алтаря, западнее неё хоры.
+        let x = (r.x + r.w - 3) as f32;
         let (a, b) = seg(false, r.y + r.h, x, x + 1.0);
         door(m, &mut doors, a, b, PortalKind::Door);
     }
@@ -496,7 +504,7 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
                 let near_door = doors.iter().any(|d| (d[0] - mid[0]).abs() + (d[1] - mid[1]).abs() < 2.0);
                 let east_end = part == Part::Chancel && side == 1;
                 // У восточного конца северного бокового нефа стоит орган — окна там нет.
-                let organ_wall = part == Part::Aisle(true) && side == 0 && along >= r.x + r.w - 3;
+                let organ_wall = part == Part::Aisle(true) && side == 0 && along >= r.x + r.w - 5;
                 // В ризнице у северной и восточной стен — спуск в крипту.
                 let stairs_wall = part == Part::Vestry && (side == 0 || side == 1);
                 if !lay.covers(ox, oy) && !near_door && !east_end && !organ_wall && !stairs_wall {
@@ -741,7 +749,7 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
         let my = r.y as f32 + r.h as f32 / 2.0;
         if north {
             if !missing("organ") {
-                drop(m, "organ", [ex - 1.4, wall_y as f32 + inward * (WALL_GAP + 0.5)], 0.0, 1.0);
+                drop(m, "organ", [ex - 3.0, wall_y as f32 + inward * (WALL_GAP + 0.5)], 0.0, 1.0);
             }
         } else {
             // Боковой алтарь у восточной стены, канделябры — по обе его стороны.
