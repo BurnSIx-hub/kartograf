@@ -709,7 +709,9 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
             drop(m, "font_water", [fx, fy], 0.0, 0.62);
         }
     } else {
-        drop(m, "fountain", [fx, fy], 0.0, 0.6);
+        // Встроенный фонтан — во много клеток: ужать до купели в клетку с третью.
+        let f = asset("fountain");
+        drop_pick(m, &f, [fx, fy], 0.0, 1.3 / f.size[0].max(f.size[1]));
     }
     sp.block(nave.x, axis + 1, 3, 3);
 
