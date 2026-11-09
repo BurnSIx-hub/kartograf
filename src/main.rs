@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> app::Args {
-    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None };
+    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,6 +41,7 @@ fn parse_args() -> app::Args {
             "--export" => args.export = it.next().map(PathBuf::from),
             "--px" => args.px = it.next().and_then(|s| s.parse().ok()),
             "--plan" => args.plan = it.next().map(PathBuf::from),
+            "--osm" => args.osm = it.next().map(PathBuf::from),
             "--aside" => {}
             "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
@@ -106,7 +107,7 @@ fn main() -> eframe::Result {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast;
-    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None };
+    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None };
     wasm_bindgen_futures::spawn_local(async move {
         let canvas = web_sys::window()
             .and_then(|w| w.document())

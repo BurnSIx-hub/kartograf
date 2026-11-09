@@ -28,12 +28,33 @@ const FLOORS: &[Slot] = &[
     ("grass_green", &[&["grass"], &["трава"]], &["dry", "dead", "yellow", "frost", "snow", "burnt"]),
     ("stone_tiles", &[&["tiles"], &["tile"], &["плитка"]], &["roof", "mosaic"]),
     ("grass_dry", &[&["grass", "dry"], &["grass", "dead"], &["grass", "yellow"], &["сухая", "трава"]], &[]),
+    // Местность из OSM. Трава FA — семейства (`Grass_A`…`G`, `Short`, `Rough`, `Wild`,
+    // `Marsh`…) в тонах по номеру, и номер у семейств значит разное: у `D`–`G`,
+    // `Short`, `Rough`, `Wild` `_01` зелёный, `_02`–`_03` бурые, у `A` зелёный `_06`.
+    // Поэтому луг и пустошь названы файлами поимённо: по номеру луг выходил бурым.
+    ("meadow", &[&["grass", "short", "a", "01"], &["grass", "short", "b", "01"], &["grass", "a", "06"], &["grass", "d", "01"], &["grass", "e", "01"]], &["marsh", "rough", "sparse", "wild", "wind", "long", "medium"]),
+    // Пустошь — средние оливково-бурые `Grass_A_04`, `A_07`, `A_09`: бурые `Rough`,
+    // `Wild`, `E_02` на карте почти чёрные против снимка.
+    ("rough_grass", &[&["grass", "a", "04"], &["grass", "a", "07"], &["grass", "a", "09"]], &["marsh", "rough", "wild", "sparse", "wind", "short", "long", "medium"]),
+    // Речная галька — светлая серо-бежевая (`Gravel_01_Earthy_G`–`I`, как на снимке):
+    // не тёмный сланец, не бурая `_F` и не рыжий песок.
+    ("shingle", &[&["gravel", "01", "earthy", "g"], &["gravel", "01", "earthy", "h"], &["gravel", "01", "earthy", "i"]], &[]),
+    // Гравийная дорожка парка — светлая утоптанная (`Gravel_03_Sandstone`): тёмный
+    // гравий на траве почти не виден.
+    ("path_gravel", &[&["gravel", "03", "sandstone"]], &[]),
+    // Мостовая улицы — серый и землистый булыжник; размытый «грязный», рыжий,
+    // чёрный и квадратный — нет.
+    ("street", &[&["cobblestone", "earthy"], &["cobblestone", "slate"]], &["square", "snowy"]),
     // У FA иней — `Frosted_Grass`, `Grassy_Snow`; снег с песком (`Snow_Sand`) выглядит
     // булыжником — не берётся.
     ("grass_frost", &[&["grass", "frost"], &["frost"], &["frosted", "grass"], &["grassy", "snow"], &["иней"]], &[]),
     ("snow", &[&["snow"], &["снег"]], &["roof", "sand", "disturbed"]),
-    ("water_shallow", &[&["water", "shallow"], &["shallow"], &["water"], &["мелководье"], &["вода"]], &["deep", "fall", "lily"]),
-    ("water_deep", &[&["water", "deep"], &["deep"], &["глубина"]], &["fall"]),
+    // Вода FA (`Water_Still_*`, `Water_Opaque_*`) — один рисунок в семи цветах по
+    // номеру: 01 бирюза, 02 синяя, 03 голубая, 04 зелёная, 05 оливковая, 06 бурая,
+    // 07 серая. Из любой брался то омут цвета ряски, то лужа. Мелководье — бирюза и
+    // голубая рябь, глубина — синяя; «непрозрачная» без ряби рядом не смотрится.
+    ("water_shallow", &[&["water", "shallow"], &["shallow"], &["water"], &["мелководье"], &["вода"]], &["deep", "fall", "lily", "opaque", "arctic", "02", "04", "05", "06", "07"]),
+    ("water_deep", &[&["water", "deep"], &["deep"], &["water", "still", "02"], &["глубина"]], &["fall"]),
     ("cave_floor", &[&["cave"], &["пещера"]], &["wall"]),
     // Полы пещер FA по породе: `Cave_Floor_02_Slate`, `_01_Earthy`, `_03_Sandstone`, `_05_Volcanic`.
     ("cave_slate", &[&["cave", "slate"]], &["wall"]),
@@ -250,6 +271,9 @@ const OBJECTS: &[Slot] = &[
     ("font_base", &[&["basin", "base", "marble", "white", "small", "octagon"], &["basin", "base", "stone", "small", "octagon"]], &["tiled"]),
     ("font_water", &[&["basin", "water", "small", "octagon"]], &[]),
     ("tombstone", &[&["tombstone"], &["надгробие"]], &["broken", "fallen"]),
+    // Папоротник FA — зелёный: рыжий (`Fern_Red`) ярко-алый, на пустоши как кровь.
+    ("fern", &[&["fern", "green"]], &[]),
+    ("lilypad", &[&["lilypad", "green"]], &[]),
     ("grave_kerb", &[&["grave", "stone"]], &["double", "hole", "pile"]),
     ("grave_mound", &[&["rock", "pile", "grave"]], &[]),
     ("grave_open", &[&["grave", "hole", "dirt"]], &[]),
@@ -277,6 +301,13 @@ const OBJECTS: &[Slot] = &[
     ("tree_winter", &[&["pine", "green"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
     ("tree_magic", &[&["tree", "multicolor2"], &["tree", "multicolor3"], &["pine", "blue"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
     ("tree_bare", &[&["bare", "tree"]], &["shadow", "branch", "fallen"]),
+    // Камни-переходы через ручей и реку (`Stepping_Stone_*` FA).
+    ("stepping_stone", &[&["stepping", "stone"]], &[]),
+    // Хвойный лес из OSM: только зелёные сосны (у «зимнего» есть и синие).
+    ("pine", &[&["pine", "green"], &["сосна"]], &["dead", "stump", "fallen", "log", "shadow"]),
+    // Летнее лиственное без пестроты: у FA `Multicolor1` — с жёлтым и рыжим, рядом
+    // со снимком лес выходил осенним.
+    ("tree_green", &[&["tree", "green"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
     // Фонтаны FA — части под сборку: половинки «Cut», настенные, струи. Целого нет,
     // поэтому фонтан всегда встроенный.
     ("fountain", &[&["fountain"], &["фонтан"]], &["cut", "wall", "arched", "feature", "spill", "spout", "water", "statue", "empty"]),
@@ -489,6 +520,14 @@ const NEAR: &[(&str, &str)] = &[
     ("tree_winter", "tree"),
     ("tree_magic", "tree"),
     ("tree_bare", "tree_winter"),
+    ("pine", "tree"),
+    ("tree_green", "tree_summer"),
+    ("stepping_stone", "boulder"),
+    ("meadow", "grass_green"),
+    ("rough_grass", "grass_dry"),
+    ("shingle", "gravel"),
+    ("path_gravel", "gravel"),
+    ("street", "cobblestone"),
     ("bush_summer", "bush"),
     ("bush_spring", "bush"),
     ("bush_autumn", "bush"),

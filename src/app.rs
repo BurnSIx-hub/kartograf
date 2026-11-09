@@ -206,6 +206,8 @@ pub struct Args {
     pub px: Option<u32>,
     /// `--plan файл.json`: построить карту по плану при запуске.
     pub plan: Option<PathBuf>,
+    /// `--osm файл.osm`: местность из выгрузки OpenStreetMap при запуске.
+    pub osm: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -365,6 +367,8 @@ pub struct App {
     pub first_thumb: Rect,
     /// План из командной строки ждёт, пока прочитаются паки.
     pending_plan: Option<PathBuf>,
+    /// Выгрузка OpenStreetMap из командной строки — тоже.
+    pending_osm: Option<PathBuf>,
     pub drawer_area: Rect,
     family_pick: std::collections::HashMap<String, String>,
     pub fly: Option<usize>,
@@ -575,6 +579,7 @@ impl App {
             gen_dungeon: crate::plan::DungeonKind::Crypt,
             first_thumb: Rect::NOTHING,
             pending_plan: None,
+            pending_osm: None,
             drawer_area: Rect::NOTHING,
             door_asset: Some(library::DEFAULT_DOOR.into()),
             door_kind: PortalKind::Door,
@@ -597,12 +602,13 @@ impl App {
         };
         if let Some(file) = args.file {
             app.open_path(&file);
-        } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && app.orphans.is_empty() {
+        } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && args.osm.is_none() && app.orphans.is_empty() {
             // Запуск без карты — сразу спросить размер новой.
             app.new_map = Some(NewMap { width: app.map.width, height: app.map.height });
         }
         // План строится, когда прочитаны паки: иначе план «из библиотеки» взял бы встроенное.
         app.pending_plan = args.plan;
+        app.pending_osm = args.osm;
         app
     }
 
@@ -1332,24 +1338,7 @@ impl App {
         // «Из библиотеки» (железные двери и косяки FA).
         let cyber = plan.kind == generate::Kind::Cyber;
         let library_mode = plan.assets == crate::plan::Assets::Library;
-        let palette = if library_mode || cyber {
-            let assets: Vec<library::Asset> = self
-                .library
-                .assets
-                .iter()
-                .filter(|a| match library::set_of(&a.key) {
-                    Some(set) => cyber && set == "cyberpunk",
-                    None => library_mode,
-                })
-                .cloned()
-                .collect();
-            let (sources, seen, dense, strung) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
-            Palette::from_library(&assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
-                .with_ends(Box::new(move |key| library::strand_ends(&strung, key)))
-                .with_opacity(Box::new(move |key| library::opacity(&dense, key)))
-        } else {
-            Palette::builtin()
-        };
+        let palette = self.generator_palette(library_mode, cyber);
         match procgen::build(&mut self.map, plan, self.material, palette) {
             Ok(r) => {
                 // Сид пустого плана случайный и наружу не выходит — тогда карта без сида.
@@ -1377,6 +1366,28 @@ impl App {
         }
     }
 
+    /// Подбор ассетов для генератора: свои из библиотеки (`library_mode`) и набор
+    /// киберпанка (`cyber`), иначе встроенные.
+    fn generator_palette(&self, library_mode: bool, cyber: bool) -> Palette {
+        if !library_mode && !cyber {
+            return Palette::builtin();
+        }
+        let assets: Vec<library::Asset> = self
+            .library
+            .assets
+            .iter()
+            .filter(|a| match library::set_of(&a.key) {
+                Some(set) => cyber && set == "cyberpunk",
+                None => library_mode,
+            })
+            .cloned()
+            .collect();
+        let (sources, seen, dense, strung) = (self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone(), self.textures.sources.clone());
+        Palette::from_library(&assets, Box::new(move |key| library::dimensions(&sources, key))).with_visible(Box::new(move |key| library::visible_box(&seen, key)))
+            .with_ends(Box::new(move |key| library::strand_ends(&strung, key)))
+            .with_opacity(Box::new(move |key| library::opacity(&dense, key)))
+    }
+
     /// «Построить из плана…»: JSON-файл плана (см. `plans/README.md`).
     pub fn build_from_file(&mut self, path: &Path) -> bool {
         let plan = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Plan::from_json(&t)) {
@@ -1400,6 +1411,33 @@ impl App {
                 generate::Kind::Jarl => "комнат",
             }));
         }
+        true
+    }
+
+    /// «Местность из OpenStreetMap…»: выгрузка `.osm` заменяет карту целиком,
+    /// размер — по участку. Ассеты — как у генератора: из библиотеки, если там
+    /// отмечено «из библиотеки». Отменяется Ctrl+Z.
+    pub fn import_osm_file(&mut self, path: &Path) -> bool {
+        if self.levels.len() > 1 {
+            self.error = Some("Местность ставится на карту с одним этажом, а у этой их несколько".into());
+            return false;
+        }
+        let palette = self.generator_palette(self.settings.gen_library, false);
+        let built = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| procgen::import_osm(&t, procgen::osm::Options::default(), palette));
+        let (map, r) = match built {
+            Ok(x) => x,
+            Err(e) => {
+                self.error = Some(format!("{}: {e}", path.display()));
+                return false;
+            }
+        };
+        self.checkpoint();
+        self.sel = None;
+        self.map = map;
+        self.fitted = false;
+        self.edges_dirty = true;
+        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.notice = Some(if r.warnings.is_empty() { format!("Местность «{name}»: домов {}", r.count) } else { format!("Местность «{name}»: домов {}; {}", r.count, r.warnings.join("; ")) });
         true
     }
 
@@ -1562,6 +1600,11 @@ impl App {
             && let Some(plan) = self.pending_plan.take()
         {
             self.build_from_file(&plan);
+        }
+        if !self.library.loading()
+            && let Some(osm) = self.pending_osm.take()
+        {
+            self.import_osm_file(&osm);
         }
         if self.library.loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -2109,6 +2152,11 @@ impl App {
                     && let Some(path) = crate::plat::FileDialog::new().add_filter("План карты", &["json"]).pick_file()
                 {
                     self.build_from_file(&path);
+                }
+                if item(ui, "Местность из OpenStreetMap…", "")
+                    && let Some(path) = crate::plat::FileDialog::new().add_filter("Выгрузка OpenStreetMap", &["osm"]).pick_file()
+                {
+                    self.import_osm_file(&path);
                 }
             });
             ui.menu_button("Биом", |ui| self.biome_ui(ui));
@@ -4969,6 +5017,7 @@ impl App {
             && let Some((dir, px)) = self.export_args.clone()
             && self.frame >= 10
             && self.pending_plan.is_none()
+            && self.pending_osm.is_none()
             && !self.library.loading()
             && self.textures.idle()
             && self.canvas.width() > 100.0

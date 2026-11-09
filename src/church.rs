@@ -972,7 +972,7 @@ fn churchyard(m: &mut Map, lay: &Lay, entries: &[([f32; 2], i32)], rng: &mut Rng
 }
 
 /// Одна могила с серединой в `q` (2 клетки вдоль, 1 поперёк), изголовье — на западе.
-fn grave(m: &mut Map, rng: &mut Rng, q: [f32; 2], library: bool, dirt: usize, snow: bool) {
+pub(super) fn grave(m: &mut Map, rng: &mut Rng, q: [f32; 2], library: bool, dirt: usize, snow: bool) {
     let jitter = |rng: &mut Rng| (rng.random() as f32 - 0.5) * 0.2;
     let head = [q[0] - 0.85 + jitter(rng), q[1] + jitter(rng)];
     if !library {

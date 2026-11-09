@@ -890,10 +890,11 @@ impl Label {
     }
 }
 
-/// Плоское по имени: лежит на полу и тени не даёт.
+/// Плоское по имени: лежит на полу и тени не даёт. Папоротник и кувшинки стелются
+/// по земле и воде: в Foundry им место в картинке карты, а не сотней тайлов.
 pub fn flat_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
-    ["rug", "carpet", "mat_", "drone_pad", "floor_fan", "manhole", "shadow", "puddle", "stain", "blood", "decal", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
+    ["rug", "carpet", "mat_", "drone_pad", "floor_fan", "manhole", "shadow", "puddle", "stain", "blood", "decal", "fern_", "lilypad", "ковёр", "ковер", "ковр", "тень", "лужа", "кровь", "пятно"].iter().any(|w| k.contains(w))
 }
 
 /// Падающие тени: свет с одной стороны, тень — смещённый размытый силуэт стен

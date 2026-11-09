@@ -81,6 +81,8 @@ mod church;
 mod walls;
 #[path = "jarl.rs"]
 mod jarl;
+#[path = "osm.rs"]
+pub mod osm;
 
 /// Сколько клеток у края карты отдаётся реке у дома.
 const RIVER_ROOM: i32 = 9;
@@ -184,7 +186,7 @@ fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
     let Some(p) = m.props.last_mut() else { return };
     // Слот дерева — дерево (пни, бревна и пальмы не берутся): своё тоже уходит
     // в Foundry кроной над токенами, как встроенное.
-    if name.starts_with("tree") && !crate::map::canopy_by_name(&p.asset) {
+    if (name.starts_with("tree") || name == "pine") && !crate::map::canopy_by_name(&p.asset) {
         p.canopy = Some(true);
     }
     // У встроенного дерева и куста одна картинка на все сезоны — подкрашиваем.
@@ -2590,6 +2592,16 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
     };
     mood(m, p);
     Ok(Report { count, warnings })
+}
+
+/// Карта из выгрузки OpenStreetMap (`osm.rs`); своими ассетами, если подбор не пуст.
+pub fn import_osm(xml: &str, opt: osm::Options, palette: Palette) -> Result<(Map, Report), String> {
+    let _guard = PaletteGuard;
+    if !palette.is_empty() {
+        palette.seed("osm");
+        PALETTE.with(|slot| *slot.borrow_mut() = Some(palette));
+    }
+    osm::import(xml, opt)
 }
 
 #[cfg(test)]
