@@ -469,7 +469,17 @@ fn pick<'a>(rng: &mut Rng, of: &[&'a str]) -> &'a str {
 /// Место под обеденный стол со стульями и шаг между ними: у готовых наборов FA
 /// (обычно 2×2) — 2×2 и проход в клетку, у своих стола со стульями — 3×4.
 fn dining_cell() -> (i32, i32) {
-    if missing("dining_set") { (3, 4) } else { (2, 2) }
+    if missing("dining_set") {
+        return (3, 4);
+    }
+    // Место — под самый мелкий набор слота (`dining` из шести попыток берёт тот,
+    // что влез): у FA есть 2×2, а в своих бывают только 3×3, и в клетку 2×2 такой
+    // не влезал — зал таверны оставался без столов. Мерим по именам, а не выбором:
+    // выбор тянет случайное и сдвинул бы всю раскладку.
+    let keys = PALETTE.with(|p| p.borrow().as_ref().map(|pal| pal.keys("dining_set")).unwrap_or_default());
+    let small = keys.iter().filter_map(|k| library::size_from_name(&library::label(k))).map(|s| s[0].max(s[1])).fold(f32::INFINITY, f32::min);
+    let c = if small.is_finite() { (small - 0.25).ceil().max(2.0) as i32 } else { 2 };
+    (c, c)
 }
 
 fn dining(m: &mut Map, sp: &mut Spots, rng: &mut Rng, x: i32, y: i32) -> bool {

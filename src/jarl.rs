@@ -158,7 +158,7 @@ pub(super) fn jarl(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>)
                 for side in [-1.0f32, 1.0] {
                     drop_pick(m, &bench, [f(x) + 1.0, f(ty) + side * 0.95], if side * toward > 0.0 { 0.0 } else { 180.0 }, 0.9);
                 }
-                if rng.chance(0.6) {
+                if rng.chance(0.6) && !missing("table_clutter") {
                     drop(m, "table_clutter", [f(x) + 1.0, f(ty)], 0.0, 0.8);
                 }
                 x += 3;
@@ -238,7 +238,8 @@ pub(super) fn jarl(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>)
         by_wall(m, &mut sp, rng, guard, n, 0.9, true);
     }
     inside(m, &mut sp, rng, guard, "table", 0.8);
-    for n in ["oven", "cauldron", "shelf_full", "barrel", "sacks", "barrel", "crate"] {
+    // Печи и полки с припасом встроенных нет — только из библиотеки.
+    for n in ["oven", "cauldron", "shelf_full", "barrel", "sacks", "barrel", "crate"].into_iter().filter(|n| !missing(n)) {
         by_wall(m, &mut sp, rng, kitchen, n, 0.9, true);
     }
     inside(m, &mut sp, rng, kitchen, "table", 0.8);
@@ -280,7 +281,9 @@ pub(super) fn jarl(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>)
     m.paths.push(path.clone());
     m.paths.push(back);
     let wood = if winter && !missing("firewood_snowy") { "firewood_snowy" } else { "firewood_pile" };
-    drop(m, wood, [f(bx) + 4.0, f(y1) + 0.7], 0.0, 1.0);
+    if !missing(wood) {
+        drop(m, wood, [f(bx) + 4.0, f(y1) + 0.7], 0.0, 1.0);
+    }
     drop(m, "barrel", [f(bx) - 0.7, f(axis) - 2.0], 0.0, 0.8);
     drop(m, "barrel", [f(bx) - 0.7, f(axis) + 2.0], 0.0, 0.8);
     // Деревья — вокруг, не у стен и не на тропе.
