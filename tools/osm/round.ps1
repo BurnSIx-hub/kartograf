@@ -14,6 +14,8 @@ param(
     [string]$Osm = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Картограф OSM'),
     [string]$Exe = (Join-Path $PSScriptRoot '..\..\target\release\kartograf.exe')
 )
+# Через -File список приходит одной строкой «a,b,c» — разбить.
+$Areas = $Areas | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
 $here = $PSScriptRoot
 $work = Join-Path $Osm 'круги'
 New-Item -ItemType Directory -Force $work | Out-Null
