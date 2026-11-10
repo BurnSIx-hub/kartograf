@@ -8,7 +8,7 @@ description = "Редактор карт для настольных игр: п�
 base64 = "0.22.1"
 flate2 = "1.1.10"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
 roxmltree = "0.20"
 sha2 = "0.10"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -155,6 +155,19 @@ fn zones(map: &Map) -> Vec<Zone> {
                 }
             }
         }
+        // Камни-переходы — тоже сухой путь через воду: кружок под каждым, при
+        // шаге 0,9 клетки они сливаются в полосу брода.
+        for p in map.props.iter().filter(|p| p.asset.to_lowercase().contains("stepping")) {
+            let r = 0.6;
+            for j in (((p.pos[1] - r) * res).floor().max(0.0) as usize)..(((p.pos[1] + r) * res).ceil().max(0.0) as usize).min(mask.h) {
+                for i in (((p.pos[0] - r) * res).floor().max(0.0) as usize)..(((p.pos[0] + r) * res).ceil().max(0.0) as usize).min(mask.w) {
+                    let (dx, dy) = ((i as f32 + 0.5) / res - p.pos[0], (j as f32 + 0.5) / res - p.pos[1]);
+                    if dx * dx + dy * dy <= r * r {
+                        mask.data[j * mask.w + i] = 0;
+                    }
+                }
+            }
+        }
         if mask.is_empty() {
             continue;
         }

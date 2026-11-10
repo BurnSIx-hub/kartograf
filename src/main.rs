@@ -12,6 +12,7 @@ mod map;
 mod mask;
 mod palette;
 mod pck;
+mod place;
 mod plan;
 mod plat;
 mod procgen;
@@ -32,7 +33,7 @@ use std::path::PathBuf;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> app::Args {
-    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None };
+    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -43,9 +44,13 @@ fn parse_args() -> app::Args {
             "--px" => args.px = it.next().and_then(|s| s.parse().ok()),
             "--plan" => args.plan = it.next().map(PathBuf::from),
             "--osm" => args.osm = it.next().map(PathBuf::from),
+            "--place" => args.place = it.next(),
+            "--trees" => args.trees = it.next().and_then(|s| s.parse().ok()),
+            "--cells" => args.cells = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             "--aside" => {}
             "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
+            "--analyse" => std::process::exit(place::compare(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             _ => args.file = Some(PathBuf::from(a)),
         }
@@ -108,7 +113,7 @@ fn main() -> eframe::Result {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast;
-    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None };
+    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None };
     wasm_bindgen_futures::spawn_local(async move {
         let canvas = web_sys::window()
             .and_then(|w| w.document())

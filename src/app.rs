@@ -233,6 +233,39 @@ pub struct Args {
     pub plan: Option<PathBuf>,
     /// `--osm файл.osm`: местность из выгрузки OpenStreetMap при запуске.
     pub osm: Option<PathBuf>,
+    /// `--place "широта,долгота"` (или ссылка на карту): местность по координатам
+    /// при запуске, размером `--cells ШxВ` (по умолчанию 40×30).
+    pub place: Option<String>,
+    pub cells: Option<[u32; 2]>,
+    /// `--trees 0..1`: досадить рощи на свободную сушу.
+    pub trees: Option<f32>,
+}
+
+/// Окно «местность по координатам»: что вписано и размер в клетках.
+struct PlaceForm {
+    text: String,
+    cells: [u32; 2],
+    /// Досадить рощи, 0..1 (`osm::Options::trees`).
+    trees: f32,
+}
+
+/// Сборка места в фоне: ход и готовое.
+#[derive(Default)]
+struct PlaceJob {
+    rx: Option<std::sync::mpsc::Receiver<crate::place::Msg>>,
+    step: String,
+    error: Option<String>,
+    ready: Option<crate::place::Place>,
+    /// Из `--place` при запуске — ждёт первого кадра.
+    start: Option<(f64, f64, [u32; 2])>,
+    /// Досадить рощи при импорте собранного места.
+    trees: f32,
+}
+
+impl PlaceJob {
+    fn busy(&self) -> bool {
+        self.rx.is_some() || self.ready.is_some() || self.start.is_some()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -403,6 +436,8 @@ pub struct App {
     pending_plan: Option<PathBuf>,
     /// Выгрузка OpenStreetMap из командной строки — тоже.
     pending_osm: Option<PathBuf>,
+    place_form: Option<PlaceForm>,
+    place: PlaceJob,
     pub drawer_area: Rect,
     family_pick: std::collections::HashMap<String, String>,
     pub fly: Option<usize>,
@@ -622,6 +657,8 @@ impl App {
             first_thumb: Rect::NOTHING,
             pending_plan: None,
             pending_osm: None,
+            place_form: None,
+            place: PlaceJob::default(),
             drawer_area: Rect::NOTHING,
             door_asset: Some(library::DEFAULT_DOOR.into()),
             door_kind: PortalKind::Door,
@@ -644,13 +681,15 @@ impl App {
         };
         if let Some(file) = args.file {
             app.open_path(&file);
-        } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && args.osm.is_none() && app.orphans.is_empty() {
+        } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && args.osm.is_none() && args.place.is_none() && app.orphans.is_empty() {
             // Запуск без карты — сразу спросить размер новой.
             app.new_map = Some(NewMap { width: app.map.width, height: app.map.height });
         }
         // План строится, когда прочитаны паки: иначе план «из библиотеки» взял бы встроенное.
         app.pending_plan = args.plan;
         app.pending_osm = args.osm;
+        app.place.start = args.place.as_deref().and_then(crate::place::parse_place).map(|(lat, lon)| (lat, lon, args.cells.unwrap_or([40, 30])));
+        app.place.trees = args.trees.unwrap_or(0.0).clamp(0.0, 1.0);
         app
     }
 
@@ -1556,10 +1595,16 @@ impl App {
             let extra = osm_relations(&procgen::osm::incomplete(&t));
             procgen::import_osm(&t, &extra, cover.as_ref(), procgen::osm::Options::default(), palette)
         });
+        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.take_terrain(built.map_err(|e| format!("{}: {e}", path.display())), &name)
+    }
+
+    /// Положить собранную местность на карту (с отменой) и сказать, что вышло.
+    fn take_terrain(&mut self, built: Result<(Map, procgen::Report), String>, name: &str) -> bool {
         let (map, r) = match built {
             Ok(x) => x,
             Err(e) => {
-                self.error = Some(format!("{}: {e}", path.display()));
+                self.error = Some(e);
                 return false;
             }
         };
@@ -1568,9 +1613,116 @@ impl App {
         self.map = map;
         self.fitted = false;
         self.edges_dirty = true;
-        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.notice = Some(if r.warnings.is_empty() { format!("Местность «{name}»: домов {}", r.count) } else { format!("Местность «{name}»: домов {}; {}", r.count, r.warnings.join("; ")) });
         true
+    }
+
+    /// Местность по координатам: запустить сборку в фоне, принять её ход и, когда
+    /// готово и паки прочитаны, положить на карту.
+    fn place_step(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((lat, lon, cells)) = self.place.start.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cache = self.data_dir.join("местность");
+            let ctx = ctx.clone();
+            self.place.rx = Some(rx);
+            self.place.error = None;
+            self.place.step = String::new();
+            std::thread::spawn(move || {
+                let (steps, repaint) = (tx.clone(), ctx.clone());
+                let done = crate::place::build(lat, lon, cells, &cache, &move |s| {
+                    let _ = steps.send(crate::place::Msg::Step(s.to_owned()));
+                    repaint.request_repaint();
+                });
+                let _ = tx.send(crate::place::Msg::Done(Box::new(done)));
+                ctx.request_repaint();
+            });
+        }
+        if let Some(rx) = &self.place.rx {
+            let mut finished = false;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    crate::place::Msg::Step(s) => self.place.step = s,
+                    crate::place::Msg::Done(done) => {
+                        finished = true;
+                        match *done {
+                            Ok(place) => self.place.ready = Some(place),
+                            Err(e) => self.place.error = Some(e),
+                        }
+                    }
+                }
+            }
+            if finished {
+                self.place.rx = None;
+            }
+        }
+        if !self.library.loading()
+            && let Some(place) = self.place.ready.take()
+        {
+            let palette = self.generator_palette(self.settings.gen_library, false);
+            let opt = procgen::osm::Options { trees: self.place.trees, ..Default::default() };
+            let built = procgen::import_osm(&place.xml, &place.extra, Some(&place.cover), opt, palette);
+            let name = place.folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if self.take_terrain(built, &name) {
+                self.place_form = None;
+                self.notice = Some(format!("{} — {}", self.notice.clone().unwrap_or_default(), place.summary));
+            }
+        }
+        if let Some(e) = self.place.error.take().filter(|_| self.place_form.is_none()) {
+            self.error = Some(e);
+        }
+    }
+
+    fn place_window(&mut self, ctx: &egui::Context) {
+        let Some(form) = &mut self.place_form else { return };
+        let mut open = true;
+        let mut go = None;
+        let busy = self.place.busy();
+        egui::Window::new("Местность по координатам").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label("Координаты или ссылка на карту:");
+            ui.add(egui::TextEdit::singleline(&mut form.text).desired_width(360.0).hint_text("59.46956, 25.65897"));
+            let found = crate::place::parse_place(&form.text);
+            ui.horizontal(|ui| {
+                ui.label("Размер, клеток:");
+                ui.add(egui::DragValue::new(&mut form.cells[0]).range(8..=256));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut form.cells[1]).range(8..=256));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Деревья:");
+                ui.add(egui::Slider::new(&mut form.trees, 0.0..=1.0).custom_formatter(|v, _| if v <= 0.0 { "по снимку".to_owned() } else { format!("+{:.0} %", v * 100.0) }));
+            });
+            if let Some((lat, lon)) = found {
+                ui.label(format!("{lat:.5}, {lon:.5}"));
+            }
+            if ui.add_enabled(found.is_some() && !busy, egui::Button::new("Собрать")).clicked() {
+                go = found.map(|(lat, lon)| (lat, lon, form.cells, form.trees));
+            }
+            if busy {
+                let step = match self.place.step.as_str() {
+                    "osm" => "Выгрузка OpenStreetMap…",
+                    "photo" => "Снимок…",
+                    "layers" => "Карты лесов и болот…",
+                    "analysis" => "Разбор снимка…",
+                    _ => "Готовлю…",
+                };
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(step);
+                });
+            }
+            if let Some(e) = &self.place.error {
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 70), e);
+            }
+        });
+        if let Some((lat, lon, cells, trees)) = go {
+            self.place.error = None;
+            self.place.trees = trees;
+            self.place.start = Some((lat, lon, cells));
+        }
+        if !open {
+            self.place_form = None;
+        }
     }
 
     // ----- файлы -----
@@ -1738,6 +1890,7 @@ impl App {
         {
             self.import_osm_file(&osm);
         }
+        self.place_step(&ctx);
         if self.library.loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -1824,6 +1977,7 @@ impl App {
 
     fn windows(&mut self, ctx: &egui::Context) {
         self.update_window(ctx);
+        self.place_window(ctx);
         if let Some(e) = self.error.clone() {
             let mut open = true;
             egui::Window::new("Ошибка").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| ui.label(e));
@@ -2297,6 +2451,10 @@ impl App {
                     && let Some(path) = crate::plat::FileDialog::new().add_filter("Выгрузка OpenStreetMap", &["osm"]).pick_file()
                 {
                     self.import_osm_file(&path);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if item(ui, "Местность по координатам…", "") {
+                    self.place_form.get_or_insert(PlaceForm { text: String::new(), cells: [40, 30], trees: 0.0 });
                 }
             });
             ui.menu_button("Биом", |ui| self.biome_ui(ui));
@@ -5289,6 +5447,7 @@ impl App {
             && self.frame >= 10
             && self.pending_plan.is_none()
             && self.pending_osm.is_none()
+            && !self.place.busy()
             && !self.library.loading()
             && self.textures.idle()
             && self.canvas.width() > 100.0

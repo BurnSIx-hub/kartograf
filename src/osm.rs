@@ -28,11 +28,14 @@ pub struct Options {
     pub cell_m: f32,
     /// Наибольшая сторона карты в клетках: участок крупнее ужимается.
     pub max_cells: u32,
+    /// Досадить рощи на свободную сушу, 0..1: 0 — деревья только по снимку и OSM.
+    /// Боевая карта у брода Болтона по снимку вышла голой: берег — трава и галька.
+    pub trees: f32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { cell_m: CELL_M, max_cells: 256 }
+        Self { cell_m: CELL_M, max_cells: 256, trees: 0.0 }
     }
 }
 
@@ -66,6 +69,13 @@ pub struct Crown {
     /// с очередью меньше `p` (тёмные и холодные на снимке, куртинами).
     #[serde(default)]
     queue: f32,
+}
+
+impl Crown {
+    /// Крона из анализа снимка в программе (`place.rs`).
+    pub fn new(u: f32, v: f32, r: f32, kind: String, src: String, queue: f32) -> Self {
+        Self { u, v, r, kind, src, queue }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -119,6 +129,53 @@ impl Cover {
             })
             .collect();
         Ok(Self { w, h, data, crowns: None })
+    }
+
+    /// Из классов анализа снимка в программе (`place.rs`): номер класса — место
+    /// в `COLORS`, по строкам.
+    pub fn from_classes(w: usize, h: usize, data: Vec<u8>, crowns: Vec<Crown>) -> Self {
+        Self { w, h, data, crowns: Some(crowns) }
+    }
+
+    /// Положить рядом с выгрузкой `place.cover.png` и `place.crowns.json` — те же
+    /// файлы, что пишут скрипты `tools/osm`: «Местность из OpenStreetMap…» по
+    /// `place.osm` из этой папки соберёт ту же карту.
+    pub fn save_files(&self, folder: &std::path::Path) -> Result<(), String> {
+        let img = image::RgbImage::from_fn(self.w as u32, self.h as u32, |x, y| image::Rgb(Self::COLORS[self.data[y as usize * self.w + x as usize] as usize % Self::COLORS.len()].0));
+        img.save(folder.join("place.cover.png")).map_err(|e| e.to_string())?;
+        let crowns: Vec<serde_json::Value> = self
+            .crowns
+            .iter()
+            .flatten()
+            .map(|c| serde_json::json!({"u": c.u, "v": c.v, "r": c.r, "kind": c.kind, "src": c.src, "queue": c.queue}))
+            .collect();
+        std::fs::write(folder.join("place.crowns.json"), serde_json::to_vec_pretty(&serde_json::json!({"crowns": crowns})).unwrap_or_default()).map_err(|e| e.to_string())
+    }
+
+    /// Доля пикселей того же класса, что у другой подсказки того же размера (сверка).
+    pub fn agreement(&self, other: &Cover) -> f32 {
+        if (self.w, self.h) != (other.w, other.h) {
+            return 0.0;
+        }
+        self.data.iter().zip(&other.data).filter(|(a, b)| a == b).count() as f32 / self.data.len().max(1) as f32
+    }
+
+    /// Породы и источники крон (сверка).
+    pub fn crown_kinds(&self) -> Vec<(String, String)> {
+        self.crowns.iter().flatten().map(|c| (c.kind.clone(), c.src.clone())).collect()
+    }
+
+    /// Доли классов строкой (сверка).
+    pub fn class_shares(&self) -> String {
+        const NAMES: [&str; 10] = ["grass", "trees", "brown", "rock", "water", "dry", "earth", "snow", "ice", "bog"];
+        let n = self.data.len().max(1) as f32;
+        (0..10u8)
+            .filter_map(|k| {
+                let c = self.data.iter().filter(|&&v| v == k).count();
+                (c > 0).then(|| format!("{} {:.0}%", NAMES[k as usize], c as f32 / n * 100.0))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// С кронами из анализа снимка (`<имя>.crowns.json`).
@@ -2566,6 +2623,69 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 planted += 1;
             }
         }
+        // Рощи по желанию (`Options::trees`): куртины деревьев и кустов на свободной
+        // суше — не на воде, пляже, камне, в домах и на тропах, не там, где снимок
+        // видит воду, камень или снег. Порода — как у крон снимка (доля хвойных среди
+        // крон с известной породой), в сухом краю — каменный дуб, на болоте — низкие
+        // сосенки; на снегу и льду не растёт ничего.
+        if opt.trees > 0.0 && !cold {
+            let mut bare = vec![false; mw * m.rooms.h];
+            for a in areas.iter() {
+                let hard = building(a.tags).is_some()
+                    || matches!(ground(a.tags), Some((t, _)) if t.starts_with("water") || t.starts_with("sea") || t.starts_with("rock_") || matches!(t, "sand" | "shingle" | "gravel" | "stone_tiles" | "street" | "flagstones"));
+                if hard {
+                    for (k, v) in coverage(&m.rooms, &a.rings, 0.0) {
+                        bare[k] |= v > 0.3;
+                    }
+                }
+            }
+            let known: Vec<&Crown> = hint.as_ref().and_then(|h| h.cover.crowns.as_ref()).map(|c| c.iter().filter(|c| c.src != "none" && c.kind != "bush").collect()).unwrap_or_default();
+            let needles = if known.len() >= 5 { known.iter().filter(|c| c.kind == "conifer").count() as f32 / known.len() as f32 } else { 0.15 };
+            let mut rng = Rng::new("osm/grove");
+            for _ in 0..(w * h) as usize {
+                if planted >= MAX_PLANTS {
+                    break;
+                }
+                let q = [rng.random() as f32 * w as f32, rng.random() as f32 * h as f32];
+                if blocked.at(q) || bare[(q[1] * res) as usize * mw + (q[0] * res) as usize] {
+                    continue;
+                }
+                // Галька у берега на снимке — «камень»: на ней не растёт, но лишь
+                // где её больше половины; вода, снег и лёд — уже с четверти.
+                if let Some(h) = &hint
+                    && ([Class::Water, Class::Snow, Class::Ice].iter().any(|&c| h.share(q, 1.0, c) > 0.25) || h.share(q, 1.0, Class::Rock) > 0.5)
+                {
+                    continue;
+                }
+                let copse = (noise(q, 8.0, 41) * 0.5 + 0.5).clamp(0.0, 1.0);
+                if !rng.chance((opt.trees * (0.03 + 0.5 * copse.powf(2.5) * 2.0)) as f64) {
+                    continue;
+                }
+                // В гуще куртины — деревья, по её краю и вразброс — кусты.
+                let tree = rng.chance((0.25 + 0.75 * copse) as f64);
+                let (slot, scale, gap) = if !tree {
+                    (if bog { "bush_summer" } else { arid_slot("bush_summer", arid) }, 0.6 + rng.random() as f32 * 0.4, 1.6)
+                } else if bog {
+                    ("fir", 0.55 + rng.random() as f32 * 0.25, 2.0)
+                } else if arid {
+                    ("encina", 0.9 + rng.random() as f32 * 0.5, 2.8)
+                } else if rng.chance(needles as f64) {
+                    let r = 1.6 + rng.random() as f32 * 1.0;
+                    (conifer_slot(r), 0.8 + rng.random() as f32 * 0.4, 2.4)
+                } else {
+                    ("tree_green", 1.0 + rng.random() as f32 * 0.5, 2.8)
+                };
+                if missing(slot) || !spacing.free(q, gap) {
+                    continue;
+                }
+                spacing.add(q);
+                drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
+                planted += 1;
+                if tree && !bog {
+                    litter.push((q, 2.4));
+                }
+            }
+        }
     }
 
     // Кувшинки — купами у берега стоячей воды, где мелко, как в заводях на снимке.
@@ -3147,6 +3267,25 @@ mod tests {
         let (east, west) = (floor(w * 5 / 6, h / 2), floor(w / 8, h / 2));
         assert!(east.contains("dirt"), "в пустыне не земля: {east}");
         assert_ne!(east, west, "зелёное пятно не легло");
+    }
+
+    #[test]
+    fn groves_on_request_grow_on_land_and_not_in_water() {
+        const EMPTY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+</osm>"#;
+        // Луг на западе, вода по снимку на востоке.
+        let cover = Cover::grid(60, 60, |x, _| if x < 30 { Class::Grass } else { Class::Water });
+        let plants = |trees: f32| {
+            let (m, _) = import_cover(EMPTY, &[], Some(&cover), Options { trees, ..Default::default() }).unwrap();
+            let east = m.props.iter().filter(|p| p.pos[0] > m.width as f32 * 0.6).count();
+            (m.props.len(), east)
+        };
+        let (plain, _) = plants(0.0);
+        let (groves, wet) = plants(1.0);
+        assert!(groves >= plain + 10, "рощ не прибавилось: {plain} → {groves}");
+        assert_eq!(wet, 0, "деревья в воде");
     }
 
     #[test]
