@@ -40,15 +40,26 @@ def classify(im):
     h, s, v = hsv[..., 0] * 360 / 255, hsv[..., 1] / 255, hsv[..., 2] / 255
     vb, vbig = blur(v, 1.5), blur(v, 8)
     texture = blur(np.clip(np.abs(v - blur(v, 3)) * 4, 0, 1), 6)
-    water = ((vbig < 0.13) & (texture < 0.12)) | ((h > 165) & (h < 250) & (s > 0.3))
+    # Бирюзовое море Лулворта — оттенок 161–163 при насыщенности 0,9: тёмные
+    # кроны не бирюзовее 143 и не насыщеннее 0,7.
+    water = ((vbig < 0.13) & (texture < 0.12)) | ((h > 165) & (h < 250) & (s > 0.3)) | ((h > 150) & (h < 250) & (s > 0.75))
     # Середина — по суше: море в полкадра (Лулворт) тянуло её вниз, и лес не
     # выходил «темнее середины».
     land = v[~water] if (~water).any() else v
     med = np.median(land)
     # Кроны — тёмные пятна шире 3 м: открытие кругом 9 px (~3 м) снимает тонкие
     # тёмные линии — каменные ограды с тенью, — они на Малхеме вставали рядами деревьев.
-    dark = Image.fromarray(((vb < med * 0.72) & ~water).astype(np.uint8) * 255)
-    trees = np.asarray(dark.filter(ImageFilter.MinFilter(9)).filter(ImageFilter.MaxFilter(9))) > 127
+    # Освещённая сторона кроны не темнее луга, а маска по одной тени брала
+    # полкроны — и на карту вставали две-три мелких вместо одной большой.
+    # Мерено на Болтоне: освещённая крона — оттенок 113–123, насыщенность
+    # 0,37–0,63, пестрота 0,15–0,25; стриженый газон — 70–86, 0,35, 0,04.
+    fine = blur(np.clip(np.abs(v - blur(v, 3)) * 4, 0, 1), 3)
+    lit = (h > 105) & (h < 135) & (s > 0.35) & (fine > 0.11) & (vb > med * 0.6)
+    dark = Image.fromarray((((vb < med * 0.72) | lit) & ~water).astype(np.uint8) * 255)
+    # Закрытие сливает тень и свет одной кроны, открытие снимает тонкое.
+    trees = dark.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
+    trees = np.asarray(trees.filter(ImageFilter.MinFilter(9)).filter(ImageFilter.MaxFilter(9))) > 127
+    trees &= ~water
     warm = (h < 62) & (s > 0.28) & (vb > 0.12) & ~trees & ~water
     # Тёплое светлое — сухая и скошенная трава, тёмное и рыжее — орляк и вереск.
     dry = warm & (vb > med * 1.05)
@@ -68,7 +79,7 @@ def classify(im):
     return cls
 
 
-for osm in sys.argv[1:]:
+for osm in sys.argv[1:] if __name__ == "__main__" else []:
     im, fetched = satlib.image(osm)
     cls = classify(im)
     stem = os.path.splitext(osm)[0]

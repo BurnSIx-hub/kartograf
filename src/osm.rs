@@ -17,6 +17,7 @@
 use super::*;
 use crate::map::segment_distance;
 use std::collections::{BTreeSet, HashMap};
+use std::f32::consts::{FRAC_PI_4, FRAC_PI_8};
 
 /// Метров в клетке D&D: 5 футов.
 pub const CELL_M: f32 = 1.524;
@@ -107,6 +108,15 @@ impl Cover {
         }
         if all == 0 { 0.0 } else { hit as f32 / all as f32 }
     }
+
+    /// Класс в точке; `u`, `v` — доли рамки. За рамкой — ничего.
+    fn at(&self, u: f32, v: f32) -> Option<Class> {
+        let (x, y) = ((u * self.w as f32).floor(), (v * self.h as f32).floor());
+        if x < 0.0 || y < 0.0 || x as usize >= self.w || y as usize >= self.h {
+            return None;
+        }
+        Self::COLORS.get(self.data[y as usize * self.w + x as usize] as usize).map(|c| c.1)
+    }
 }
 
 /// Подсказка, приложенная к карте: точки — в клетках карты.
@@ -121,6 +131,134 @@ impl Hint<'_> {
     fn share(&self, p: [f32; 2], r: f32, class: Class) -> f32 {
         self.cover.share(p[0] / self.span[0], p[1] / self.span[1], r / self.span[0], r / self.span[1], class)
     }
+
+    fn at(&self, p: [f32; 2]) -> Option<Class> {
+        self.cover.at(p[0] / self.span[0], p[1] / self.span[1])
+    }
+
+    /// Кроны снимка по одной: центр и радиус в клетках карты `w`×`h`. Центр самой
+    /// большой — в самой глубокой точке пятна крон (дальше всех от его края),
+    /// следующие — по убыванию глубины, пока центр новой не попадёт в уже
+    /// найденную. Круглое пятно даёт одну крону, слипшиеся — по кроне на каждое,
+    /// сплошной полог — кроны по 10–17 м вплотную. Прежняя посадка дротиками с
+    /// шагом 3,2 клетки ставила на одну крону снимка в 20 м три-пять деревьев.
+    fn crowns(&self, w: usize, h: usize) -> Vec<([f32; 2], f32)> {
+        const G: usize = 3;
+        const BUCKET: f32 = 8.0;
+        let (gw, gh) = (w * G, h * G);
+        let pos = |k: usize| [((k % gw) as f32 + 0.5) / G as f32, ((k / gw) as f32 + 0.5) / G as f32];
+        let trees: Vec<bool> = (0..gw * gh).map(|k| self.at(pos(k)) == Some(Class::Trees)).collect();
+        let depth = distance_inside(&trees, gw, gh);
+        let mut cand: Vec<(f32, usize)> = depth.iter().enumerate().filter(|(_, d)| **d >= CROWN_MIN * G as f32).map(|(k, d)| (*d / G as f32, k)).collect();
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut out: Vec<([f32; 2], f32)> = Vec::new();
+        let mut near: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let reach = ((2.0 * CROWN_LONE) / BUCKET).ceil() as i32;
+        for (inner, k) in cand {
+            let c = pos(k);
+            let (bx, by) = ((c[0] / BUCKET).floor() as i32, (c[1] / BUCKET).floor() as i32);
+            let others = || (-reach..=reach).flat_map(move |dx| (-reach..=reach).map(move |dy| (bx + dx, by + dy)));
+            // Центр — не в чужой кроне.
+            if others().any(|b| near.get(&b).is_some_and(|v| v.iter().any(|&j| length(out[j].0, c) < out[j].1))) {
+                continue;
+            }
+            // Крона сама по себе или в купе — пятно за ней кончается хотя бы с
+            // четверти сторон: на круге в 1,6 её радиуса есть просвет. В сплошном
+            // пологе кроны уже, чем глубина пятна. Большая крона у аббатства Болтона,
+            // слипшаяся с соседними, при пороге «половина круга» урезалась вдвое.
+            let ring = 1.6 * inner + 0.5;
+            let around = (0..16).filter(|i| self.at([c[0] + ring * (*i as f32 * FRAC_PI_8).cos(), c[1] + ring * (*i as f32 * FRAC_PI_8).sin()]) == Some(Class::Trees)).count();
+            let cap = if inner * CROWN_GROW <= CROWN_LONE && around < 12 {
+                CROWN_LONE
+            } else {
+                CROWN_CANOPY.0 + (CROWN_CANOPY.1 - CROWN_CANOPY.0) * (0.5 + 0.5 * noise(c, 3.0, 31))
+            };
+            let r = (inner * CROWN_GROW).min(cap);
+            // Мелкая крона у края большой — лопасть того же пятна, а не дерево:
+            // новая выходит из уже найденных хотя бы на половину радиуса. Без
+            // этого большую крону обсаживали кольцом мелких.
+            if others().any(|b| near.get(&b).is_some_and(|v| v.iter().any(|&j| length(out[j].0, c) < (CROWN_OVERLAP * (r + out[j].1)).max(out[j].1 + 0.5 * r)))) {
+                continue;
+            }
+            near.entry((bx, by)).or_default().push(out.len());
+            out.push((c, r));
+        }
+        out
+    }
+}
+
+/// Кроны сплошного полога, клетки радиуса: в зрелом лесу кроны 12–18 м.
+const CROWN_CANOPY: (f32, f32) = (4.0, 6.0);
+/// Самая широкая одиночная крона, клетки радиуса: дуб или бук у аббатства — 20 м.
+const CROWN_LONE: f32 = 7.0;
+/// Соседние кроны стоят не ближе этой доли суммы радиусов: случайная укладка
+/// кругов рыхлее сотовой, и при 0,8 в пологе Болтона оставались просветы.
+const CROWN_OVERLAP: f32 = 0.75;
+/// Крона на карте шире круга, вписанного в пятно на снимке: пятно не круглое.
+const CROWN_GROW: f32 = 1.2;
+/// Крона уже — куст, клетки радиуса.
+const CROWN_BUSH: f32 = 1.3;
+/// Самая узкая крона по снимку, клетки радиуса: cover.py снимает всё уже 3 м.
+const CROWN_MIN: f32 = 0.9;
+
+/// Расстояние от каждой точки маски до ближайшей точки вне её, в точках сетки
+/// (точный евклидов, Фельценшваб — Хуттенлохер). Край сетки краем не считается.
+fn distance_inside(mask: &[bool], w: usize, h: usize) -> Vec<f32> {
+    const FAR: f64 = 1e20;
+    fn pass(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
+        let n = f.len();
+        let (mut k, sq) = (0usize, |q: usize| (q * q) as f64);
+        v[0] = 0;
+        z[0] = f64::NEG_INFINITY;
+        z[1] = f64::INFINITY;
+        for q in 1..n {
+            loop {
+                let s = ((f[q] + sq(q)) - (f[v[k]] + sq(v[k]))) / (2.0 * (q as f64 - v[k] as f64));
+                if s <= z[k] {
+                    k -= 1;
+                    continue;
+                }
+                k += 1;
+                v[k] = q;
+                z[k] = s;
+                z[k + 1] = f64::INFINITY;
+                break;
+            }
+        }
+        k = 0;
+        for (q, out) in d.iter_mut().enumerate() {
+            while z[k + 1] < q as f64 {
+                k += 1;
+            }
+            *out = (q as f64 - v[k] as f64).powi(2) + f[v[k]];
+        }
+    }
+    let mut g: Vec<f64> = mask.iter().map(|&m| if m { FAR } else { 0.0 }).collect();
+    let n = w.max(h);
+    let (mut f, mut d, mut v, mut z) = (vec![0.0; n], vec![0.0; n], vec![0usize; n], vec![0.0; n + 1]);
+    for x in 0..w {
+        for y in 0..h {
+            f[y] = g[y * w + x];
+        }
+        pass(&f[..h], &mut d[..h], &mut v[..h], &mut z[..h + 1]);
+        for y in 0..h {
+            g[y * w + x] = d[y];
+        }
+    }
+    for y in 0..h {
+        f[..w].copy_from_slice(&g[y * w..(y + 1) * w]);
+        pass(&f[..w], &mut d[..w], &mut v[..w], &mut z[..w + 1]);
+        g[y * w..(y + 1) * w].copy_from_slice(&d[..w]);
+    }
+    g.iter().map(|&s| if s >= FAR / 2.0 { f32::INFINITY } else { s.sqrt() as f32 }).collect()
+}
+
+/// Дерево или куст слота, чья видимая крона — круг радиуса `r` клеток. У картинок
+/// FA крона — 0,7–0,95 холста; видимая рамка шире круга той же площади на 7 %.
+fn drop_crown(m: &mut Map, slot: &str, q: [f32; 2], rot: f32, r: f32) {
+    let pick = asset(slot);
+    let across = pick.visible.map_or(0.85 * pick.size[0].max(pick.size[1]), |[l, t, rr, b]| 0.93 * (rr - l).max(b - t));
+    drop_as(m, slot, &pick, q, rot, 2.0 * r / across.max(0.1));
 }
 
 type Tags = BTreeMap<String, String>;
@@ -1309,6 +1447,7 @@ fn split_at_gates(pts: &[[f32; 2]], gaps: &[Option<f32>]) -> Vec<Vec<[f32; 2]>> 
 }
 
 /// Где сажать нельзя: дома, дороги, вода, ограды. Сетка маски (`RES` точек на клетку).
+#[derive(Clone)]
 struct Blocked {
     w: usize,
     h: usize,
@@ -1356,9 +1495,6 @@ impl Blocked {
 /// Сколько всего деревьев и кустов сажать на карту: больше — Foundry тяжело
 /// (у каждой кроны свой тайл).
 const MAX_PLANTS: usize = 3000;
-/// Шаг деревьев по снимку, клетки: крона на снимке Болтона — 8–10 м, 5–6 клеток,
-/// соседние кроны смыкаются.
-const COVER_TREE_GAP: f32 = 3.2;
 
 /// Посаженное, разложенное по корзинам в клетку: не ближе шага к соседу.
 #[derive(Default)]
@@ -1850,6 +1986,17 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // Лес, сад, кустарник, вереск, болото: отдельных деревьев в OSM у них нет —
     // сажаем дротиками, мимо домов, дорог, воды, оград и соседей.
     let mut blocked = Blocked::new(&m);
+    for a in &areas {
+        if matches!(ground(a.tags), Some(("water_deep" | "water_shallow", _))) {
+            for (k, v) in coverage(&m.rooms, &a.rings, 0.0) {
+                if v > 0.5 {
+                    blocked.cells[k] = true;
+                }
+            }
+        }
+    }
+    // Дома и вода: над ними кроны не нависают, над дорогой и оградой — да.
+    let hard = blocked.clone();
     // Полоса скалы ложится вниз от кромки, до трёх клеток: на ней не растёт.
     for (l, _) in &cliffs {
         blocked.line(l, 1.0);
@@ -1860,15 +2007,6 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     }
     for wl in &m.walls {
         blocked.line(&wl.points, 0.8);
-    }
-    for a in &areas {
-        if matches!(ground(a.tags), Some(("water_deep" | "water_shallow", _))) {
-            for (k, v) in coverage(&m.rooms, &a.rings, 0.0) {
-                if v > 0.5 {
-                    blocked.cells[k] = true;
-                }
-            }
-        }
     }
     let mut spacing = Spacing::default();
     let mut planted = 0usize;
@@ -1899,33 +2037,60 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         }
     }
 
-    // Деревья по снимку — первыми: где кроны занимают больше половины круга в
-    // две клетки, стоит дерево, в лесу и за его краем, на лугу и у реки. В OSM
-    // одиноких деревьев и редколесья по склонам почти нет. Тонкие тёмные линии
-    // (ограды, тени стен) половины круга не набирают. Только за городом: в городе
+    // Деревья по снимку — первыми, по дереву на крону и размером с неё (см.
+    // [`Hint::crowns`]): в лесу и за его краем, на лугу и у реки. В OSM одиноких
+    // деревьев и редколесья по склонам почти нет. Только за городом: в городе
     // тёмное — тени домов.
+    let mut planted_crowns: Vec<([f32; 2], f32)> = Vec::new();
     if let Some(hint) = hint.as_ref().filter(|_| rural) {
         let mut rng = Rng::new("osm/cover-trees");
-        for _ in 0..(w * h) as usize * 2 {
+        let woods: Vec<&Area> = areas.iter().filter(|a| growth(a.tags).is_some_and(|g| g.litter)).collect();
+        let mut crowns: Vec<([f32; 2], f32)> = Vec::new();
+        for (q, mut r) in hint.crowns(w as usize, h as usize) {
+            if blocked.at(q) || hint.share(q, r.min(2.0), Class::Water) > 0.3 {
+                continue;
+            }
+            // Крона нависает над дорогой и оградой (на снимке полог над дорогой
+            // смыкается), над домом и водой — не дальше половины радиуса.
+            let hits = |r: f32| (0..8).any(|i| hard.at([q[0] + 0.5 * r * (i as f32 * FRAC_PI_4).cos(), q[1] + 0.5 * r * (i as f32 * FRAC_PI_4).sin()]));
+            while r >= CROWN_MIN && hits(r) {
+                r *= 0.85;
+            }
+            if r >= CROWN_MIN {
+                crowns.push((q, r));
+            }
+        }
+        // Мелкие снизу: большое дерево выше и ложится поверх.
+        crowns.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for (q, r) in crowns {
             if planted >= MAX_PLANTS {
                 break;
             }
-            let q = [rng.random() as f32 * w as f32, rng.random() as f32 * h as f32];
-            if blocked.at(q) || hint.share(q, 1.3, Class::Trees) < 0.55 || hint.share(q, 1.3, Class::Water) > 0.3 || !spacing.free(q, COVER_TREE_GAP) {
-                continue;
-            }
-            spacing.add(q);
-            let slot = if rng.chance(0.35) { "pine" } else { "tree_green" };
+            // Порода — по лесу OSM (`leaf_type`), за лесом — лиственное, изредка ель:
+            // треть елей наугад вставала тёмными звёздами в ясеневой роще Малхема.
+            let wood = woods.iter().find(|a| inside(&a.rings, q)).and_then(|a| growth(a.tags));
+            let slot = if r < CROWN_BUSH {
+                "bush_summer"
+            } else if let Some(g) = &wood {
+                let trees: Vec<&str> = g.slots.iter().copied().filter(|s| s.starts_with("tree") || *s == "pine").collect();
+                trees.get(rng.int(0, trees.len() as i32 - 1).max(0) as usize).copied().unwrap_or("tree_green")
+            } else if rng.chance(0.15) {
+                "pine"
+            } else {
+                "tree_green"
+            };
             if missing(slot) {
                 continue;
             }
-            // Размер — по снимку: одиночная крона на нём 4–6 м, в сомкнутом пологе
-            // кроны шире. Ровные 1,2–1,7 давали кроны по 9 м, и лес Тарн-Хауса на карте
-            // занимал втрое больше снимка.
-            let canopy = hint.share(q, 2.6, Class::Trees);
-            let scale = 0.75 + 0.85 * canopy.clamp(0.0, 1.0) + rng.random() as f32 * 0.2;
-            drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
+            drop_crown(&mut m, slot, q, rng.int(0, 359) as f32, r);
             planted += 1;
+            planted_crowns.push((q, r));
+            spacing.add(q);
+            // Под кроной ничего не сажать: мелочь легла бы поверх неё.
+            blocked.disk(q, r * 0.95);
+            if r >= CROWN_BUSH && wood.is_some() {
+                litter.push((q, r));
+            }
         }
     }
 
@@ -1990,18 +2155,15 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             } else {
                 g.slots[rng.int(0, g.slots.len() as i32 - 1) as usize]
             };
-            // Деревья пустоши со снимком уже стоят там, где он их видит.
-            if hint.is_some() && !g.litter && g.rank >= 3 && slot == "tree_green" {
+            // Со снимком деревья уже стоят по его кронам: лишние мелкие у большой
+            // кроны дробили её.
+            if hint.is_some() && (slot.starts_with("tree") || slot == "pine") {
                 continue;
             }
             if missing(slot) {
                 continue;
             }
-            let mut scale = g.scale.0 + rng.random() as f32 * (g.scale.1 - g.scale.0);
-            // Деревья леса со снимком — как деревья по снимку: по сомкнутости полога.
-            if let Some(h) = hint.as_ref().filter(|_| g.litter && !glade) {
-                scale = 0.75 + 0.85 * h.share(q, 2.6, Class::Trees) + rng.random() as f32 * 0.2;
-            }
+            let scale = g.scale.0 + rng.random() as f32 * (g.scale.1 - g.scale.0);
             if slot == "boulder" {
                 // Камни одной породы: вперемешку с синими и рудными выходила пёстрая
                 // галька. На пустоши — мшистые, на скале и осыпи — по тегу `rock`.
@@ -2044,10 +2206,12 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 continue;
             }
             spacing.add(q);
-            // Со снимком деревья уже стоят; здесь — кусты по краю крон.
+            // Со снимком деревья и кусты уже стоят по его пятнам (куст — мелкое
+            // пятно); здесь — редкие одиночные. Кусты по краю крон кольцом
+            // обсаживали большое дерево мелочью.
             let edge = hint.as_ref().map(|h| h.share(q, 1.5, Class::Trees));
             let chance = match edge {
-                Some(t) => if (0.25..0.55).contains(&t) { 0.5 } else { 0.02 },
+                Some(_) => 0.01,
                 None => {
                     let copse = noise(q, 16.0, 11).max(0.0);
                     0.06 + 0.5 * copse * copse
@@ -2146,7 +2310,9 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let res = mask::RES as f32;
     let outdoors = |m: &Map, p: [f32; 2]| m.contains(p[0].floor() as i32, p[1].floor() as i32) && m.rooms.get((p[0] * res).floor() as isize, (p[1] * res).floor() as isize) < 128;
     for (id, p) in trees {
-        if !outdoors(&m, p) {
+        // Дерево OSM в кроне со снимка — то же дерево: второе, мельче, вставало
+        // рядом с ним или на нём.
+        if !outdoors(&m, p) || planted_crowns.iter().any(|(c, r)| length(*c, p) < r.max(2.0)) {
             continue;
         }
         let mut rng = Rng::new(&format!("osm/tree/{id}"));
@@ -2582,11 +2748,43 @@ mod tests {
         let half = m.width as f32 / 2.0;
         let trees: Vec<[f32; 2]> = m.props.iter().filter(|p| p.asset.contains("tree") || p.asset.contains("pine")).map(|p| p.pos).collect();
         let west = trees.iter().filter(|p| p[0] < half).count();
-        assert!(west >= 20, "на западе деревьев {west}: {trees:?}");
+        assert!(west >= 6, "на западе деревьев {west}: {trees:?}");
         assert!(trees.iter().all(|p| p[0] < half + 1.5), "дерево на траве: {:?}", trees.iter().filter(|p| p[0] >= half + 1.5).collect::<Vec<_>>());
-        // Кроны смыкаются, но не наползают: шаг не меньше COVER_TREE_GAP.
-        for (i, a) in trees.iter().enumerate() {
-            assert!(trees[i + 1..].iter().all(|b| (a[0] - b[0]).hypot(a[1] - b[1]) >= COVER_TREE_GAP - 1e-3), "кроны слиплись у {a:?}");
+        // Сплошной полог — кроны по 10–17 м, смыкаются, но не наползают.
+        let crowns = crowns_of(&m);
+        for (i, a) in crowns.iter().enumerate() {
+            assert!(a.1 >= CROWN_MIN && a.1 <= CROWN_CANOPY.1 + 1e-3, "крона полога {a:?}");
+            assert!(crowns[i + 1..].iter().all(|b| length(a.0, b.0) >= CROWN_OVERLAP * (a.1 + b.1) - 1e-3), "кроны слиплись у {a:?}");
+        }
+        assert!(crowns.iter().any(|c| c.1 >= CROWN_CANOPY.0), "в пологе одна мелочь: {crowns:?}");
+    }
+
+    /// Кроны деревьев карты: центр и видимый радиус в клетках.
+    fn crowns_of(m: &Map) -> Vec<([f32; 2], f32)> {
+        m.props.iter().filter(|p| p.asset.contains("tree") || p.asset.contains("pine")).map(|p| (p.pos, p.scale * 0.85 * p.size[0].max(p.size[1]) / 2.0)).collect()
+    }
+
+    #[test]
+    fn one_crown_on_the_photo_is_one_tree_of_its_size() {
+        // На лугу два дерева: большое круглое в 15 м и рядом впритык два средних
+        // по 9 м. Дротики с ровным шагом ставили на большую крону 3–5 мелких.
+        const EMPTY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+</osm>"#;
+        let (bare, _) = import(EMPTY, Options::default()).unwrap();
+        let (w, h) = (bare.width as f32, bare.height as f32);
+        let disks = [([12.0, 14.0], 5.0), ([27.0, 14.0], 3.0), ([32.5, 14.0], 3.0)];
+        let cover = Cover::grid(240, 240, |x, y| {
+            let p = [(x as f32 + 0.5) / 240.0 * w, (y as f32 + 0.5) / 240.0 * h];
+            if disks.iter().any(|(c, r)| length(p, *c) < *r) { Class::Trees } else { Class::Grass }
+        });
+        let (m, _) = import_cover(EMPTY, &[], Some(&cover), Options::default()).unwrap();
+        let crowns = crowns_of(&m);
+        assert_eq!(crowns.len(), 3, "по дереву на крону: {crowns:?}");
+        for (c, r) in disks {
+            let got = crowns.iter().find(|k| length(k.0, c) < 1.2).unwrap_or_else(|| panic!("нет дерева у {c:?}: {crowns:?}"));
+            assert!(got.1 > r * 0.9 && got.1 < r * 1.35, "крона у {c:?} радиусом {} вместо {r}", got.1);
         }
     }
 

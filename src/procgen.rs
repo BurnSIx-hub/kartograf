@@ -182,7 +182,12 @@ fn drop(m: &mut Map, name: &str, pos: [f32; 2], rot: f32, scale: f32) {
     // Голые деревья FA по 8–11 клеток — втрое больше кроны: без ужатия ветви
     // накрывают весь зимний лес.
     let scale = if name == "tree_bare" && pick.own { scale * (5.0 / pick.size[0].max(pick.size[1])).min(1.0) } else { scale };
-    drop_pick(m, &pick, pos, rot, scale);
+    drop_as(m, name, &pick, pos, rot, scale);
+}
+
+/// Как [`drop`], но ассет уже выбран: когда масштаб считается от его размера.
+fn drop_as(m: &mut Map, name: &str, pick: &Pick, pos: [f32; 2], rot: f32, scale: f32) {
+    drop_pick(m, pick, pos, rot, scale);
     let Some(p) = m.props.last_mut() else { return };
     // Слот дерева — дерево (пни, бревна и пальмы не берутся): своё тоже уходит
     // в Foundry кроной над токенами, как встроенное.
