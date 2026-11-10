@@ -714,6 +714,26 @@ impl SelfTest {
                 app.paint((10, 1), (13, 3));
                 let dark = app.map.shade.as_ref().map_or(0, |m| m.get(11 * mask::RES as isize, 2 * mask::RES as isize));
                 self.check("тень 60% легла прямоугольником", dark == 153, &format!("{dark}"));
+                // Рельеф: жёсткий прямоугольник — плато с обрывом, мазок «Опустить» — ложбина.
+                app.set_tool(Tool::Relief);
+                app.relief_mode = crate::app::ReliefMode::Raise;
+                app.relief_height = 2.0;
+                app.brush.hardness = 1.0;
+                app.paint((20, 1), (24, 4));
+                let top = app.map.relief.as_ref().map_or(0.0, |r| r.at([22.5, 2.5]));
+                let cliffs = app.map.relief.as_ref().map_or(0, |r| crate::relief::edges(r).iter().filter(|e| e.kind == crate::relief::EdgeKind::Cliff).count());
+                self.check("«Рельеф» рамкой поднял плато на 2 яруса с обрывом", (top - 2.0).abs() < 0.05 && cliffs > 0, &format!("высота {top}, обрывов {cliffs}"));
+                app.relief_mode = crate::app::ReliefMode::Lower;
+                app.brush.shape = Tip::Circle;
+                app.brush.flow = 1.0;
+                app.brush.radius = 1.5;
+                app.brush.hardness = 0.3;
+                app.begin_stroke([30.0, 6.0]);
+                app.stroke_to([34.0, 6.0]);
+                app.stroke_to([34.0, 6.0]);
+                app.end_stroke();
+                let low = app.map.relief.as_ref().map_or(0.0, |r| r.at([32.0, 6.0]));
+                self.check("мазок «Опустить» — ложбина не глубже 2 клеток", (-2.05..-1.0).contains(&low), &format!("{low}"));
                 app.set_tool(Tool::Text);
                 app.label_style.text = "Колодец".into();
                 let p = at(app, [15.0, 7.0]);

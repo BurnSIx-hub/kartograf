@@ -11,7 +11,7 @@ use crate::library;
 use crate::map::{Label, Layer, Live, Map, Material, Paint, Path, Portal, PortalKind, Prop, Roof, RoofShape, Segment, Shadows, Wall, WallStyle};
 use crate::mask::{self, Brush, Mask, Shape};
 use crate::palette::{Palette, Pick};
-use crate::plan::{self, Assets, CaveKind, LinkKind, Mood, Plan, River, Role, Season, Size, SizeName, OUTSIDE};
+use crate::plan::{self, Assets, CaveKind, Hills, LinkKind, Mood, Plan, River, Role, Season, Size, SizeName, OUTSIDE};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -1164,6 +1164,7 @@ fn clear(m: &mut Map) {
     m.labels.clear();
     m.roofs.clear();
     m.shade = None;
+    m.relief = None;
     m.shadows = Shadows { on: true, angle: 45.0, dist: 0.7, blur: 0.3, opacity: 0.6, fade: 0.7, ..Shadows::default() };
 }
 
@@ -1463,22 +1464,99 @@ fn stream(m: &mut Map, line: Vec<[f32; 2]>, width: f32) -> Stream {
     Stream { bank, water, deep }
 }
 
-/// Мост через реку там, где `path` её пересекает: поперёк течения, серединой на
-/// стрежне, концами на сухом за галькой. Картинка тянется по длине под ширину
+/// Направление русла у точки `c`: единичный вектор по течению.
+fn flow_at(river: &Stream, c: [f32; 2]) -> Option<[f32; 2]> {
+    let line = river.water.curve();
+    let i = (0..line.len()).min_by(|&a, &b| {
+        let d = |k: usize| (line[k][0] - c[0]).hypot(line[k][1] - c[1]);
+        d(a).total_cmp(&d(b))
+    })?;
+    let (p, q) = (line[i.saturating_sub(2)], line[(i + 2).min(line.len() - 1)]);
+    let len = (q[0] - p[0]).hypot(q[1] - p[1]);
+    (len > 1e-3).then(|| [(q[0] - p[0]) / len, (q[1] - p[1]) / len])
+}
+
+/// Дорога через реку — прямо поперёк течения: у воды её линия выпрямляется на
+/// длину моста с запасом. Мост потом ложится по дороге и тоже выходит поперёк.
+/// Конец дороги за краем карты `size` у самой воды уходит за край по прямой;
+/// конец на карте не сдвигается — прямая у него обрезается.
+fn square_crossing(path: &mut Path, river: &Stream, size: [f32; 2]) {
+    let Some((c, along)) = crossing(path, &river.water) else { return };
+    let Some(f) = flow_at(river, c) else { return };
+    let a = along.to_radians();
+    let mut n = [-f[1], f[0]];
+    if n[0] * a.cos() + n[1] * a.sin() < 0.0 {
+        n = [-n[0], -n[1]];
+    }
+    // Чуть наискось можно — до SKEW: дорога, шедшая к реке под острым углом,
+    // не ломается у въезда на мост.
+    const SKEW: f32 = 20.0;
+    // На сколько повернуть поперечную, чтобы она смотрела по дороге, — но не больше SKEW.
+    let off = (n[0] * a.sin() - n[1] * a.cos()).atan2(n[0] * a.cos() + n[1] * a.sin());
+    let turn = off.clamp(-SKEW.to_radians(), SKEW.to_radians());
+    let n = [n[0] * turn.cos() - n[1] * turn.sin(), n[0] * turn.sin() + n[1] * turn.cos()];
+    if path.points.len() < 2 {
+        return;
+    }
+    let mut pts = path.points.clone();
+    let t = |p: [f32; 2]| (p[0] - c[0]) * n[0] + (p[1] - c[1]) * n[1];
+    // Отрезок ломаной, на котором дорога переходит реку: знак смещения меняется,
+    // а из нескольких таких — ближайший к переправе.
+    let Some(j) = (0..pts.len() - 1).filter(|&k| t(pts[k]) < 0.0 && t(pts[k + 1]) >= 0.0).min_by(|&x, &y| {
+        let d = |k: usize| crate::map::segment_distance(c, pts[k], pts[k + 1]);
+        d(x).total_cmp(&d(y))
+    }) else {
+        return;
+    };
+    let half = river.bank.width / 2.0;
+    // Прямо — до `far`: у кривой через точки касательная в точке смотрит на соседей,
+    // поэтому за `far` ещё одна точка на той же прямой, изгиб начинается за ней.
+    let (near, far, out) = (half + 0.8, half + 2.5, half + 4.5);
+    // Старые точки в полосе прямой выкидываются, концы дороги остаются.
+    let mut before = j;
+    while before > 0 && t(pts[before]) > -(out + 1.0) {
+        before -= 1;
+    }
+    let mut after = j + 1;
+    let last = pts.len() - 1;
+    while after < last && t(pts[after]) < out + 1.0 {
+        after += 1;
+    }
+    let at = |s: f32| [c[0] + n[0] * s, c[1] + n[1] * s];
+    let outside = |p: [f32; 2]| p[0] < 0.0 || p[1] < 0.0 || p[0] > size[0] || p[1] > size[1];
+    // Сколько идти по прямой от переправы до края карты, с клеткой запаса.
+    let exit = |dir: f32| {
+        let mut s = far;
+        while !outside(at(dir * s)) && s < size[0] + size[1] {
+            s += 0.5;
+        }
+        s + 1.0
+    };
+    if before == 0 && t(pts[0]) > -(out + 1.0) && outside(pts[0]) {
+        pts[0] = at(-exit(-1.0));
+    }
+    if after == last && t(pts[last]) < out + 1.0 && outside(pts[last]) {
+        pts[last] = at(exit(1.0));
+    }
+    let (lo, hi) = (t(pts[before]), t(pts[after]));
+    let straight = [-out, -far, -near, 0.0, near, far, out].into_iter().filter(|&s| s > lo + 0.5 && s < hi - 0.5).map(at);
+    let mut out: Vec<[f32; 2]> = pts[..=before].to_vec();
+    out.extend(straight);
+    out.extend_from_slice(&pts[after..]);
+    path.points = out;
+}
+
+/// Мост через реку там, где `path` её пересекает: по ходу дороги и серединой на
+/// ней, концами на сухом за галькой. Картинка тянется по длине под ширину
 /// реки (до полутора раз), а сверх того — растёт целиком.
 fn bridge(m: &mut Map, path: &Path, river: &Stream) -> bool {
-    let Some((_, along)) = crossing(path, &river.water) else { return false };
-    let line = river.water.curve();
-    let near = |q: [f32; 2]| path.distance(q);
-    let Some(i) = (1..line.len().saturating_sub(1)).min_by(|&a, &b| near(line[a]).total_cmp(&near(line[b]))) else { return false };
-    let (p, q) = (line[i.saturating_sub(2)], line[(i + 2).min(line.len() - 1)]);
-    let flow = (q[1] - p[1]).atan2(q[0] - p[0]).to_degrees();
-    // Из двух поперечных — ближняя к ходу тропы.
-    let mut rot = flow + 90.0;
-    let diff = ((rot - along).rem_euclid(360.0) + 180.0).rem_euclid(360.0) - 180.0;
-    if diff.abs() > 90.0 {
-        rot += 180.0;
-    }
+    let Some((at, along)) = crossing(path, &river.water) else { return false };
+    let mut rot = along;
+    // Наискось через реку мост длиннее: ширина берега по ходу дороги.
+    let skew = flow_at(river, at).map_or(1.0, |f| {
+        let a = along.to_radians();
+        (f[0] * a.sin() - f[1] * a.cos()).abs().max(0.5)
+    });
     let pick = asset("bridge");
     let [l, t, r, u] = bounds(&pick, "bridge", 0.0, 1.0);
     // Длинная сторона картинки — вдоль хода: у встроенного и у FA мост лежит по x.
@@ -1487,11 +1565,11 @@ fn bridge(m: &mut Map, path: &Path, river: &Stream) -> bool {
     if !lengthwise {
         rot -= 90.0;
     }
-    let span = river.bank.width + 1.4;
+    let span = river.bank.width / skew + 1.4;
     let f = span / long.max(0.5);
     let scale = if f > 1.5 { f / 1.5 } else if f < 0.75 { f / 0.75 } else { 1.0 };
     let stretch = f / scale;
-    drop_pick(m, &pick, line[i], rot.rem_euclid(360.0), scale);
+    drop_pick(m, &pick, at, rot.rem_euclid(360.0), scale);
     if let Some(pr) = m.props.last_mut() {
         pr.size[if lengthwise { 0 } else { 1 }] *= stretch;
     }
@@ -1509,7 +1587,7 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
 
     let (left, right) = (h * (0.25 + rng.random() as f32 * 0.5), h * (0.25 + rng.random() as f32 * 0.5));
     let line = road(rng, [-1.0, left], [w + 1.0, right], h * 0.14);
-    let trail = Path { points: line, material: dirt, width: 2.0, soft: 0.5, rough: 0.25, along: false };
+    let mut trail = Path { points: line, material: dirt, width: 2.0, soft: 0.5, rough: 0.25, along: false };
     // Ручей с севера на юг; план выбирает берег или убирает ручей вовсе.
     let river = match p.river {
         River::None => None,
@@ -1524,14 +1602,35 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
         let line = road(rng, [top, -1.0], [low, h + 1.0], w * 0.09);
         stream(m, line, width)
     });
+    if let Some(s) = &water_paths {
+        square_crossing(&mut trail, s, [w, h]);
+    }
     // Расстояния считаются от края гальки.
     let near_water = |p: [f32; 2], d: f32| water_paths.as_ref().is_some_and(|s| s.near(p, d - 1.6));
+
+    // Рельеф — своим генератором случайности: прежние лесные сиды не сдвигаются.
+    let mut rr = Rng::new(&format!("{}/relief", p.seed));
+    let hills = match p.hills {
+        Hills::Auto if rr.chance(0.5) => Hills::Cliffs,
+        Hills::Auto => Hills::Gentle,
+        k => k,
+    };
+    // Обрыв идёт поперёк карты с запада на восток, в стороне от дороги.
+    let ridge: Option<Vec<[f32; 2]>> = (hills == Hills::Cliffs).then(|| {
+        let mid = (left + right) / 2.0;
+        let y = if mid > h / 2.0 { mid * (0.4 + rr.random() as f32 * 0.15) } else { mid + (h - mid) * (0.45 + rr.random() as f32 * 0.15) };
+        let tilt = (rr.random() as f32 - 0.5) * h * 0.15;
+        crate::map::smooth_line(&road(&mut rr, [-2.0, y - tilt], [w + 2.0, y + tilt], h * 0.07))
+    });
 
     // Лагерь в стороне от дороги и ручья, к нему идёт своя тропинка.
     let mut camp = [w / 2.0, h / 2.0];
     let mut best = f32::MIN;
     for _ in 0..200 {
         let q = [w * (0.15 + rng.random() as f32 * 0.7), h * (0.15 + rng.random() as f32 * 0.7)];
+        if ridge.as_ref().is_some_and(|r| side_distance(r, q).abs() < glade + 1.5) {
+            continue;
+        }
         let room = water_paths.as_ref().map_or(trail.distance(q), |s| trail.distance(q).min(s.bank.distance(q) - s.bank.width / 2.0 + 1.6));
         let score = -(room - glade - 2.0).abs();
         if score > best {
@@ -1542,6 +1641,14 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let line = trail.curve();
     let join = line.iter().copied().min_by(|a, b| (a[0] - camp[0]).hypot(a[1] - camp[1]).total_cmp(&(b[0] - camp[0]).hypot(b[1] - camp[1]))).unwrap_or(camp);
     let side_path = Path { points: road(rng, join, camp, 0.8), material: dirt, width: 1.1, soft: 0.6, rough: 0.3, along: false };
+    if hills != Hills::None {
+        let mut keep = vec![trail.clone(), side_path.clone()];
+        keep.extend(water_paths.as_ref().map(|s| s.bank.clone()));
+        let mut r = forest_relief(m, &mut rr, hills, ridge.as_deref(), &keep, water_paths.as_ref().map(|s| &s.bank), camp, glade);
+        relief_strips(&mut r, p.options.season);
+        m.relief = Some(r);
+    }
+    let steep = |m: &Map, q: [f32; 2], r: f32, lim: f32| m.relief.as_ref().is_some_and(|rl| rl.steepest(q, r) > lim);
     let floor = mat(m, look.under);
     let bare = blobs(m, &[(camp, glade * 0.55)], 0.2, 0.6);
     m.paint(Layer::Floor, dirt, &bare);
@@ -1558,7 +1665,7 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
         tries -= 1;
         let q = [rng.random() as f32 * w, rng.random() as f32 * h];
         let far = |c: [f32; 2], d: f32| (c[0] - q[0]).hypot(c[1] - q[1]) >= d;
-        if !far(camp, glade + 1.0) || trail.distance(q) < 2.2 || side_path.distance(q) < 1.6 || near_water(q, 2.6) || !trees.iter().all(|&t| far(t, spacing)) {
+        if !far(camp, glade + 1.0) || steep(m, q, 0.9, 1.0) || trail.distance(q) < 2.2 || side_path.distance(q) < 1.6 || near_water(q, 2.6) || !trees.iter().all(|&t| far(t, spacing)) {
             continue;
         }
         trees.push(q);
@@ -1566,12 +1673,14 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let under: Vec<_> = trees.iter().map(|&t| (t, 2.4)).collect();
     let shade = blobs(m, &under, 0.15, 0.8);
     m.paint(Layer::Floor, floor, &shade);
+    let avoid = m.paths.clone();
+    cliff_dressing(m, &mut rr, &avoid);
     // Сначала низкое, деревья последними: кроны накрывают камни и кусты, а не наоборот.
     let brush = (w * h * (0.02 + density * 0.03) * look.brush) as i32;
     for _ in 0..brush {
         let q = [rng.random() as f32 * w, rng.random() as f32 * h];
         let clear_of_tree = trees.iter().all(|t| (t[0] - q[0]).hypot(t[1] - q[1]) > 1.4);
-        if clear_of_tree && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
+        if clear_of_tree && !steep(m, q, 0.5, 1.2) && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
             let n = pick(rng, &[look.bush, look.bush, look.bush, "boulder"]);
             drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.6);
         }
@@ -1598,6 +1707,161 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
         drop(m, slot, q, rot, scale);
     }
     trees.len()
+}
+
+/// Расстояние до ломаной со знаком: слева по ходу — плюс, справа — минус.
+fn side_distance(line: &[[f32; 2]], p: [f32; 2]) -> f32 {
+    let mut best = (f32::INFINITY, 1.0f32);
+    for s in line.windows(2) {
+        let d = crate::map::segment_distance(p, s[0], s[1]);
+        if d < best.0 {
+            let cross = (s[1][0] - s[0][0]) * (p[1] - s[0][1]) - (s[1][1] - s[0][1]) * (p[0] - s[0][0]);
+            best = (d, if cross >= 0.0 { 1.0 } else { -1.0 });
+        }
+    }
+    best.0 * best.1
+}
+
+/// Рельеф леса: холмы из шума, ручей в ложбине, лагерь на ровном. С обрывом —
+/// ступень вдоль `ridge`; там, где её пересекают тропы и ручей, ступень
+/// расплывается в пологий въезд.
+#[allow(clippy::too_many_arguments)]
+fn forest_relief(m: &Map, rng: &mut Rng, hills: Hills, ridge: Option<&[[f32; 2]]>, keep: &[Path], water: Option<&Path>, camp: [f32; 2], glade: f32) -> crate::relief::Relief {
+    use crate::relief::{fbm, noise, Relief};
+    let mut r = Relief::for_cells(m.width, m.height);
+    let seed = (rng.random() * 4294967296.0) as u32;
+    // Холмы — в два-три яруса; с обрывом холмы ниже, а сам обрыв — в 2–4 яруса.
+    let (amp, scale) = if hills == Hills::Cliffs { (0.9, 14.0) } else { (1.7, 13.0) };
+    let step = rng.int(2, 4) as f32;
+    let up = if rng.chance(0.5) { 1.0 } else { -1.0 };
+    let lines: Vec<(Vec<[f32; 2]>, f32)> = keep.iter().map(|p| (p.curve(), p.width / 2.0)).collect();
+    let water_line = water.map(|p| (p.curve(), p.width / 2.0));
+    let dist = |line: &[[f32; 2]], q: [f32; 2]| line.windows(2).map(|s| crate::map::segment_distance(q, s[0], s[1])).fold(f32::INFINITY, f32::min);
+    let smooth = |a: f32, b: f32, x: f32| {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // Насколько точка у дороги или ручья: там съезд, а не уступы.
+    let mut road = vec![0.0f32; r.w * r.h];
+    for j in 0..r.h {
+        for i in 0..r.w {
+            let q = crate::mask::sample_pos(i as isize, j as isize);
+            let mut z = (fbm(q, scale, seed) - 0.5) * 2.0 * amp;
+            let gap = lines.iter().map(|(l, half)| dist(l, q) - half).fold(f32::INFINITY, f32::min);
+            // Съезд — только у троп (первые две линии), не вдоль всего ручья.
+            let path_gap = lines.iter().take(2).map(|(l, half)| dist(l, q) - half).fold(f32::INFINITY, f32::min);
+            road[j * r.w + i] = 1.0 - smooth(0.6, 2.5, path_gap);
+            if let Some(line) = ridge {
+                let open = 1.0 - smooth(0.8, 3.5, gap);
+                let width = 0.35 + open * 3.0;
+                // Край обрыва неровный: шум сдвигает его на полклетки.
+                let sd = side_distance(line, q) * up + (noise(q[0] * 0.9, q[1] * 0.9, seed ^ 0xA5A5) - 0.5) * 0.9;
+                z += step * smooth(-width, width, sd);
+            }
+            r.data[j * r.w + i] = z;
+        }
+    }
+    // Ручей — на одном ярусе по всей длине: вода не перетекает через уступы.
+    if let Some((l, half)) = &water_line {
+        let mut low = f32::INFINITY;
+        for j in 0..r.h {
+            for i in 0..r.w {
+                if dist(l, crate::mask::sample_pos(i as isize, j as isize)) < *half {
+                    low = low.min(r.data[j * r.w + i]);
+                }
+            }
+        }
+        if low.is_finite() {
+            for j in 0..r.h {
+                for i in 0..r.w {
+                    let k = j * r.w + i;
+                    // У тропы к мосту спуск к воде длинный и пологий — съезд, а не стенка.
+                    let t = 1.0 - smooth(half + 0.6, half + 3.5 + road[k] * 7.0, dist(l, crate::mask::sample_pos(i as isize, j as isize)));
+                    r.data[k] += (low - r.data[k]) * t;
+                }
+            }
+        }
+    }
+    // Лагерь — на ровном месте.
+    let at_camp = r.at(camp);
+    for j in 0..r.h {
+        for i in 0..r.w {
+            let q = crate::mask::sample_pos(i as isize, j as isize);
+            let t = 1.0 - smooth(glade * 0.6, glade + 2.5, (q[0] - camp[0]).hypot(q[1] - camp[1]));
+            let k = j * r.w + i;
+            r.data[k] += (at_camp - r.data[k]) * t;
+        }
+    }
+    // Ярусы: внутри яруса земля ровная, между ярусами — уступ. У дорог — ровный
+    // съезд: уступы там сделали бы съезд обрывом. Нижний ярус — нулевой.
+    let lo = r.data.iter().copied().fold(f32::INFINITY, f32::min).round();
+    for (v, &near) in r.data.iter_mut().zip(&road) {
+        let z = *v - lo;
+        let base = z.floor();
+        let stepped = base + smooth(0.2, 0.8, z - base);
+        *v = stepped + (z - stepped) * near;
+    }
+    r.quantize();
+    r
+}
+
+/// Полосы рельефа из библиотеки, если они там есть; нет — встроенные. Кромка
+/// встроенного гребня — по сезону: зелёная трава на снег не ложится.
+fn relief_strips(r: &mut crate::relief::Relief, season: Season) {
+    let own = |slot: &str, tone: &str| {
+        let p = asset_toned(slot, tone);
+        if p.own { p.key } else { String::new() }
+    };
+    r.face = own("wall_cliff", "earthy");
+    r.ridge = own("wall_ridge", "dirt");
+    r.under = own("wall_under_cliff", "earthy");
+    if r.ridge.is_empty() {
+        let builtin = match season {
+            Season::Winter => "wall_ridge_snow",
+            Season::Autumn => "wall_ridge_dry",
+            _ => "",
+        };
+        if !builtin.is_empty() {
+            r.ridge = format!("{}{builtin}", crate::library::BUILTIN);
+        }
+    }
+}
+
+/// У обрывов поверху — полоса голой каменистой земли, у подножия — камни и осыпь.
+fn cliff_dressing(m: &mut Map, rng: &mut Rng, avoid: &[Path]) {
+    let Some(r) = m.relief.clone() else { return };
+    let edges: Vec<crate::relief::Edge> = crate::relief::edges(&r).into_iter().filter(|e| e.kind == crate::relief::EdgeKind::Cliff).collect();
+    if edges.is_empty() {
+        return;
+    }
+    let rocky = mat(m, "rocky_ground");
+    let mut rim = Vec::new();
+    for e in &edges {
+        for k in (0..e.points.len()).step_by(3) {
+            let (p, up) = (e.points[k], e.up(k));
+            rim.push(([p[0] + up[0] * 0.4, p[1] + up[1] * 0.4], 0.55));
+        }
+    }
+    let weights = blobs(m, &rim, 0.25, 0.4);
+    m.paint(Layer::Floor, rocky, &weights);
+    let curves: Vec<(Vec<[f32; 2]>, f32)> = avoid.iter().map(|p| (p.curve(), p.width / 2.0)).collect();
+    let (w, h) = (m.width as f32, m.height as f32);
+    for e in &edges {
+        for k in (0..e.points.len()).step_by(6) {
+            if !rng.chance(0.55) {
+                continue;
+            }
+            let (p, up) = (e.points[k], e.up(k));
+            let d = e.width[k] * 0.85 + 0.25 + rng.random() as f32 * 0.6;
+            let q = [p[0] - up[0] * d, p[1] - up[1] * d];
+            let clear = curves.iter().all(|(l, half)| l.windows(2).map(|s| crate::map::segment_distance(q, s[0], s[1])).fold(f32::INFINITY, f32::min) > half + 1.0);
+            if !clear || q[0] < 0.5 || q[1] < 0.5 || q[0] > w - 0.5 || q[1] > h - 0.5 || r.steepest(q, 0.3) >= crate::relief::CLIFF {
+                continue;
+            }
+            let slot = pick(rng, &["boulder", "rubble", "boulder"]);
+            drop(m, slot, q, rng.int(0, 3) as f32 * 90.0, 0.45 + rng.random() as f32 * 0.4);
+        }
+    }
 }
 
 /// Бордюр: стена-полоса вдоль контура мощёного; прямые стороны идут прямо, углы чуть скруглены.
@@ -2717,6 +2981,38 @@ mod tests {
     }
 
     #[test]
+    fn forest_cliff_leaves_paths_and_trees_on_walkable_ground() {
+        use crate::relief::{edges, EdgeKind, CLIFF};
+        for seed in ["обрыв", "уступ", "кряж"] {
+            let mut p = Plan::random(&opt(Kind::Forest, seed), [40, 30]);
+            p.hills = Hills::Cliffs;
+            let mut m = Map::new(40, 30);
+            build(&mut m, &p, 0, Palette::builtin()).unwrap();
+            let r = m.relief.as_ref().expect("рельеф");
+            assert!(edges(r).iter().any(|e| e.kind == EdgeKind::Cliff), "{seed}: обрыва нет");
+            // Тропы и ручей пересекают обрыв по пологому въезду.
+            for path in &m.paths {
+                for q in path.curve() {
+                    if q[0] > 0.5 && q[1] > 0.5 && q[0] < 39.5 && q[1] < 29.5 {
+                        assert!(r.steepest(q, 0.25) < CLIFF, "{seed}: дорога по обрыву в {q:?}");
+                    }
+                }
+            }
+            for t in m.props.iter().filter(|t| t.asset.contains("tree")) {
+                assert!(r.steepest(t.pos, 0.5) < CLIFF, "{seed}: дерево на обрыве в {:?}", t.pos);
+            }
+            // В Foundry кромка — стена, которую не пройти, а видно поверх.
+            let la = crate::export::layout(&m, &[]);
+            assert!(!la.cliffs.is_empty());
+        }
+        let mut p = Plan::random(&opt(Kind::Forest, "ровно"), [40, 30]);
+        p.hills = Hills::None;
+        let mut m = Map::new(40, 30);
+        build(&mut m, &p, 0, Palette::builtin()).unwrap();
+        assert!(m.relief.is_none());
+    }
+
+    #[test]
     fn every_kind_builds_and_repeats() {
         for kind in Kind::ALL {
             for (w, h) in [(40, 30), (24, 24), (12, 10), (80, 20), (60, 60)] {
@@ -2839,6 +3135,32 @@ mod tests {
         build(&mut dry, &p, 0, Palette::builtin()).unwrap();
         assert_eq!(dry.paths.len(), 2);
         assert!(!dry.props.iter().any(|p| p.asset.ends_with("bridge")));
+    }
+
+    #[test]
+    fn forest_bridge_lies_along_the_road_across_the_stream() {
+        for seed in ["мост1", "мост2", "мост3", "мост4", "мост5", "мост6", "мост7", "мост8"] {
+            let mut p = Plan::random(&opt(Kind::Forest, seed), [40, 30]);
+            p.river = if seed.ends_with(['1', '3', '5', '7']) { River::East } else { River::West };
+            let mut m = Map::new(40, 30);
+            build(&mut m, &p, 0, Palette::builtin()).unwrap();
+            let br = m.props.iter().find(|q| q.asset.ends_with("bridge")).unwrap_or_else(|| panic!("{seed}: нет моста"));
+            let (water, trail) = (&m.paths[1], &m.paths[3]);
+            let (at, along) = crossing(trail, water).unwrap();
+            // Мост по дороге и на ней.
+            let off = |a: f32, b: f32| {
+                let d = (a - b).rem_euclid(180.0);
+                d.min(180.0 - d)
+            };
+            assert!(off(br.rot, along) < 3.0, "{seed}: мост {} дорога {along}", br.rot);
+            assert!(trail.distance(br.pos) < 0.3, "{seed}: мост мимо дороги");
+            // Дорога через воду — поперёк течения, перекос не больше 20°.
+            let line = water.curve();
+            let i = (0..line.len()).min_by(|&a, &b| ((line[a][0] - at[0]).hypot(line[a][1] - at[1])).total_cmp(&(line[b][0] - at[0]).hypot(line[b][1] - at[1]))).unwrap();
+            let (p0, p1) = (line[i.saturating_sub(2)], line[(i + 2).min(line.len() - 1)]);
+            let flow = (p1[1] - p0[1]).atan2(p1[0] - p0[0]).to_degrees();
+            assert!((off(along, flow) - 90.0).abs() < 22.0, "{seed}: дорога к течению под {}", off(along, flow));
+        }
     }
 
     #[test]
@@ -3054,4 +3376,3 @@ mod tests {
         }
     }
 }
-

@@ -1150,6 +1150,9 @@ pub struct Map {
     /// Нарисованная тень: насколько темно в точке, 255 — чёрное.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shade: Option<Mask>,
+    /// Высота земли; нет — карта ровная.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relief: Option<crate::relief::Relief>,
 }
 
 /// Ключ отрезка стены комнаты — его середина с шагом 1/64 клетки.
@@ -1262,6 +1265,7 @@ impl Map {
             paths: Vec::new(),
             shadows: Shadows { on: true, ..Shadows::default() },
             shade: None,
+            relief: None,
             labels: Vec::new(),
             roofs: Vec::new(),
             name: String::new(),
@@ -1318,6 +1322,12 @@ impl Map {
     pub fn prune(&mut self) {
         if self.shade.as_ref().is_some_and(|m| m.is_empty()) {
             self.shade = None;
+        }
+        if self.relief.as_ref().is_some_and(|r| r.is_flat()) {
+            self.relief = None;
+        }
+        if let Some(r) = &mut self.relief {
+            r.quantize();
         }
         self.terrain.retain(|c| !c.mask.is_empty());
         self.room_floor.retain(|c| !c.mask.is_empty());
@@ -1549,7 +1559,7 @@ impl Map {
         let map = if format == 1 { Self::from_v1(serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))?)? } else { serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))? };
         let (w, h) = (map.width as usize * mask::RES, map.height as usize * mask::RES);
         let fits = |m: &Mask| m.w == w && m.h == h;
-        if map.width == 0 || map.height == 0 || !fits(&map.rooms) || map.shade.as_ref().is_some_and(|m| !fits(m)) || !map.terrain.iter().chain(&map.room_floor).all(|c| fits(&c.mask)) {
+        if map.width == 0 || map.height == 0 || !fits(&map.rooms) || map.shade.as_ref().is_some_and(|m| !fits(m)) || map.relief.as_ref().is_some_and(|r| r.w != map.rooms.w || r.h != map.rooms.h) || !map.terrain.iter().chain(&map.room_floor).all(|c| fits(&c.mask)) {
             return Err("размер карты не сходится с размером слоёв".into());
         }
         if map.terrain.iter().chain(&map.room_floor).any(|c| c.material as usize >= map.materials.len()) || map.paths.iter().any(|p| p.material >= map.materials.len()) {

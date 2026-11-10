@@ -44,6 +44,9 @@ pub struct Plan {
     /// С какой стороны река; `auto` — как решит генератор, `none` — без реки.
     #[serde(default, skip_serializing_if = "River::is_auto")]
     pub river: River,
+    /// Рельеф: ровно, холмы или холмы с обрывом; `auto` — как решит генератор.
+    #[serde(default, skip_serializing_if = "Hills::is_auto")]
+    pub hills: Hills,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rooms: Vec<RoomSpec>,
     /// Связи между комнатами. Пусто — строитель соединит комнаты сам.
@@ -313,6 +316,38 @@ pub enum River {
     South,
     #[serde(alias = "запад", alias = "слева")]
     West,
+}
+
+/// Рельеф местности.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hills {
+    #[default]
+    #[serde(alias = "авто")]
+    Auto,
+    #[serde(alias = "нет", alias = "ровно", alias = "flat")]
+    None,
+    #[serde(alias = "холмы", alias = "hills")]
+    Gentle,
+    #[serde(alias = "обрыв", alias = "обрывы", alias = "cliff")]
+    Cliffs,
+}
+
+impl Hills {
+    pub const ALL: [Hills; 4] = [Hills::Auto, Hills::None, Hills::Gentle, Hills::Cliffs];
+
+    pub fn is_auto(&self) -> bool {
+        *self == Hills::Auto
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Hills::Auto => "Авто",
+            Hills::None => "Ровно",
+            Hills::Gentle => "Холмы",
+            Hills::Cliffs => "Обрыв",
+        }
+    }
 }
 
 impl River {
@@ -676,6 +711,7 @@ impl Plan {
             assets: Assets::Builtin,
             style: Style::default(),
             river: River::Auto,
+            hills: Hills::Auto,
             rooms: Vec::new(),
             links: Vec::new(),
             objects: Vec::new(),
@@ -706,6 +742,7 @@ impl Plan {
         plan.size = Some(size);
         plan.seed = opt.seed.clone();
         plan.assets = if opt.library { Assets::Library } else { Assets::Builtin };
+        plan.hills = opt.hills;
         let least = size[0].min(size[1]).saturating_sub(2).max(2);
         let lo = opt.min_size.clamp(2, least);
         plan.options = Opts { density: opt.density, loops: opt.loops, fill: opt.fill, room_size: [lo, opt.max_size.clamp(lo, least)], season: opt.season, cave: opt.cave, district: opt.district, dungeon: opt.dungeon };
@@ -932,6 +969,9 @@ impl Plan {
                 }
                 if self.kind != Kind::Forest && !self.river.is_auto() {
                     out.push(format!("{kind}: река не поддерживается"));
+                }
+                if self.kind != Kind::Forest && !self.hills.is_auto() {
+                    out.push(format!("{kind}: рельеф пока только у леса"));
                 }
             }
             Kind::Dungeon | Kind::Cyber => {

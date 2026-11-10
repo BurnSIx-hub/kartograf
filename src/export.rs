@@ -18,6 +18,8 @@ pub struct Layout {
     pub walls: Vec<Vec<[f32; 2]>>,
     /// Низкие стены (`Wall::low`): шаг держат, зрение и свет — ограниченно.
     pub low: Vec<Vec<[f32; 2]>>,
+    /// Кромки обрывов рельефа: не пройти, а видно, светит и слышно поверх.
+    pub cliffs: Vec<Vec<[f32; 2]>>,
     /// Двери и окна — отрезок в клетках; пустые проёмы сюда не попадают.
     pub portals: Vec<PortalOut>,
     /// Свет: середина в клетках, радиус яркого и тусклого в клетках, цвет.
@@ -283,7 +285,25 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
     let tents = map.props.iter().filter(|p| map::awning_by_name(&p.asset)).flat_map(|p| tent_walls(p, None)).collect();
-    Layout { walls, low, portals, lights, zones, tents }
+    let cliffs = map
+        .relief
+        .as_ref()
+        .map(|r| {
+            crate::relief::edges(r)
+                .into_iter()
+                .filter(|e| e.kind == crate::relief::EdgeKind::Cliff)
+                .map(|e| {
+                    let mut line = e.points;
+                    if e.closed {
+                        line.push(line[0]);
+                    }
+                    simplify(&line, e.closed, 0.05)
+                })
+                .filter(|l| l.len() >= 2)
+                .collect()
+        })
+        .unwrap_or_default();
+    Layout { walls, low, cliffs, portals, lights, zones, tents }
 }
 
 /// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
@@ -718,6 +738,15 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
             let (a, b) = (at(w[0]), at(w[1]));
             if a != b {
                 walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]], "sight": 10, "light": 10, "sound": 10}));
+            }
+        }
+    }
+    // Кромка обрыва: шаг держит, а зрению, свету и звуку не мешает.
+    for line in &layout.cliffs {
+        for w in line.windows(2) {
+            let (a, b) = (at(w[0]), at(w[1]));
+            if a != b {
+                walls.push(json!({"_id": doc_id('w', walls.len()), "c": [a[0], a[1], b[0], b[1]], "sight": 0, "light": 0, "sound": 0}));
             }
         }
     }

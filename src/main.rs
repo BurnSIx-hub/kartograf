@@ -16,6 +16,7 @@ mod plan;
 mod plat;
 mod procgen;
 mod recovery;
+mod relief;
 mod roofs;
 mod selftest;
 mod sets;

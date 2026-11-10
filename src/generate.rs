@@ -137,11 +137,13 @@ pub struct Options {
     pub district: crate::plan::District,
     /// Подземелье: склеп, темница, храм, руины.
     pub dungeon: crate::plan::DungeonKind,
+    /// Лес: ровно, холмы, обрыв.
+    pub hills: crate::plan::Hills,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone, district: crate::plan::District::Mixed, dungeon: crate::plan::DungeonKind::Crypt }
+        Self { kind: Kind::Dungeon, fill: true, density: 0.5, rooms: 8, min_size: 5, max_size: 10, loops: 0.1, seed: String::new(), library: false, season: crate::plan::Season::Summer, cave: crate::plan::CaveKind::Stone, district: crate::plan::District::Mixed, dungeon: crate::plan::DungeonKind::Crypt, hills: crate::plan::Hills::Auto }
     }
 }
 

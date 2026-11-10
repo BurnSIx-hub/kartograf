@@ -119,7 +119,7 @@ pub const BUILTIN_OBJECTS: [(&str, &str, [f32; 2], &[u8]); 54] = [
 /// Стены, зашитые в программу: имя, подпись, толщина в клетках, байты. Картинка —
 /// полоса гребня стены, бесшовная по длине, высотой «толщина × 256» с обводкой
 /// по краям, как в паках FA (`tools/walls.py`).
-pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 16] = [
+pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 21] = [
     ("wall_stone_blocks", "Каменные блоки", 0.45, include_bytes!("../assets/builtin/walls/stone_blocks.webp")),
     ("wall_sandstone", "Песчаник", 0.45, include_bytes!("../assets/builtin/walls/sandstone.webp")),
     ("wall_brick", "Кирпич", 0.35, include_bytes!("../assets/builtin/walls/brick.webp")),
@@ -138,6 +138,13 @@ pub const BUILTIN_WALLS: [(&str, &str, f32, &[u8]); 16] = [
     ("wall_drow", "Обсидиан дроу", 0.45, include_bytes!("../assets/builtin/walls/drow.webp")),
     // Зубцы парапета из каменных блоков, `tools/crenels.py`: мерлон ~1 клетка, бойница ~0,45.
     ("wall_crenels", "Зубцы", 0.5, include_bytes!("../assets/builtin/walls/crenels.webp")),
+    // Полосы рельефа, `tools/cliffs.py`: стенка обрыва, гребень уступа (кромка травой,
+    // сухой травой, снегом), осыпь под обрывом.
+    ("wall_cliff", "Обрыв", 1.0, include_bytes!("../assets/builtin/walls/cliff.webp")),
+    ("wall_ridge", "Гребень", 1.0, include_bytes!("../assets/builtin/walls/ridge.webp")),
+    ("wall_ridge_dry", "Гребень, сухая трава", 1.0, include_bytes!("../assets/builtin/walls/ridge_dry.webp")),
+    ("wall_ridge_snow", "Гребень, снег", 1.0, include_bytes!("../assets/builtin/walls/ridge_snow.webp")),
+    ("wall_under_cliff", "Осыпь", 0.5, include_bytes!("../assets/builtin/walls/under_cliff.webp")),
 ];
 
 /// Встроенные двери, косяки и окна (`tools/portals.py`): ключ, подпись, размер холста
@@ -263,6 +270,10 @@ pub fn is_builtin_key(key: &str) -> bool {
 
 fn is_cliff_path(lower: &str) -> bool {
     lower.contains("cliff") && !lower.contains("under_cliff")
+}
+
+fn is_relief_path(lower: &str) -> bool {
+    ["grass_ridge_", "/bank_", "under_cliff_"].iter().any(|w| lower.contains(w))
 }
 
 /// Скала FA из паков: стена-дорожка, толщина которой — высота картинки.
@@ -525,8 +536,10 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
             "terrain" | "patterns" => Some(Kind::Floor),
             "walls" => Some(Kind::Wall),
             // Скалы FA — дорожки Dungeondraft (`paths/…Cliff…`): полоса вдоль линии,
-            // как стена. Тень под скалой (`Under_Cliff`) — не стена.
+            // как стена.
             "paths" if is_cliff_path(&lower) => Some(Kind::Wall),
+            // Полосы рельефа FA: гребень уступа, берег, осыпь под обрывом.
+            "paths" if is_relief_path(&lower) => Some(Kind::Wall),
             // Каменные ступени FA — тоже дорожка, но ставятся пролётом, как предмет.
             "paths" if lower.contains("/stairs_stone_") || lower.contains("/stairs_railing_stone_") => Some(Kind::Object),
             "portals" => Some(Kind::Door),
@@ -1196,6 +1209,10 @@ mod tests {
             let px = (width * super::PX_PER_CELL).round() as u32;
             assert_eq!(img.height(), px, "{id}: высота полосы — толщина × 256");
             assert!(img.width() > img.height() * 3, "{id}: полоса должна быть длинной");
+            // Гребень и осыпь — полупрозрачные полосы рельефа: тень откоса тает книзу.
+            if ["wall_ridge", "wall_ridge_dry", "wall_ridge_snow", "wall_under_cliff"].contains(&id) {
+                continue;
+            }
             let mid = img.height() / 2;
             assert_eq!(img.get_pixel(0, mid)[3], 255, "{id}: середина полосы непрозрачна");
             assert_eq!(super::builtin_wall_width(&format!("{}{id}", super::BUILTIN)), Some(width));
@@ -1254,7 +1271,10 @@ mod tests {
         assert_eq!(kind_of("textures/lights/Candle.png", true), None);
         // Скалы FA — дорожки, но в библиотеке это стены; тень под скалой и прочие дорожки — нет.
         assert_eq!(kind_of("textures/paths/Natural_Decor_Paths/Cliffs_Paths/Cliff_Stone_Earthy_A1.webp", true), Some(Kind::Wall));
-        assert_eq!(kind_of("textures/paths/Cliff_Paths/Under_Cliff_Paths/Under_Cliff_A1.webp", true), None);
+        // Осыпь под обрывом — полоса рельефа, как и гребень.
+        assert_eq!(kind_of("textures/paths/Cliff_Paths/Under_Cliff_Paths/Under_Cliff_A1.webp", true), Some(Kind::Wall));
+        assert_eq!(kind_of("textures/paths/Natural_Decor_Paths/Cliffs_Paths/Grass_Ridge_Dirt_01_A1.webp", true), Some(Kind::Wall));
+        assert_eq!(kind_of("textures/paths/Sand_Paths/Sand_Path_A.webp", true), None);
         assert_eq!(kind_of("textures/paths/Cable_Paths/Cable_Metal_Brass_A_Path.webp", true), None);
         assert!(is_cliff("pack:fa.dungeondraft_pack|textures/paths/Cliff_Paths/Cliff_Ice_A1.webp"));
         assert!(!is_cliff("pack:fa.dungeondraft_pack|textures/walls/Walls_Stone/Wall_Stone_A.webp"));
