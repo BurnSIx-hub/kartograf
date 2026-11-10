@@ -40,13 +40,19 @@ pub const LIVE_MODULE: &str = "burn-living-map";
 /// Свой модуль Foundry: его пометки на тайлах (паутина, сундук).
 pub const OWN_MODULE: &str = "burn-kartograf";
 
+/// Под открытым небом: лес, город, местность по координатам — не пещера и не
+/// подземелье. Пустой звук места — карта, нарисованная руками: о небе не знаем.
+fn open_sky(map: &Map) -> bool {
+    map.ambience.starts_with("forest-") || map.ambience.starts_with("town-")
+}
+
 /// Флаги сцены: формат Картографа и звук места для «Wild Canvas».
 fn scene_flags(map: &Map) -> Value {
     let mut flags = json!({"kartograf": {"format": 1}});
     if !map.ambience.is_empty() {
         flags[LIVE_MODULE] = json!({"ambience": map.ambience});
         // Под открытым небом — тени облаков «Wild Canvas».
-        if map.ambience.starts_with("forest-") || map.ambience.starts_with("town-") {
+        if open_sky(map) {
             flags[LIVE_MODULE]["clouds"] = json!(0.6);
             flags[LIVE_MODULE]["cloudCover"] = json!(0.5);
         }
@@ -756,6 +762,10 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         "levels": docs,
         "initialLevel": LEVEL_ID,
         "tokenVision": true,
+        // Под открытым небом — день: без общего света Foundry 14 оставляет токену
+        // лишь его собственный обзор (у Рэндала у брода — круг в клетку, вокруг тьма).
+        // Пещера и подземелье — во тьме, светят их огни.
+        "environment": {"globalLight": {"enabled": open_sky(map)}},
         // Зимний лес — со снегом Foundry.
         "weather": map.weather,
         "walls": walls,
@@ -1081,8 +1091,10 @@ mod tests {
         autumn.ambience = "forest-autumn".into();
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["ambience"], "forest-autumn");
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["clouds"], 0.6);
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["environment"]["globalLight"]["enabled"], true, "лес — днём");
         autumn.ambience = "cave-1".into();
         assert!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE].get("clouds").is_none());
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["environment"]["globalLight"]["enabled"], false, "пещера — во тьме");
         // Зерно — рыбкам; и без звука места.
         autumn.ambience.clear();
         autumn.seed = "озеро".into();
