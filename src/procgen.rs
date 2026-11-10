@@ -191,7 +191,7 @@ fn drop_as(m: &mut Map, name: &str, pick: &Pick, pos: [f32; 2], rot: f32, scale:
     let Some(p) = m.props.last_mut() else { return };
     // Слот дерева — дерево (пни, бревна и пальмы не берутся): своё тоже уходит
     // в Foundry кроной над токенами, как встроенное.
-    if (name.starts_with("tree") || name == "pine") && !crate::map::canopy_by_name(&p.asset) {
+    if (name.starts_with("tree") || name == "pine" || name == "fir") && !crate::map::canopy_by_name(&p.asset) {
         p.canopy = Some(true);
     }
     // У встроенного дерева и куста одна картинка на все сезоны — подкрашиваем.

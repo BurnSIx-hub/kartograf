@@ -44,6 +44,33 @@ pub struct Cover {
     w: usize,
     h: usize,
     data: Vec<u8>,
+    /// Кроны из анализа снимка (`tools/osm/trees.py`, `<имя>.crowns.json`):
+    /// место, размер и порода каждого дерева. Нет — ищутся по классам подсказки.
+    crowns: Option<Vec<Crown>>,
+}
+
+/// Крона из `<имя>.crowns.json`: центр в долях рамки, радиус в метрах, порода.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Crown {
+    u: f32,
+    v: f32,
+    r: f32,
+    /// `broad`, `conifer` или `bush`.
+    #[serde(default)]
+    kind: String,
+    /// Откуда порода: `nfi:<тип леса>` — решена по карте лесов; `none` — решает
+    /// импорт по тегу леса OSM и очереди.
+    #[serde(default)]
+    src: String,
+    /// Место в очереди на хвойную, 0..1: в лесу с долей хвойных `p` хвойные — кроны
+    /// с очередью меньше `p` (тёмные и холодные на снимке, куртинами).
+    #[serde(default)]
+    queue: f32,
+}
+
+#[derive(serde::Deserialize)]
+struct CrownFile {
+    crowns: Vec<Crown>,
 }
 
 /// Классы подсказки: открытая трава, кроны (с тенью), бурое (орляк, вереск —
@@ -80,14 +107,21 @@ impl Cover {
                 Self::COLORS.iter().enumerate().min_by_key(|(_, (c, _))| d(*c)).map_or(0, |(k, _)| k as u8)
             })
             .collect();
-        Ok(Self { w, h, data })
+        Ok(Self { w, h, data, crowns: None })
+    }
+
+    /// С кронами из анализа снимка (`<имя>.crowns.json`).
+    pub fn with_crowns(mut self, json: &str) -> Result<Self, String> {
+        let f: CrownFile = serde_json::from_str(json).map_err(|e| format!("кроны: {e}"))?;
+        self.crowns = Some(f.crowns);
+        Ok(self)
     }
 
     /// Ровная подсказка одного класса, для проверок: `classes` по строкам.
     #[cfg(test)]
     fn grid(w: usize, h: usize, at: impl Fn(usize, usize) -> Class) -> Self {
         let data = (0..w * h).map(|k| Self::COLORS.iter().position(|c| c.1 == at(k % w, k / w)).unwrap_or(0) as u8).collect();
-        Self { w, h, data }
+        Self { w, h, data, crowns: None }
     }
 
     /// Доля класса в круге радиуса `r` вокруг точки; `u`, `v`, `r` — в долях рамки по x и y.
@@ -134,6 +168,24 @@ impl Hint<'_> {
 
     fn at(&self, p: [f32; 2]) -> Option<Class> {
         self.cover.at(p[0] / self.span[0], p[1] / self.span[1])
+    }
+
+    /// Деревья снимка в клетках карты `w`×`h`: из анализа (`crowns.json`), а без
+    /// него — найденные по классам ([`Hint::crowns`]); порода тогда не решена, а
+    /// очередь на хвойную — куртинами ~25 м.
+    fn trees(&self, w: usize, h: usize, cell_m: f32) -> Vec<Spot> {
+        match &self.cover.crowns {
+            Some(list) => list
+                .iter()
+                .map(|c| Spot {
+                    q: [c.u * self.span[0], c.v * self.span[1]],
+                    r: c.r / cell_m,
+                    conifer: c.src.starts_with("nfi").then(|| c.kind == "conifer"),
+                    queue: c.queue,
+                })
+                .collect(),
+            None => self.crowns(w, h).into_iter().map(|(q, r)| Spot { q, r, conifer: None, queue: 0.5 + 0.5 * noise(q, 16.0, 5) }).collect(),
+        }
     }
 
     /// Кроны снимка по одной: центр и радиус в клетках карты `w`×`h`. Центр самой
@@ -185,6 +237,40 @@ impl Hint<'_> {
         }
         out
     }
+}
+
+/// Дерево со снимка: центр и радиус кроны в клетках; хвойное ли (известно по
+/// карте лесов) и место в очереди на хвойную, 0..1.
+struct Spot {
+    q: [f32; 2],
+    r: f32,
+    conifer: Option<bool>,
+    queue: f32,
+}
+
+/// Слот дерева со снимка: крона `r` клеток, порода по карте лесов (`conifer`),
+/// лес OSM под ним и место в очереди на хвойную. Карта лесов главнее тега OSM.
+fn crown_slot(r: f32, conifer: Option<bool>, wood: Option<&Growth>, queue: f32) -> &'static str {
+    let needles = conifer.unwrap_or_else(|| wood.is_some_and(|g| queue < conifer_share(g)));
+    if r < CROWN_BUSH {
+        "bush_summer"
+    } else if needles {
+        conifer_slot(r)
+    } else {
+        "tree_green"
+    }
+}
+
+/// Слот хвойной кроны радиуса `r` клеток: узкая — ель, широкая — сосна.
+fn conifer_slot(r: f32) -> &'static str {
+    if r < 2.2 { "fir" } else { "pine" }
+}
+
+/// Доля хвойных в лесу OSM по его слотам деревьев (`leaf_type`: хвойный — все,
+/// лиственный — ни одного, смешанный и без тега — по слотам).
+fn conifer_share(g: &Growth) -> f32 {
+    let trees: Vec<&&str> = g.slots.iter().filter(|s| s.starts_with("tree") || **s == "pine").collect();
+    if trees.is_empty() { 0.0 } else { trees.iter().filter(|s| ***s == "pine").count() as f32 / trees.len() as f32 }
 }
 
 /// Кроны сплошного полога, клетки радиуса: в зрелом лесу кроны 12–18 м.
@@ -2045,8 +2131,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     if let Some(hint) = hint.as_ref().filter(|_| rural) {
         let mut rng = Rng::new("osm/cover-trees");
         let woods: Vec<&Area> = areas.iter().filter(|a| growth(a.tags).is_some_and(|g| g.litter)).collect();
-        let mut crowns: Vec<([f32; 2], f32)> = Vec::new();
-        for (q, mut r) in hint.crowns(w as usize, h as usize) {
+        let mut crowns: Vec<Spot> = Vec::new();
+        for Spot { q, mut r, conifer, queue } in hint.trees(w as usize, h as usize, cell) {
             if blocked.at(q) || hint.share(q, r.min(2.0), Class::Water) > 0.3 {
                 continue;
             }
@@ -2057,28 +2143,21 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 r *= 0.85;
             }
             if r >= CROWN_MIN {
-                crowns.push((q, r));
+                crowns.push(Spot { q, r, conifer, queue });
             }
         }
         // Мелкие снизу: большое дерево выше и ложится поверх.
-        crowns.sort_by(|a, b| a.1.total_cmp(&b.1));
-        for (q, r) in crowns {
+        crowns.sort_by(|a, b| a.r.total_cmp(&b.r));
+        for Spot { q, r, conifer, queue } in crowns {
             if planted >= MAX_PLANTS {
                 break;
             }
-            // Порода — по лесу OSM (`leaf_type`), за лесом — лиственное, изредка ель:
-            // треть елей наугад вставала тёмными звёздами в ясеневой роще Малхема.
+            // Порода: по карте лесов, если анализ снимка её знал; иначе в лесу OSM —
+            // по его `leaf_type`, долей хвойных из очереди (куртинами, тёмные первыми);
+            // за лесом — лиственное. Ели наугад вставали тёмными звёздами в ясеневой
+            // роще Малхема и по одной среди дубов Болтона.
             let wood = woods.iter().find(|a| inside(&a.rings, q)).and_then(|a| growth(a.tags));
-            let slot = if r < CROWN_BUSH {
-                "bush_summer"
-            } else if let Some(g) = &wood {
-                let trees: Vec<&str> = g.slots.iter().copied().filter(|s| s.starts_with("tree") || *s == "pine").collect();
-                trees.get(rng.int(0, trees.len() as i32 - 1).max(0) as usize).copied().unwrap_or("tree_green")
-            } else if rng.chance(0.15) {
-                "pine"
-            } else {
-                "tree_green"
-            };
+            let slot = crown_slot(r, conifer, wood.as_ref(), queue);
             if missing(slot) {
                 continue;
             }
@@ -2762,6 +2841,46 @@ mod tests {
     /// Кроны деревьев карты: центр и видимый радиус в клетках.
     fn crowns_of(m: &Map) -> Vec<([f32; 2], f32)> {
         m.props.iter().filter(|p| p.asset.contains("tree") || p.asset.contains("pine")).map(|p| (p.pos, p.scale * 0.85 * p.size[0].max(p.size[1]) / 2.0)).collect()
+    }
+
+    #[test]
+    fn crown_species_comes_from_the_forest_map_then_the_osm_tag() {
+        let tags = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Tags>();
+        let needle = growth(&tags(&[("natural", "wood"), ("leaf_type", "needleleaved")])).unwrap();
+        let broad = growth(&tags(&[("natural", "wood"), ("leaf_type", "broadleaved")])).unwrap();
+        let mixed = growth(&tags(&[("natural", "wood"), ("leaf_type", "mixed")])).unwrap();
+        // Куст — по размеру, что бы ни сказала карта.
+        assert_eq!(crown_slot(1.0, Some(true), Some(&needle), 0.0), "bush_summer");
+        // Карта лесов главнее тега: лиственная крона в «хвойном» лесу OSM.
+        assert_eq!(crown_slot(3.0, Some(false), Some(&needle), 0.0), "tree_green");
+        assert_eq!(crown_slot(3.0, Some(true), None, 0.9), "pine");
+        assert_eq!(crown_slot(1.8, Some(true), None, 0.9), "fir");
+        // Без карты — тег леса; смешанный — по очереди.
+        assert_eq!(crown_slot(3.0, None, Some(&needle), 0.99), "pine");
+        assert_eq!(crown_slot(3.0, None, Some(&broad), 0.0), "tree_green");
+        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.1), "pine");
+        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.9), "tree_green");
+        // За лесом хвойных наугад нет.
+        assert_eq!(crown_slot(3.0, None, None, 0.0), "tree_green");
+    }
+
+    #[test]
+    fn crowns_file_puts_each_tree_where_the_analysis_found_it() {
+        const EMPTY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+</osm>"#;
+        // Подсказка — сплошная трава: деревья только из файла.
+        let json = r#"{"crowns": [{"u": 0.5, "v": 0.5, "r": 6.0, "kind": "broad", "src": "nfi:Broadleaved", "queue": 0.3},
+                                  {"u": 0.2, "v": 0.3, "r": 1.7, "kind": "bush", "src": "none", "queue": 0.1}]}"#;
+        let cover = Cover::grid(40, 40, |_, _| Class::Grass).with_crowns(json).unwrap();
+        let (m, _) = import_cover(EMPTY, &[], Some(&cover), Options::default()).unwrap();
+        let crowns = crowns_of(&m);
+        assert_eq!(crowns.len(), 1, "деревья: {crowns:?}");
+        let (q, r) = crowns[0];
+        assert!((q[0] - m.width as f32 / 2.0).abs() < 1.0 && (q[1] - m.height as f32 / 2.0).abs() < 1.0, "дерево не в середине: {q:?}");
+        assert!((r - 6.0 / CELL_M).abs() < 0.6, "крона {r} клеток вместо {}", 6.0 / CELL_M);
+        assert!(m.props.iter().any(|p| p.asset.contains("bush") && length(p.pos, [0.2 * m.width as f32, 0.3 * m.height as f32]) < 1.5), "куста нет");
     }
 
     #[test]

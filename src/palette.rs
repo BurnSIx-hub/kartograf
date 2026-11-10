@@ -324,6 +324,8 @@ const OBJECTS: &[Slot] = &[
     ("stepping_stone", &[&["stepping", "stone"]], &[]),
     // Хвойный лес из OSM: только зелёные сосны (у «зимнего» есть и синие).
     ("pine", &[&["pine", "green"], &["сосна"]], &["dead", "stump", "fallen", "log", "shadow"]),
+    // Ель — звездой сверху, мельче сосны: для хвойных крон уже 6 м.
+    ("fir", &[&["fir", "green"], &["ель"]], &["dead", "stump", "fallen", "log", "shadow", "snow", "frosted", "christmas"]),
     // Летнее лиственное без пестроты: у FA `Multicolor1` — с жёлтым и рыжим, рядом
     // со снимком лес выходил осенним.
     ("tree_green", &[&["tree", "green"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
@@ -545,6 +547,7 @@ const NEAR: &[(&str, &str)] = &[
     ("tree_magic", "tree"),
     ("tree_bare", "tree_winter"),
     ("pine", "tree"),
+    ("fir", "pine"),
     ("tree_green", "tree_summer"),
     ("stepping_stone", "boulder"),
     ("meadow", "grass_green"),

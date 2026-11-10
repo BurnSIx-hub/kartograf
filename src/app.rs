@@ -1538,9 +1538,15 @@ impl App {
         // Подсказка со снимка (`tools/osm/cover.py`) — рядом, `<имя>.cover.png`.
         let cover_path = path.with_extension("cover.png");
         let cover = std::fs::read(&cover_path).ok().map(|b| procgen::osm::Cover::from_image(&b));
+        // Кроны из анализа снимка (`tools/osm/trees.py`) — `<имя>.crowns.json`.
+        let crowns_path = path.with_extension("crowns.json");
+        let cover = cover.map(|c| c.and_then(|c| match std::fs::read_to_string(&crowns_path) {
+            Ok(t) => c.with_crowns(&t).map_err(|e| format!("{}: {e}", crowns_path.display())),
+            Err(_) => Ok(c),
+        }));
         let cover = match cover {
             Some(Err(e)) => {
-                self.error = Some(format!("{}: {e}", cover_path.display()));
+                self.error = Some(if e.contains("кроны") { e } else { format!("{}: {e}", cover_path.display()) });
                 return false;
             }
             Some(Ok(c)) => Some(c),
