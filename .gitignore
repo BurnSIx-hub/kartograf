@@ -1,3 +1,4 @@
 /target
 /selftest-out
 /foundry/pkg
+__pycache__/

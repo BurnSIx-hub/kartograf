@@ -23,6 +23,8 @@ const REACH: f32 = 16.0;
 /// Насколько темнее каждый ярус ниже верхнего и предел.
 const DEPTH: f32 = 0.12;
 const DEPTH_MAX: f32 = 0.45;
+/// У рельефа настоящей местности склон положе этого (ярусов на клетку) — без гребня.
+const NATURAL_RIDGE: f32 = 0.3;
 /// Ширина полосы гребня, клетки.
 pub const RIDGE_WIDTH: f32 = 1.0;
 /// Ширина осыпи под обрывом, клетки.
@@ -44,12 +46,16 @@ pub struct Relief {
     pub face: String,
     pub ridge: String,
     pub under: String,
+    /// Рельеф настоящей местности (из OSM): ярусы не темнеют по высоте и пологие
+    /// склоны идут без гребней. На снимках низина не темнее склона — темнеет только
+    /// тень от обрыва, а гребни на пологом подъёме ложились кольцами горизонталей.
+    pub natural: bool,
 }
 
 impl Relief {
     pub fn for_cells(cells_w: u32, cells_h: u32) -> Self {
         let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
-        Self { w, h, data: vec![0.0; w * h], face: String::new(), ridge: String::new(), under: String::new() }
+        Self { w, h, data: vec![0.0; w * h], face: String::new(), ridge: String::new(), under: String::new(), natural: false }
     }
 
     pub fn face_key(&self) -> String {
@@ -331,6 +337,11 @@ fn edges_and_bare(r: &Relief) -> (Vec<Edge>, Vec<[f32; 2]>) {
                     kind.push(Some(EdgeKind::Cliff));
                     width.push(foot.max(0.35 + 0.35 * d).clamp(0.5, 3.0));
                     drop.push(d);
+                } else if r.natural && r.steepest(p, 0.5) < NATURAL_RIDGE {
+                    // Пологий склон настоящей местности — без гребня.
+                    kind.push(None);
+                    width.push(0.0);
+                    drop.push(0.0);
                 } else {
                     kind.push(Some(EdgeKind::Ridge));
                     width.push(RIDGE_WIDTH);
@@ -523,7 +534,7 @@ pub fn look(r: &Relief, angle: f32, roads: &[(Vec<[f32; 2]>, f32)]) -> Look {
     }
     let mut dark = Mask { w, h, data: vec![0; w * h] };
     for k in 0..w * h {
-        let depth = ((top - steps.data[k]) * DEPTH).min(DEPTH_MAX);
+        let depth = if r.natural { 0.0 } else { ((top - steps.data[k]) * DEPTH).min(DEPTH_MAX) };
         // Тень и глубина складываются как два слоя полупрозрачного чёрного.
         let v = 1.0 - (1.0 - depth) * (1.0 - cast[k] * CAST);
         dark.data[k] = byte(v);
@@ -619,6 +630,8 @@ struct Packed {
     ridge: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     under: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    natural: bool,
 }
 
 impl Serialize for Relief {
@@ -628,7 +641,7 @@ impl Serialize for Relief {
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
         let _ = enc.write_all(&bytes);
         let z = enc.finish().unwrap_or_default();
-        Packed { w: self.w, h: self.h, z: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, z), face: self.face.clone(), ridge: self.ridge.clone(), under: self.under.clone() }.serialize(s)
+        Packed { w: self.w, h: self.h, z: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, z), face: self.face.clone(), ridge: self.ridge.clone(), under: self.under.clone(), natural: self.natural }.serialize(s)
     }
 }
 
@@ -644,7 +657,7 @@ impl<'de> Deserialize<'de> for Relief {
             return Err(D::Error::custom("рельеф повреждён"));
         }
         let data = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / QUANT).collect();
-        Ok(Relief { w: p.w, h: p.h, data, face: p.face, ridge: p.ridge, under: p.under })
+        Ok(Relief { w: p.w, h: p.h, data, face: p.face, ridge: p.ridge, under: p.under, natural: p.natural })
     }
 }
 
@@ -713,6 +726,19 @@ mod tests {
         assert!(at(4.0) > at(1.0) + 40, "тень обрыва к западу: {} против {}", at(4.0), at(1.0));
         assert!(at(1.0) > 40, "нижний ярус темнее: {}", at(1.0));
         assert_eq!(at(8.0), 0, "верхний ярус не темнеет");
+    }
+
+    #[test]
+    fn natural_relief_darkens_only_by_shadow() {
+        // Настоящая местность: нижний ярус вдали от обрыва не темнее верхнего; тень обрыва есть.
+        let mut r = mesa();
+        r.natural = true;
+        let l = look(&r, 180.0, &[]);
+        let at = |x: f32| l.dark.get((x * RES as f32) as isize, 20);
+        assert_eq!(at(0.5), 0, "низина не темнеет по высоте");
+        assert!(at(4.0) > 40, "тень обрыва осталась: {}", at(4.0));
+        let back: Relief = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(back.natural, "флаг сохраняется в файле");
     }
 
     #[test]

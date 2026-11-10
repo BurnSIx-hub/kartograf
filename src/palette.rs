@@ -36,9 +36,14 @@ const FLOORS: &[Slot] = &[
     // Пустошь — средние оливково-бурые `Grass_A_04`, `A_07`, `A_09`: бурые `Rough`,
     // `Wild`, `E_02` на карте почти чёрные против снимка.
     ("rough_grass", &[&["grass", "a", "04"], &["grass", "a", "07"], &["grass", "a", "09"]], &["marsh", "rough", "wild", "sparse", "wind", "short", "long", "medium"]),
-    // Речная галька — светлая серо-бежевая (`Gravel_01_Earthy_G`–`I`, как на снимке):
-    // не тёмный сланец, не бурая `_F` и не рыжий песок.
-    ("shingle", &[&["gravel", "01", "earthy", "g"], &["gravel", "01", "earthy", "h"], &["gravel", "01", "earthy", "i"]], &[]),
+    // Сухая, скошенная трава по снимку — светлая ровная `Grass_A_09` (Lab ~35/−3/37,
+    // пестрота самая низкая): кочковатые `A_04`, `A_07` на выгоне Малхема рябили.
+    ("dry_grass", &[&["grass", "a", "09"]], &["marsh", "rough", "wild", "sparse", "wind", "short", "long", "medium"]),
+    // Речная галька — светлая (`Gravel_03_Sandstone_B`–`E`, средний цвет ~(172, 146, 99)).
+    // Альфа у текстур FA — высота для смешивания, а не прозрачность: на белом листе
+    // `Gravel_01_Earthy_G` выглядела светлой, а её цвет ~(95, 86, 70), и отмель на
+    // карте выходила тёмно-серой против почти белой на снимке. Подбирать по цвету.
+    ("shingle", &[&["gravel", "03", "sandstone", "b"], &["gravel", "03", "sandstone", "c"], &["gravel", "03", "sandstone", "d"], &["gravel", "03", "sandstone", "e"]], &[]),
     // Гравийная дорожка парка — светлая утоптанная (`Gravel_03_Sandstone`): тёмный
     // гравий на траве почти не виден.
     ("path_gravel", &[&["gravel", "03", "sandstone"]], &[]),
@@ -55,6 +60,9 @@ const FLOORS: &[Slot] = &[
     // голубая рябь, глубина — синяя; «непрозрачная» без ряби рядом не смотрится.
     ("water_shallow", &[&["water", "shallow"], &["shallow"], &["water"], &["мелководье"], &["вода"]], &["deep", "fall", "lily", "opaque", "arctic", "02", "04", "05", "06", "07"]),
     ("water_deep", &[&["water", "deep"], &["deep"], &["water", "still", "02"], &["глубина"]], &["fall"]),
+    // Глубина моря — тёмная бирюза (`Water_Still_A_01`, `C_01`): на снимках у
+    // берегов моря вода зелёно-бирюзовая, синяя `_02` выходила чернильной.
+    ("sea_deep", &[&["water", "still", "a", "01"], &["water", "still", "c", "01"]], &["overlay"]),
     ("cave_floor", &[&["cave"], &["пещера"]], &["wall"]),
     // Полы пещер FA по породе: `Cave_Floor_02_Slate`, `_01_Earthy`, `_03_Sandstone`, `_05_Volcanic`.
     ("cave_slate", &[&["cave", "slate"]], &["wall"]),
@@ -541,6 +549,7 @@ const NEAR: &[(&str, &str)] = &[
     ("stepping_stone", "boulder"),
     ("meadow", "grass_green"),
     ("rough_grass", "grass_dry"),
+    ("dry_grass", "rough_grass"),
     ("shingle", "gravel"),
     ("path_gravel", "gravel"),
     ("rock_chalk", "rocky_ground"),
@@ -562,6 +571,7 @@ const NEAR: &[(&str, &str)] = &[
     ("swamp_wet", "swamp"),
     ("ash", "dirt"),
     ("water_deep", "water_shallow"),
+    ("sea_deep", "water_deep"),
     ("stone_tiles", "flagstones"),
     ("dungeon_flagstones", "flagstones"),
     ("crypt_floor", "dungeon_flagstones"),
@@ -658,7 +668,13 @@ pub struct Palette {
     /// Чем мерить непрозрачность текстуры пола; нет — не мерить.
     opacity: Option<Opacity>,
     alphas: RefCell<HashMap<String, Option<f32>>>,
-    rng: RefCell<Rng>,
+    /// Случайность выбора вариантов — своя у каждого слота: вариант зависит от
+    /// зерна карты, слота и номера выбора в этом слоте, а не от того, сколько
+    /// выбрали до него. С общим генератором новый слот или сотня деревьев по снимку
+    /// сдвигали все следующие выборы: тропа Лулворта выходила то серой, то бурой,
+    /// аббатство Болтона — белым.
+    rngs: RefCell<BTreeMap<String, Rng>>,
+    base: RefCell<String>,
     /// Рамы окон FA (`Window_Frame_*`): ставятся поверх подоконника.
     frames: Vec<(String, String)>,
 }
@@ -676,7 +692,7 @@ fn table_of(kind: Kind) -> &'static [Slot] {
 impl Palette {
     /// Всё встроенное.
     pub fn builtin() -> Self {
-        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames: Vec::new() }
+        Self { slots: BTreeMap::new(), measure: Box::new(|_| None), sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rngs: RefCell::default(), base: RefCell::default(), frames: Vec::new() }
     }
 
     /// Замены из библиотеки: только не встроенные ассеты. Слот крыши без своих
@@ -721,7 +737,7 @@ impl Palette {
             v.dedup();
         }
         frames.sort();
-        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rng: RefCell::new(Rng::new("")), frames }
+        Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rngs: RefCell::default(), base: RefCell::default(), frames }
     }
 
     /// Рама под подоконник FA: того же размера (`1x1`, `2x1`, «large»), ближе всех
@@ -786,7 +802,8 @@ impl Palette {
 
     /// Случайность выбора вариантов: то же зерно — те же варианты.
     pub fn seed(&self, seed: &str) {
-        *self.rng.borrow_mut() = Rng::new(&format!("{seed}/assets"));
+        *self.base.borrow_mut() = format!("{seed}/assets");
+        self.rngs.borrow_mut().clear();
     }
 
     /// Встроенный ассет слота — когда библиотека не в деле.
@@ -823,7 +840,14 @@ impl Palette {
         let alias = if tone == "redrock" { "red".to_string() } else { tone.clone() };
         let toned: Vec<(String, String)> = if tone.is_empty() { Vec::new() } else { all.iter().filter(|(_, n)| { let w = file_words(n); w.contains(&tone) || w.contains(&alias) }).cloned().collect() };
         let found = if toned.is_empty() { all } else { &toned };
-        let mut i = if found.len() > 1 { self.rng.borrow_mut().int(0, found.len() as i32 - 1) as usize } else { 0 };
+        let mut i = if found.len() > 1 {
+            let base = self.base.borrow().clone();
+            let mut rngs = self.rngs.borrow_mut();
+            let rng = rngs.entry(slot.to_owned()).or_insert_with(|| Rng::new(&format!("{base}/{slot}")));
+            rng.int(0, found.len() as i32 - 1) as usize
+        } else {
+            0
+        };
         // Выпала накладка — следующий по списку: мерить все варианты долго (секунды).
         if indoor && let Some(k) = (0..found.len()).map(|step| (i + step) % found.len()).find(|&k| self.solid(&found[k].0)) {
             i = k;

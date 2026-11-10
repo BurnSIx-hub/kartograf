@@ -1659,20 +1659,44 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
         None => vec![trail.clone(), side_path.clone()],
     };
 
-    // Деревья дротиками: новое ставится, только если не лезет на тропу, ручей и соседей.
-    let spacing = 3.4 - density * 1.5;
-    let mut trees: Vec<[f32; 2]> = Vec::new();
-    let mut tries = (w * h * 3.0) as i32;
+    // Деревья — по полю густоты, как на снимках настоящего леса (круги сверки OSM):
+    // стоят куртинами (вокруг дерева крон в 3,5–6 раз гуще среднего), жмутся к воде
+    // (в 10 м от берега кроны втрое гуще, чем дальше) и до самой гальки, а поодиночке
+    // мельче. Ровная сетка дротиков с одним шагом на всю карту выглядела посадкой.
+    let seed = rng.int(0, 1 << 20) as u32;
+    let thick = |q: [f32; 2]| -> f32 {
+        let clump = crate::relief::fbm(q, 12.0, seed);
+        let c = ((clump - 0.43) / 0.13).clamp(0.0, 1.0);
+        let shore = water_paths.as_ref().map_or(0.0, |s| (1.0 - (s.bank.distance(q) - s.bank.width / 2.0) / 6.0).clamp(0.0, 1.0));
+        (0.1 + 0.9 * c * c * (3.0 - 2.0 * c) + 0.6 * shore + (density - 0.5) * 0.4).clamp(0.0, 1.0)
+    };
+    // Шаг между деревьями — от густоты: в куртине кроны смыкаются, в редколесье
+    // шаг шире, в просвете (густота ниже 0,15) деревьев нет. Вероятностью густоту
+    // не задать: дротиков много, и редкое место всё равно забивалось до тесноты.
+    let reach = |d: f32, scale: f32| (1.3 + 1.0 * scale) / d.max(0.3).sqrt();
+    // У моста кроны не ложатся на настил: тропа у переправы свободна шире.
+    let ford = water_paths.as_ref().and_then(|s| crossing(&trail, &s.water)).map(|(c, _)| c);
+    let mut trees: Vec<([f32; 2], f32, f32)> = Vec::new();
+    let mut tries = (w * h * 4.0) as i32;
     while tries > 0 {
         tries -= 1;
         let q = [rng.random() as f32 * w, rng.random() as f32 * h];
-        let far = |c: [f32; 2], d: f32| (c[0] - q[0]).hypot(c[1] - q[1]) >= d;
-        if !far(camp, glade + 1.0) || steep(m, q, 0.9, 1.0) || trail.distance(q) < 2.2 || side_path.distance(q) < 1.6 || near_water(q, 2.6) || !trees.iter().all(|&t| far(t, spacing)) {
+        let d = thick(q);
+        if d < 0.15 {
             continue;
         }
-        trees.push(q);
+        // Крона в сомкнутой куртине шире, одиночное дерево — мельче.
+        let scale = 0.75 + 0.6 * d + rng.random() as f32 * 0.2;
+        let gap = reach(d, scale);
+        let far = |c: [f32; 2], g: f32| (c[0] - q[0]).hypot(c[1] - q[1]) >= g;
+        let by_bridge = ford.is_some_and(|c| (c[0] - q[0]).hypot(c[1] - q[1]) < 7.0) && trail.distance(q) < 1.0 + 2.2 * scale;
+        if by_bridge || !far(camp, glade + 1.0) || steep(m, q, 0.9, 1.0) || trail.distance(q) < 2.2 || side_path.distance(q) < 1.6 || near_water(q, 1.6) || !trees.iter().all(|&(t, _, g)| far(t, (gap + g) / 2.0)) {
+            continue;
+        }
+        trees.push((q, scale, gap));
     }
-    let under: Vec<_> = trees.iter().map(|&t| (t, 2.4)).collect();
+    let trees: Vec<([f32; 2], f32)> = trees.into_iter().map(|(q, s, _)| (q, s)).collect();
+    let under: Vec<_> = trees.iter().map(|&(t, s)| (t, 1.8 * s + 0.6)).collect();
     let shade = blobs(m, &under, 0.15, 0.8);
     m.paint(Layer::Floor, floor, &shade);
     let avoid = m.paths.clone();
@@ -1681,8 +1705,10 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     let brush = (w * h * (0.02 + density * 0.03) * look.brush) as i32;
     for _ in 0..brush {
         let q = [rng.random() as f32 * w, rng.random() as f32 * h];
-        let clear_of_tree = trees.iter().all(|t| (t[0] - q[0]).hypot(t[1] - q[1]) > 1.4);
-        if clear_of_tree && !steep(m, q, 0.5, 1.2) && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
+        let clear_of_tree = trees.iter().all(|(t, _)| (t[0] - q[0]).hypot(t[1] - q[1]) > 1.4);
+        // Подлесок и камни — больше в просветах: под сомкнутым пологом им темно.
+        let open = rng.chance((1.15 - thick(q)) as f64);
+        if open && clear_of_tree && !steep(m, q, 0.5, 1.2) && trail.distance(q) > 1.5 && side_path.distance(q) > 1.2 && !near_water(q, 2.0) && (q[0] - camp[0]).hypot(q[1] - camp[1]) > glade * 0.7 {
             let n = pick(rng, &[look.bush, look.bush, look.bush, "boulder"]);
             drop(m, n, q, rng.int(0, 3) as f32 * 90.0, 0.6 + rng.random() as f32 * 0.6);
         }
@@ -1703,8 +1729,8 @@ fn forest(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize
     if p.mood == Mood::Abandoned {
         abandon(m, rng, &[]);
     }
-    for &q in &trees {
-        let (rot, scale) = (rng.int(0, 3) as f32 * 90.0, 0.8 + rng.random() as f32 * 0.5);
+    for &(q, scale) in &trees {
+        let rot = rng.int(0, 3) as f32 * 90.0;
         let slot = if rng.chance(look.bare) { "tree_bare" } else { tree_slot(p.options.season) };
         drop(m, slot, q, rot, scale);
     }
@@ -2868,15 +2894,15 @@ pub fn build(m: &mut Map, p: &Plan, material: usize, palette: Palette) -> Result
     Ok(Report { count, warnings })
 }
 
-/// Карта из выгрузки OpenStreetMap (`osm.rs`) и докачанных к ней контуров;
-/// своими ассетами, если подбор не пуст.
-pub fn import_osm(xml: &str, extra: &[String], opt: osm::Options, palette: Palette) -> Result<(Map, Report), String> {
+/// Карта из выгрузки OpenStreetMap (`osm.rs`) и докачанных к ней контуров, с
+/// подсказкой со снимка, если она есть; своими ассетами, если подбор не пуст.
+pub fn import_osm(xml: &str, extra: &[String], cover: Option<&osm::Cover>, opt: osm::Options, palette: Palette) -> Result<(Map, Report), String> {
     let _guard = PaletteGuard;
     if !palette.is_empty() {
         palette.seed("osm");
         PALETTE.with(|slot| *slot.borrow_mut() = Some(palette));
     }
-    osm::import_with(xml, extra, opt)
+    osm::import_cover(xml, extra, cover, opt)
 }
 
 #[cfg(test)]
@@ -2905,6 +2931,27 @@ mod tests {
             a("Portals/Door_Wooden_A_1x1.webp", K::Door),
         ];
         Palette::from_library(&assets, Box::new(crate::palette::fake_measure))
+    }
+
+    #[test]
+    fn variant_of_a_slot_does_not_depend_on_other_slots() {
+        // Вариант стула — тот же, сколько бы деревьев ни выбрали между выборами:
+        // с общим генератором новые деревья по снимку сдвигали все выборы после них.
+        let p = fake_library();
+        let chairs = |trees_between: usize| {
+            p.seed("стабильно");
+            (0..6)
+                .map(|_| {
+                    for _ in 0..trees_between {
+                        p.pick("tree");
+                    }
+                    p.pick("chair").key
+                })
+                .collect::<Vec<_>>()
+        };
+        let plain = chairs(0);
+        assert_eq!(plain, chairs(7));
+        assert!(plain.iter().any(|k| k != &plain[0]), "варианты всё же меняются: {plain:?}");
     }
 
     #[test]

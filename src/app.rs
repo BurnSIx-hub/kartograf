@@ -1535,9 +1535,20 @@ impl App {
             return false;
         }
         let palette = self.generator_palette(self.settings.gen_library, false);
+        // Подсказка со снимка (`tools/osm/cover.py`) — рядом, `<имя>.cover.png`.
+        let cover_path = path.with_extension("cover.png");
+        let cover = std::fs::read(&cover_path).ok().map(|b| procgen::osm::Cover::from_image(&b));
+        let cover = match cover {
+            Some(Err(e)) => {
+                self.error = Some(format!("{}: {e}", cover_path.display()));
+                return false;
+            }
+            Some(Ok(c)) => Some(c),
+            None => None,
+        };
         let built = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| {
             let extra = osm_relations(&procgen::osm::incomplete(&t));
-            procgen::import_osm(&t, &extra, procgen::osm::Options::default(), palette)
+            procgen::import_osm(&t, &extra, cover.as_ref(), procgen::osm::Options::default(), palette)
         });
         let (map, r) = match built {
             Ok(x) => x,
