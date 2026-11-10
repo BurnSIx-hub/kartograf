@@ -513,7 +513,8 @@ pub fn is_bare_tree(key: &str) -> bool {
 
 /// Куст: в Foundry уходит тайлом, который качает ветер «Wild Canvas», как крону.
 pub fn bush_by_name(key: &str) -> bool {
-    let lower = key.to_lowercase();
+    // Ключ своей папки — путь Windows с `\`: папку `bushes` иначе не узнать.
+    let lower = key.to_lowercase().replace('\\', "/");
     key == format!("{}bush", crate::library::BUILTIN) || (lower.contains("/bushes/") && !lower.contains("dead") && !lower.contains("shadow"))
 }
 

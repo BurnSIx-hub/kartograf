@@ -1415,6 +1415,7 @@ impl App {
     }
 
     /// «Местность из OpenStreetMap…»: выгрузка `.osm` заменяет карту целиком,
+    /// неполные в ней природные контуры докачиваются из API OSM (`osm_relations`),
     /// размер — по участку. Ассеты — как у генератора: из библиотеки, если там
     /// отмечено «из библиотеки». Отменяется Ctrl+Z.
     pub fn import_osm_file(&mut self, path: &Path) -> bool {
@@ -1423,7 +1424,10 @@ impl App {
             return false;
         }
         let palette = self.generator_palette(self.settings.gen_library, false);
-        let built = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| procgen::import_osm(&t, procgen::osm::Options::default(), palette));
+        let built = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| {
+            let extra = osm_relations(&procgen::osm::incomplete(&t));
+            procgen::import_osm(&t, &extra, procgen::osm::Options::default(), palette)
+        });
         let (map, r) = match built {
             Ok(x) => x,
             Err(e) => {
@@ -5584,6 +5588,34 @@ fn value_noise(x: f32, seed: u32) -> f32 {
 
 fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// Отношения OSM целиком (`relation/{id}/full`): неполные в выгрузке природные
+/// контуры. Что не скачалось (нет сети), пропускается — импорт предупредит.
+#[cfg(not(target_arch = "wasm32"))]
+fn osm_relations(ids: &[i64]) -> Vec<String> {
+    use std::time::Duration;
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(8))).timeout_global(Some(Duration::from_secs(30))).build().into();
+    let ua = format!("Kartograf/{} (OSM import)", env!("CARGO_PKG_VERSION"));
+    let mut out = Vec::new();
+    for id in ids {
+        let url = format!("https://api.openstreetmap.org/api/0.6/relation/{id}/full");
+        match agent.get(&url).header("User-Agent", &ua).call().and_then(|mut r| r.body_mut().read_to_string()) {
+            Ok(text) => out.push(text),
+            // Первый отказ — скорее всего, сети нет: остальные не ждём.
+            Err(_) if out.is_empty() => break,
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+#[cfg(target_arch = "wasm32")]
+fn osm_relations(_ids: &[i64]) -> Vec<String> {
+    Vec::new()
 }
 
 fn ago(secs: u64) -> String {

@@ -75,12 +75,47 @@ fn ident(n: roxmltree::Node) -> Option<i64> {
 }
 
 fn parse(xml: &str) -> Result<Osm, String> {
+    let mut osm = Osm { bounds: [f64::NAN; 4], nodes: HashMap::new(), ways: BTreeMap::new(), relations: BTreeMap::new() };
+    let bounds = parse_into(&mut osm, xml)?;
+    osm.bounds = match bounds {
+        Some([Some(s), Some(w), Some(n), Some(e)]) if n > s && e > w => [s, w, n, e],
+        _ => {
+            if osm.nodes.is_empty() {
+                return Err("в выгрузке нет ни одной точки".into());
+            }
+            let lat = osm.nodes.values().map(|n| n.lat);
+            let lon = osm.nodes.values().map(|n| n.lon);
+            [lat.clone().fold(f64::MAX, f64::min), lon.clone().fold(f64::MAX, f64::min), lat.fold(f64::MIN, f64::max), lon.fold(f64::MIN, f64::max)]
+        }
+    };
+    Ok(osm)
+}
+
+/// Природный мультиполигон, неполный в выгрузке: «Экспорт» openstreetmap.org
+/// отдаёт только пути, что задевают участок, и большой лес, озеро или осыпь
+/// не замыкаются — импорт их выбрасывал (осыпь Уэст-Уотер, луг Лулворта).
+/// Номера таких отношений — докачать целиком (`relation/{id}/full`).
+pub fn incomplete(xml: &str) -> Vec<i64> {
+    let Ok(osm) = parse(xml) else { return Vec::new() };
+    osm.relations
+        .iter()
+        .filter(|(_, r)| get(&r.tags, "type") == "multipolygon" && !unseen(&r.tags) && (ground(&r.tags, false).is_some() || growth(&r.tags).is_some()))
+        .filter(|(_, r)| r.ways.iter().any(|w| !osm.ways.contains_key(w)))
+        .map(|(id, _)| *id)
+        .take(MAX_FETCH)
+        .collect()
+}
+
+/// Сколько неполных контуров докачивать за один импорт.
+pub const MAX_FETCH: usize = 25;
+
+/// Узлы, пути и отношения из докачанной выгрузки — к своим; рамка — своя.
+fn parse_into(osm: &mut Osm, xml: &str) -> Result<Option<[Option<f64>; 4]>, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| format!("не читается как OSM: {e}"))?;
     let root = doc.root_element();
     if root.tag_name().name() != "osm" {
         return Err("это не выгрузка OpenStreetMap (.osm)".into());
     }
-    let mut osm = Osm { bounds: [f64::NAN; 4], nodes: HashMap::new(), ways: BTreeMap::new(), relations: BTreeMap::new() };
     let mut bounds = None;
     for n in root.children().filter(|n| n.is_element()) {
         match n.tag_name().name() {
@@ -109,18 +144,7 @@ fn parse(xml: &str) -> Result<Osm, String> {
             _ => {}
         }
     }
-    osm.bounds = match bounds {
-        Some([Some(s), Some(w), Some(n), Some(e)]) if n > s && e > w => [s, w, n, e],
-        _ => {
-            if osm.nodes.is_empty() {
-                return Err("в выгрузке нет ни одной точки".into());
-            }
-            let lat = osm.nodes.values().map(|n| n.lat);
-            let lon = osm.nodes.values().map(|n| n.lon);
-            [lat.clone().fold(f64::MAX, f64::min), lon.clone().fold(f64::MAX, f64::min), lat.fold(f64::MIN, f64::max), lon.fold(f64::MIN, f64::max)]
-        }
-    };
-    Ok(osm)
+    Ok(bounds)
 }
 
 fn get<'a>(t: &'a Tags, k: &str) -> &'a str {
@@ -240,15 +264,18 @@ fn ground(t: &Tags, sea: bool) -> Option<(&'static str, u8)> {
     if natural == "wetland" {
         return Some(("swamp", 3));
     }
+    // Пляж и скала — поверх воды: в OSM пляж лежит по обе стороны линии берега
+    // (половина — приливная полоса), причал начинается от его внешнего края, и
+    // море, закрывшее эту половину, оставляло причал висеть в воде.
     if matches!(natural, "bare_rock" | "scree" | "stone") {
-        return Some(("rocky_ground", 3));
+        return Some((rock_kind(t).0, 5));
     }
     let surface = get(t, "surface");
     if natural == "shingle" || (natural == "beach" && (matches!(surface, "gravel" | "pebblestone" | "shingle" | "stone") || (surface.is_empty() && !sea))) {
-        return Some(("shingle", 3));
+        return Some(("shingle", 5));
     }
     if matches!(natural, "sand" | "beach" | "dune") {
-        return Some(("sand", 3));
+        return Some(("sand", 5));
     }
     if matches!(landuse, "grass" | "meadow" | "village_green" | "recreation_ground" | "cemetery" | "allotments" | "flowerbed" | "orchard")
         || matches!(leisure, "park" | "garden" | "pitch" | "playground" | "common" | "dog_park")
@@ -269,11 +296,42 @@ fn ground(t: &Tags, sea: bool) -> Option<(&'static str, u8)> {
     if get(t, "railway") == "platform" || (get(t, "highway") == "pedestrian" && get(t, "area") == "yes") || get(t, "place") == "square" || t.contains_key("area:highway") {
         return Some(("stone_tiles", 5));
     }
+    if get(t, "man_made") == "pier" {
+        return Some(("wood_planks", 6));
+    }
     None
+}
+
+/// Порода голого камня по тегам `rock`, `geological`, `surface`: слот пола и тон
+/// камней FA (`Boulder_Stone_Earthy`, `_Slate`…). Прежний `rocky_ground` брал любую
+/// породу на карту, вплоть до красной. Без тега — светлая: на снимке освещённая
+/// скала почти всегда светлее травы (мел Лулворта, известняк Малхема), а
+/// «землистая» `C` на карте вышла тёмно-серой.
+fn rock_kind(t: &Tags) -> (&'static str, &'static str) {
+    let v = format!("{};{};{}", get(t, "rock"), get(t, "geological"), get(t, "surface")).to_lowercase();
+    let has = |w: &[&str]| w.iter().any(|w| v.contains(w));
+    if has(&["chalk", "limestone", "marl", "dolomite", "marble"]) {
+        ("rock_chalk", "earthy")
+    } else if has(&["red_sandstone", "redrock", "red sandstone"]) {
+        ("rock_redrock", "redrock")
+    } else if has(&["sandstone", "gritstone"]) {
+        ("rock_sandstone", "sandstone")
+    } else if has(&["slate", "shale", "schist", "mudstone", "granite", "gneiss"]) {
+        ("rock_slate", "slate")
+    } else if has(&["basalt", "volcanic", "lava", "tuff", "obsidian", "andesite"]) {
+        ("rock_volcanic", "volcanic")
+    } else if has(&["earth", "conglomerate", "clay"]) {
+        ("rock_earthy", "earthy")
+    } else {
+        ("rock_chalk", "earthy")
+    }
 }
 
 /// Сколько клеток у берега глубокого водоёма мелководье.
 const WATER_EDGE: f32 = 2.0;
+
+/// За сколько клеток от мелководья море набирает полную глубину.
+const SEA_SHELF: f32 = 24.0;
 
 /// Шаг камней-переходов в клетках: человеку — шаг, фигурке — клетка.
 const STEPPING: f32 = 0.9;
@@ -295,6 +353,20 @@ fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area]) {
     let weights: Vec<(usize, f32)> = union.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, v)| (i, *v)).collect();
     if weights.is_empty() {
         return;
+    }
+    // Вода FA полупрозрачна: под морем — песчаное дно, иначе мелководье у берега
+    // бурое, как трава под водой, а на снимке там бирюза.
+    let mut shelf = vec![false; mw * mh];
+    let seas: Vec<&&Area> = parts.iter().filter(|a| get(a.tags, "water") == "sea").collect();
+    if !seas.is_empty() {
+        let sand = floors.get(m, "sand");
+        for a in seas {
+            let cov = coverage(&m.rooms, &a.rings, 0.0);
+            for &(i, v) in &cov {
+                shelf[i] |= v >= 0.5;
+            }
+            m.paint(Layer::Floor, sand, &cov);
+        }
     }
     let shallow = floors.get(m, "water_shallow");
     m.paint(Layer::Floor, shallow, &weights);
@@ -330,17 +402,219 @@ fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area]) {
     }
     let res = mask::RES as f32;
     let aa = 0.5 / res;
+    // У моря отмель широкая и глубина набирается плавно — на снимке бирюза у
+    // берега переходит в синеву десятками метров; у озера и реки край резкий.
     let deep: Vec<(usize, f32)> = dist
         .iter()
         .enumerate()
         .filter(|(_, d)| **d > 0)
-        .map(|(i, &d)| (i, (0.5 + ((d.min(far) as f32 / 3.0 / res) - WATER_EDGE) / (2.0 * aa)).clamp(0.0, 1.0)))
+        .map(|(i, &d)| {
+            let cells = d.min(far) as f32 / 3.0 / res;
+            let v = if shelf[i] { ((cells - WATER_EDGE) / SEA_SHELF).clamp(0.0, 1.0).powf(0.8) } else { 0.5 + (cells - WATER_EDGE) / (2.0 * aa) };
+            (i, v.clamp(0.0, 1.0))
+        })
         .filter(|(_, v)| *v > 0.0)
         .collect();
     if !deep.is_empty() {
         let t = floors.get(m, "water_deep");
         m.paint(Layer::Floor, t, &deep);
     }
+}
+
+/// Запас рамки моря за краем карты в клетках: изгиб природного контура рамку
+/// внутрь карты не заводит.
+const SEA_FRAME: f32 = 3.0;
+
+/// Море — кольца в клетках. Площадью моря в OSM нет: есть линия берега
+/// `natural=coastline`, суша слева по ходу, вода справа (на карте, где y вниз, —
+/// слева по формуле). Линия режется рамкой карты с запасом, а море замыкается
+/// вдоль рамки по часовой стрелке на экране до следующего входа линии в рамку.
+/// Острова целиком в рамке — дыры (кольца чётно-нечётно). Конец линии внутри
+/// рамки — выгрузка обрезала путь — продлевается по ходу до рамки. Линии в
+/// рамке нет — море или суша по стороне ближайшего отрезка от середины карты.
+fn sea_rings(osm: &Osm, proj: &Proj, w: f32, h: f32) -> Vec<Vec<[f32; 2]>> {
+    let coast: Vec<&Way> = osm.ways.values().filter(|w| get(&w.tags, "natural") == "coastline" && w.nodes.len() >= 2).collect();
+    if coast.is_empty() {
+        return Vec::new();
+    }
+    // Цепочки: конец пути — начало следующего; сначала от голов, потом кольца.
+    let starts: HashMap<i64, usize> = coast.iter().enumerate().map(|(k, w)| (w.nodes[0], k)).collect();
+    let ends: BTreeSet<i64> = coast.iter().filter_map(|w| w.nodes.last().copied()).collect();
+    let mut used = vec![false; coast.len()];
+    let mut chains: Vec<(Vec<[f32; 2]>, bool)> = Vec::new();
+    let heads: Vec<usize> = (0..coast.len()).filter(|&k| !ends.contains(&coast[k].nodes[0])).chain(0..coast.len()).collect();
+    for k0 in heads {
+        if used[k0] {
+            continue;
+        }
+        used[k0] = true;
+        let mut ids = coast[k0].nodes.clone();
+        let closed = loop {
+            let end = ids[ids.len() - 1];
+            if end == ids[0] {
+                break true;
+            }
+            match starts.get(&end) {
+                Some(&k) if !used[k] => {
+                    used[k] = true;
+                    ids.extend_from_slice(&coast[k].nodes[1..]);
+                }
+                _ => break false,
+            }
+        };
+        let mut pts: Vec<[f32; 2]> = ids.iter().filter_map(|id| osm.nodes.get(id)).map(|n| proj.at(n.lat, n.lon)).collect();
+        pts.dedup();
+        if closed && pts.len() > 1 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        if pts.len() >= 2 {
+            chains.push((pts, closed));
+        }
+    }
+    let m = SEA_FRAME;
+    let (x0, y0, x1, y1) = (-m, -m, w + m, h + m);
+    let in_frame = |p: [f32; 2]| p[0] > x0 && p[0] < x1 && p[1] > y0 && p[1] < y1;
+    let lerp = |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    // Отрезок против рамки (Лян — Барски): доли входа и выхода.
+    let clip = |a: [f32; 2], b: [f32; 2]| -> Option<(f32, f32)> {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for (p, q) in [(-dx, a[0] - x0), (dx, x1 - a[0]), (-dy, a[1] - y0), (dy, y1 - a[1])] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return None;
+                }
+                continue;
+            }
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+        (t0 < t1).then_some((t0, t1))
+    };
+    // Луч из точки внутри рамки до рамки.
+    let ray = |p: [f32; 2], d: [f32; 2]| {
+        let mut t = f32::INFINITY;
+        for (c, lo, hi) in [(0, x0, x1), (1, y0, y1)] {
+            if d[c] > 1e-9 {
+                t = t.min((hi - p[c]) / d[c]);
+            } else if d[c] < -1e-9 {
+                t = t.min((lo - p[c]) / d[c]);
+            }
+        }
+        if t.is_finite() { [p[0] + d[0] * t, p[1] + d[1] * t] } else { [x0, p[1]] }
+    };
+    let mut pieces: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut islands: Vec<Vec<[f32; 2]>> = Vec::new();
+    for (pts, closed) in &chains {
+        let pts = if *closed {
+            // Кольцо — с точки за рамкой, чтобы кусок в рамке не рвался на старте.
+            match pts.iter().position(|&p| !in_frame(p)) {
+                None => {
+                    islands.push(pts.clone());
+                    continue;
+                }
+                Some(k) => pts[k..].iter().chain(&pts[..=k]).copied().collect::<Vec<_>>(),
+            }
+        } else {
+            pts.clone()
+        };
+        let mut cur: Option<Vec<[f32; 2]>> = in_frame(pts[0]).then(|| vec![ray(pts[0], [pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]]), pts[0]]);
+        for s in pts.windows(2) {
+            let Some((t0, t1)) = clip(s[0], s[1]) else { continue };
+            let c = cur.get_or_insert_with(|| vec![lerp(s[0], s[1], t0)]);
+            if t1 < 1.0 {
+                c.push(lerp(s[0], s[1], t1));
+                pieces.extend(cur.take());
+            } else {
+                c.push(s[1]);
+            }
+        }
+        if let Some(mut c) = cur {
+            let n = c.len();
+            c.push(ray(c[n - 1], [c[n - 1][0] - c[n - 2][0], c[n - 1][1] - c[n - 2][1]]));
+            pieces.push(c);
+        }
+    }
+    // Место на рамке: путь по часовой стрелке от левого верхнего угла.
+    let (fw, fh) = (x1 - x0, y1 - y0);
+    let per = 2.0 * (fw + fh);
+    let at = |p: [f32; 2]| {
+        let d = [(p[1] - y0).abs(), (x1 - p[0]).abs(), (y1 - p[1]).abs(), (p[0] - x0).abs()];
+        match (0..4).min_by(|&i, &j| d[i].total_cmp(&d[j])).unwrap_or(0) {
+            0 => (p[0] - x0).clamp(0.0, fw),
+            1 => fw + (p[1] - y0).clamp(0.0, fh),
+            2 => fw + fh + (x1 - p[0]).clamp(0.0, fw),
+            _ => 2.0 * fw + fh + (y1 - p[1]).clamp(0.0, fh),
+        }
+    };
+    let corners = [(fw, [x1, y0]), (fw + fh, [x1, y1]), (2.0 * fw + fh, [x0, y1]), (per, [x0, y0])];
+    let mut rings = Vec::new();
+    if !pieces.is_empty() {
+        let entries: Vec<f32> = pieces.iter().map(|p| at(p[0])).collect();
+        let exits: Vec<f32> = pieces.iter().map(|p| at(p[p.len() - 1])).collect();
+        let mut done = vec![false; pieces.len()];
+        for first in 0..pieces.len() {
+            if done[first] {
+                continue;
+            }
+            let mut ring = Vec::new();
+            let mut k = first;
+            for _ in 0..pieces.len() {
+                done[k] = true;
+                ring.extend_from_slice(&pieces[k]);
+                let from = exits[k];
+                let ahead = |i: usize| (entries[i] - from).rem_euclid(per);
+                let next = (0..pieces.len()).min_by(|&i, &j| ahead(i).total_cmp(&ahead(j))).unwrap_or(first);
+                // Углы рамки между выходом и следующим входом.
+                let to = from + ahead(next);
+                for lap in [0.0, per] {
+                    for &(s, c) in &corners {
+                        if s + lap > from && s + lap < to {
+                            ring.push(c);
+                        }
+                    }
+                }
+                if next == first || done[next] {
+                    break;
+                }
+                k = next;
+            }
+            if ring.len() >= 3 {
+                rings.push(ring);
+            }
+        }
+    } else {
+        // Ни один кусок не входит в рамку: вся карта — море, если середина со
+        // стороны воды (острова — дыры), иначе суша.
+        let c = [w / 2.0, h / 2.0];
+        let (mut best, mut side) = (f32::INFINITY, 0.0f32);
+        for (pts, closed) in &chains {
+            let n = pts.len();
+            for k in 0..if *closed { n } else { n - 1 } {
+                let (a, b) = (pts[k], pts[(k + 1) % n]);
+                let d = segment_distance(c, a, b);
+                let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                let len = length(a, b).max(1e-6);
+                // У общей вершины двух отрезков решает тот, от чьей прямой точка дальше.
+                if d < best - 1e-4 || (d < best + 1e-4 && (cross / len).abs() > side.abs()) {
+                    best = best.min(d);
+                    side = cross / len;
+                }
+            }
+        }
+        if side > 0.0 {
+            rings.push(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+        }
+    }
+    if !islands.is_empty() && rings.is_empty() {
+        rings.push(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+    }
+    rings.extend(islands);
+    rings
 }
 
 /// Что растёт на площадном объекте: слот, шаг между посадками в клетках, масштаб
@@ -372,7 +646,9 @@ fn growth(t: &Tags) -> Option<Growth> {
         return Some(Growth { slots: &["tree_green"], spacing: 4.5, scale: (0.7, 0.9), share: 1.0, litter: false, rank: 1 });
     }
     if natural == "scrub" {
-        return Some(Growth { slots: &["bush_summer", "bush_summer", "bush_summer", "tree_green"], spacing: 2.2, scale: (0.7, 1.2), share: 0.8, litter: false, rank: 2 });
+        // Кустарник сверху — сплошной полог кустов и подроста (на снимке Лулворта
+        // не отличить от леса); редкие кусты на бурой траве выглядели пустошью.
+        return Some(Growth { slots: &["bush_summer", "bush_summer", "bush_summer", "tree_green", "tree_green"], spacing: 1.9, scale: (0.8, 1.4), share: 0.95, litter: false, rank: 2 });
     }
     if natural == "wetland" {
         return Some(Growth { slots: &["cattail", "cattail", "bush_summer"], spacing: 2.0, scale: (0.7, 1.1), share: 0.4, litter: false, rank: 3 });
@@ -380,9 +656,32 @@ fn growth(t: &Tags) -> Option<Growth> {
     if natural == "heath" {
         // Пустошь сверху — папоротник и вереск куртинами, кусты и редкие молодые деревья;
         // голая трава с камнями была пустой против снимка. Папоротник — только из паков.
-        return Some(Growth { slots: &["fern", "fern", "fern", "bush_summer", "bush_summer", "tree_green", "pine", "boulder"], spacing: 2.6, scale: (0.6, 1.0), share: 0.5, litter: false, rank: 4 });
+        // Деревьев мало: в OSM пустошь — кустарнички, вереск, папоротник, а пастбища
+        // Малхема с тем же тегом на снимке — открытая трава; деревья по всей пустоши
+        // делали из неё редколесье.
+        return Some(Growth {
+            slots: &["fern", "fern", "fern", "fern", "fern", "bush_summer", "bush_summer", "bush_summer", "tree_green", "boulder"],
+            spacing: 2.6,
+            scale: (0.6, 1.0),
+            share: 0.4,
+            litter: false,
+            rank: 4,
+        });
+    }
+    // Осыпь — россыпь камней, скала — редкие глыбы; порода по тегу `rock`. Старше
+    // пустоши и кустарника: скала внутри пастбища не зарастает кустами.
+    if natural == "scree" {
+        return Some(Growth { slots: &["boulder"], spacing: 2.4, scale: (0.3, 0.7), share: 0.5, litter: false, rank: 1 });
+    }
+    if matches!(natural, "bare_rock" | "stone") {
+        return Some(Growth { slots: &["boulder"], spacing: 4.5, scale: (0.4, 0.9), share: 0.2, litter: false, rank: 1 });
     }
     None
+}
+
+/// Голый камень: скала, осыпь, камни.
+fn growth_rock(t: &Tags) -> bool {
+    matches!(get(t, "natural"), "bare_rock" | "scree" | "stone")
 }
 
 /// Рамка колец, обрезанная по карте; пустая — контур весь за краем.
@@ -747,7 +1046,7 @@ impl Floors {
             let k = mat(m, slot);
             // Трава, земля и вода лежат полями на сотни клеток: без перемешивания
             // плитки (как у встроенных) по лугу идёт узор повтора.
-            if matches!(slot, "grass_green" | "grass_dry" | "meadow" | "rough_grass" | "dirt" | "gravel" | "shingle" | "path_gravel" | "sand" | "mud" | "forest_floor" | "swamp" | "rocky_ground" | "water_shallow" | "water_deep") {
+            if slot.starts_with("rock_") || matches!(slot, "grass_green" | "grass_dry" | "meadow" | "rough_grass" | "dirt" | "gravel" | "shingle" | "path_gravel" | "sand" | "mud" | "forest_floor" | "swamp" | "rocky_ground" | "water_shallow" | "water_deep") {
                 m.materials[k].vary = true;
             }
             k
@@ -904,8 +1203,17 @@ struct House {
 /// Линия, которая ляжет дорогой: этаж, порядок и сами дороги снизу вверх.
 type Lane = (f32, u8, Vec<Path>);
 
+#[cfg(test)]
 pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
-    let osm = parse(xml)?;
+    import_with(xml, &[], opt)
+}
+
+/// Карта из выгрузки и докачанных к ней контуров (`incomplete`); рамка — у выгрузки.
+pub fn import_with(xml: &str, extra: &[String], opt: Options) -> Result<(Map, Report), String> {
+    let mut osm = parse(xml)?;
+    for e in extra {
+        let _ = parse_into(&mut osm, e);
+    }
     let [south, west, north, east] = osm.bounds;
     let mid = ((south + north) / 2.0).to_radians();
     let (mx, my) = (111_320.0 * mid.cos(), 110_574.0);
@@ -916,16 +1224,31 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
         cell = wm.max(hm) / opt.max_cells as f32;
         warnings.push(format!("участок {:.0}×{:.0} м больше {} клеток по 5 футов: клетка {:.1} м", wm, hm, opt.max_cells, cell));
     }
+    // Природное, что так и не замкнулось (сети не было), — пропадает: сказать.
+    let lost: Vec<String> = osm
+        .relations
+        .values()
+        .filter(|r| get(&r.tags, "type") == "multipolygon" && !unseen(&r.tags) && (ground(&r.tags, false).is_some() || growth(&r.tags).is_some()))
+        .filter(|r| r.ways.iter().any(|w| !osm.ways.contains_key(w)))
+        .map(|r| match get(&r.tags, "name") {
+            "" => ["natural", "landuse", "leisure"].iter().map(|k| get(&r.tags, k)).find(|v| !v.is_empty()).unwrap_or("контур").to_owned(),
+            n => n.to_owned(),
+        })
+        .collect();
+    if !lost.is_empty() {
+        warnings.push(format!("неполные в выгрузке и пропущены: {}", lost.join(", ")));
+    }
     let (w, h) = (((wm / cell - 0.001).ceil() as u32).max(8), ((hm / cell - 0.001).ceil() as u32).max(8));
     let proj = Proj { north, west, kx: mx / cell as f64, ky: my / cell as f64 };
     let m_to_cells = |metres: f32| metres / cell;
     let mut m = Map::new(w, h);
+    let sea_tags: Tags = [("natural", "water"), ("water", "sea")].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
     let mut areas = areas(&osm, &proj);
     let sea = osm.ways.values().any(|w| get(&w.tags, "natural") == "coastline");
     let ground = |t: &Tags| ground(t, sea);
     // Природные контуры — с изгибом; дома, мощёное и пути остаются по линейке.
     // Узлы, общие для нескольких природных контуров, не срезаются.
-    let natural: Vec<bool> = areas.iter().map(|a| building(a.tags).is_none() && (growth(a.tags).is_some() || matches!(ground(a.tags), Some((t, _)) if !matches!(t, "stone_tiles" | "gravel" | "dirt")))).collect();
+    let natural: Vec<bool> = areas.iter().map(|a| building(a.tags).is_none() && (growth(a.tags).is_some() || matches!(ground(a.tags), Some((t, _)) if !matches!(t, "stone_tiles" | "gravel" | "dirt" | "wood_planks")))).collect();
     let mut uses: HashMap<i64, u32> = HashMap::new();
     for a in areas.iter().zip(&natural).filter(|(_, n)| **n).map(|(a, _)| a) {
         for ring in &a.nodes {
@@ -951,6 +1274,12 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
             })
             .collect();
     }
+    // Море по линии берега — обычной водой, с тем же изгибом берега.
+    let sea_rings = sea_rings(&osm, &proj, w as f32, h as f32);
+    if !sea_rings.is_empty() {
+        let rings = sea_rings.iter().map(|r| natural_outline(r, &vec![false; r.len()])).collect();
+        areas.push(Area { rings, nodes: Vec::new(), tags: &sea_tags });
+    }
     // Город или природа — по доле застройки: от этого зависят пол под всем,
     // дорожки без тега покрытия и стены-ограды.
     // Застройка — только та, что на карте: в выгрузке дома и за её краем.
@@ -969,6 +1298,7 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
     grounds.sort();
     let waters: Vec<usize> = grounds.iter().map(|g| g.1).filter(|&k| matches!(ground(areas[k].tags), Some(("water_deep", _)))).collect();
     let mut water_done = false;
+    let mut rock_mats: Vec<usize> = Vec::new();
     for (_, k) in grounds {
         let (tex, _) = ground(areas[k].tags).unwrap_or(("flagstones", 0));
         if tex == "water_deep" {
@@ -980,8 +1310,17 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
         }
         let weights = coverage(&m.rooms, &areas[k].rings, 0.0);
         if !weights.is_empty() {
+            // Бассейн и фонтан — на плитке: вода FA полупрозрачна, по траве
+            // бассейн выходил тёмной кляксой.
+            if tex == "water_shallow" {
+                let tiles = floors.get(&mut m, "stone_tiles");
+                m.paint(Layer::Floor, tiles, &weights);
+            }
             let t = floors.get(&mut m, tex);
             m.paint(Layer::Floor, t, &weights);
+            if tex.starts_with("rock_") && !rock_mats.contains(&t) {
+                rock_mats.push(t);
+            }
         }
     }
     if rural {
@@ -1000,6 +1339,10 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
                 .collect()
         };
         let (on_meadow, on_rough) = (only(&m, meadow), only(&m, rough));
+        // Голый камень — с травой в трещинах и на уступах: на снимке мел и сланец
+        // местами заросли, сплошная серая заливка выглядела асфальтом.
+        let on_rock: Vec<bool> = rock_mats.iter().map(|&r| only(&m, r)).fold(vec![false; (w * h) as usize], |acc, v| acc.iter().zip(v).map(|(a, b)| *a || b).collect());
+        let mut to_grass = Vec::new();
         let res = mask::RES as f32;
         let (mw, mh) = (m.rooms.w, m.rooms.h);
         let (mut to_rough, mut to_meadow) = (Vec::new(), Vec::new());
@@ -1008,14 +1351,24 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
                 let p = [(i as f32 + 0.5) / res, (j as f32 + 0.5) / res];
                 let cell = (p[1] as usize).min(h as usize - 1) * w as usize + (p[0] as usize).min(w as usize - 1);
                 let k = j * mw + i;
-                if on_meadow[cell] {
-                    let n = noise(p, 13.0, 21) * 0.7 + noise(p, 4.5, 22) * 0.3;
+                if on_rock[cell] {
+                    // Пятна не мельче нескольких клеток: в клетку-две они упирались
+                    // в шаг маски (4 точки на клетку) и выходили квадратными кляксами.
+                    let n = noise(p, 10.0, 25) * 0.72 + noise(p, 3.8, 26) * 0.2 + noise(p, 1.3, 29) * 0.08;
+                    let v = ((n - 0.18) / 0.32).clamp(0.0, 1.0) * 0.85;
+                    if v > 0.0 {
+                        to_grass.push((k, v));
+                    }
+                } else if on_meadow[cell] {
+                    // Мелкая октава в клетку — край пятна рваный, как у травы, а не
+                    // ломаный по отрезкам сетки шума.
+                    let n = noise(p, 13.0, 21) * 0.62 + noise(p, 4.5, 22) * 0.26 + noise(p, 1.2, 27) * 0.12;
                     let v = ((n - 0.2) / 0.3).clamp(0.0, 1.0) * 0.65;
                     if v > 0.0 {
                         to_rough.push((k, v));
                     }
                 } else if on_rough[cell] {
-                    let n = noise(p, 9.0, 23) * 0.7 + noise(p, 3.5, 24) * 0.3;
+                    let n = noise(p, 9.0, 23) * 0.62 + noise(p, 3.5, 24) * 0.26 + noise(p, 1.2, 28) * 0.12;
                     let v = ((n - 0.15) / 0.3).clamp(0.0, 1.0) * 0.6;
                     if v > 0.0 {
                         to_meadow.push((k, v));
@@ -1025,6 +1378,7 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
         }
         m.paint(Layer::Floor, rough, &to_rough);
         m.paint(Layer::Floor, meadow, &to_meadow);
+        m.paint(Layer::Floor, meadow, &to_grass);
     }
 
     // Дома: комнаты по контуру.
@@ -1154,6 +1508,14 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
                 {
                     street_names.insert(name.to_owned(), (a, b, m_to_cells(metres)));
                 }
+            } else if get(t, "man_made") == "pier" && !closed {
+                // Причал линией — дощатый настил вдоль, с подложкой, как у мостков.
+                let width = m_to_cells(width_tag(t).unwrap_or(3.0)).max(1.0);
+                let planks = floors.get(&mut m, "wood_planks");
+                let mut deck = path(planks, width, 0.0, 0.0);
+                deck.along = true;
+                lanes.push((lay.max(1.0), 3, vec![path(deck_base, width, 0.0, 0.0), deck]));
+                walks.push(line.clone());
             } else if get(t, "railway") == "platform" && !closed {
                 let tiles = floors.get(&mut m, "stone_tiles");
                 lanes.push((lay, 2, vec![path(tiles, m_to_cells(width_tag(t).unwrap_or(4.0)), 0.05, 0.0)]));
@@ -1265,6 +1627,11 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
                 0.35
             } else if g.litter {
                 g.share
+            } else if g.rank >= 3 && g.rank <= 4 {
+                // Пустошь и болото — куртинами между открытыми местами: ровный
+                // «горох» кустов по всей пустоши против снимка выглядел узором.
+                let c = ((noise(q, 11.0, 9) + 0.1) / 0.45).clamp(0.0, 1.0);
+                (g.share * 1.9 * (c * c * (3.0 - 2.0 * c)) as f64).clamp(0.0, 0.95)
             } else {
                 (g.share * (1.0 + 0.8 * noise(q, 10.0, 9) as f64)).clamp(0.0, 1.0)
             };
@@ -1280,7 +1647,14 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
                 continue;
             }
             let scale = g.scale.0 + rng.random() as f32 * (g.scale.1 - g.scale.0);
-            drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
+            if slot == "boulder" {
+                // Камни одной породы: вперемешку с синими и рудными выходила пёстрая
+                // галька. На пустоши — мшистые, на скале и осыпи — по тегу `rock`.
+                let tone = if growth_rock(a.tags) { rock_kind(a.tags).1 } else { "mossy" };
+                drop_pick(&mut m, &asset_toned("boulder", tone), q, rng.int(0, 359) as f32, scale);
+            } else {
+                drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
+            }
             // Папоротник ложится в картинку карты, тайла у него нет — в предел не идёт.
             if !slot.starts_with("fern") {
                 planted += 1;
@@ -1334,7 +1708,7 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
     // Только из паков: встроенных нет. На реке их сносит течением.
     if !missing("lilypad") {
         let mut rng = Rng::new("osm/lily");
-        for a in areas.iter().filter(|a| get(a.tags, "natural") == "water" && !matches!(get(a.tags, "water"), "river" | "canal" | "stream" | "lock" | "wastewater" | "fountain")) {
+        for a in areas.iter().filter(|a| get(a.tags, "natural") == "water" && !matches!(get(a.tags, "water"), "river" | "canal" | "stream" | "lock" | "wastewater" | "fountain" | "sea" | "bay" | "lagoon")) {
             let Some((lo, hi)) = clipped_box(&a.rings, w as f32, h as f32) else { continue };
             let edge = |p: [f32; 2]| a.rings.iter().flat_map(|r| (0..r.len()).map(move |k| (r[k], r[(k + 1) % r.len()]))).map(|(u, v)| segment_distance(p, u, v)).fold(f32::INFINITY, f32::min);
             let cells = (hi[0] - lo[0]) * (hi[1] - lo[1]);
@@ -1379,11 +1753,13 @@ pub fn import(xml: &str, opt: Options) -> Result<(Map, Report), String> {
     // Камни по точкам.
     let mut rocks: Vec<(i64, [f32; 2])> = osm.nodes.iter().filter(|(_, n)| matches!(get(&n.tags, "natural"), "rock" | "stone") && !unseen(&n.tags)).map(|(id, n)| (*id, proj.at(n.lat, n.lon))).collect();
     rocks.sort_by_key(|r| r.0);
+    // Порода камней — как у скал на карте.
+    let tone = areas.iter().find(|a| growth_rock(a.tags)).map_or("earthy", |a| rock_kind(a.tags).1);
     for (id, p) in rocks {
         if m.contains(p[0].floor() as i32, p[1].floor() as i32) {
             let mut rng = Rng::new(&format!("osm/rock/{id}"));
             let scale = 1.0 + rng.random() as f32 * 0.6;
-            drop(&mut m, "boulder", p, rng.int(0, 359) as f32, scale);
+            drop_pick(&mut m, &asset_toned("boulder", tone), p, rng.int(0, 359) as f32, scale);
         }
     }
 
@@ -1735,6 +2111,93 @@ mod tests {
         assert!(floor.contains("gravel"), "речной пляж — галька: {floor}");
     }
 
+    /// Берег моря из двух путей с запада на восток (суша слева — на севере) и остров
+    /// в море (кольцо против часовой — суша внутри). Моря площадью нет.
+    const COAST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+ <node id="61" lat="51.53025" lon="-0.1253"/>
+ <node id="62" lat="51.53025" lon="-0.12455"/>
+ <node id="63" lat="51.53022" lon="-0.1238"/>
+ <way id="60"><nd ref="61"/><nd ref="62"/><tag k="natural" v="coastline"/></way>
+ <way id="64"><nd ref="62"/><nd ref="63"/><tag k="natural" v="coastline"/></way>
+ <node id="71" lat="51.53005" lon="-0.1247"/>
+ <node id="72" lat="51.53005" lon="-0.1245"/>
+ <node id="73" lat="51.53013" lon="-0.1245"/>
+ <node id="74" lat="51.53013" lon="-0.1247"/>
+ <way id="70"><nd ref="71"/><nd ref="72"/><nd ref="73"/><nd ref="74"/><nd ref="71"/><tag k="natural" v="coastline"/></way>
+ <node id="81" lat="51.53027" lon="-0.1243"/>
+ <node id="82" lat="51.53016" lon="-0.1243"/>
+ <way id="80"><nd ref="81"/><nd ref="82"/><tag k="man_made" v="pier"/></way>
+</osm>"#;
+
+    #[test]
+    fn sea_from_coastline_with_island_and_cut_line() {
+        let floor = |m: &Map, x: i32, y: i32| match m.floor_at(x, y) {
+            0 => String::new(),
+            k => match &m.materials[k as usize - 1].paint {
+                Paint::Texture(t) => t.clone(),
+                Paint::Color(_) => "color".into(),
+            },
+        };
+        let (m, _) = import(COAST, Options::default()).unwrap();
+        // Берег около y = 10,9; остров — 13,6–22,7 × 19,6–25,4 клетки.
+        for (x, y) in [(3, 3), (20, 5), (38, 4), (18, 22)] {
+            assert!(floor(&m, x, y).contains("grass"), "суша ({x}, {y}): {}", floor(&m, x, y));
+        }
+        for (x, y) in [(3, 20), (30, 15), (38, 27), (18, 15), (8, 27)] {
+            assert!(floor(&m, x, y).contains("water"), "море ({x}, {y}): {}", floor(&m, x, y));
+        }
+        // У берега мелко, глубина набирается плавно — на 15 клетках уже есть, но не вся.
+        assert!(floor(&m, 3, 13).contains("water_shallow"), "у берега мелко: {}", floor(&m, 3, 13));
+        let deep = m.materials.iter().position(|t| matches!(&t.paint, Paint::Texture(t) if t.contains("water_deep"))).expect("глубины нет");
+        let depth = |x: f32, y: f32| m.terrain.iter().filter(|l| l.material as usize == deep).map(|l| l.mask.get((x * mask::RES as f32) as isize, (y * mask::RES as f32) as isize)).max().unwrap_or(0);
+        assert!(depth(3.0, 13.0) < depth(3.0, 20.0) && depth(3.0, 20.0) < depth(3.0, 27.0) && depth(3.0, 27.0) < 255, "{} {} {}", depth(3.0, 13.0), depth(3.0, 20.0), depth(3.0, 27.0));
+        // Под полупрозрачной водой моря — песчаное дно; причал — доски вдоль.
+        assert!(m.materials.iter().any(|t| matches!(&t.paint, Paint::Texture(t) if t.contains("sand"))), "дна нет");
+        assert!(m.paths.iter().any(|p| p.along && matches!(&m.materials[p.material].paint, Paint::Texture(t) if t.contains("plank"))), "причала нет");
+        // В море ничего не растёт.
+        let wet = |p: [f32; 2]| p[1] > 12.5 && !((13.0..23.5).contains(&p[0]) && (19.0..26.0).contains(&p[1]));
+        assert!(m.props.iter().all(|q| !wet(q.pos)), "{:?}", m.props.iter().filter(|q| wet(q.pos)).map(|q| (&q.asset, q.pos)).collect::<Vec<_>>());
+        // Выгрузка оборвала берег посреди карты — линия продлевается по ходу до края.
+        let cut = COAST.replace(r#"<way id="64"><nd ref="62"/><nd ref="63"/><tag k="natural" v="coastline"/></way>"#, "");
+        let (m, _) = import(&cut, Options::default()).unwrap();
+        assert!(floor(&m, 35, 20).contains("water"), "{}", floor(&m, 35, 20));
+        assert!(floor(&m, 35, 4).contains("grass"), "{}", floor(&m, 35, 4));
+    }
+
+    /// Лес-мультиполигон из двух путей; в выгрузке только первый — второй за краем.
+    const PART_WOOD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+ <node id="1" lat="51.53005" lon="-0.1249"/>
+ <node id="2" lat="51.53005" lon="-0.1243"/>
+ <node id="3" lat="51.53035" lon="-0.1243"/>
+ <way id="901"><nd ref="1"/><nd ref="2"/><nd ref="3"/></way>
+ <relation id="900"><member type="way" ref="901" role="outer"/><member type="way" ref="902" role="outer"/><tag k="type" v="multipolygon"/><tag k="natural" v="wood"/><tag k="name" v="Half Wood"/></relation>
+</osm>"#;
+
+    const PART_WOOD_REST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <node id="1" lat="51.53005" lon="-0.1249"/>
+ <node id="3" lat="51.53035" lon="-0.1243"/>
+ <node id="4" lat="51.53035" lon="-0.1249"/>
+ <way id="902"><nd ref="3"/><nd ref="4"/><nd ref="1"/></way>
+ <relation id="900"><member type="way" ref="901" role="outer"/><member type="way" ref="902" role="outer"/><tag k="type" v="multipolygon"/><tag k="natural" v="wood"/><tag k="name" v="Half Wood"/></relation>
+</osm>"#;
+
+    #[test]
+    fn incomplete_wood_is_reported_and_fetched_rest_completes_it() {
+        assert_eq!(incomplete(PART_WOOD), vec![900]);
+        let trees = |m: &Map| m.props.iter().filter(|q| q.asset.contains("tree")).count();
+        let (m, r) = import_with(PART_WOOD, &[], Options::default()).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("Half Wood")), "{:?}", r.warnings);
+        assert!(trees(&m) <= 4, "без второй половины леса нет: {}", trees(&m));
+        let (m, r) = import_with(PART_WOOD, &[PART_WOOD_REST.to_owned()], Options::default()).unwrap();
+        assert!(!r.warnings.iter().any(|w| w.contains("неполные")), "{:?}", r.warnings);
+        assert!(trees(&m) >= 15, "докачанный лес засажен: {}", trees(&m));
+    }
+
     /// Река из двух кусков с общим краем уходит за края карты; через неё пешеходный мост.
     const RIVER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <osm version="0.6">
@@ -1840,6 +2303,22 @@ mod tests {
         let stem = std::path::Path::new(&path).with_extension("");
         std::fs::write(stem.with_extension("karta"), m.to_json()).unwrap();
         preview(&m, 4).save(format!("{}_preview.png", stem.display())).unwrap();
+    }
+
+    /// Все пути ассетов из паков настроек в файл: `DUMP_KEYS=путь cargo test fa_keys -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fa_keys() {
+        let Ok(out) = std::env::var("DUMP_KEYS") else { return };
+        let settings = std::path::PathBuf::from(std::env::var("APPDATA").unwrap()).join("Kartograf/settings.json");
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(settings).unwrap()).unwrap();
+        let mut lines = Vec::new();
+        for p in s["packs"].as_array().unwrap() {
+            if let Ok(pack) = crate::pck::read_index(std::path::Path::new(p.as_str().unwrap())) {
+                lines.extend(pack.entries.iter().map(|e| format!("{}\t{}", pack.name, e.path)));
+            }
+        }
+        std::fs::write(out, lines.join("\n")).unwrap();
     }
 
     /// Что подбор берёт в слоты из всех паков настроек (полы тоже):

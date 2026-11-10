@@ -71,6 +71,15 @@ const FLOORS: &[Slot] = &[
     ("forest_floor", &[&["forest", "floor"], &["leaves"], &["подстилка"]], &[]),
     ("moss", &[&["moss"], &["мох"]], &["stone", "flagstone", "wall"]),
     ("rocky_ground", &[&["rock"], &["rocky"], &["stone", "ground"], &["камни"]], &["wall", "lava"]),
+    // Голый камень местности из OSM по породе. У FA `Ground_Rock_*` варианты `A`, `B`
+    // в тёмных швах — сверху мостовая; природный камень — `C`. Мел — светлый
+    // `Desert_Rock_Ground_Chalk` `C`–`E`.
+    ("rock_chalk", &[&["desert", "rock", "ground", "chalk", "c"], &["desert", "rock", "ground", "chalk", "d"], &["desert", "rock", "ground", "chalk", "e"]], &[]),
+    ("rock_earthy", &[&["ground", "rock", "earthy", "c"]], &[]),
+    ("rock_slate", &[&["ground", "rock", "slate", "c"]], &[]),
+    ("rock_sandstone", &[&["ground", "rock", "sandstone", "c"]], &[]),
+    ("rock_redrock", &[&["ground", "rock", "redrock", "c"]], &[]),
+    ("rock_volcanic", &[&["ground", "rock", "volcanic", "c"]], &[]),
     ("ash", &[&["ash"], &["пепел"]], &["tree"]),
     ("lava", &[&["lava"], &["magma"], &["лава"]], &[]),
     ("dungeon_flagstones", &[&["dungeon"], &["flagstone", "dark"], &["подземелье"]], &["moss"]),
@@ -227,7 +236,8 @@ const OBJECTS: &[Slot] = &[
     ("chest_open", &[&["chest", "open"], &["сундук", "открытый"]], &["empty"]),
     ("chest_empty", &[&["chest", "empty"], &["сундук", "пустой"]], &[]),
     // Бочки с надписью «TNT» — не для таверны и не для улицы.
-    ("barrel", &[&["barrel"], &["бочка"]], &["broken", "tnt"]),
+    // Открытая бочка с водой — свой слот `water_barrel`, в погреб она не годится.
+    ("barrel", &[&["barrel"], &["бочка"]], &["broken", "tnt", "water"]),
     ("crate", &[&["crate"], &["ящик"]], &["broken", "flower", "planter"]),
     ("sacks", &[&["sack"], &["sacks"], &["bag"], &["мешки"], &["мешок"]], &["sleeping"]),
     ("rug", &[&["rug"], &["carpet"], &["ковёр"], &["ковер"]], &["round", "круглый"]),
@@ -285,7 +295,8 @@ const OBJECTS: &[Slot] = &[
     ("statue", &[&["statue"], &["статуя"]], &["broken"]),
     ("pillar", &[&["pillar"], &["column"], &["колонна"]], &["broken", "ruined"]),
     ("rubble", &[&["rubble", "pile"], &["rubble"], &["debris"], &["обломки"]], &["wall"]),
-    ("boulder", &[&["boulder"], &["rock"], &["валун"]], &["wall", "ground", "floor", "small"]),
+    // Рудные камни FA (`Rock_Stone_*_Ore_Silver`) — не валуны: в поле выходили синей галькой.
+    ("boulder", &[&["boulder"], &["rock"], &["валун"]], &["wall", "ground", "floor", "small", "ore"]),
     ("well", &[&["well"], &["колодец"]], &[]),
     ("plant_pot", &[&["plant", "pot"], &["potted"], &["plant"], &["растение"]], &["wall"]),
     ("bush", &[&["bush"], &["shrub"], &["куст"]], &["berry", "dead"]),
@@ -335,7 +346,8 @@ const OBJECTS: &[Slot] = &[
     ("shelf_full", &[&["shelf", "filled"], &["shelf", "arrangement"], &["cupboard", "arrangement"]], &["corner"]),
     ("storage_pile", &[&["storage", "arrangement"]], &[]),
     ("hay", &[&["hay", "bale"]], &["bundle"]),
-    ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &[]),
+    // Снежная — свой слот `firewood_snowy`, летом её быть не должно.
+    ("firewood_pile", &[&["firewood", "pile"], &["firewood", "log", "pile"]], &["snowy", "frosty"]),
     ("trough", &[&["trough", "wood"]], &["wine"]),
     // Квартал: горн кузни, печь пекарни, нужник во дворе, бельё на верёвке.
     ("forge", &[&["forge", "lit"], &["forge"]], &["chimney", "tool", "accessor"]),
@@ -527,6 +539,12 @@ const NEAR: &[(&str, &str)] = &[
     ("rough_grass", "grass_dry"),
     ("shingle", "gravel"),
     ("path_gravel", "gravel"),
+    ("rock_chalk", "rocky_ground"),
+    ("rock_earthy", "rocky_ground"),
+    ("rock_slate", "rocky_ground"),
+    ("rock_sandstone", "rocky_ground"),
+    ("rock_redrock", "rocky_ground"),
+    ("rock_volcanic", "rocky_ground"),
     ("street", "cobblestone"),
     ("bush_summer", "bush"),
     ("bush_spring", "bush"),
@@ -847,6 +865,31 @@ mod tests {
 
     fn asset(path: &str, kind: Kind) -> Asset {
         Asset::new(format!("pack:fa.dungeondraft_pack|textures/x/{path}"), &format!("FA/{path}"), kind)
+    }
+
+    /// Самопроверка своего набора: в какие слоты попадает каждый файл папки, кто в двух
+    /// слотах сразу и кто ни в одном. `OWN_DIR=папка cargo test own_slots -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn own_slots() {
+        let Ok(dir) = std::env::var("OWN_DIR") else { return };
+        let mut lib = library::Library::default();
+        lib.set_folder(std::path::Path::new(&dir));
+        let own: Vec<Asset> = lib.assets.iter().filter(|a| !a.is_builtin() && !a.key.starts_with(library::SET)).cloned().collect();
+        let pal = Palette::from_library(&own, Box::new(|_| None));
+        for a in &own {
+            let file = a.name.rsplit(['/', '\\']).next().unwrap_or(&a.name);
+            let mut found: Vec<&str> = Vec::new();
+            for table in [FLOORS, OBJECTS, WALLS, PORTALS] {
+                found.extend(table.iter().map(|s| s.0).filter(|slot| pal.keys(slot).contains(&a.key)));
+            }
+            let mark = match found.len() {
+                0 => "НИГДЕ ",
+                1 => "      ",
+                _ => "ДВА+  ",
+            };
+            println!("{mark}{file:48} {}", found.join(", "));
+        }
     }
 
     #[test]
