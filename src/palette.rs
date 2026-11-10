@@ -58,10 +58,16 @@ const FLOORS: &[Slot] = &[
     // пустыни Табернас (150, 149, 119) — светлая потрескавшаяся (167, 151, 118);
     // серый песок (179, 173, 161) на карте выходил сиреневым. Земля сухого
     // пастбища — бурая (104, 84, 60).
-    ("earth_pale", &[&["cracked", "dirt", "a", "06"]], &[]),
+    // Свои (сгенерированные, папка текстур): мергель и потрескавшаяся глина пустыни;
+    // нет своих — светлая потрескавшаяся FA.
+    ("earth_pale", &[&["marga"], &["tierra", "agrietada"]], &[]),
+    ("earth_pale_fa", &[&["cracked", "dirt", "a", "06"]], &[]),
+    // Выгоревшая трава сухого пастбища (Испания в августе): своя, а нет — сухая FA.
+    ("straw_grass", &[&["pasto", "seco"]], &[]),
     ("earth_dry", &[&["cracked", "dirt", "b", "02"], &["cracked", "dirt", "c", "02"], &["cracked", "dirt", "d", "02"]], &[]),
     // Летний лёд ледника серо-белый (168, 178, 160): белёсый лёд FA, не синий.
-    ("ice_glacier", &[&["ice", "c1"], &["ice", "c2"]], &["cave"]),
+    ("ice_glacier", &[&["hielo", "glaciar"]], &[]),
+    ("ice_pale", &[&["ice", "c1"], &["ice", "c2"]], &["cave"]),
     // Вода FA (`Water_Still_*`, `Water_Opaque_*`) — один рисунок в семи цветах по
     // номеру: 01 бирюза, 02 синяя, 03 голубая, 04 зелёная, 05 оливковая, 06 бурая,
     // 07 серая. Из любой брался то омут цвета ряски, то лужа. Мелководье — бирюза и
@@ -334,6 +340,11 @@ const OBJECTS: &[Slot] = &[
     ("pine", &[&["pine", "green"], &["сосна"]], &["dead", "stump", "fallen", "log", "shadow"]),
     // Ель — звездой сверху, мельче сосны: для хвойных крон уже 6 м.
     ("fir", &[&["fir", "green"], &["ель"]], &["dead", "stump", "fallen", "log", "shadow", "snow", "frosted", "christmas"]),
+    // Сухой юг (свои, сгенерированные): каменный дуб дехесы, олива, кусты —
+    // ракитник, эспарто, розмарин. Нет своих — лиственное и куст FA.
+    ("encina", &[&["encina"]], &[]),
+    ("olivo", &[&["olivo"]], &[]),
+    ("matorral", &[&["retama"], &["esparto"], &["romero"]], &[]),
     // Летнее лиственное без пестроты: у FA `Multicolor1` — с жёлтым и рыжим, рядом
     // со снимком лес выходил осенним.
     ("tree_green", &[&["tree", "green"]], &["dead", "stump", "fallen", "log", "palm", "shadow"]),
@@ -579,9 +590,15 @@ const NEAR: &[(&str, &str)] = &[
     ("moss", "grass_green"),
     ("forest_floor", "grass_green"),
     ("mud", "dirt"),
-    ("earth_pale", "dirt"),
+    ("earth_pale", "earth_pale_fa"),
+    ("earth_pale_fa", "dirt"),
     ("earth_dry", "dirt"),
-    ("ice_glacier", "ice"),
+    ("straw_grass", "dry_grass"),
+    ("ice_glacier", "ice_pale"),
+    ("ice_pale", "ice"),
+    ("encina", "tree_green"),
+    ("olivo", "tree_green"),
+    ("matorral", "bush_summer"),
     ("swamp_wet", "swamp"),
     ("ash", "dirt"),
     ("water_deep", "water_shallow"),

@@ -159,7 +159,7 @@ impl Cover {
     /// Основа сельского участка по снимку (биом, cover.py и photo.py): в Англии —
     /// луг; где голого больше 45 % при траве меньше 20 % (пустыня Табернас) —
     /// светлая сухая земля; где сухого и голого больше 45 % при траве меньше 30 %
-    /// (пастбище Трухильо) — сухая трава; где снега и льда больше 30 % — снег, а
+    /// (пастбище Трухильо) — выгоревшая трава; где снега и льда больше 30 % — снег, а
     /// у ледника OSM (`glacier`) — лёд: летом ледник серый, белый снег на нём
     /// выглядел зимой (Мер-де-Глас).
     fn base_floor(&self, glacier: bool) -> &'static str {
@@ -169,7 +169,7 @@ impl Cover {
         } else if f(Class::Earth) + f(Class::Rock) > 0.45 && f(Class::Grass) < 0.2 {
             "earth_pale"
         } else if f(Class::Dry) + f(Class::Brown) + f(Class::Earth) > 0.45 && f(Class::Grass) < 0.3 {
-            "dry_grass"
+            "straw_grass"
         } else {
             "meadow"
         }
@@ -282,15 +282,23 @@ struct Spot {
 
 /// Слот дерева со снимка: крона `r` клеток, порода по карте лесов (`conifer`),
 /// лес OSM под ним и место в очереди на хвойную. Карта лесов главнее тега OSM.
-fn crown_slot(r: f32, conifer: Option<bool>, wood: Option<&Growth>, queue: f32) -> &'static str {
+/// В сухом краю (`arid`) лиственное — каменный дуб, куст — сухой.
+fn crown_slot(r: f32, conifer: Option<bool>, wood: Option<&Growth>, queue: f32, arid: bool) -> &'static str {
     let needles = conifer.unwrap_or_else(|| wood.is_some_and(|g| queue < conifer_share(g)));
     if r < CROWN_BUSH {
-        "bush_summer"
+        if arid { "matorral" } else { "bush_summer" }
     } else if needles {
         conifer_slot(r)
+    } else if arid {
+        "encina"
     } else {
         "tree_green"
     }
+}
+
+/// Куст и папоротник в сухом краю — сухой куст.
+fn arid_slot(slot: &'static str, arid: bool) -> &'static str {
+    if arid && matches!(slot, "bush_summer" | "bush" | "fern") { "matorral" } else { slot }
 }
 
 /// Слот хвойной кроны радиуса `r` клеток: узкая — ель, широкая — сосна.
@@ -1740,6 +1748,9 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let mut floors = Floors::default();
     let glacier = areas.iter().any(|a| get(a.tags, "natural") == "glacier");
     let base_slot = if rural { hint.as_ref().map_or("meadow", |h| h.cover.base_floor(glacier)) } else { "flagstones" };
+    // Сухой юг по снимку: лиственное — каменный дуб, сад — оливы, куст — ракитник,
+    // эспарто, розмарин; папоротнику там не расти.
+    let arid = matches!(base_slot, "earth_pale" | "straw_grass");
     let base = floors.get(&mut m, base_slot);
     let all = mask::cells(m.rooms.w, m.rooms.h, (0, 0), (w as i32 - 1, h as i32 - 1));
     m.paint(Layer::Floor, base, &all);
@@ -1888,7 +1899,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                     // Мелкая октава в клетку — край пятна рваный, как у травы, а не
                     // ломаный по отрезкам сетки шума.
                     // Сухая и скошенная трава — своим ровным полом, не кочками пустоши.
-                    if let Some(dry) = seen(Class::Dry).filter(|_| base_slot != "dry_grass") {
+                    if let Some(dry) = seen(Class::Dry).filter(|_| base_slot != "straw_grass") {
                         let v = ramp(dry, 0.3, 0.65) * 0.85;
                         if v > 0.0 {
                             to_dry.push((k, v));
@@ -1951,7 +1962,10 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             m.paint(Layer::Floor, dry, &to_dry);
         }
         // Голая земля: на сухом пастбище — бурая потрескавшаяся, в пустыне — светлая.
-        for (slot, cells) in [(if base_slot == "dry_grass" { "earth_dry" } else { "earth_pale" }, &to_earth), ("snow", &to_snow), (rock_kind(&Tags::new()).0, &to_rock)] {
+        // Камень и земля на леднике — серая морена (сланец): мел и мергель на нём
+        // выходили бежевыми.
+        let icy = matches!(base_slot, "ice_glacier" | "snow");
+        for (slot, cells) in [(if icy { "rock_slate" } else if base_slot == "straw_grass" { "earth_dry" } else { "earth_pale" }, &to_earth), ("snow", &to_snow), (if icy { "rock_slate" } else { rock_kind(&Tags::new()).0 }, &to_rock)] {
             if !cells.is_empty() {
                 let t = floors.get(&mut m, slot);
                 m.paint(Layer::Floor, t, cells);
@@ -2228,6 +2242,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     if let Some(hint) = hint.as_ref().filter(|_| rural) {
         let mut rng = Rng::new("osm/cover-trees");
         let woods: Vec<&Area> = areas.iter().filter(|a| growth(a.tags).is_some_and(|g| g.litter)).collect();
+        let orchards: Vec<&Area> = areas.iter().filter(|a| get(a.tags, "landuse") == "orchard").collect();
         let mut crowns: Vec<Spot> = Vec::new();
         for Spot { q, mut r, conifer, queue } in hint.trees(w as usize, h as usize, cell) {
             if blocked.at(q) || hint.share(q, r.min(2.0), Class::Water) > 0.3 {
@@ -2254,7 +2269,9 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             // за лесом — лиственное. Ели наугад вставали тёмными звёздами в ясеневой
             // роще Малхема и по одной среди дубов Болтона.
             let wood = woods.iter().find(|a| inside(&a.rings, q)).and_then(|a| growth(a.tags));
-            let slot = crown_slot(r, conifer, wood.as_ref(), queue);
+            // Сад — оливы: в сухом краю всякий, в зелёном — по тегу (`trees=olive_trees`).
+            let olive = orchards.iter().any(|a| inside(&a.rings, q) && (arid || get(a.tags, "trees").contains("olive") || get(a.tags, "crop") == "olive"));
+            let slot = if olive && r >= CROWN_BUSH { "olivo" } else { crown_slot(r, conifer, wood.as_ref(), queue, arid) };
             if missing(slot) {
                 continue;
             }
@@ -2326,11 +2343,14 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             if !rng.chance(share) {
                 continue;
             }
-            let slot = if glade {
-                if rng.chance(0.7) { "fern" } else { "bush_summer" }
-            } else {
-                g.slots[rng.int(0, g.slots.len() as i32 - 1) as usize]
-            };
+            let slot = arid_slot(
+                if glade {
+                    if rng.chance(0.7) { "fern" } else { "bush_summer" }
+                } else {
+                    g.slots[rng.int(0, g.slots.len() as i32 - 1) as usize]
+                },
+                arid,
+            );
             // Со снимком деревья уже стоят по его кронам: лишние мелкие у большой
             // кроны дробили её.
             if hint.is_some() && (slot.starts_with("tree") || slot == "pine") {
@@ -2397,7 +2417,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 continue;
             }
             let tree = edge.is_none() && rng.chance(0.45);
-            let slot = if tree { "tree_green" } else { "bush_summer" };
+            let slot = if tree { "tree_green" } else { arid_slot("bush_summer", arid) };
             if missing(slot) {
                 continue;
             }
@@ -2959,7 +2979,7 @@ mod tests {
         // Табернас: земля 65 %, камень 26 %.
         assert_eq!(mix(&[(Class::Earth, 65), (Class::Rock, 26), (Class::Trees, 6), (Class::Grass, 3)]).base_floor(false), "earth_pale");
         // Трухильо: сухое 35 %, бурое 15 %, земля 28 %, трава 13 %.
-        assert_eq!(mix(&[(Class::Dry, 35), (Class::Brown, 15), (Class::Earth, 28), (Class::Grass, 13), (Class::Trees, 9)]).base_floor(false), "dry_grass");
+        assert_eq!(mix(&[(Class::Dry, 35), (Class::Brown, 15), (Class::Earth, 28), (Class::Grass, 13), (Class::Trees, 9)]).base_floor(false), "straw_grass");
         // Мер-де-Глас: лёд 61 %, морена 32 %.
         assert_eq!(mix(&[(Class::Snow, 61), (Class::Rock, 32), (Class::Earth, 7)]).base_floor(false), "snow");
         // Тот же лёд у ледника OSM — лёд, а не зимний снег.
@@ -3001,18 +3021,22 @@ mod tests {
         let broad = growth(&tags(&[("natural", "wood"), ("leaf_type", "broadleaved")])).unwrap();
         let mixed = growth(&tags(&[("natural", "wood"), ("leaf_type", "mixed")])).unwrap();
         // Куст — по размеру, что бы ни сказала карта.
-        assert_eq!(crown_slot(1.0, Some(true), Some(&needle), 0.0), "bush_summer");
+        assert_eq!(crown_slot(1.0, Some(true), Some(&needle), 0.0, false), "bush_summer");
         // Карта лесов главнее тега: лиственная крона в «хвойном» лесу OSM.
-        assert_eq!(crown_slot(3.0, Some(false), Some(&needle), 0.0), "tree_green");
-        assert_eq!(crown_slot(3.0, Some(true), None, 0.9), "pine");
-        assert_eq!(crown_slot(1.8, Some(true), None, 0.9), "fir");
+        assert_eq!(crown_slot(3.0, Some(false), Some(&needle), 0.0, false), "tree_green");
+        assert_eq!(crown_slot(3.0, Some(true), None, 0.9, false), "pine");
+        assert_eq!(crown_slot(1.8, Some(true), None, 0.9, false), "fir");
         // Без карты — тег леса; смешанный — по очереди.
-        assert_eq!(crown_slot(3.0, None, Some(&needle), 0.99), "pine");
-        assert_eq!(crown_slot(3.0, None, Some(&broad), 0.0), "tree_green");
-        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.1), "pine");
-        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.9), "tree_green");
+        assert_eq!(crown_slot(3.0, None, Some(&needle), 0.99, false), "pine");
+        assert_eq!(crown_slot(3.0, None, Some(&broad), 0.0, false), "tree_green");
+        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.1, false), "pine");
+        assert_eq!(crown_slot(3.0, None, Some(&mixed), 0.9, false), "tree_green");
         // За лесом хвойных наугад нет.
-        assert_eq!(crown_slot(3.0, None, None, 0.0), "tree_green");
+        assert_eq!(crown_slot(3.0, None, None, 0.0, false), "tree_green");
+        // Сухой край: каменный дуб и сухой куст; хвойные — как везде.
+        assert_eq!(crown_slot(3.0, None, None, 0.0, true), "encina");
+        assert_eq!(crown_slot(1.0, None, None, 0.0, true), "matorral");
+        assert_eq!(crown_slot(3.0, Some(true), None, 0.0, true), "pine");
     }
 
     #[test]
