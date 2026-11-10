@@ -42,6 +42,11 @@ BUSH = 1.3 * CELL_M  # уже — куст
 # Ель и пихта уже: сплошной ельник Рустайна — кроны в 4–6 м, а не 12–18.
 CONIFER_CANOPY = (1.4 * CELL_M, 2.2 * CELL_M)
 CONIFER_LONE = 2.8 * CELL_M
+# Густой лес по Copernicus (вне Англии): лиственная крона там не шире 3–3,5 клетки.
+# В ельнике Рустайна длинные тени елей сливались в одно пятно, и на него вставала
+# «лиственная» крона в 7 м радиусом.
+DENSE_CANOPY = (2.4 * CELL_M, 3.2 * CELL_M)
+DENSE_LONE = 3.5 * CELL_M
 
 
 def metres_per_px(osm, w):
@@ -54,9 +59,10 @@ def blur(x, r):
     return ndimage.gaussian_filter(x, r)
 
 
-def find(trees, mpp, needles=None):
+def find(trees, mpp, needles=None, dense=None):
     """Кроны по одной: [(x, y, r)] в пикселях снимка, r — в метрах. `needles` —
-    доля хвойных в каждом пикселе (Copernicus): там кроны уже."""
+    доля хвойных в каждом пикселе (Copernicus): там кроны уже; `dense` — густой
+    лес по Copernicus: там и лиственные уже."""
     depth = ndimage.distance_transform_edt(trees) * mpp
     h, w = trees.shape
     ys, xs = np.nonzero(depth >= MIN)
@@ -79,8 +85,10 @@ def find(trees, mpp, needles=None):
             px, py = int(x + ring * math.cos(i * math.pi / 8)), int(y + ring * math.sin(i * math.pi / 8))
             around += 0 <= px < w and 0 <= py < h and trees[py, px]
         k = float(needles[y, x]) if needles is not None else 0.0
-        lone = LONE + (CONIFER_LONE - LONE) * k
-        lo, hi = CANOPY[0] + (CONIFER_CANOPY[0] - CANOPY[0]) * k, CANOPY[1] + (CONIFER_CANOPY[1] - CANOPY[1]) * k
+        thick = dense is not None and dense[y, x]
+        broad_lone, broad = (DENSE_LONE, DENSE_CANOPY) if thick else (LONE, CANOPY)
+        lone = broad_lone + (CONIFER_LONE - broad_lone) * k
+        lo, hi = broad[0] + (CONIFER_CANOPY[0] - broad[0]) * k, broad[1] + (CONIFER_CANOPY[1] - broad[1]) * k
         cap = lone if inner * GROW <= lone and around < 12 else lo + (hi - lo) * rng.random()
         r = min(inner * GROW, cap)
         if any(dd < max(OVERLAP * (r + out[j][2]), out[j][2] + 0.5 * r) for j, dd in zip(near, dist)):
@@ -260,12 +268,13 @@ def run(osm):
     trees = np.abs(cv - np.array(TREES)).sum(-1) < 30
     mpp = metres_per_px(osm, im.width)
     dlt = eu.load(osm, "dlt", im.width, im.height)
-    needles = None
+    needles = dense = None
     if dlt is not None and nfi(osm, 1, 1)[0] is None:
         win = max(3, round(20 / mpp))
         forest = ndimage.uniform_filter(((dlt == 1) | (dlt == 2)).astype(float), win)
         needles = np.where(forest > 0.2, ndimage.uniform_filter((dlt == 2).astype(float), win) / np.maximum(forest, 1e-6), 0.0)
-    crowns = find(trees, mpp, needles)
+        dense = forest > 0.5
+    crowns = find(trees, mpp, needles, dense)
     feats, med = features(im, trees, crowns, mpp)
     kinds, photo = species(crowns, feats, im, cv, osm, mpp)
     rows = []

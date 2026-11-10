@@ -1710,7 +1710,9 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     if !lost.is_empty() {
         warnings.push(format!("неполные в выгрузке и пропущены: {}", lost.join(", ")));
     }
-    let (w, h) = (((wm / cell - 0.001).ceil() as u32).max(8), ((hm / cell - 0.001).ceil() as u32).max(8));
+    // Десятая клетки сверху — округление границ в выгрузке (7 знаков: рамка
+    // 40×30 клеток выходила 40,04×30,04 и на карте — 41×31 с полоской).
+    let (w, h) = (((wm / cell - 0.1).ceil() as u32).max(8), ((hm / cell - 0.1).ceil() as u32).max(8));
     let proj = Proj { north, west, kx: mx / cell as f64, ky: my / cell as f64 };
     let hint = cover.map(|c| Hint { cover: c, span: [wm / cell, hm / cell] });
     let m_to_cells = |metres: f32| metres / cell;
@@ -1775,6 +1777,10 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // Снег и лёд по снимку: камень — серый сланец (мел и мергель выходили бежевыми),
     // тропа — примятый снег.
     let cold = matches!(base_slot, "ice_glacier" | "snow");
+    // Снег и лёд по снимку — зимний звук места, а не летний лес.
+    if rural && cold {
+        m.ambience = Season::Winter.ambience().into();
+    }
     // Верховое болото: бочаги — торфяная вода без кувшинок, мочажины — топь.
     let bog = base_slot == "bog_moss";
     // Сухой юг по снимку: лиственное — каменный дуб, сад — оливы, куст — ракитник,
@@ -1859,7 +1865,6 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 .collect()
         };
         // На основе (луг, а вне зелёного биома — земля, сухая трава, снег).
-        let (on_meadow, on_rough) = (only(&m, base), only(&m, rough));
         let on_ice = if glacier && base_slot != "snow" {
             let ice = floors.get(&mut m, "ice_glacier");
             only(&m, ice)
@@ -1882,11 +1887,30 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         let res = mask::RES as f32;
         let (mw, mh) = (m.rooms.w, m.rooms.h);
         let (mut to_rough, mut to_meadow) = (Vec::new(), Vec::new());
+        // Доля пола в точке маски. Пятна по снимку ложатся по ней, а не по клетке
+        // с соседями: у края контура OSM клеточная проверка резала пятно по сетке —
+        // ступеньки в клетку на краю снега у ледника Мёнхсйоха. К краю (доля
+        // 0,95 → 0,6) пятно слабеет и на соседний пол не лезет.
+        let ice_mat = (!on_ice.is_empty()).then(|| floors.get(&mut m, "ice_glacier"));
+        let share_of = |mat: usize| -> Vec<f32> {
+            match m.terrain.iter().find(|c| c.material as usize == mat) {
+                Some(c) => c.mask.data.iter().map(|&v| v as f32 / 255.0).collect(),
+                None => vec![0.0; mw * mh],
+            }
+        };
+        let (base_share, rough_share) = (share_of(base), share_of(rough));
+        let ice_share = ice_mat.map_or_else(Vec::new, share_of);
+        let fade = |x: f32| {
+            let t = ((x - 0.6) / 0.35).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
         for j in 0..mh {
             for i in 0..mw {
                 let p = [(i as f32 + 0.5) / res, (j as f32 + 0.5) / res];
                 let cell = (p[1] as usize).min(h as usize - 1) * w as usize + (p[0] as usize).min(w as usize - 1);
                 let k = j * mw + i;
+                let marks = [to_earth.len(), to_snow.len(), to_rock.len(), to_ice.len(), to_grass.len(), to_dry.len(), to_rough.len(), to_meadow.len()];
+                let mut f = 1.0f32;
                 // Со снимком пятна — где они на самом деле: бурое на лугу — орляк и
                 // сухая трава, зелень на пустоши и на камне — трава. Без снимка — по шуму.
                 let seen = |class: Class| hint.as_ref().map(|h| h.share(p, 0.8, class));
@@ -1907,7 +1931,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                     if v > 0.0 {
                         to_grass.push((k, v));
                     }
-                } else if on_meadow[cell] {
+                } else if base_share[k] > 0.6 {
+                    f = fade(base_share[k]);
                     // Вне зелёного биома основа — не луг: зелень на ней — луг, серое
                     // без тёплого оттенка — камень.
                     if base_slot != "meadow" {
@@ -1953,7 +1978,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                     if v > 0.0 {
                         to_rough.push((k, v));
                     }
-                } else if on_ice.get(cell).copied().unwrap_or(false) {
+                } else if ice_share.get(k).is_some_and(|&x| x > 0.6) {
+                    f = fade(ice_share[k]);
                     // Морена на леднике — камень по снимку; фирн (белое) — снег.
                     if let Some(rock) = seen(Class::Rock) {
                         let v = ramp(rock, 0.35, 0.7) * 0.85;
@@ -1967,7 +1993,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                             to_snow.push((k, v));
                         }
                     }
-                } else if on_rough[cell] {
+                } else if rough_share[k] > 0.6 {
+                    f = fade(rough_share[k]);
                     // Кустарник в пустыне — по голой земле; снег на пустоши — снег.
                     for (class, out) in [(Class::Earth, &mut to_earth), (Class::Snow, &mut to_snow)] {
                         if let Some(x) = seen(class) {
@@ -1993,6 +2020,13 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                     };
                     if v > 0.0 {
                         to_meadow.push((k, v));
+                    }
+                }
+                if f < 1.0 {
+                    for (out, from) in [&mut to_earth, &mut to_snow, &mut to_rock, &mut to_ice, &mut to_grass, &mut to_dry, &mut to_rough, &mut to_meadow].into_iter().zip(marks) {
+                        for e in &mut out[from..] {
+                            e.1 *= f;
+                        }
                     }
                 }
             }
@@ -2023,6 +2057,16 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             if !cells.is_empty() {
                 let t = floors.get(&mut m, slot);
                 m.paint(Layer::Floor, t, cells);
+            }
+        }
+    }
+
+    // Верховое болото — топь целиком: пятна выгоревшего мха, зелени и кочек тоже
+    // болото для «Живой карты» и для шага (вдвое дороже), а не только сам мох.
+    if bog {
+        for slot in ["bog_moss", "bog_hummock", "straw_grass", "meadow"] {
+            if let Some(&i) = floors.0.get(slot) {
+                m.materials[i].live = Live::Swamp;
             }
         }
     }
@@ -2171,10 +2215,15 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 // подложка цвета дерева, иначе сквозь мост видно реку.
                 let under = (bridge && order == 3).then(|| path(deck_base, width, 0.0, 0.0));
                 lanes.push((lay, order, under.into_iter().chain([deck]).collect()));
-                if bridge {
+                // Настил по болоту (`bridge=boardwalk`) лежит на земле, перил у него
+                // нет: на Виру раба с тропы нельзя было сойти в болото. Перила моста —
+                // только у карты: за краем сцены они тянулись на десятки клеток.
+                if bridge && get(t, "bridge") != "boardwalk" {
                     let style = WallStyle { width: 0.15, ..wall(if order == 3 { "wall_wood" } else { "wall_stone_blocks" }) };
                     for side in [-width / 2.0, width / 2.0] {
-                        m.walls.push(Wall { points: offset(&line, side), closed: false, bends: Vec::new(), low: true, style: Some(style.clone()) });
+                        for points in near_map(&offset(&line, side), w as f32, h as f32, 0.5) {
+                            m.walls.push(Wall { points, closed: false, bends: Vec::new(), low: true, style: Some(style.clone()) });
+                        }
                     }
                 }
                 (if order >= 4 { &mut streets } else { &mut walks }).push(line.clone());
@@ -3297,6 +3346,11 @@ mod tests {
         assert!(matches!(m.materials[m.paths[0].material].paint, Paint::Color(_)), "подложка не снизу");
         let stones = m.props.iter().filter(|q| q.asset.contains("boulder")).count();
         assert!((25..=40).contains(&stones), "камней {stones}");
+        // Мостки по болоту лежат на земле — без перил: с них сходят в топь.
+        let boardwalk = RIVER.replace(r#"<tag k="bridge" v="yes"/>"#, r#"<tag k="bridge" v="boardwalk"/>"#);
+        let (m, _) = import(&boardwalk, Options::default()).unwrap();
+        assert_eq!(m.walls.iter().filter(|w| w.low).count(), 0, "перила у мостков");
+        assert!(m.paths.iter().any(|p| p.along), "настил мостков");
     }
 
     #[test]

@@ -120,11 +120,41 @@ pub fn surfaces(map: &Map) -> Option<Value> {
 }
 
 /// Контуры живых материалов: по эффекту — все залитые им места, острова — дырами.
+/// Покрытия одного эффекта сливаются в одну маску до обводки: Foundry вычитает
+/// дыры области из всех её фигур, и дыра мха под светлым пятном (тоже болото)
+/// вырезала бы само пятно.
 fn zones(map: &Map) -> Vec<Zone> {
-    let mut out: Vec<Zone> = Vec::new();
+    let mut masks: Vec<(&'static str, mask::Mask)> = Vec::new();
     for (m, mat) in map.materials.iter().enumerate() {
         let Some(effect) = mat.live().effect() else { continue };
         let mask = map.material_mask(m);
+        match masks.iter_mut().find(|(e, _)| *e == effect) {
+            Some((_, all)) => {
+                for (a, v) in all.data.iter_mut().zip(&mask.data) {
+                    *a = a.saturating_add(*v);
+                }
+            }
+            None => masks.push((effect, mask)),
+        }
+    }
+    let mut out: Vec<Zone> = Vec::new();
+    for (effect, mut mask) in masks {
+        // Под настилом (дорожка вдоль линии — мостки, мост) живого нет: по тропе
+        // через болото Виру раба шаг обычный, вода и рыбы под досками не идут.
+        let res = mask::RES as f32;
+        for p in map.paths.iter().filter(|p| p.along) {
+            let hw = p.width / 2.0;
+            for seg in p.points.windows(2) {
+                let (lo, hi) = ([seg[0][0].min(seg[1][0]) - hw, seg[0][1].min(seg[1][1]) - hw], [seg[0][0].max(seg[1][0]) + hw, seg[0][1].max(seg[1][1]) + hw]);
+                for j in ((lo[1] * res).floor().max(0.0) as usize)..((hi[1] * res).ceil().max(0.0) as usize).min(mask.h) {
+                    for i in ((lo[0] * res).floor().max(0.0) as usize)..((hi[0] * res).ceil().max(0.0) as usize).min(mask.w) {
+                        if map::segment_distance([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], seg[0], seg[1]) <= hw {
+                            mask.data[j * mask.w + i] = 0;
+                        }
+                    }
+                }
+            }
+        }
         if mask.is_empty() {
             continue;
         }
@@ -137,10 +167,7 @@ fn zones(map: &Map) -> Vec<Zone> {
                 (l.clone(), depth % 2 == 1)
             })
             .collect::<Vec<_>>();
-        match out.iter_mut().find(|z| z.effect == effect) {
-            Some(z) => z.loops.extend(tagged),
-            None => out.push(Zone { effect, loops: tagged, place: String::new() }),
-        }
+        out.push(Zone { effect, loops: tagged, place: String::new() });
     }
     out
 }
@@ -682,9 +709,17 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "place" => ("Звук внутри", "#c9a24a"),
                 _ => ("Вода", "#2a8fd6"),
             };
+            // Болото и вода — труднопроходимые: шаг вдвое дороже (поведение ядра
+            // Foundry, работает в любой системе). Без него токен шёл по топи и
+            // бочагам Виру раба, как по лугу.
+            let behaviors = if matches!(z.effect, "swamp" | "water") {
+                json!([{"_id": doc_id('b', regions.len()), "type": "modifyMovementCost", "system": {"difficulties": {"walk": 2}}}])
+            } else {
+                json!([])
+            };
             let region = json!({
                 "_id": doc_id('r', regions.len()), "name": title, "color": color, "shapes": shapes,
-                "elevation": {"bottom": null, "top": null},
+                "elevation": {"bottom": null, "top": null}, "behaviors": behaviors,
                 "flags": if z.effect == "place" { json!({LIVE_MODULE: {"place": z.place}}) } else { json!({LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}) }
             });
             regions.push(tag(region));
@@ -907,6 +942,31 @@ mod tests {
     }
 
     #[test]
+    fn bog_patches_join_one_region_and_the_boardwalk_is_cut_out() {
+        // Мох и светлое пятно на нём — оба болото: одна область без дыры под
+        // пятном; мостки поперёк — вырез (по ним шаг обычный).
+        let mut m = Map::new(12, 8);
+        let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        m.materials[water].live = crate::map::Live::Swamp;
+        let straw = 3;
+        m.materials[straw].live = crate::map::Live::Swamp;
+        m.paint(crate::map::Layer::Floor, water, &crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (11, 7)));
+        m.paint(crate::map::Layer::Floor, straw, &crate::mask::cells(m.rooms.w, m.rooms.h, (7, 1), (9, 2)));
+        m.paths.push(crate::map::Path { points: vec![[-1.0, 5.0], [13.0, 5.0]], material: 0, width: 1.2, soft: 0.0, rough: 0.0, along: true });
+        m.prune();
+        let lay = layout(&m, &[]);
+        let swamp: Vec<&Zone> = lay.zones.iter().filter(|z| z.effect == "swamp").collect();
+        assert_eq!(swamp.len(), 1, "одна область болота");
+        let covered = |p: [f32; 2]| {
+            let n = swamp[0].loops.iter().filter(|(l, _)| inside(p, l)).count();
+            n % 2 == 1
+        };
+        assert!(covered([8.5, 2.0]), "светлое пятно — тоже болото");
+        assert!(covered([3.5, 2.5]), "мох — болото");
+        assert!(!covered([6.0, 5.0]), "настил вырезан");
+    }
+
+    #[test]
     fn water_becomes_living_region_with_island_hole() {
         let mut m = Map::new(12, 12);
         let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
@@ -924,6 +984,9 @@ mod tests {
         let scene = foundry_levels(&m, "Пруд", &[SceneLevel { name: "Пруд".into(), image_src: "p.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
         let r = &scene["regions"][0];
         assert_eq!(r["flags"][LIVE_MODULE]["effect"], "water");
+        // Вода — труднопроходимая: шаг вдвое дороже.
+        assert_eq!(r["behaviors"][0]["type"], "modifyMovementCost");
+        assert_eq!(r["behaviors"][0]["system"]["difficulties"]["walk"], 2);
         assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
         assert_eq!(r["shapes"][0]["type"], "polygon");
     }
