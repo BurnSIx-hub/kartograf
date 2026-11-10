@@ -47,12 +47,35 @@ pub enum Tool {
     Scatter,
     Path,
     Shade,
+    Relief,
     Text,
     Roof,
 }
 
+/// Кисть «Рельеф»: что делает мазок.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReliefMode {
+    Raise,
+    Lower,
+    Flatten,
+    Smooth,
+}
+
+impl ReliefMode {
+    const ALL: [ReliefMode; 4] = [ReliefMode::Raise, ReliefMode::Lower, ReliefMode::Flatten, ReliefMode::Smooth];
+
+    fn label(self) -> &'static str {
+        match self {
+            ReliefMode::Raise => "Поднять",
+            ReliefMode::Lower => "Опустить",
+            ReliefMode::Flatten => "Выровнять",
+            ReliefMode::Smooth => "Сгладить",
+        }
+    }
+}
+
 impl Tool {
-    const ALL: [Tool; 12] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text];
+    const ALL: [Tool; 13] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Relief, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text];
 
     fn label(self) -> &'static str {
         match self {
@@ -66,6 +89,7 @@ impl Tool {
             Tool::Scatter => "Разброс",
             Tool::Path => "Дорога",
             Tool::Shade => "Тень",
+            Tool::Relief => "Рельеф",
             Tool::Text => "Подпись",
             Tool::Roof => "Крыша",
         }
@@ -83,6 +107,7 @@ impl Tool {
             Tool::Scatter => Key::S,
             Tool::Path => Key::L,
             Tool::Shade => Key::H,
+            Tool::Relief => Key::M,
             Tool::Text => Key::T,
             Tool::Roof => Key::K,
         }
@@ -107,7 +132,7 @@ impl Group {
     fn has(self, tool: Tool) -> bool {
         match self {
             Group::Select => tool == Tool::Select,
-            Group::Brush => matches!(tool, Tool::Dungeon | Tool::Floor | Tool::Shade | Tool::Erase),
+            Group::Brush => matches!(tool, Tool::Dungeon | Tool::Floor | Tool::Shade | Tool::Relief | Tool::Erase),
             Group::Wall => matches!(tool, Tool::Wall | Tool::Door),
             Group::Roof => tool == Tool::Roof,
             Group::Object => matches!(tool, Tool::Object | Tool::Scatter),
@@ -337,6 +362,8 @@ pub struct App {
     dabs: u32,
     edges: Vec<Segment>,
     edges_dirty: bool,
+    /// Выведенное из рельефа для отрисовки — по отпечатку высот и солнца.
+    relief_look: Option<(u64, std::rc::Rc<crate::relief::Look>)>,
     /// Объект, который тащат, и за что взяли.
     moving: Option<(usize, Grip)>,
     pub bending: Option<Bend>,
@@ -351,6 +378,13 @@ pub struct App {
     /// Затухание тени кистью: 0 — ровная до края, 1 — тает от середины мазка.
     pub shade_soft: f32,
     shade_erase: bool,
+    /// Кисть «Рельеф»: что делает, на сколько клеток поднимает; Alt — наоборот.
+    pub relief_mode: ReliefMode,
+    pub relief_height: f32,
+    relief_alt: bool,
+    /// Высоты до мазка и высота, к которой ровняет «Выровнять».
+    relief_base: Option<crate::relief::Relief>,
+    relief_target: f32,
     /// Образец новой подписи; тащат подпись — откуда взяли.
     pub label_style: map::Label,
     label_grab: Option<(usize, [f32; 2])>,
@@ -416,6 +450,7 @@ pub struct App {
     used_only: bool,
     /// Время года последнего леса: окно генератора открывается с ним.
     gen_season: crate::plan::Season,
+    gen_hills: crate::plan::Hills,
     gen_cave: crate::plan::CaveKind,
     gen_district: crate::plan::District,
     gen_dungeon: crate::plan::DungeonKind,
@@ -517,6 +552,7 @@ impl App {
             dabs: 0,
             edges: Vec::new(),
             edges_dirty: true,
+            relief_look: None,
             moving: None,
             picked: Vec::new(),
             band_from: None,
@@ -530,6 +566,11 @@ impl App {
             shade_level: 0.4,
             shade_soft: 0.5,
             shade_erase: false,
+            relief_mode: ReliefMode::Raise,
+            relief_height: 2.0,
+            relief_alt: false,
+            relief_base: None,
+            relief_target: 0.0,
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
             roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
@@ -574,6 +615,7 @@ impl App {
             window_glass: std::collections::HashMap::new(),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
+            gen_hills: crate::plan::Hills::Auto,
             gen_cave: crate::plan::CaveKind::Stone,
             gen_district: crate::plan::District::Mixed,
             gen_dungeon: crate::plan::DungeonKind::Crypt,
@@ -735,6 +777,21 @@ impl App {
     /// Кисти «Клетки» и «Овал»: прямоугольник клеток или овал в нём.
     pub fn paint(&mut self, a: (i32, i32), b: (i32, i32)) {
         let mut probe = self.map.clone();
+        if self.tool == Tool::Relief {
+            let (w, h) = (probe.rooms.w, probe.rooms.h);
+            let mut weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
+            mask::soften(w, h, &mut weights, 1.0 - self.brush.hardness);
+            let base = probe.relief.clone().unwrap_or_else(|| crate::relief::Relief::for_cells(probe.width, probe.height));
+            let c = [(a.0.min(b.0) + a.0.max(b.0) + 1) as f32 / 2.0, (a.1.min(b.1) + a.1.max(b.1) + 1) as f32 / 2.0];
+            self.relief_target = base.at(c);
+            probe.relief = Some(self.sculpt(&base, &weights));
+            probe.prune();
+            if probe != self.map {
+                self.checkpoint();
+                self.map = probe;
+            }
+            return;
+        }
         if self.tool == Tool::Shade {
             let (w, h) = (probe.rooms.w, probe.rooms.h);
             let mut weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
@@ -797,6 +854,26 @@ impl App {
             *v = if old >= 1.0 { 0.0 } else { (*v - old) / (1.0 - old) };
             *v > 0.0
         });
+        if self.tool == Tool::Relief {
+            let base = match &self.relief_base {
+                Some(b) => b.clone(),
+                None => return,
+            };
+            let mut relief = self.map.relief.take().unwrap_or_else(|| base.clone());
+            if self.relief_mode == ReliefMode::Smooth {
+                relief.smooth(&weights);
+            } else {
+                // Высота — от того, что было до мазка, по полной силе отпечатка:
+                // сколько ни води, плато не выше заданного.
+                let raw: Vec<(usize, f32)> = weights.iter().map(|&(i, _)| (i, self.stroke_max.get(&i).copied().unwrap_or(0.0))).collect();
+                let done = self.sculpt(&base, &raw);
+                for &(i, _) in &raw {
+                    relief.data[i] = done.data[i];
+                }
+            }
+            self.map.relief = Some(relief);
+            return;
+        }
         match self.tool {
             Tool::Shade if self.shade_erase => self.map.shade_fade(&weights),
             Tool::Shade => {
@@ -811,9 +888,42 @@ impl App {
         self.edges_dirty = true;
     }
 
+    /// Высоты после мазка по весам `weights` поверх `base` — по режиму кисти.
+    fn sculpt(&self, base: &crate::relief::Relief, weights: &[(usize, f32)]) -> crate::relief::Relief {
+        let mut r = base.clone();
+        let mode = match (self.relief_mode, self.relief_alt) {
+            (ReliefMode::Raise, true) => ReliefMode::Lower,
+            (ReliefMode::Lower, true) => ReliefMode::Raise,
+            (m, _) => m,
+        };
+        match mode {
+            ReliefMode::Smooth => {
+                for _ in 0..3 {
+                    r.smooth(weights);
+                }
+            }
+            _ => {
+                for &(i, v) in weights {
+                    let b = base.data[i];
+                    r.data[i] = match mode {
+                        ReliefMode::Raise => b + self.relief_height * v,
+                        ReliefMode::Lower => b - self.relief_height * v,
+                        _ => b + (self.relief_target - b) * v,
+                    };
+                }
+            }
+        }
+        r
+    }
+
     /// Начало мазка: одна правка в истории на весь мазок.
     pub fn begin_stroke(&mut self, w: [f32; 2]) {
         self.checkpoint();
+        if self.tool == Tool::Relief {
+            let base = self.map.relief.clone().unwrap_or_else(|| crate::relief::Relief::for_cells(self.map.width, self.map.height));
+            self.relief_target = base.at(w);
+            self.relief_base = Some(base);
+        }
         self.stroke_last = Some(w);
         self.stroke_tip = w;
         self.stroke_max.clear();
@@ -848,6 +958,7 @@ impl App {
                 self.dab(tip);
             }
             self.stroke_last = None;
+            self.relief_base = None;
             self.map.prune();
             self.edges_dirty = true;
         }
@@ -1836,6 +1947,13 @@ impl App {
                             }
                         });
                         ui.end_row();
+                        ui.label("Рельеф");
+                        ui.horizontal(|ui| {
+                            for k in crate::plan::Hills::ALL {
+                                ui.selectable_value(&mut opt.hills, k, k.label());
+                            }
+                        });
+                        ui.end_row();
                     } else if matches!(opt.kind, generate::Kind::Town | generate::Kind::Walls | generate::Kind::House | generate::Kind::Tavern | generate::Kind::Arena | generate::Kind::Church | generate::Kind::Jarl) {
                         ui.label("Время года");
                         ui.horizontal(|ui| {
@@ -1907,6 +2025,7 @@ impl App {
                     self.save_settings();
                 }
                 self.gen_season = opt.season;
+                self.gen_hills = opt.hills;
                 self.gen_cave = opt.cave;
                 self.gen_district = opt.district;
                 self.gen_dungeon = opt.dungeon;
@@ -2143,7 +2262,7 @@ impl App {
                         if kind == generate::Kind::Dungeon {
                             self.material = crate::procgen::dungeon_look(&mut self.map);
                         }
-                        let mut o = Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, cave: self.gen_cave, district: self.gen_district, dungeon: self.gen_dungeon, ..Default::default() };
+                        let mut o = Options { kind, seed: generate::new_seed(), library: self.settings.gen_library, season: self.gen_season, hills: self.gen_hills, cave: self.gen_cave, district: self.gen_district, dungeon: self.gen_dungeon, ..Default::default() };
                         // Подземелье и киберпанк растут от входа: комнат побольше, колец заметно.
                         if kind.grows() {
                             (o.rooms, o.loops) = (10, 0.4);
@@ -2300,6 +2419,7 @@ impl App {
             Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
             Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — в строке над картой.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
+            Tool::Relief => "Ярусы по 5 футов. Жёсткая кисть поднимает плато с обрывом — полоса скалы, в Foundry стена; мягкая — пологий склон уступами-гребнями. Нижние ярусы темнее. «Выровнять» тянет к ярусу, с которого начат мазок. Alt — наоборот.",
             Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
             Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком на полке.",
             Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Alt — на время наоборот с привязкой, Alt с колесом — размер, R — поворот.",
@@ -2361,7 +2481,7 @@ impl App {
     fn group_modes(&self, group: Group) -> Vec<(String, Mode)> {
         let tool = |t: Tool| (format!("{}   {}", t.label(), t.key().name()), Mode::Tool(t));
         match group {
-            Group::Brush => [Tool::Dungeon, Tool::Floor, Tool::Shade, Tool::Erase].map(tool).to_vec(),
+            Group::Brush => [Tool::Dungeon, Tool::Floor, Tool::Shade, Tool::Relief, Tool::Erase].map(tool).to_vec(),
             Group::Object => [Tool::Object, Tool::Scatter].map(tool).to_vec(),
             Group::Wall => std::iter::once(tool(Tool::Wall)).chain(PortalKind::ALL.map(|k| (k.label().to_owned(), Mode::Door(k)))).collect(),
             Group::Roof => map::RoofShape::ALL.map(|s| (s.label().to_owned(), Mode::Roof(s))).to_vec(),
@@ -2545,7 +2665,22 @@ impl App {
                 }
                 match self.tool {
                     _ if path_sel => self.path_panel(ui),
-                    Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade => {
+                    Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief => {
+                        if self.tool == Tool::Relief {
+                            ui.horizontal_wrapped(|ui| {
+                                for mode in ReliefMode::ALL {
+                                    ui.selectable_value(&mut self.relief_mode, mode, mode.label());
+                                }
+                            });
+                            if matches!(self.relief_mode, ReliefMode::Raise | ReliefMode::Lower) {
+                                let ft = (self.relief_height * 5.0).round();
+                                ui.add(egui::Slider::new(&mut self.relief_height, 1.0..=8.0).step_by(1.0).text(format!("ярусов ({ft} фт)")));
+                            }
+                            if let (Some(r), Some(h)) = (&self.map.relief, self.hover) {
+                                let lv = r.level_at(self.cam.to_world(self.canvas, h));
+                                ui.weak(format!("Под курсором: ярус {lv} ({} фт)", lv * 5));
+                            }
+                        }
                         if self.tool == Tool::Shade {
                             ui.horizontal(|ui| {
                                 for level in [0.2, 0.4, 0.6, 0.8] {
@@ -3149,7 +3284,7 @@ impl App {
                     .sum::<f32>()
             });
             // Ctrl с колесом у кисти — её размер, а не масштаб карты.
-            let brush = matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade) && !self.brush.shape.drags();
+            let brush = matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief) && !self.brush.shape.drags();
             let (ctrl, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.alt));
             let prop = matches!(self.tool, Tool::Select | Tool::Object);
             if !alt {
@@ -3338,7 +3473,7 @@ impl App {
         }
         let tap = self.tap(ui, resp);
         match self.tool {
-            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade if !self.brush.shape.drags() => {
+            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade | Tool::Relief if !self.brush.shape.drags() => {
                 // Мазок начинается сразу по нажатию, а не после порога протяжки.
                 let (pressed, down, at) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
                 if pressed
@@ -3346,6 +3481,7 @@ impl App {
                     && let Some(p) = at
                 {
                     self.shade_erase = alt;
+                    self.relief_alt = alt;
                     self.begin_stroke(self.cam.to_world(rect, p));
                 } else if self.stroke_last.is_some() {
                     match (down, at) {
@@ -3354,8 +3490,9 @@ impl App {
                     }
                 }
             }
-            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade => {
+            Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade | Tool::Relief => {
                 self.shade_erase = alt;
+                self.relief_alt = alt;
                 if resp.drag_started_by(PointerButton::Primary) {
                     let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
                     self.drag_from = origin.map(|p| self.cam.cell(rect, p));
@@ -3705,12 +3842,42 @@ impl App {
         self.map.room_floor = room_floor;
         self.map.rooms = rooms;
 
+        let relief = self.relief_look();
+
         // Дороги и реки — поверх пола.
         let paths = std::mem::take(&mut self.map.paths);
         for (i, path) in paths.iter().enumerate() {
             self.draw_path(painter, canvas, path, i as u32);
         }
         self.map.paths = paths;
+
+        // Затемнение ярусов и их тени — поверх пола и дорог.
+        if let Some(look) = &relief {
+            let black = Material { name: String::new(), paint: Paint::Color([10, 14, 26]), vary: false, live: map::Live::Auto };
+            self.draw_mask(painter, canvas, &black, &look.dark, &[], None, view);
+        }
+
+        // По кромкам ярусов полосы — осыпь под обрывом, гребни уступов, стенки
+        // обрывов — поверх затемнения: стенка не тонет в тени нижнего яруса.
+        // Гребень под дорогой гаснет: тропа идёт через уступ.
+        if let Some(look) = &relief {
+            let (face, ridge, under) = self.map.relief.as_ref().map(|r| (r.face_key(), r.ridge_key(), r.under_key())).unwrap_or_default();
+            for (e, fade) in look.edges.iter().zip(&look.fade).filter(|(e, _)| e.kind == crate::relief::EdgeKind::Cliff) {
+                let inner = e.width.iter().map(|w| w * 0.85).collect::<Vec<_>>();
+                let outer = e.width.iter().map(|w| w * 0.85 + crate::relief::UNDER_WIDTH * (0.5 + 0.5 * (w / 1.2).min(1.0))).collect::<Vec<_>>();
+                self.draw_relief_strip(painter, canvas, &under, e, &inner, &outer, fade, view);
+            }
+            for (e, fade) in look.edges.iter().zip(&look.fade).filter(|(e, _)| e.kind == crate::relief::EdgeKind::Ridge) {
+                // Трава кромки — на верхнем ярусе, у полос гребня она в верхней пятой части.
+                let inner = vec![-0.16; e.points.len()];
+                self.draw_relief_strip(painter, canvas, &ridge, e, &inner, &e.width, fade, view);
+            }
+            for (e, fade) in look.edges.iter().zip(&look.fade).filter(|(e, _)| e.kind == crate::relief::EdgeKind::Cliff) {
+                // Кромка чуть заходит на высокий ярус: рваный верх полосы ложится на край.
+                let inner = vec![-0.12; e.points.len()];
+                self.draw_relief_strip(painter, canvas, &face, e, &inner, &e.width, fade, view);
+            }
+        }
 
         // Нарисованная тень — поверх пола и дорог.
         if let Some(shade) = self.map.shade.take() {
@@ -3940,10 +4107,11 @@ impl App {
                 let color = if alt { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(140, 220, 160) };
                 painter.circle_stroke(h, self.scatter.radius * s, Stroke::new(1.5, color));
             }
-            (Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade, Some(h)) if !self.brush.shape.drags() => {
+            (Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief, Some(h)) if !self.brush.shape.drags() => {
                 // Контур кисти: куда ляжет мазок.
                 let r = self.brush.radius * s;
-                let erase = self.tool == Tool::Erase || (self.tool == Tool::Shade && painter.ctx().input(|i| i.modifiers.alt));
+                let alt = painter.ctx().input(|i| i.modifiers.alt);
+                let erase = self.tool == Tool::Erase || (self.tool == Tool::Shade && alt) || (self.tool == Tool::Relief && ((self.relief_mode == ReliefMode::Lower) != alt));
                 let color = if erase { Color32::from_rgb(255, 130, 110) } else { Color32::from_rgb(120, 180, 255) };
                 let stroke = Stroke::new(1.5, color);
                 match self.brush.shape {
@@ -4719,6 +4887,88 @@ impl App {
     /// Дорога лентой вдоль плавной линии: четыре ряда вершин поперёк — внешний край
     /// прозрачный, внутренние сплошные, между ними край тает. Ширина каждой стороны
     /// гуляет по своему шуму, как берег. Текстура — по сетке, как пол, или вдоль.
+    /// Свет, тень и обрывы рельефа; считаются заново, только когда поменялись
+    /// высоты или солнце.
+    fn relief_look(&mut self) -> Option<std::rc::Rc<crate::relief::Look>> {
+        use std::hash::{Hash, Hasher};
+        let r = self.map.relief.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (r.w, r.h).hash(&mut h);
+        for v in &r.data {
+            v.to_bits().hash(&mut h);
+        }
+        self.map.shadows.angle.to_bits().hash(&mut h);
+        for p in &self.map.paths {
+            p.width.to_bits().hash(&mut h);
+            for q in &p.points {
+                (q[0].to_bits(), q[1].to_bits()).hash(&mut h);
+            }
+        }
+        let key = h.finish();
+        if let Some((k, look)) = &self.relief_look
+            && *k == key
+        {
+            return Some(look.clone());
+        }
+        // Гребень под дорогой и мостом гаснет: тропа идёт через уступ поверх него;
+        // тени и затемнение там — от плавного съезда, а не от ступени.
+        let roads: Vec<(Vec<[f32; 2]>, f32)> = self.map.paths.iter().map(|p| (p.curve(), p.width / 2.0)).collect();
+        let look = crate::relief::look(r, self.map.shadows.angle, &roads);
+        let look = std::rc::Rc::new(look);
+        self.relief_look = Some((key, look.clone()));
+        Some(look)
+    }
+
+    /// Полоса рельефа вдоль кромки: от `inner` до `outer` клеток вниз по склону
+    /// (вправо по ходу кромки). Верх картинки — к кромке, как у полос FA.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_relief_strip(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, e: &crate::relief::Edge, inner: &[f32], outer: &[f32], fade: &[f32], view: Rect) {
+        let n = e.points.len();
+        if n < 2 {
+            return;
+        }
+        let reach = outer.iter().copied().fold(0.0f32, f32::max) + 1.0;
+        if !e.points.iter().any(|p| view.expand(reach).contains(pos2(p[0], p[1]))) {
+            return;
+        }
+        let Some((tex, px)) = self.textures.get(key, false).map(|(t, px)| (t.id(), px)) else { return };
+        let aspect = px[0] as f32 / px[1].max(1) as f32;
+        let mean = (0..n).map(|k| outer[k] - inner[k]).sum::<f32>() / n as f32;
+        let mut repeat = (aspect * mean.max(0.2)).max(0.5);
+        let total: f32 = e.points.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum::<f32>()
+            + if e.closed { (e.points[0][0] - e.points[n - 1][0]).hypot(e.points[0][1] - e.points[n - 1][1]) } else { 0.0 };
+        if e.closed {
+            repeat = total / (total / repeat).round().max(1.0);
+        }
+        let cam = self.cam;
+        let mut mesh = egui::Mesh::with_texture(tex);
+        let mut along = 0.0;
+        let count = if e.closed { n + 1 } else { n };
+        for k in 0..count {
+            let i = k % n;
+            if k > 0 {
+                let q = e.points[(k - 1) % n];
+                along += (e.points[i][0] - q[0]).hypot(e.points[i][1] - q[1]);
+            }
+            let p = e.points[i];
+            let up = e.smooth_up(i, 4);
+            let at = |d: f32| cam.to_screen(canvas, [p[0] - up[0] * d, p[1] - up[1] * d]);
+            let u = along / repeat;
+            // Гаснущая полоса гаснет сперва снизу: у конца не прямой срез поперёк,
+            // а косой — стенка ниже и ниже уходит в склон.
+            let f = fade[i].clamp(0.0, 1.0);
+            let alpha = |v: f32| Color32::from_white_alpha((v * 255.0).round() as u8);
+            mesh.vertices.push(egui::epaint::Vertex { pos: at(inner[i]), uv: pos2(u, 0.0), color: alpha(f) });
+            mesh.vertices.push(egui::epaint::Vertex { pos: at(outer[i]), uv: pos2(u, 1.0), color: alpha(f * f * f) });
+            if k > 0 {
+                let b = (k as u32 - 1) * 2;
+                mesh.add_triangle(b, b + 1, b + 3);
+                mesh.add_triangle(b, b + 3, b + 2);
+            }
+        }
+        painter.add(Shape::mesh(mesh));
+    }
+
     fn draw_path(&mut self, painter: &egui::Painter, canvas: Rect, path: &map::Path, seed: u32) {
         let Some(material) = self.map.materials.get(path.material) else { return };
         let (tex, tile, tint) = match &material.paint {

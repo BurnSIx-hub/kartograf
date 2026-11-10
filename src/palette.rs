@@ -70,7 +70,7 @@ const FLOORS: &[Slot] = &[
     ("swamp_wet", &[&["marsh", "wet"], &["swamp", "wet"], &["топь"]], &[]),
     ("forest_floor", &[&["forest", "floor"], &["leaves"], &["подстилка"]], &[]),
     ("moss", &[&["moss"], &["мох"]], &["stone", "flagstone", "wall"]),
-    ("rocky_ground", &[&["rock"], &["rocky"], &["stone", "ground"], &["камни"]], &["wall", "lava"]),
+    ("rocky_ground", &[&["rock"], &["rocky"], &["stone", "ground"], &["камни"]], &["wall", "lava", "snow", "snowy", "ice", "arctic"]),
     // Голый камень местности из OSM по породе. У FA `Ground_Rock_*` варианты `A`, `B`
     // в тёмных швах — сверху мостовая; природный камень — `C`. Мел — светлый
     // `Desert_Rock_Ground_Chalk` `C`–`E`.
@@ -418,6 +418,10 @@ const WALLS: &[Slot] = &[
     ("wall_cave_moss", &[&["cliff", "stone", "mossy"], &["cliff", "dirt"]], &["top"]),
     ("wall_cave_volcanic", &[&["cliff", "stone", "volcanic"]], &["top", "sand", "desert"]),
     ("wall_cave_purple", &[&["cliff", "stone", "purple"]], &["top"]),
+    // Рельеф: стенка обрыва (полоса скалы FA, верх — кромка), гребень уступа, осыпь.
+    ("wall_cliff", &[&["cliff", "stone", "earthy"], &["cliff", "stone", "slate"], &["cliff", "stone"]], &["top", "sand", "desert", "purple", "arctic"]),
+    ("wall_ridge", &[&["grass", "ridge", "dirt"], &["grass", "ridge", "stone"], &["bank", "grass"]], &[]),
+    ("wall_under_cliff", &[&["under", "cliff", "stone", "earthy"], &["under", "cliff", "stone"], &["under", "cliff"]], &["desert"]),
     ("cy_wall", &[&["alloy"]], &[]),
     ("cy_wall_pipes", &[&["pipes", "steel"]], &[]),
     // Трубы по полу от приборов: полосы с прозрачным фоном.
