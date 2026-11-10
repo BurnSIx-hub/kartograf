@@ -15,7 +15,10 @@
   сухое   (210, 190, 110) — скошенная, выгоревшая трава (светлое тёплое);
   земля   (150, 120,  85) — голая земля: мергель, пашня, утоптанное (только вне
                             зелёного биома);
-  снег    (240, 245, 250) — снег и лёд (только в биоме льда).
+  снег    (240, 245, 250) — снег и фирн: светлое бесцветное (только в биоме льда);
+  лёд     (170, 200, 215) — летний лёд ледника: серо-голубое темнее снега;
+  мох     (110, 120,  70) — моховое болото (только в биоме болота; мочажины —
+                            «бурое»).
 
 Правила — по оттенку и светлоте относительно самого участка (у снимков разный
 свет и баланс): кроны — заметно темнее середины, бурое — тёплый оттенок,
@@ -32,19 +35,21 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import eu  # noqa: E402
 import photo  # noqa: E402
 import satlib  # noqa: E402
 
-PALETTE = np.array([[120, 190, 90], [20, 70, 30], [170, 90, 50], [220, 220, 210], [30, 60, 160], [210, 190, 110], [150, 120, 85], [240, 245, 250]], np.uint8)
-GRASS, TREES, BROWN, ROCK, WATER, DRY, EARTH, SNOW = range(8)
-NAMES = ["grass", "trees", "brown", "rock", "water", "dry", "earth", "snow"]
+PALETTE = np.array([[120, 190, 90], [20, 70, 30], [170, 90, 50], [220, 220, 210], [30, 60, 160], [210, 190, 110], [150, 120, 85], [240, 245, 250],
+                    [170, 200, 215], [110, 120, 70]], np.uint8)
+GRASS, TREES, BROWN, ROCK, WATER, DRY, EARTH, SNOW, ICE, BOG = range(10)
+NAMES = ["grass", "trees", "brown", "rock", "water", "dry", "earth", "snow", "ice", "bog"]
 
 
 def blur(x, r):
     return np.asarray(Image.fromarray(np.clip(x * 255, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(r)), float) / 255
 
 
-def classify(im, biome="green"):
+def classify(im, biome="green", forest=None):
     green_biome = biome == "green"
     hsv = np.asarray(im.convert("HSV"), float)
     h, s, v = hsv[..., 0] * 360 / 255, hsv[..., 1] / 255, hsv[..., 2] / 255
@@ -53,6 +58,9 @@ def classify(im, biome="green"):
     # Бирюзовое море Лулворта — оттенок 161–163 при насыщенности 0,9: тёмные
     # кроны не бирюзовее 143 и не насыщеннее 0,7.
     water = ((vbig < 0.13) & (texture < 0.12)) | ((h > 165) & (h < 250) & (s > 0.3)) | ((h > 150) & (h < 250) & (s > 0.75))
+    # Ельник в тени тёмен и гладок, как вода (Рустайн): где Copernicus видит лес — не вода.
+    if forest is not None:
+        water &= ~forest
     # Середина — по суше: море в полкадра (Лулворт) тянуло её вниз, и лес не
     # выходил «темнее середины».
     land = v[~water] if (~water).any() else v
@@ -100,24 +108,40 @@ def classify(im, biome="green"):
         # ледника (оттенок 116–118, насыщенность 0,10–0,16, пестрота от 0,23) — камень.
         rock = (sb < 0.2) & ((h >= 62) | (sb < 0.1)) & (texture > 0.13) & ~water
         veg = (sb >= 0.25) & (h >= 60) & (h <= 150)
-        cls = np.full(v.shape, EARTH, np.uint8)
+        # В горах неопознанное серое — скала, а не земля: гнейс Мёнхсйоха ровный
+        # (пестрота ниже порога камня) и ложился светлой землёй.
+        cls = np.full(v.shape, ROCK if biome == "ice" else EARTH, np.uint8)
         cls[veg] = GRASS
     cls[brown] = BROWN
     cls[dry] = DRY
     cls[rock] = ROCK
     if biome == "ice":
-        # Лёд и снег — светлое почти бесцветное и гладкое; пёстрое на леднике — морена.
-        snow = (vb > 0.55) & (sb < 0.16) & (h >= 80) & (h <= 230) & (texture < 0.2) & ~water
+        # Снег — светлое бесцветное при любом оттенке (у белого оттенка нет); лёд —
+        # серо-голубое темнее; пёстрое на леднике — морена.
+        snow = (vb > 0.78) & (sb < 0.12) & ~water
+        ice = (vb > 0.55) & (sb < 0.16) & (h >= 80) & (h <= 230) & (texture < 0.2) & ~snow & ~water
+        cls[ice] = ICE
         cls[snow] = SNOW
+    if biome == "bog":
+        # Болото: мох; кочки с кустарничками (темнее середины) — «бурое»,
+        # выгоревший мох (светлее) — «сухое», зелёный сфагнум у бочагов — трава.
+        # Мерено на Виру раба: тёмная треть (80, 79, 52), середина (100, 95, 64),
+        # светлая (111, 103, 71), зеленоватое (82, 85, 52). Серое на болоте —
+        # настил тропы, его рисует OSM.
+        cls[:] = BOG
+        cls[vb < med * 0.85] = BROWN
+        cls[vb > med * 1.12] = DRY
+        cls[(sb >= 0.2) & (h >= 60) & (h <= 150)] = GRASS
     cls[trees] = TREES
     cls[water] = WATER
     return cls
 
 
 for osm in sys.argv[1:] if __name__ == "__main__" else []:
-    im, fetched = satlib.image(osm)
+    im, fetched, _ = satlib.work(osm)
     biome = photo.passport(osm, im)["biome"]
-    cls = classify(im, biome)
+    dlt = eu.load(osm, "dlt", im.width, im.height)
+    cls = classify(im, biome, None if dlt is None else (dlt == 1) | (dlt == 2))
     stem = os.path.splitext(osm)[0]
     Image.fromarray(PALETTE[cls]).save(stem + ".cover.png")
     both = Image.new("RGB", (im.width * 2 + 10, im.height), "white")

@@ -14,6 +14,8 @@
   ice     — льда и снега больше 20 % (Мер-де-Глас 2026: летний лёд ледника);
   barren  — голого больше половины при растительности меньше 20 % (Табернас);
   dry     — сухого больше 30 % при растительности меньше 45 % (Трухильо);
+  bog     — мокрой земли по Copernicus (eu.py, слой waw) больше четверти (Виру
+            раба: мох оливково-жёлтый, как выгоревшая трава, — по снимку это «сухое»);
   green   — остальное (Англия).
 """
 import json
@@ -24,6 +26,7 @@ import numpy as np
 from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import eu  # noqa: E402
 import satlib  # noqa: E402
 
 
@@ -40,11 +43,15 @@ def measure(im):
     green = (sb >= 0.25) & (h >= 60) & (h <= 150)
     straw = (sb >= 0.25) & (h < 62)
     grey = sb < 0.2
-    ice = (vb > 0.55) & (sb < 0.16) & (h >= 80) & (h <= 230)
+    # Снег — светлое и бесцветное при любом оттенке: у чисто белого оттенка нет
+    # (0), и правило «оттенок 80–230» снег Мёнхсйоха не видело совсем. Лёд —
+    # серо-голубое темнее снега (летний лёд Мер-де-Гласа).
+    snow = (vb > 0.78) & (sb < 0.12)
+    ice = (vb > 0.55) & (sb < 0.16) & (h >= 80) & (h <= 230) & ~snow
     shadow = vb < 0.15
-    out = {"green": share(green), "straw": share(straw), "grey": share(grey), "ice": share(ice), "shadow": share(shadow),
+    out = {"green": share(green), "straw": share(straw), "grey": share(grey), "snow": share(snow), "ice": share(ice), "shadow": share(shadow),
            "water": float(water.mean()), "median_v": float(np.median(v[land])) if land.any() else float(np.median(v))}
-    if out["ice"] > 0.2:
+    if out["ice"] + out["snow"] > 0.2:
         biome = "ice"
     elif out["grey"] > 0.5 and out["green"] < 0.2:
         biome = "barren"
@@ -62,14 +69,21 @@ def passport(osm, im=None):
     if os.path.exists(path) and im is None:
         return json.load(open(path, encoding="utf-8"))
     if im is None:
-        im, _ = satlib.image(osm)
+        im, _, _ = satlib.work(osm)
     p = measure(im)
+    waw = eu.load(osm, "waw")
+    if waw is not None:
+        known = waw < 254
+        if known.mean() > 0.5:
+            p["wet"] = round(float(np.isin(waw[known], (3, 4)).mean()), 3)
+            if p["biome"] != "ice" and p["wet"] > 0.25:
+                p["biome"] = "bog"
     json.dump(p, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     return p
 
 
 if __name__ == "__main__":
     for osm in sys.argv[1:]:
-        im, _ = satlib.image(osm)
+        im, _, _ = satlib.work(osm)
         p = passport(osm, im)
-        print(f"{os.path.basename(osm):20} {p['biome']:7} " + " ".join(f"{k} {p[k]:.0%}" for k in ("green", "straw", "grey", "ice", "shadow", "water")))
+        print(f"{os.path.basename(osm):20} {p['biome']:7} " + " ".join(f"{k} {p[k]:.0%}" for k in ("green", "straw", "grey", "snow", "ice", "shadow", "water")))

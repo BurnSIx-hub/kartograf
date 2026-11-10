@@ -87,10 +87,14 @@ pub enum Class {
     Dry,
     Earth,
     Snow,
+    /// Летний лёд ледника: серо-голубое темнее снега.
+    Ice,
+    /// Моховое верховое болото.
+    Bog,
 }
 
 impl Cover {
-    const COLORS: [([u8; 3], Class); 8] = [
+    const COLORS: [([u8; 3], Class); 10] = [
         ([120, 190, 90], Class::Grass),
         ([20, 70, 30], Class::Trees),
         ([170, 90, 50], Class::Brown),
@@ -99,6 +103,8 @@ impl Cover {
         ([210, 190, 110], Class::Dry),
         ([150, 120, 85], Class::Earth),
         ([240, 245, 250], Class::Snow),
+        ([170, 200, 215], Class::Ice),
+        ([110, 120, 70], Class::Bog),
     ];
 
     /// Из картинки `.cover.png`: каждый пиксель — ближайший цвет класса.
@@ -162,10 +168,15 @@ impl Cover {
     /// (пастбище Трухильо) — выгоревшая трава; где снега и льда больше 30 % — снег, а
     /// у ледника OSM (`glacier`) — лёд: летом ледник серый, белый снег на нём
     /// выглядел зимой (Мер-де-Глас).
-    fn base_floor(&self, glacier: bool) -> &'static str {
+    fn base_floor(&self) -> &'static str {
         let f = |c| self.land_share(c);
-        if f(Class::Snow) > 0.3 {
-            if glacier { "ice_glacier" } else { "snow" }
+        if f(Class::Snow) + f(Class::Ice) > 0.3 {
+            // Серый лёд (Мер-де-Глас) — лёд; белый снег и фирн (Мёнхсйох, хоть и
+            // на леднике OSM) — снег.
+            if f(Class::Ice) > f(Class::Snow) { "ice_glacier" } else { "snow" }
+        } else if f(Class::Bog) + f(Class::Brown) > 0.4 && f(Class::Bog) > 0.2 {
+            // Болото по Copernicus и снимку: мох, мочажины — бурое.
+            "bog_moss"
         } else if f(Class::Earth) + f(Class::Rock) > 0.45 && f(Class::Grass) < 0.2 {
             "earth_pale"
         } else if f(Class::Dry) + f(Class::Brown) + f(Class::Earth) > 0.45 && f(Class::Grass) < 0.3 {
@@ -212,7 +223,7 @@ impl Hint<'_> {
                 .map(|c| Spot {
                     q: [c.u * self.span[0], c.v * self.span[1]],
                     r: c.r / cell_m,
-                    conifer: c.src.starts_with("nfi").then(|| c.kind == "conifer"),
+                    conifer: (c.src.starts_with("nfi") || c.src.starts_with("dlt")).then(|| c.kind == "conifer"),
                     queue: c.queue,
                 })
                 .collect(),
@@ -285,7 +296,11 @@ struct Spot {
 /// В сухом краю (`arid`) лиственное — каменный дуб, куст — сухой.
 fn crown_slot(r: f32, conifer: Option<bool>, wood: Option<&Growth>, queue: f32, arid: bool) -> &'static str {
     let needles = conifer.unwrap_or_else(|| wood.is_some_and(|g| queue < conifer_share(g)));
-    if r < CROWN_BUSH {
+    // Малая крона, которую анализ сам назвал хвойной (ельник по Copernicus), —
+    // молодая ель; тег леса и очередь куст в ель не превращают.
+    if r < CROWN_BUSH && conifer == Some(true) {
+        conifer_slot(r)
+    } else if r < CROWN_BUSH {
         if arid { "matorral" } else { "bush_summer" }
     } else if needles {
         conifer_slot(r)
@@ -614,7 +629,8 @@ fn ground(t: &Tags, sea: bool) -> Option<(&'static str, u8)> {
         return Some(("water_deep", 4));
     }
     if natural == "wetland" {
-        return Some(("swamp", 3));
+        let bog = matches!(get(t, "wetland"), "bog" | "string_bog" | "palsa_bog");
+        return Some((if bog { "bog_moss" } else { "swamp" }, 3));
     }
     // Ледник — лёд; морена на нём — по снимку (камень).
     if natural == "glacier" {
@@ -696,7 +712,7 @@ const STEPPING: f32 = 0.9;
 /// `WATER_EDGE` от берега общей воды. Река из нескольких кусков в OSM иначе
 /// получала мели поперёк русла на стыках; край карты берегом не считается —
 /// вода уходит за него.
-fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area]) {
+fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area], bog: bool) {
     let (mw, mh) = (m.rooms.w, m.rooms.h);
     // Сумма, а не наибольшее: на общем крае двух кусков каждый даёт половину,
     // и по наибольшему вдоль шва оставалась полоса суши в полводы.
@@ -724,7 +740,9 @@ fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area]) {
             m.paint(Layer::Floor, sand, &cov);
         }
     }
-    let shallow = floors.get(m, "water_shallow");
+    let shallow = floors.get(m, if bog { "bog_water_edge" } else { "water_shallow" });
+    // У бочага берег — торфяной обрыв: мелкой полосы почти нет.
+    let edge = if bog { 0.6 } else { WATER_EDGE };
     m.paint(Layer::Floor, shallow, &weights);
     // Расстояние до суши по сетке маски, фаской 3–4 (3 — шаг по прямой).
     let far = u32::MAX / 2;
@@ -766,14 +784,14 @@ fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area]) {
         .filter(|(_, d)| **d > 0)
         .map(|(i, &d)| {
             let cells = d.min(far) as f32 / 3.0 / res;
-            let v = if shelf[i] { ((cells - WATER_EDGE) / SEA_SHELF).clamp(0.0, 1.0).powf(0.8) } else { 0.5 + (cells - WATER_EDGE) / (2.0 * aa) };
+            let v = if shelf[i] { ((cells - edge) / SEA_SHELF).clamp(0.0, 1.0).powf(0.8) } else { 0.5 + (cells - edge) / (2.0 * aa) };
             (i, v.clamp(0.0, 1.0))
         })
         .filter(|(_, v)| *v > 0.0)
         .collect();
     // Глубина моря — бирюзой потемнее, озёр и рек — синей.
     let (sea, inland): (Vec<(usize, f32)>, Vec<(usize, f32)>) = deep.into_iter().partition(|(i, _)| shelf[*i]);
-    for (slot, part) in [("sea_deep", sea), ("water_deep", inland)] {
+    for (slot, part) in [("sea_deep", sea), (if bog { "bog_water" } else { "water_deep" }, inland)] {
         if !part.is_empty() {
             let t = floors.get(m, slot);
             m.paint(Layer::Floor, t, &part);
@@ -1740,14 +1758,25 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // Застройка — только та, что на карте: в выгрузке дома и за её краем.
     let cells_of = |a: &Area| coverage(&m.rooms, &a.rings, 0.0).iter().map(|c| c.1).sum::<f32>() / (mask::RES * mask::RES) as f32;
     let built: f32 = areas.iter().filter(|a| building(a.tags).is_some()).map(cells_of).sum();
-    let rural = built < 0.06 * (w * h) as f32;
+    // Боевая карта с хижиной или хутором (дом-три на рамку в 60 м, без городских
+    // улиц и рельсов) — природа, хоть дома и занимают больше 6 % рамки.
+    let houses = areas.iter().filter(|a| building(a.tags).is_some() && cells_of(a) > 0.0).count();
+    let streets = osm.ways.values().any(|w| {
+        matches!(get(&w.tags, "highway"), "residential" | "living_street" | "pedestrian" | "primary" | "secondary" | "tertiary" | "trunk") || !get(&w.tags, "railway").is_empty()
+    });
+    let rural = built < 0.06 * (w * h) as f32 || (houses <= 3 && !streets);
     m.ambience = if rural { Season::Summer.ambience() } else { "town-1" }.into();
     m.wall_style = wall(if rural { "wall_fieldstone" } else { "wall_brick" });
 
     // Под всем — мостовая или трава пятнами, поверх — земля, трава, вода и платформы.
     let mut floors = Floors::default();
     let glacier = areas.iter().any(|a| get(a.tags, "natural") == "glacier");
-    let base_slot = if rural { hint.as_ref().map_or("meadow", |h| h.cover.base_floor(glacier)) } else { "flagstones" };
+    let base_slot = if rural { hint.as_ref().map_or("meadow", |h| h.cover.base_floor()) } else { "flagstones" };
+    // Снег и лёд по снимку: камень — серый сланец (мел и мергель выходили бежевыми),
+    // тропа — примятый снег.
+    let cold = matches!(base_slot, "ice_glacier" | "snow");
+    // Верховое болото: бочаги — торфяная вода без кувшинок, мочажины — топь.
+    let bog = base_slot == "bog_moss";
     // Сухой юг по снимку: лиственное — каменный дуб, сад — оливы, куст — ракитник,
     // эспарто, розмарин; папоротнику там не расти.
     let arid = matches!(base_slot, "earth_pale" | "straw_grass");
@@ -1761,9 +1790,18 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let mut rock_mats: Vec<usize> = Vec::new();
     for (_, k) in grounds {
         let (tex, _) = ground(areas[k].tags).unwrap_or(("flagstones", 0));
+        // Ледник, что на снимке белый (фирн Мёнхсйоха), — снег: иначе по краю
+        // ледника OSM оставалась ступенчатая полоса серого льда.
+        let tex = if cold && tex.starts_with("rock_") {
+            "rock_alpine"
+        } else if base_slot == "snow" && tex == "ice_glacier" {
+            "snow"
+        } else {
+            tex
+        };
         if tex == "water_deep" {
             if !water_done {
-                water(&mut m, &mut floors, &waters.iter().map(|&k| &areas[k]).collect::<Vec<_>>());
+                water(&mut m, &mut floors, &waters.iter().map(|&k| &areas[k]).collect::<Vec<_>>(), bog);
                 water_done = true;
             }
             continue;
@@ -1822,13 +1860,13 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         };
         // На основе (луг, а вне зелёного биома — земля, сухая трава, снег).
         let (on_meadow, on_rough) = (only(&m, base), only(&m, rough));
-        let on_ice = if glacier {
+        let on_ice = if glacier && base_slot != "snow" {
             let ice = floors.get(&mut m, "ice_glacier");
             only(&m, ice)
         } else {
             Vec::new()
         };
-        let (mut to_earth, mut to_snow, mut to_rock) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut to_earth, mut to_snow, mut to_rock, mut to_ice) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // Голый камень — с травой в трещинах и на уступах: на снимке мел и сланец
         // местами заросли, сплошная серая заливка выглядела асфальтом.
         let on_rock: Vec<bool> = rock_mats.iter().map(|&r| only(&m, r)).fold(vec![false; (w * h) as usize], |acc, v| acc.iter().zip(v).map(|(a, b)| *a || b).collect());
@@ -1888,7 +1926,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                             }
                         }
                     }
-                    for (class, slot_is_base, out) in [(Class::Earth, base_slot == "earth_pale", &mut to_earth), (Class::Snow, matches!(base_slot, "snow" | "ice_glacier"), &mut to_snow)] {
+                    for (class, slot_is_base, out) in [(Class::Earth, base_slot == "earth_pale", &mut to_earth), (Class::Snow, base_slot == "snow", &mut to_snow), (Class::Ice, base_slot == "ice_glacier", &mut to_ice)] {
                         if let Some(x) = seen(class).filter(|_| !slot_is_base) {
                             let v = ramp(x, 0.3, 0.65) * 0.85;
                             if v > 0.0 {
@@ -1916,11 +1954,17 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                         to_rough.push((k, v));
                     }
                 } else if on_ice.get(cell).copied().unwrap_or(false) {
-                    // Морена на леднике — камень по снимку.
+                    // Морена на леднике — камень по снимку; фирн (белое) — снег.
                     if let Some(rock) = seen(Class::Rock) {
                         let v = ramp(rock, 0.35, 0.7) * 0.85;
                         if v > 0.0 {
                             to_rock.push((k, v));
+                        }
+                    }
+                    if let Some(snow) = seen(Class::Snow) {
+                        let v = ramp(snow, 0.3, 0.65) * 0.9;
+                        if v > 0.0 {
+                            to_snow.push((k, v));
                         }
                     }
                 } else if on_rough[cell] {
@@ -1953,19 +1997,29 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 }
             }
         }
-        m.paint(Layer::Floor, rough, &to_rough);
+        // На болоте тёмное по снимку — кочки: тёмный мох (бурая трава FA светлее
+        // мха и выходила светлыми пятнами).
+        let hummock = if bog { floors.get(&mut m, "bog_hummock") } else { rough };
+        m.paint(Layer::Floor, hummock, &to_rough);
         m.paint(Layer::Floor, meadow, &to_meadow);
         // Трава на камне, что по снимку зарос, — основа: в пустыне земля, на леднике снег.
         m.paint(Layer::Floor, base, &to_grass);
         if !to_dry.is_empty() {
-            let dry = floors.get(&mut m, "dry_grass");
-            m.paint(Layer::Floor, dry, &to_dry);
+            // Выгоревший мох болота — светлая сухая трава вполсилы: сплошь мох FA
+            // темнее снимка, а без светлых пятен болото — ровный бурый ковёр.
+            if bog {
+                let straw = floors.get(&mut m, "straw_grass");
+                let light: Vec<(usize, f32)> = to_dry.iter().map(|&(k, v)| (k, v * 0.6)).collect();
+                m.paint(Layer::Floor, straw, &light);
+            } else {
+                let dry = floors.get(&mut m, "dry_grass");
+                m.paint(Layer::Floor, dry, &to_dry);
+            }
         }
         // Голая земля: на сухом пастбище — бурая потрескавшаяся, в пустыне — светлая.
         // Камень и земля на леднике — серая морена (сланец): мел и мергель на нём
         // выходили бежевыми.
-        let icy = matches!(base_slot, "ice_glacier" | "snow");
-        for (slot, cells) in [(if icy { "rock_slate" } else if base_slot == "straw_grass" { "earth_dry" } else { "earth_pale" }, &to_earth), ("snow", &to_snow), (if icy { "rock_slate" } else { rock_kind(&Tags::new()).0 }, &to_rock)] {
+        for (slot, cells) in [(if cold { "rock_alpine" } else if base_slot == "straw_grass" { "earth_dry" } else { "earth_pale" }, &to_earth), ("ice_glacier", &to_ice), ("snow", &to_snow), (if cold { "rock_alpine" } else { rock_kind(&Tags::new()).0 }, &to_rock)] {
             if !cells.is_empty() {
                 let t = floors.get(&mut m, slot);
                 m.paint(Layer::Floor, t, cells);
@@ -2070,7 +2124,13 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 // Мост: у пешеходного — дощатый настил вдоль и деревянные перила,
                 // у проезжего — своё мощение и каменный парапет.
                 let bridge = !matches!(get(t, "bridge"), "" | "no");
-                let tex = if bridge && order == 3 { "wood_planks" } else { tex };
+                let tex = if bridge && order == 3 {
+                    "wood_planks"
+                } else if cold && natural_surface(tex) {
+                    "snow_trampled"
+                } else {
+                    tex
+                };
                 let material = floors.get(&mut m, tex);
                 // Гравийная дорожка парка ровнее тропы: на снимке у неё чёткий край.
                 let (soft, rough) = if bridge {
@@ -2425,11 +2485,43 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
             planted += 1;
         }
+        // Верховое болото: на тёмных кочках (бурое по снимку) — кустарнички и
+        // изредка низкая сосенка, на светлом мху — пучки осоки. Голый мох на
+        // боевой карте читался ровным ковром, а на снимке он весь в кочках.
+        if let Some(hint) = hint.as_ref().filter(|_| bog) {
+            let mut rng = Rng::new("osm/bog");
+            for _ in 0..(w * h) as usize {
+                if planted >= MAX_PLANTS {
+                    break;
+                }
+                let q = [rng.random() as f32 * w as f32, rng.random() as f32 * h as f32];
+                if blocked.at(q) || claimed[(q[1] * res) as usize * mw + (q[0] * res) as usize] || !spacing.free(q, 1.6) {
+                    continue;
+                }
+                let hummock = hint.share(q, 1.0, Class::Brown);
+                if hint.share(q, 0.8, Class::Water) > 0.0 || !rng.chance((0.03 + 0.3 * hummock) as f64) {
+                    continue;
+                }
+                let (slot, scale) = if hummock > 0.5 && rng.chance(0.12) {
+                    ("fir", 0.55 + rng.random() as f32 * 0.25)
+                } else if hummock > 0.3 {
+                    ("bush_summer", 0.4 + rng.random() as f32 * 0.25)
+                } else {
+                    ("tussock", 0.5 + rng.random() as f32 * 0.3)
+                };
+                if missing(slot) {
+                    continue;
+                }
+                spacing.add(q);
+                drop(&mut m, slot, q, rng.int(0, 359) as f32, scale);
+                planted += 1;
+            }
+        }
     }
 
     // Кувшинки — купами у берега стоячей воды, где мелко, как в заводях на снимке.
     // Только из паков: встроенных нет. На реке их сносит течением.
-    if !missing("lilypad") {
+    if !missing("lilypad") && !bog {
         let mut rng = Rng::new("osm/lily");
         for a in areas.iter().filter(|a| get(a.tags, "natural") == "water" && !matches!(get(a.tags, "water"), "river" | "canal" | "stream" | "lock" | "wastewater" | "fountain" | "sea" | "bay" | "lagoon")) {
             let Some((lo, hi)) = clipped_box(&a.rings, w as f32, h as f32) else { continue };
@@ -2975,15 +3067,15 @@ mod tests {
             })
         };
         // Англия: трава и кроны, сухое пятнами — луг; вода в счёт не идёт.
-        assert_eq!(mix(&[(Class::Water, 44), (Class::Grass, 30), (Class::Trees, 14), (Class::Rock, 11), (Class::Dry, 1)]).base_floor(false), "meadow");
+        assert_eq!(mix(&[(Class::Water, 44), (Class::Grass, 30), (Class::Trees, 14), (Class::Rock, 11), (Class::Dry, 1)]).base_floor(), "meadow");
         // Табернас: земля 65 %, камень 26 %.
-        assert_eq!(mix(&[(Class::Earth, 65), (Class::Rock, 26), (Class::Trees, 6), (Class::Grass, 3)]).base_floor(false), "earth_pale");
+        assert_eq!(mix(&[(Class::Earth, 65), (Class::Rock, 26), (Class::Trees, 6), (Class::Grass, 3)]).base_floor(), "earth_pale");
         // Трухильо: сухое 35 %, бурое 15 %, земля 28 %, трава 13 %.
-        assert_eq!(mix(&[(Class::Dry, 35), (Class::Brown, 15), (Class::Earth, 28), (Class::Grass, 13), (Class::Trees, 9)]).base_floor(false), "straw_grass");
-        // Мер-де-Глас: лёд 61 %, морена 32 %.
-        assert_eq!(mix(&[(Class::Snow, 61), (Class::Rock, 32), (Class::Earth, 7)]).base_floor(false), "snow");
-        // Тот же лёд у ледника OSM — лёд, а не зимний снег.
-        assert_eq!(mix(&[(Class::Snow, 61), (Class::Rock, 32), (Class::Earth, 7)]).base_floor(true), "ice_glacier");
+        assert_eq!(mix(&[(Class::Dry, 35), (Class::Brown, 15), (Class::Earth, 28), (Class::Grass, 13), (Class::Trees, 9)]).base_floor(), "straw_grass");
+        // Мер-де-Глас: серый лёд 61 %, морена 32 % — лёд.
+        assert_eq!(mix(&[(Class::Ice, 61), (Class::Rock, 32), (Class::Snow, 7)]).base_floor(), "ice_glacier");
+        // Мёнхсйох: белый снег и фирн 45 %, скала 50 % — снег, хоть в OSM и ледник.
+        assert_eq!(mix(&[(Class::Snow, 45), (Class::Rock, 50), (Class::Ice, 5)]).base_floor(), "snow");
     }
 
     #[test]
@@ -3020,8 +3112,10 @@ mod tests {
         let needle = growth(&tags(&[("natural", "wood"), ("leaf_type", "needleleaved")])).unwrap();
         let broad = growth(&tags(&[("natural", "wood"), ("leaf_type", "broadleaved")])).unwrap();
         let mixed = growth(&tags(&[("natural", "wood"), ("leaf_type", "mixed")])).unwrap();
-        // Куст — по размеру, что бы ни сказала карта.
-        assert_eq!(crown_slot(1.0, Some(true), Some(&needle), 0.0, false), "bush_summer");
+        // Куст — по размеру, что бы ни сказал тег леса; малая крона, которую
+        // анализ назвал хвойной (ельник по Copernicus), — молодая ель.
+        assert_eq!(crown_slot(1.0, None, Some(&needle), 0.0, false), "bush_summer");
+        assert_eq!(crown_slot(1.0, Some(true), Some(&needle), 0.0, false), "fir");
         // Карта лесов главнее тега: лиственная крона в «хвойном» лесу OSM.
         assert_eq!(crown_slot(3.0, Some(false), Some(&needle), 0.0, false), "tree_green");
         assert_eq!(crown_slot(3.0, Some(true), None, 0.9, false), "pine");

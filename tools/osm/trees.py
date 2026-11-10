@@ -28,6 +28,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import eu  # noqa: E402
 import satlib  # noqa: E402
 
 CELL_M = 1.524
@@ -38,6 +39,9 @@ GROW = 1.2  # крона шире круга, вписанного в пятно
 OVERLAP = 0.75  # соседи не ближе этой доли суммы радиусов
 MIN = 0.9 * CELL_M  # самая узкая крона, радиус
 BUSH = 1.3 * CELL_M  # уже — куст
+# Ель и пихта уже: сплошной ельник Рустайна — кроны в 4–6 м, а не 12–18.
+CONIFER_CANOPY = (1.4 * CELL_M, 2.2 * CELL_M)
+CONIFER_LONE = 2.8 * CELL_M
 
 
 def metres_per_px(osm, w):
@@ -50,8 +54,9 @@ def blur(x, r):
     return ndimage.gaussian_filter(x, r)
 
 
-def find(trees, mpp):
-    """Кроны по одной: [(x, y, r)] в пикселях снимка, r — в метрах."""
+def find(trees, mpp, needles=None):
+    """Кроны по одной: [(x, y, r)] в пикселях снимка, r — в метрах. `needles` —
+    доля хвойных в каждом пикселе (Copernicus): там кроны уже."""
     depth = ndimage.distance_transform_edt(trees) * mpp
     h, w = trees.shape
     ys, xs = np.nonzero(depth >= MIN)
@@ -73,7 +78,10 @@ def find(trees, mpp):
         for i in range(16):
             px, py = int(x + ring * math.cos(i * math.pi / 8)), int(y + ring * math.sin(i * math.pi / 8))
             around += 0 <= px < w and 0 <= py < h and trees[py, px]
-        cap = LONE if inner * GROW <= LONE and around < 12 else CANOPY[0] + (CANOPY[1] - CANOPY[0]) * rng.random()
+        k = float(needles[y, x]) if needles is not None else 0.0
+        lone = LONE + (CONIFER_LONE - LONE) * k
+        lo, hi = CANOPY[0] + (CONIFER_CANOPY[0] - CANOPY[0]) * k, CANOPY[1] + (CONIFER_CANOPY[1] - CANOPY[1]) * k
+        cap = lone if inner * GROW <= lone and around < 12 else lo + (hi - lo) * rng.random()
         r = min(inner * GROW, cap)
         if any(dd < max(OVERLAP * (r + out[j][2]), out[j][2] + 0.5 * r) for j, dd in zip(near, dist)):
             continue
@@ -210,6 +218,22 @@ def species(crowns, feats, im, cover, osm, mpp):
     rank = np.argsort(np.argsort(-queue)) / max(len(crowns) - 1, 1)  # 0 — первая в очереди
     ids, types = nfi(osm, im.width, im.height)
     out = [("bush" if r < BUSH else "broad", "none", float(rank[i])) for i, (_, _, r) in enumerate(crowns)]
+    dlt = eu.load(osm, "dlt", im.width, im.height) if ids is None else None
+    if dlt is not None:
+        # Вне Англии — Copernicus (eu.py): доля хвойных среди лесных пикселей в 10 м
+        # вокруг кроны; какие именно кроны — по той же очереди. Вне леса по
+        # Copernicus — как без источника.
+        reach = max(1, round(10 / mpp))
+        for i, (x, y, r) in enumerate(crowns):
+            win = dlt[max(0, y - reach):y + reach + 1, max(0, x - reach):x + reach + 1]
+            forest = (win == 1) | (win == 2)
+            if forest.sum() < 0.2 * win.size:
+                continue
+            share = float((win == 2).sum() / forest.sum())
+            # Малая крона в ельнике — молодая ель, а не куст.
+            if r < BUSH and share < 0.6:
+                continue
+            out[i] = ("conifer" if out[i][2] < share else ("bush" if r < BUSH else "broad"), f"dlt:{share:.2f}", out[i][2])
     if ids is not None:
         groups = {}
         for i, (x, y, r) in enumerate(crowns):
@@ -229,13 +253,19 @@ COLORS = {"broad": (90, 230, 60), "conifer": (40, 160, 255), "bush": (255, 240, 
 
 def run(osm):
     stem = os.path.splitext(osm)[0]
-    im, _ = satlib.image(osm)
+    im, _, _ = satlib.work(osm)
     cv = np.asarray(Image.open(stem + ".cover.png").convert("RGB"), int)
     if cv.shape[:2] != (im.height, im.width):
         cv = np.asarray(Image.fromarray(cv.astype(np.uint8)).resize(im.size, Image.NEAREST), int)
     trees = np.abs(cv - np.array(TREES)).sum(-1) < 30
     mpp = metres_per_px(osm, im.width)
-    crowns = find(trees, mpp)
+    dlt = eu.load(osm, "dlt", im.width, im.height)
+    needles = None
+    if dlt is not None and nfi(osm, 1, 1)[0] is None:
+        win = max(3, round(20 / mpp))
+        forest = ndimage.uniform_filter(((dlt == 1) | (dlt == 2)).astype(float), win)
+        needles = np.where(forest > 0.2, ndimage.uniform_filter((dlt == 2).astype(float), win) / np.maximum(forest, 1e-6), 0.0)
+    crowns = find(trees, mpp, needles)
     feats, med = features(im, trees, crowns, mpp)
     kinds, photo = species(crowns, feats, im, cv, osm, mpp)
     rows = []

@@ -53,7 +53,8 @@ const FLOORS: &[Slot] = &[
     // У FA иней — `Frosted_Grass`, `Grassy_Snow`; снег с песком (`Snow_Sand`) выглядит
     // булыжником — не берётся.
     ("grass_frost", &[&["grass", "frost"], &["frost"], &["frosted", "grass"], &["grassy", "snow"], &["иней"]], &[]),
-    ("snow", &[&["snow"], &["снег"]], &["roof", "sand", "disturbed"]),
+    // Чистый снег: травянистый, каменистый и слякоть — не снежное поле.
+    ("snow", &[&["snow"], &["снег"]], &["roof", "sand", "disturbed", "grassy", "rocky", "slush", "cobblestone", "flagstone", "herringbone", "overlay"]),
     // Голая земля по снимку (cover.py, класс «земля»), цвет мерен без альфы: мергель
     // пустыни Табернас (150, 149, 119) — светлая потрескавшаяся (167, 151, 118);
     // серый песок (179, 173, 161) на карте выходил сиреневым. Земля сухого
@@ -90,6 +91,15 @@ const FLOORS: &[Slot] = &[
     ("mud", &[&["mud"], &["wet", "mud"], &["грязь"]], &[]),
     ("swamp", &[&["swamp"], &["bog"], &["marsh"], &["болото"]], &[]),
     ("swamp_wet", &[&["marsh", "wet"], &["swamp", "wet"], &["топь"]], &[]),
+    // Верховое болото (Виру раба): мох — мокрое болото FA с лужицами (85, 80, 40),
+    // самое светлое из болотных; тёмные `Marsh _02` (61, 48, 11) — на кочки, а
+    // сплошь выходили бурой тьмой против мха снимка (100, 95, 64). Grass_Marsh
+    // почти чёрная.
+    ("bog_moss", &[&["marsh", "wet", "a", "01"], &["marsh", "wet", "b", "01"]], &["grass"]),
+    ("bog_hummock", &[&["marsh", "a", "02"], &["marsh", "b", "02"]], &["wet", "grass"]),
+    // Бочаг на снимке чёрный: Opaque_A_05 — в золотых пятнах, читался мхом.
+    ("bog_water", &[&["water", "opaque", "a", "02"]], &[]),
+    ("bog_water_edge", &[&["water", "still", "b", "07"]], &[]),
     ("forest_floor", &[&["forest", "floor"], &["leaves"], &["подстилка"]], &[]),
     ("moss", &[&["moss"], &["мох"]], &["stone", "flagstone", "wall"]),
     ("rocky_ground", &[&["rock"], &["rocky"], &["stone", "ground"], &["камни"]], &["wall", "lava", "snow", "snowy", "ice", "arctic"]),
@@ -99,6 +109,10 @@ const FLOORS: &[Slot] = &[
     ("rock_chalk", &[&["desert", "rock", "ground", "chalk", "c"], &["desert", "rock", "ground", "chalk", "d"], &["desert", "rock", "ground", "chalk", "e"]], &[]),
     ("rock_earthy", &[&["ground", "rock", "earthy", "c"]], &[]),
     ("rock_slate", &[&["ground", "rock", "slate", "c"]], &[]),
+    // Скала и морена высокогорья: на снимке светло-серые (Мёнхсйох 175, 173, 162;
+    // Мер-де-Глас 167, 178, 162) — светлый «меловой» камень FA (164, 159, 147),
+    // сланец (98, 96, 94) выходил почти чёрным.
+    ("rock_alpine", &[&["desert", "rough", "rock", "chalk"], &["desert", "rock", "ground", "chalk", "e"], &["desert", "rock", "ground", "chalk", "g"]], &[]),
     ("rock_sandstone", &[&["ground", "rock", "sandstone", "c"]], &[]),
     ("rock_redrock", &[&["ground", "rock", "redrock", "c"]], &[]),
     ("rock_volcanic", &[&["ground", "rock", "volcanic", "c"]], &[]),
@@ -305,6 +319,8 @@ const OBJECTS: &[Slot] = &[
     ("tombstone", &[&["tombstone"], &["надгробие"]], &["broken", "fallen"]),
     // Папоротник FA — зелёный: рыжий (`Fern_Red`) ярко-алый, на пустоши как кровь.
     ("fern", &[&["fern", "green"]], &[]),
+    // Пучок осоки на моховом болоте.
+    ("tussock", &[&["grass", "patch", "green1"], &["grass", "patch", "green2"], &["grass", "patch", "green3"]], &[]),
     ("lilypad", &[&["lilypad", "green"]], &[]),
     ("grave_kerb", &[&["grave", "stone"]], &["double", "hole", "pile"]),
     ("grave_mound", &[&["rock", "pile", "grave"]], &[]),
@@ -322,7 +338,8 @@ const OBJECTS: &[Slot] = &[
     ("well", &[&["well"], &["колодец"]], &[]),
     ("plant_pot", &[&["plant", "pot"], &["potted"], &["plant"], &["растение"]], &["wall"]),
     ("bush", &[&["bush"], &["shrub"], &["куст"]], &["berry", "dead"]),
-    ("bush_summer", &[&["bush", "green"], &["bush", "multicolor1"]], &["berry", "dead"]),
+    // Только зелёный: Multicolor1 в летней траве выходил рыжим, осенним.
+    ("bush_summer", &[&["bush", "green"]], &["berry", "dead"]),
     ("bush_spring", &[&["berry", "bush", "green"], &["bush", "green"]], &["dead"]),
     ("bush_autumn", &[&["bush", "red"], &["bush", "yellow"]], &["berry", "dead"]),
     ("bush_magic", &[&["bush", "multicolor2"], &["bush", "multicolor3"]], &["berry", "dead"]),
@@ -577,6 +594,7 @@ const NEAR: &[(&str, &str)] = &[
     ("rock_chalk", "rocky_ground"),
     ("rock_earthy", "rocky_ground"),
     ("rock_slate", "rocky_ground"),
+    ("rock_alpine", "rock_chalk"),
     ("rock_sandstone", "rocky_ground"),
     ("rock_redrock", "rocky_ground"),
     ("rock_volcanic", "rocky_ground"),
@@ -600,6 +618,10 @@ const NEAR: &[(&str, &str)] = &[
     ("olivo", "tree_green"),
     ("matorral", "bush_summer"),
     ("swamp_wet", "swamp"),
+    ("bog_moss", "swamp"),
+    ("bog_hummock", "bog_moss"),
+    ("bog_water", "water_deep"),
+    ("bog_water_edge", "water_shallow"),
     ("ash", "dirt"),
     ("water_deep", "water_shallow"),
     ("sea_deep", "water_deep"),
