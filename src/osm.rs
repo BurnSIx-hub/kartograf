@@ -1077,9 +1077,85 @@ fn barrier(t: &Tags, rural: bool) -> Option<(&'static str, bool, f32)> {
         "fence" => Some(("wall_wood", true, 0.15)),
         "railing" | "guard_rail" | "handrail" => Some(("wall_metal", true, 0.12)),
         "hedge" => Some(("wall_hedge", false, 0.45)),
-        _ if get(t, "natural") == "cliff" => Some(("wall_cave", false, 0.6)),
+        // Обрыв — не стена, а рельеф (`cliff_relief`): полоса скалы, тень и стена в Foundry.
         _ => None,
     }
+}
+
+/// Ярусов у обрыва без тега `height` и предел: обрыв Малхема в 80 м — полсотни
+/// ярусов, а сверху стенка всё равно отвесная, и полоса в десятки клеток съела бы карту.
+const CLIFF_LEVELS: f32 = 3.0;
+const CLIFF_MAX: f32 = 6.0;
+/// Плато за кромкой обрыва, клетки; дальше земля спадает на `CLIFF_FALL` яруса
+/// на клетку — гребнями, а не вторым обрывом.
+const CLIFF_SHELF: f32 = 3.0;
+const CLIFF_FALL: f32 = 0.35;
+/// За концом линии обрыв сходит на нет на этом пути, клетки.
+const CLIFF_END: f32 = 2.0;
+
+/// Высота обрыва в ярусах (ярус — клетка, 1,524 м) по тегу `height`.
+fn cliff_levels(t: &Tags) -> f32 {
+    get(t, "height").trim().trim_end_matches('m').trim().parse::<f32>().ok().filter(|v| *v > 0.0).map_or(CLIFF_LEVELS, |m| (m / CELL_M).round().clamp(1.0, CLIFF_MAX))
+}
+
+/// Рельеф по обрывам OSM. Верх обрыва в OSM — слева по ходу линии при севере
+/// сверху; на карте, где y вниз, это нормаль `(dy, −dx)` к ходу `(dx, dy)`
+/// (линия на восток — верх на севере). Опускается нижняя сторона, а не
+/// поднимается верхняя: рельеф темнит ярусы ниже самого верхнего, и узкое
+/// поднятое плато затемняло всю карту вокруг. Низ — полоса `CLIFF_SHELF`, дальше
+/// плавный подъём обратно; за концами линии — на нет за `CLIFF_END`. Кромки,
+/// полосы, тени и стены Foundry дальше строит рельеф сам.
+fn cliff_relief(lines: &[(Vec<[f32; 2]>, f32)], w: u32, h: u32) -> Option<crate::relief::Relief> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut r = crate::relief::Relief::for_cells(w, h);
+    let res = mask::RES as f32;
+    for (line, levels) in lines {
+        let reach = CLIFF_SHELF + levels / CLIFF_FALL + CLIFF_END;
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in line {
+            for c in 0..2 {
+                lo[c] = lo[c].min(p[c] - reach);
+                hi[c] = hi[c].max(p[c] + reach);
+            }
+        }
+        let i0 = ((lo[0] * res).floor().max(0.0) as usize).min(r.w);
+        let i1 = ((hi[0] * res).ceil().max(0.0) as usize).min(r.w);
+        let j0 = ((lo[1] * res).floor().max(0.0) as usize).min(r.h);
+        let j1 = ((hi[1] * res).ceil().max(0.0) as usize).min(r.h);
+        let n = line.len() - 1;
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let p = [(i as f32 + 0.5) / res, (j as f32 + 0.5) / res];
+                // Ближайший отрезок; у общей вершины — тот, от чьей прямой точка дальше.
+                let (mut best, mut side, mut beyond) = (f32::INFINITY, 0.0f32, 0.0f32);
+                for (k, s) in line.windows(2).enumerate() {
+                    let (a, b) = (s[0], s[1]);
+                    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                    let len = dx.hypot(dy).max(1e-6);
+                    let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (len * len);
+                    let q = [a[0] + dx * t.clamp(0.0, 1.0), a[1] + dy * t.clamp(0.0, 1.0)];
+                    let d = (p[0] - q[0]).hypot(p[1] - q[1]);
+                    let s = ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / len;
+                    if d < best - 1e-4 || (d < best + 1e-4 && s.abs() > side.abs()) {
+                        best = best.min(d);
+                        side = s;
+                        beyond = if k == 0 && t < 0.0 { -t * len } else if k + 1 == n && t > 1.0 { (t - 1.0) * len } else { 0.0 };
+                    }
+                }
+                if side > 0.0 {
+                    continue;
+                }
+                let fall = if best <= CLIFF_SHELF { 1.0 } else { (1.0 - (best - CLIFF_SHELF) * CLIFF_FALL / levels).max(0.0) };
+                let end = (1.0 - beyond / CLIFF_END).max(0.0);
+                let v = -levels * fall * end;
+                let k = j * r.w + i;
+                r.data[k] = r.data[k].min(v);
+            }
+        }
+    }
+    Some(r)
 }
 
 /// Проход в ограде и его ширина в клетках: ворота, калитка, перелаз.
@@ -1544,9 +1620,32 @@ pub fn import_with(xml: &str, extra: &[String], opt: Options) -> Result<(Map, Re
         }
     }
 
+    // Обрывы — рельефом: земля опускается с нижней стороны линии, полосы скалы,
+    // тени и стены Foundry строит рельеф.
+    let cliffs: Vec<(Vec<[f32; 2]>, f32)> = osm
+        .ways
+        .values()
+        .filter(|way| get(&way.tags, "natural") == "cliff" && !unseen(&way.tags))
+        .flat_map(|way| {
+            let pts: Vec<[f32; 2]> = way.nodes.iter().filter_map(|id| osm.nodes.get(id)).map(|n| proj.at(n.lat, n.lon)).collect();
+            let levels = cliff_levels(&way.tags);
+            near_map(&pts, w as f32, h as f32, 25.0).into_iter().map(move |l| (l, levels))
+        })
+        .collect();
+    if let Some(mut r) = cliff_relief(&cliffs, w, h) {
+        relief_strips(&mut r, Season::Summer);
+        r.quantize();
+        m.relief = Some(r);
+    }
+
     // Лес, сад, кустарник, вереск, болото: отдельных деревьев в OSM у них нет —
     // сажаем дротиками, мимо домов, дорог, воды, оград и соседей.
     let mut blocked = Blocked::new(&m);
+    // Полоса скалы ложится вниз от кромки, до трёх клеток: на ней не растёт.
+    for (l, _) in &cliffs {
+        blocked.line(l, 1.0);
+        blocked.line(&offset(l, -1.8), 1.8);
+    }
     for p in &m.paths {
         blocked.line(&p.curve(), p.width / 2.0 + 0.6);
     }
@@ -2164,6 +2263,44 @@ mod tests {
         let (m, _) = import(&cut, Options::default()).unwrap();
         assert!(floor(&m, 35, 20).contains("water"), "{}", floor(&m, 35, 20));
         assert!(floor(&m, 35, 4).contains("grass"), "{}", floor(&m, 35, 4));
+    }
+
+    /// Обрыв поперёк карты с запада на восток (y ≈ 13 клеток): верх по OSM — на севере.
+    const CLIFF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+ <node id="1" lat="51.53022" lon="-0.1253"/>
+ <node id="2" lat="51.53022" lon="-0.12455"/>
+ <node id="3" lat="51.53022" lon="-0.1238"/>
+ <way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><tag k="natural" v="cliff"/></way>
+</osm>"#;
+
+    #[test]
+    fn cliff_raises_its_left_side_into_relief_cliff() {
+        let (m, _) = import(CLIFF, Options::default()).unwrap();
+        let r = m.relief.as_ref().expect("рельефа нет");
+        assert_eq!((r.w, r.h), (m.rooms.w, m.rooms.h));
+        // Без `height` — 3 яруса: север (меньший y) выше юга. Опускается юг —
+        // основная земля остаётся на верхнем ярусе и не темнеет.
+        assert!(r.at([20.0, 10.0]).abs() < 0.1, "север {}", r.at([20.0, 10.0]));
+        assert!((r.at([20.0, 15.0]) + 3.0).abs() < 0.1, "юг {}", r.at([20.0, 15.0]));
+        assert!(r.at([20.0, 28.0]) > -1.0, "дальше от обрыва земля поднимается обратно: {}", r.at([20.0, 28.0]));
+        let cliffs: Vec<crate::relief::Edge> = crate::relief::edges(r).into_iter().filter(|e| e.kind == crate::relief::EdgeKind::Cliff).collect();
+        assert!(!cliffs.is_empty(), "обрыва нет");
+        // Обрыв один — по линии; верх смотрит на север. Дальний край плато спадает
+        // гребнями, а не вторым обрывом.
+        for e in &cliffs {
+            assert!(e.points.iter().all(|p| (p[1] - 13.0).abs() < 2.0), "обрыв не на линии: {:?}", &e.points[..3.min(e.points.len())]);
+            let k = e.points.len() / 2;
+            assert!(e.up(k)[1] < -0.5, "верх не на севере: {:?}", e.up(k));
+        }
+        // Тот же обрыв, проведённый на запад, поднимает юг; `height=6` — 4 яруса.
+        let west = CLIFF.replace(r#"<nd ref="1"/><nd ref="2"/><nd ref="3"/>"#, r#"<nd ref="3"/><nd ref="2"/><nd ref="1"/>"#).replace(r#"v="cliff"/>"#, r#"v="cliff"/><tag k="height" v="6"/>"#);
+        let (m, _) = import(&west, Options::default()).unwrap();
+        let r = m.relief.as_ref().unwrap();
+        assert!(r.at([20.0, 15.0]).abs() < 0.1 && (r.at([20.0, 11.0]) + 4.0).abs() < 0.1, "{} {}", r.at([20.0, 15.0]), r.at([20.0, 11.0]));
+        // Обрыв — рельеф, а не тёмная стена.
+        assert!(m.walls.is_empty(), "{:?}", m.walls);
     }
 
     /// Лес-мультиполигон из двух путей; в выгрузке только первый — второй за краем.
