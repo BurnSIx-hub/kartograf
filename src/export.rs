@@ -452,6 +452,17 @@ pub fn tent_walls(p: &map::Prop, hull: Option<&[[f32; 2]]>) -> Vec<([f32; 2], [f
 /// Предел формата по стороне: карта больше уходит в JPEG.
 pub const WEBP_MAX_SIDE: u32 = 16383;
 
+/// Наибольшая сторона картинки сцены. Больше Foundry не покажет: WebGL берёт
+/// текстуру до 16 384 точек (столько и у RX 9070 XT), и WebP её не вместит.
+pub const SCENE_MAX_SIDE: u32 = WEBP_MAX_SIDE;
+
+/// Точек на клетку, при которых картинка карты `w`×`h` клеток влезает в
+/// [`SCENE_MAX_SIDE`]. Красная площадь 256×256 при 256 на клетку — 65 536 точек,
+/// около 13 ГБ памяти и больше предела JPEG; при 100 — 25 600, Foundry её не показал бы.
+pub fn fit_px(w: u32, h: u32, px: u32) -> u32 {
+    px.min(SCENE_MAX_SIDE / w.max(h).max(1)).max(1)
+}
+
 /// WebP со сжатием: картинка карты и прозрачные слои весят в разы меньше PNG.
 /// Встроенный кодировщик `image` умеет только без потерь, поэтому libwebp.
 #[cfg(target_arch = "wasm32")]
@@ -465,6 +476,32 @@ pub fn webp_bytes(img: &image::RgbaImage, _quality: f32) -> Vec<u8> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn webp_bytes(img: &image::RgbaImage, quality: f32) -> Vec<u8> {
     webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(quality).to_vec()
+}
+
+/// WebP картинки карты или `None`, если libwebp не справился. У Красной площади
+/// (16 128 точек по стороне, миллион блоков 16×16) переполнялся первый раздел
+/// кадра (`VP8_ENC_ERROR_PARTITION0_OVERFLOW`), и `encode` ронял программу. Влезает
+/// с одним сегментом и `partition_limit` 100: 73 МБ за 14 с против 99 МБ JPEG
+/// (с четырьмя сегментами — то же переполнение). Большую сразу так, без пробы.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn try_webp(img: &image::RgbaImage, quality: f32) -> Option<Vec<u8>> {
+    let enc = webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height());
+    if img.width().max(img.height()) <= 8192
+        && let Ok(m) = enc.encode_simple(false, quality)
+    {
+        return Some(m.to_vec());
+    }
+    let mut config = webp::WebPConfig::new().ok()?;
+    config.quality = quality;
+    config.alpha_compression = 1;
+    config.segments = 1;
+    config.partition_limit = 100;
+    enc.encode_advanced(&config).ok().map(|m| m.to_vec())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn try_webp(img: &image::RgbaImage, quality: f32) -> Option<Vec<u8>> {
+    Some(webp_bytes(img, quality)).filter(|b| !b.is_empty())
 }
 
 /// Упрощение ломаной (Дуглас — Пекер): точки, отступающие от прямой меньше `tol`, уходят.
@@ -1037,6 +1074,15 @@ mod tests {
         let xs: Vec<f32> = cuts[0].loops[0].0.iter().map(|v| v[0]).collect();
         // Повёрнуто на 90°: поперёк по x — клетка, а не две.
         assert!(xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min) < 1.0);
+    }
+
+    #[test]
+    fn big_map_shrinks_to_what_foundry_shows() {
+        assert_eq!(fit_px(40, 30, 140), 140, "боевая карта — как просили");
+        assert_eq!(fit_px(256, 256, 256), 63);
+        assert_eq!(fit_px(100, 300, 100), 54, "по длинной стороне");
+        assert!(fit_px(256, 256, 256) * 256 <= SCENE_MAX_SIDE);
+        assert_eq!(fit_px(100_000, 1, 256), 1, "не меньше точки");
     }
 
     #[test]

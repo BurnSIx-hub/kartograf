@@ -2024,8 +2024,13 @@ impl App {
                         ui.selectable_value(&mut dlg.px, px, px.to_string());
                     }
                 });
-                let (w, h) = (self.map.width * dlg.px, self.map.height * dlg.px);
-                ui.weak(format!("Картинка {w}×{h}."));
+                let fit = export::fit_px(self.map.width, self.map.height, dlg.px);
+                let (w, h) = (self.map.width * fit, self.map.height * fit);
+                if fit < dlg.px {
+                    ui.weak(format!("Картинка {w}×{h}: карта большая, больше {} точек Foundry не покажет — будет {fit} на клетку.", export::SCENE_MAX_SIDE + 1));
+                } else {
+                    ui.weak(format!("Картинка {w}×{h}."));
+                }
                 ui.add_space(4.0);
                 let trees = self.map.props.iter().filter(|p| p.is_canopy()).count();
                 if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Сама так уходит только встроенная крона; чужому дереву крону включают галочкой в панели объекта.").changed() {
@@ -5403,6 +5408,8 @@ impl App {
 
     /// Начать выгрузку: плитки по размеру холста, камера и выбор запоминаются.
     pub fn start_export(&mut self, dir: PathBuf, name: String, px: u32, quit: bool) {
+        // Большая карта — мельче: иначе Foundry картинку не покажет.
+        let px = export::fit_px(self.map.width, self.map.height, px);
         let ppp = self.canvas_ppp;
         let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
         let (w, h) = (self.map.width * px, self.map.height * px);
@@ -5551,9 +5558,10 @@ impl App {
             // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
             let mut jpg = Vec::new();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
-            let big = img.width().max(img.height()) > export::WEBP_MAX_SIDE;
-            let img_path = e.dir.join(format!("{}.{}", stem(k), if big { "jpg" } else { "webp" }));
-            let bytes = if big { jpg.clone() } else { export::webp_bytes(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0) };
+            // Не вышел WebP (велика или libwebp не справился) — JPEG.
+            let webp = (img.width().max(img.height()) <= export::WEBP_MAX_SIDE).then(|| export::try_webp(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0)).flatten();
+            let img_path = e.dir.join(format!("{}.{}", stem(k), if webp.is_some() { "webp" } else { "jpg" }));
+            let bytes = webp.unwrap_or_else(|| jpg.clone());
             files.push((img_path.clone(), bytes));
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let mut lay = export::layout(map, &map.room_edges());

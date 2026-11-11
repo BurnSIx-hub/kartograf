@@ -722,8 +722,14 @@ fn ground(t: &Tags, sea: bool) -> Option<(&'static str, u8)> {
     if landuse == "railway" {
         return Some(("gravel", 1));
     }
-    if get(t, "railway") == "platform" || (get(t, "highway") == "pedestrian" && get(t, "area") == "yes") || get(t, "place") == "square" || t.contains_key("area:highway") {
-        return Some(("stone_tiles", 5));
+    if plaza(t) {
+        // Мощение площади — по её `surface`: Красная площадь — брусчатка (`sett`),
+        // а не плитка, по которой пешеходные линии ложились тёмными полосами.
+        let hw = match get(t, "area:highway") {
+            "" => "pedestrian",
+            hw => hw,
+        };
+        return Some((paving(t, hw, false), 5));
     }
     if get(t, "man_made") == "pier" {
         return Some(("wood_planks", 6));
@@ -1147,13 +1153,19 @@ fn inside(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
 }
 
 
+/// Площадь, перрон, мощёный участок дороги: место, где ходят по всей ширине.
+fn plaza(t: &Tags) -> bool {
+    get(t, "railway") == "platform" || (get(t, "highway") == "pedestrian" && get(t, "area") == "yes") || get(t, "place") == "square" || t.contains_key("area:highway")
+}
+
 /// Вид дома: пол, слот стены, деревянные ли двери.
 fn building_look(kind: &str, t: &Tags) -> (&'static str, &'static str, bool) {
+    // Пол дома не должен совпадать с мостовой: у ГУМа и Мавзолея он был той же
+    // серой плиткой, что и Красная площадь, и дом читался лишь по тонкой стене.
     let floor = match kind {
-        "house" | "residential" | "apartments" | "terrace" | "detached" | "semidetached_house" | "hotel" | "dormitory" | "hut" | "cabin" | "shed" => "wood_planks",
-        "church" | "cathedral" | "chapel" => "marble",
-        "industrial" | "warehouse" | "garage" | "garages" => "flagstones",
-        _ => "stone_tiles",
+        "church" | "cathedral" | "chapel" | "mosque" | "temple" | "synagogue" | "shrine" | "monastery" | "mausoleum" => "temple_floor",
+        "industrial" | "warehouse" | "garage" | "garages" | "hangar" | "tower" | "castle" | "fortress" | "bunker" | "train_station" | "transportation" => "brick_floor",
+        _ => "wood_planks",
     };
     let wall = match get(t, "building:material") {
         "stone" | "sandstone" | "limestone" | "granite" => "wall_stone_blocks",
@@ -1780,7 +1792,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let ground = |t: &Tags| ground(t, sea);
     // Природные контуры — с изгибом; дома, мощёное и пути остаются по линейке.
     // Узлы, общие для нескольких природных контуров, не срезаются.
-    let natural: Vec<bool> = areas.iter().map(|a| building(a.tags).is_none() && (growth(a.tags).is_some() || matches!(ground(a.tags), Some((t, _)) if !matches!(t, "stone_tiles" | "gravel" | "dirt" | "wood_planks")))).collect();
+    let natural: Vec<bool> = areas.iter().map(|a| building(a.tags).is_none() && !plaza(a.tags) && (growth(a.tags).is_some() || matches!(ground(a.tags), Some((t, _)) if !matches!(t, "stone_tiles" | "gravel" | "dirt" | "wood_planks")))).collect();
     let mut uses: HashMap<i64, u32> = HashMap::new();
     for a in areas.iter().zip(&natural).filter(|(_, n)| **n).map(|(a, _)| a) {
         for ring in &a.nodes {
@@ -2182,6 +2194,10 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // береговая тропа ложилась вдоль пляжа тёмной полосой.
     let beaches: Vec<&Area> = areas.iter().filter(|a| matches!(get(a.tags, "natural"), "beach" | "shingle" | "sand")).collect();
     let on_beach = |p: [f32; 2]| beaches.iter().any(|b| inside(&b.rings, p));
+    // Пешеходная линия по площади — разметка для маршрутов: по Красной площади
+    // они ложились светлыми полосами поперёк сплошной брусчатки.
+    let plazas: Vec<&Area> = areas.iter().filter(|a| plaza(a.tags) && building(a.tags).is_none()).collect();
+    let on_plaza = |p: [f32; 2]| plazas.iter().any(|b| inside(&b.rings, p));
     for way in osm.ways.values() {
         let t = &way.tags;
         if t.is_empty() || unseen(t) {
@@ -2248,11 +2264,14 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 // `tidal=yes` у береговой тропы Лулворта). Мощёная — видна.
                 let loose = matches!(get(t, "surface"), "" | "pebblestone" | "gravel" | "fine_gravel" | "sand" | "shingle" | "ground" | "dirt" | "earth" | "grass" | "rock" | "unpaved" | "compacted")
                     || get(t, "tidal") == "yes";
-                if order == 3 && !bridge && loose && line.iter().any(|&p| on_beach(p)) {
-                    // Куски тропы вне пляжа — порознь, по пляжу — ничего.
+                // Ступени видны и на площади: это перепад, а не разметка.
+                let steps = get(t, "highway") == "steps";
+                let hidden = |p: [f32; 2]| (loose && on_beach(p)) || (!steps && on_plaza(p));
+                if order == 3 && !bridge && line.iter().any(|&p| hidden(p)) {
+                    // Куски тропы вне пляжа и площади — порознь, по ним — ничего.
                     let mut run: Vec<[f32; 2]> = Vec::new();
                     for &p in line.iter().chain(std::iter::once(&[f32::NAN; 2])) {
-                        if p[0].is_finite() && !on_beach(p) {
+                        if p[0].is_finite() && !hidden(p) {
                             run.push(p);
                             continue;
                         }
@@ -2997,6 +3016,43 @@ mod tests {
         let bench = m.props.iter().find(|q| q.asset.contains("bench")).unwrap();
         assert!(bench.rot.abs() < 1.0 || (bench.rot - 180.0).abs() < 1.0, "скамья вдоль улицы: {}", bench.rot);
         assert!(m.labels.iter().any(|l| l.text == "Crowfall Lane" && l.gm && l.rot.abs() < 1.0));
+    }
+
+    /// Красная площадь в малом: брусчатая площадь слева, пешеходная линия через
+    /// неё и дальше, лавка справа.
+    #[test]
+    fn square_keeps_its_paving_and_shop_floor_differs() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+ <node id="1" lat="51.5301" lon="-0.1249"/>
+ <node id="2" lat="51.5301" lon="-0.1245"/>
+ <node id="3" lat="51.5303" lon="-0.1245"/>
+ <node id="4" lat="51.5303" lon="-0.1249"/>
+ <way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="highway" v="pedestrian"/><tag k="area" v="yes"/><tag k="surface" v="sett"/></way>
+ <node id="11" lat="51.5302" lon="-0.12485"/>
+ <node id="12" lat="51.5302" lon="-0.1247"/>
+ <node id="13" lat="51.5302" lon="-0.1242"/>
+ <way id="20"><nd ref="11"/><nd ref="12"/><nd ref="13"/><tag k="highway" v="footway"/></way>
+ <node id="21" lat="51.53005" lon="-0.1244"/>
+ <node id="22" lat="51.53005" lon="-0.1242"/>
+ <node id="23" lat="51.53015" lon="-0.1242"/>
+ <node id="24" lat="51.53015" lon="-0.1244"/>
+ <way id="30"><nd ref="21"/><nd ref="22"/><nd ref="23"/><nd ref="24"/><nd ref="21"/><tag k="building" v="retail"/></way>
+</osm>"#;
+        let (m, _) = import(xml, Options::default()).unwrap();
+        let tex = |mat: usize| match &m.materials[mat].paint {
+            Paint::Texture(k) => k.clone(),
+            Paint::Color(_) => "color".into(),
+        };
+        // Площадь — брусчаткой по `surface=sett`, как улица.
+        assert!(m.terrain.iter().any(|c| tex(c.material as usize).contains("cobblestone")), "{:?}", m.terrain.iter().map(|c| tex(c.material as usize)).collect::<Vec<_>>());
+        // Дорожка — только за площадью (её край — около 22,7 клетки). Других линий нет.
+        let walk: Vec<&Path> = m.paths.iter().collect();
+        assert!(!walk.is_empty(), "дорожка за площадью пропала");
+        assert!(walk.iter().flat_map(|p| p.points.iter()).all(|q| q[0] > 22.0), "дорожка легла по площади: {:?}", walk.iter().map(|p| &p.points).collect::<Vec<_>>());
+        // Пол лавки — дерево, не плитка мостовой.
+        assert!(m.room_floor.iter().any(|c| tex(c.material as usize).contains("wood_planks")), "{:?}", m.room_floor.iter().map(|c| tex(c.material as usize)).collect::<Vec<_>>());
     }
 
     /// Природа: лес слева, озеро справа, гравийная тропа через лес, каменная
