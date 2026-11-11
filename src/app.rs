@@ -4788,7 +4788,7 @@ impl App {
                     p[0].to_bits().hash(&mut hs);
                     p[1].to_bits().hash(&mut hs);
                 }
-                (piece.form as u8, &piece.paint).hash(&mut hs);
+                (piece.form as u8, &piece.paint, piece.height.to_bits(), piece.eaves.to_bits(), piece.down.map(|d| (d[0].to_bits(), d[1].to_bits())), piece.across).hash(&mut hs);
             }
             (light[0].to_bits(), light[1].to_bits()).hash(&mut hs);
             let key = hs.finish();

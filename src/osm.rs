@@ -332,11 +332,12 @@ impl Hint<'_> {
         (n >= 50).then(|| Tone { value: (value / n as f64) as f32, chroma: (chroma / n as f64) as f32 })
     }
 
-    /// Средний цвет снимка по сэмплам маски, как у [`Hint::tone`].
+    /// Цвет снимка по сэмплам маски, как у [`Hint::tone`]: срединный по каждому
+    /// каналу — блик стекла и тень трубы его не сдвигают.
     fn colour(&self, samples: &[(usize, f32)], mw: usize) -> Option<[u8; 3]> {
         let photo = self.cover.photo.as_ref()?;
         let res = mask::RES as f32;
-        let (mut sum, mut n) = ([0.0f64; 3], 0u32);
+        let mut seen: [Vec<u8>; 3] = Default::default();
         for &(k, v) in samples {
             if v < 0.5 {
                 continue;
@@ -348,11 +349,17 @@ impl Hint<'_> {
             }
             let px = photo.get_pixel(x as u32, y as u32).0;
             for c in 0..3 {
-                sum[c] += px[c] as f64;
+                seen[c].push(px[c]);
             }
-            n += 1;
         }
-        (n >= 50).then(|| sum.map(|s| (s / n as f64).round() as u8))
+        if seen[0].len() < 50 {
+            return None;
+        }
+        Some(std::array::from_fn(|c| {
+            let v = &mut seen[c];
+            let mid = v.len() / 2;
+            *v.select_nth_unstable(mid).1
+        }))
     }
 
     /// Деревья снимка в клетках карты `w`×`h`: из анализа (`crowns.json`), а без
@@ -1317,7 +1324,12 @@ fn colour(v: &str) -> Option<[u8; 3]> {
         "darksalmon" => [233, 150, 122],
         "pink" => [255, 192, 203],
         "grey" | "gray" => [128, 128, 128],
-        "darkgrey" | "darkgray" => [169, 169, 169],
+        // В CSS «тёмно-серый» светлее серого (169); в OSM им метят тёмную
+        // кровлю — Средние торговые ряды выходили серебряными.
+        "darkgrey" | "darkgray" => [96, 96, 96],
+        "dimgrey" | "dimgray" => [105, 105, 105],
+        "slategrey" | "slategray" => [112, 128, 144],
+        "darkslategrey" | "darkslategray" => [47, 79, 79],
         "lightgrey" | "lightgray" => [211, 211, 211],
         "silver" => [192, 192, 192],
         "black" => [0, 0, 0],
@@ -1329,8 +1341,99 @@ fn colour(v: &str) -> Option<[u8; 3]> {
         "lightblue" => [173, 216, 230],
         "navy" => [0, 0, 128],
         "teal" => [0, 128, 128],
+        "seagreen" => [46, 139, 87],
+        "darkseagreen" => [143, 188, 143],
+        "forestgreen" => [34, 139, 34],
+        "darkolivegreen" => [85, 107, 47],
+        "olivedrab" => [107, 142, 35],
+        "steelblue" => [70, 130, 180],
+        "skyblue" => [135, 206, 235],
+        "chocolate" => [210, 105, 30],
+        "saddlebrown" => [139, 69, 19],
+        "peru" => [205, 133, 63],
+        "rosybrown" => [188, 143, 143],
+        "burlywood" => [222, 184, 135],
+        "khaki" => [240, 230, 140],
+        "wheat" => [245, 222, 179],
+        "coral" => [255, 127, 80],
+        "tomato" => [255, 99, 71],
+        "crimson" => [220, 20, 60],
         _ => return None,
     })
+}
+
+/// Цвет крыши из тега OSM — приглушённый: там берут имена CSS, и `lightgreen`
+/// выходил кислотным, а `black` — дырой без рисунка покрытия.
+fn roof_rgb(c: [u8; 3]) -> [u8; 3] {
+    let [r, g, b] = c.map(|v| v as f32 / 255.0);
+    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+    let (l, d) = ((mx + mn) / 2.0, mx - mn);
+    let s = if d < 1e-6 { 0.0 } else { d / (1.0 - (2.0 * l - 1.0).abs()).max(1e-6) };
+    let (s2, l2) = (s.min(0.6), l.clamp(0.12, 0.7));
+    if s2 == s && l2 == l {
+        return c;
+    }
+    let h = if d < 1e-6 {
+        0.0
+    } else if mx == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    let k = (1.0 - (2.0 * l2 - 1.0).abs()) * s2;
+    let x = k * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match h as u32 {
+        0 => (k, x, 0.0),
+        1 => (x, k, 0.0),
+        2 => (0.0, k, x),
+        3 => (0.0, x, k),
+        4 => (x, 0.0, k),
+        _ => (k, 0.0, x),
+    };
+    let m = l2 - k / 2.0;
+    [r1, g1, b1].map(|v| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8)
+}
+
+/// Яркость цвета, 0..255.
+fn luma(c: [u8; 3]) -> f32 {
+    0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32
+}
+
+/// Куда смотрит скат по `roof:direction` (градусы от севера по часовой или румб
+/// `N`, `NE`…): вниз по скату, в клетках карты (x — восток, y — юг).
+fn roof_down(v: &str) -> Option<[f32; 2]> {
+    const RUMB: [&str; 16] = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+    let v = v.trim();
+    let deg = v.parse::<f32>().ok().or_else(|| RUMB.iter().position(|r| r.eq_ignore_ascii_case(v)).map(|i| i as f32 * 22.5))?;
+    let a = deg.to_radians();
+    Some([a.sin(), -a.cos()])
+}
+
+/// Цвет крыши со снимка, если ему можно верить: кусок `area` м² с верхом на
+/// `height` м. Снимок не строго сверху — крыша высокого дома сдвинута от
+/// контура (шатёр Спасской башни — метров на пятнадцать), и узкий высокий кусок
+/// брал бы по контуру землю и тень рядом. Совсем тёмное (яркость меньше 40 —
+/// Царская башня под кронами) — тень, а не кровля. Темнее цвета из тега снимок
+/// почти всегда: гранит Мавзолея в 2,3 раза, тёмно-зелёная жесть Средних рядов в
+/// 2,1 — по отношению тень от кровли не отличить.
+fn photo_roof(hint: Option<&Hint>, samples: &[(usize, f32)], mw: usize, area: f32, height: f32) -> Option<[u8; 3]> {
+    if area.max(0.0).sqrt() < 0.5 * height {
+        return None;
+    }
+    hint?.colour(samples, mw).filter(|&c| luma(c) >= 40.0)
+}
+
+/// Низ ската, м ([`RoofPiece::eaves`]): верх `height` без высоты крыши
+/// (`roof:height`, нет — до `min_height`, нет — 3 м); у плоской — верх.
+fn eaves_of(t: &Tags, form: RoofForm, height: f32) -> f32 {
+    if form == RoofForm::Flat {
+        return height;
+    }
+    let num = |k: &str| get(t, k).split_whitespace().next().and_then(|v| v.parse::<f32>().ok());
+    let roof = num("roof:height").or_else(|| num("min_height").filter(|&m| m < height).map(|m| height - m)).unwrap_or(3.0);
+    (height - roof).max(0.0)
 }
 
 /// Площадь кольца, клетки².
@@ -1339,12 +1442,17 @@ fn ring_area(r: &[[f32; 2]]) -> f32 {
 }
 
 /// Вид крыши по `roof:shape` (и плоские покрытия по `roof:material`); пусто — `default`.
+/// `round` — свод вдоль дома (пассажи ГУМа), а не купол.
 fn roof_form(shape: &str, material: &str, default: RoofForm) -> RoofForm {
     match shape {
         "flat" => RoofForm::Flat,
         "" if matches!(material, "tar_paper" | "concrete" | "asphalt" | "gravel") => RoofForm::Flat,
         "" => default,
-        "pyramidal" | "cone" | "conical" | "dome" | "onion" | "round" | "spherical" | "tent" => RoofForm::Spire,
+        "pyramidal" | "tent" => RoofForm::Spire,
+        "dome" | "onion" | "spherical" | "cone" | "conical" => RoofForm::Dome,
+        "skillion" | "lean_to" => RoofForm::Shed,
+        "gabled" | "gambrel" | "saltbox" => RoofForm::Gabled,
+        "round" | "barrel" => RoofForm::Round,
         _ => RoofForm::Pitched,
     }
 }
@@ -1357,6 +1465,7 @@ fn roof_slot(material: &str, rural: bool) -> &'static str {
         "copper" => "roof_copper",
         "thatch" | "reed" | "straw" => "roof_thatch",
         "wood" | "wooden" | "shingle" | "shingles" => "roof_shingle",
+        "stone" | "marble" | "granite" | "sandstone" => "flagstones",
         "metal" | "tin" | "steel" | "zinc" | "metal_sheet" | "glass" | "concrete" | "tar_paper" | "asphalt" => "roof_metal",
         _ if rural => "roof_clay_red",
         _ => "roof_metal",
@@ -1369,16 +1478,21 @@ fn part_height(t: &Tags) -> f32 {
     num("height").or_else(|| num("building:levels").map(|l| l * 3.0)).unwrap_or(0.0)
 }
 
-/// Крыша по контуру дома. Основа — весь дом: вид, покрытие и цвет из его тегов,
-/// нет — из самой большой части, цвет ещё и со снимка; без тегов вида — скатами.
-/// Поверх — части (`building:part`) снизу вверх по высоте, каждая своим цветом и
-/// видом (без вида — плоская, как в OSM): купола собора, шатры башен.
-fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>, weights: &[(usize, f32)], mw: usize, rural: bool) -> OutlineRoof {
+/// Крыша по контуру дома. Основа — весь дом: вид и покрытие из его тегов, нет —
+/// из самой большой части; цвет — со снимка, если ему можно верить
+/// ([`photo_roof`]), иначе из тега. Без тега вида — скатами; башня — шатром,
+/// низкая площадка (Лобное место), стройка, белая кровля и будка в городе —
+/// плоские. Поверх — части (`building:part`) снизу вверх по высоте, каждая своим
+/// видом (без вида — плоская, как в OSM, а верх башни — шатром) и цветом.
+#[allow(clippy::too_many_arguments)]
+fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>, rooms: &Mask, weights: &[(usize, f32)], cell_m: f32, rural: bool) -> OutlineRoof {
+    let mw = rooms.w;
+    let m2 = cell_m * cell_m;
     let mut mine: Vec<&(f32, [f32; 2], &Area)> = parts.iter().filter(|p| inside(&a.rings, p.1)).collect();
+    let outer = a.rings.first().map_or(0.0, |r| ring_area(r));
     // Теги основы — у части, что и есть тело дома (не меньше половины): купол
     // церкви вида основе не даёт.
-    let body = a.rings.first().map_or(0.0, |r| ring_area(r)) * 0.5;
-    let main = mine.iter().filter(|p| p.0 >= body).max_by(|x, y| x.0.total_cmp(&y.0)).map(|p| p.2.tags);
+    let main = mine.iter().filter(|p| p.0 >= outer * 0.5).max_by(|x, y| x.0.total_cmp(&y.0)).map(|p| p.2.tags);
     let tag = |k: &str| match get(a.tags, k) {
         "" => main.map_or("", |t| get(t, k)),
         v => v,
@@ -1387,17 +1501,92 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
         let key = asset(slot).key;
         rgb.map_or_else(|| key.clone(), |c| library::tint_key(c, &key))
     };
-    let base_rgb = colour(tag("roof:colour")).or_else(|| hint.and_then(|h| h.colour(weights, mw)));
+    let tower = get(a.tags, "man_made") == "tower" || !get(a.tags, "tower:type").is_empty();
+    let own_h = part_height(a.tags);
+    // Высота для доверия снимку: без тегов — два этажа.
+    let seen_h = if own_h > 0.0 { own_h } else { 6.0 };
+    let base_osm = colour(tag("roof:colour")).map(roof_rgb);
+    let base_photo = photo_roof(hint, weights, mw, outer * m2, seen_h);
+    let base_rgb = base_photo.or(base_osm);
     let base_material = tag("roof:material");
-    let mut pieces = vec![RoofPiece { rings: a.rings.clone(), form: roof_form(tag("roof:shape"), base_material, RoofForm::Pitched), paint: paint(roof_slot(base_material, rural), base_rgb) }];
+    let bare = get(a.tags, "building:levels").is_empty() && get(a.tags, "height").is_empty();
+    let platform = own_h > 0.0 && own_h <= 4.0 && get(a.tags, "building:levels").is_empty();
+    // Светлая серая кровля на снимке — плоская: скатные — жесть, черепица, медь,
+    // а светлое серое — мембрана и бетон (будки в Кремле).
+    let pale = base_photo.is_some_and(|c| c.iter().max().unwrap_or(&0) - c.iter().min().unwrap_or(&0) < 30 && luma(c) > 135.0);
+    let default = if tower {
+        RoofForm::Spire
+    } else if platform || get(a.tags, "building") == "construction" || (!rural && (pale || (bare && outer * m2 < 60.0))) {
+        RoofForm::Flat
+    } else {
+        RoofForm::Pitched
+    };
+    // Площадка без покрытия в тегах — каменная.
+    let base_slot = if platform && base_material.is_empty() { "flagstones" } else { roof_slot(base_material, rural) };
+    let base_form = roof_form(tag("roof:shape"), base_material, default);
+    let mut pieces = vec![RoofPiece {
+        rings: a.rings.clone(),
+        form: base_form,
+        paint: paint(base_slot, base_rgb),
+        height: own_h,
+        eaves: eaves_of(a.tags, base_form, own_h),
+        down: (base_form == RoofForm::Shed).then(|| roof_down(tag("roof:direction"))).flatten(),
+        across: tag("roof:orientation") == "across",
+    }];
     mine.sort_by(|x, y| part_height(x.2.tags).total_cmp(&part_height(y.2.tags)));
-    for (_, _, part) in mine {
-        let t = part.tags;
+    // Цвет частей — группами по тегу `roof:colour` (грани вальмы без тега — одной
+    // группой): со снимка по всей группе, если ему можно верить, иначе из тега,
+    // иначе цвет дома. По одной грани снимок дал бы её свет, а не цвет кровли.
+    let group = |t: &Tags| match get(t, "roof:colour").trim() {
+        "" if roof_form(get(t, "roof:shape"), "", RoofForm::Flat) == RoofForm::Shed => "~shed".to_owned(),
+        "" => String::new(),
+        c => c.to_lowercase(),
+    };
+    let height_of = |t: &Tags| match part_height(t) {
+        h if h > 0.0 => h,
+        _ => own_h,
+    };
+    let samples: Vec<Vec<(usize, f32)>> = mine.iter().map(|p| coverage(rooms, &p.2.rings, 0.0)).collect();
+    let mut groups: HashMap<String, (Vec<(usize, f32)>, f32, f32)> = HashMap::new();
+    for (p, s) in mine.iter().zip(&samples) {
+        let k = group(p.2.tags);
+        if !k.is_empty() {
+            let g = groups.entry(k).or_default();
+            g.0.extend_from_slice(s);
+            g.1 += p.0 * m2;
+            g.2 = g.2.max(height_of(p.2.tags));
+        }
+    }
+    let seen = |h: f32| if h > 0.0 { h } else { seen_h };
+    let group_rgb: HashMap<String, Option<[u8; 3]>> = groups.into_iter().map(|(k, (s, area, h))| (k, photo_roof(hint, &s, mw, area, seen(h)))).collect();
+    let top = mine.len().checked_sub(1);
+    for (i, (p, s)) in mine.iter().zip(&samples).enumerate() {
+        let t = p.2.tags;
         let material = match get(t, "roof:material") {
             "" => base_material,
             m => m,
         };
-        pieces.push(RoofPiece { rings: part.rings.clone(), form: roof_form(get(t, "roof:shape"), material, RoofForm::Flat), paint: paint(roof_slot(material, rural), colour(get(t, "roof:colour")).or(base_rgb)) });
+        let h = height_of(t);
+        let photo = match group(t) {
+            k if k.is_empty() => photo_roof(hint, s, mw, p.0 * m2, seen(h)),
+            k => group_rgb.get(&k).copied().flatten(),
+        };
+        let rgb = photo.or_else(|| colour(get(t, "roof:colour")).map(roof_rgb)).or(base_rgb);
+        let mut form = roof_form(get(t, "roof:shape"), material, RoofForm::Flat);
+        // Верх башни без вида — шатром: у Сенатской башни вид в OSM не задан.
+        if tower && Some(i) == top && get(t, "roof:shape").is_empty() {
+            form = RoofForm::Spire;
+        }
+        let slot = if get(t, "roof:material").is_empty() { base_slot } else { roof_slot(material, rural) };
+        pieces.push(RoofPiece {
+            rings: p.2.rings.clone(),
+            form,
+            paint: paint(slot, rgb),
+            height: h,
+            eaves: eaves_of(t, form, h),
+            down: (form == RoofForm::Shed).then(|| roof_down(get(t, "roof:direction"))).flatten(),
+            across: get(t, "roof:orientation") == "across",
+        });
     }
     OutlineRoof { pieces }
 }
@@ -1472,10 +1661,12 @@ fn building_look(kind: &str, t: &Tags) -> (&'static str, &'static str, bool) {
     (floor, wall, matches!(wall, "wall_wood" | "wall_timber") || floor == "wood_planks")
 }
 
-/// Дом ли это и какой: `building=*`, кроме навесов и недостроенного.
+/// Дом ли это и какой: `building=*`, кроме навесов, задуманного и снесённого.
+/// Стройка — дом: внутренний корпус Средних торговых рядов в OSM стройка, а на
+/// снимке под белой крышей.
 fn building(t: &Tags) -> Option<&str> {
     let b = get(t, "building");
-    (!b.is_empty() && !matches!(b, "no" | "roof" | "construction" | "proposed" | "demolished" | "ruins")).then_some(b)
+    (!b.is_empty() && !matches!(b, "no" | "roof" | "proposed" | "demolished" | "ruins")).then_some(b)
 }
 
 /// Чем выложена дорога: по тегу `surface`, без него — по виду дороги и месту
@@ -2535,7 +2726,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         let style = if fort { wall_tinted(slot, tag("building:colour").or(tint)) } else { wall(slot) };
         // Крыша — у всего, что сверху закрыто: у стены и трибуны её нет.
         if !wall_top && kind != "grandstand" {
-            m.outline_roofs.push(outline_roof(a, &parts, hint.as_ref(), &weights, m.rooms.w, rural));
+            m.outline_roofs.push(outline_roof(a, &parts, hint.as_ref(), &m.rooms, &weights, cell, rural));
         }
         houses.push(House { rings: a.rings.clone(), entrances, style, wood: wood && !fort, grand, doors: !wall_top });
     }
@@ -3558,8 +3749,47 @@ mod tests {
         let church = m.outline_roofs.iter().find(|r| r.pieces.len() == 2).expect("у церкви нет купола-части");
         assert_eq!(church.pieces[0].form, RoofForm::Pitched);
         assert!(church.pieces[0].paint.starts_with("tint:2e8b57:"), "{}", church.pieces[0].paint);
-        assert_eq!(church.pieces[1].form, RoofForm::Spire);
-        assert!(church.pieces[1].paint.starts_with("tint:ffd700:"), "{}", church.pieces[1].paint);
+        assert_eq!(church.pieces[1].form, RoofForm::Dome);
+        let gold = roof_rgb(colour("gold").unwrap());
+        assert!(church.pieces[1].paint.starts_with(&format!("tint:{:02x}{:02x}{:02x}:", gold[0], gold[1], gold[2])), "{}", church.pieces[1].paint);
+    }
+
+    /// Вальма Сената в OSM — грани-части `skillion` со своим `roof:direction`;
+    /// пассаж ГУМа — свод `round` поперёк.
+    #[test]
+    fn skillion_facets_face_their_direction_and_vaults_keep_orientation() {
+        let xml = town(
+            r##"<way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="building" v="yes"/></way>
+ <node id="41" lat="51.53032" lon="-0.12495"/>
+ <node id="42" lat="51.53032" lon="-0.12485"/>
+ <node id="43" lat="51.53024" lon="-0.12485"/>
+ <node id="44" lat="51.53024" lon="-0.12495"/>
+ <node id="45" lat="51.53032" lon="-0.12475"/>
+ <node id="46" lat="51.53024" lon="-0.12475"/>
+ <way id="40"><nd ref="41"/><nd ref="42"/><nd ref="43"/><nd ref="44"/><nd ref="41"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="skillion"/><tag k="roof:direction" v="W"/><tag k="height" v="25"/><tag k="min_height" v="20"/></way>
+ <way id="50"><nd ref="42"/><nd ref="45"/><nd ref="46"/><nd ref="43"/><nd ref="42"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="round"/><tag k="roof:orientation" v="across"/><tag k="height" v="23"/><tag k="roof:height" v="3"/></way>"##,
+        );
+        let (m, _) = import(&xml, Options::default()).unwrap();
+        let roof = m.outline_roofs.iter().find(|r| r.pieces.len() == 3).expect("частей нет");
+        let shed = roof.pieces.iter().find(|p| p.form == RoofForm::Shed).expect("грань не односкатная");
+        let d = shed.down.expect("у грани нет стороны");
+        assert!(d[0] < -0.99 && d[1].abs() < 0.01, "W — не на запад: {d:?}");
+        assert_eq!(shed.eaves, 20.0);
+        let vault = roof.pieces.iter().find(|p| p.form == RoofForm::Round).expect("свода нет");
+        assert!(vault.across);
+        assert_eq!(vault.eaves, 20.0);
+    }
+
+    #[test]
+    fn css_roof_colours_are_muted() {
+        let black = roof_rgb(colour("black").unwrap());
+        assert!(luma(black) >= 25.0, "чёрная — дыра: {black:?}");
+        let green = roof_rgb(colour("lightgreen").unwrap());
+        assert!(luma(green) < luma(colour("lightgreen").unwrap()), "кислотная: {green:?}");
+        // Обычный цвет кровли — как есть.
+        assert_eq!(roof_rgb([26, 89, 71]), [26, 89, 71]);
+        // «Тёмно-серая» темнее серой, как её понимают в OSM.
+        assert!(luma(colour("darkgrey").unwrap()) < luma(colour("grey").unwrap()));
     }
 
     /// Кремлёвский парк в малом: парк на всю левую часть, на снимке трава лишь
