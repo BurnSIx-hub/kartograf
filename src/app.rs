@@ -4763,7 +4763,7 @@ impl App {
             return Some(img.clone());
         }
         let bytes = self.textures.bytes(key).ok()?;
-        let img = std::sync::Arc::new(library::decode_tinted(key, &bytes).ok()?);
+        let img = std::sync::Arc::new(roofs::solid_cover(library::decode_tinted(key, &bytes).ok()?));
         self.cover_cache.insert(key.to_owned(), img.clone());
         Some(img)
     }
@@ -5720,7 +5720,7 @@ impl App {
                 for piece in &r.pieces {
                     if !outline_covers.contains_key(&piece.paint) {
                         let bytes = self.textures.bytes(&piece.paint)?;
-                        outline_covers.insert(piece.paint.clone(), library::decode_tinted(&piece.paint, &bytes)?);
+                        outline_covers.insert(piece.paint.clone(), roofs::solid_cover(library::decode_tinted(&piece.paint, &bytes)?));
                     }
                 }
                 let ppc = e.px as f32;

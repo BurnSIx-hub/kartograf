@@ -230,6 +230,68 @@ pub fn simplify_ring(ring: &[[f32; 2]], tol: f32) -> Vec<[f32; 2]> {
     if out.len() < 3 { pts } else { out }
 }
 
+/// Кольцо для скатов: уступ стены до полутора метров между двумя стенами одного
+/// хода, каждая хотя бы вдвое длиннее уступа, — в точку. У короткой стороны
+/// уступа своя грань, и она шла узкой полосой через весь скат (двор Средних
+/// рядов, уступ 1,3 м). Край крыши остаётся по [`simplify_ring`]: по этому
+/// кольцу стена с пилястрами выглядывала бы из-под свеса.
+pub fn iron_jogs(ring: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    const JOG: f32 = 1.0;
+    let mut out = ring.to_vec();
+    loop {
+        let n = out.len();
+        if n < 5 {
+            break;
+        }
+        let dir = |a: [f32; 2], b: [f32; 2]| {
+            let l = dist(a, b).max(1e-6);
+            [(b[0] - a[0]) / l, (b[1] - a[1]) / l]
+        };
+        let jog = (0..n).find(|&i| {
+            let (p, a, b, q) = (out[(i + n - 1) % n], out[i], out[(i + 1) % n], out[(i + 2) % n]);
+            let (u, w) = (dir(p, a), dir(b, q));
+            let wall = (2.0 * dist(a, b)).max(1.0);
+            dist(a, b) < JOG && dist(p, a) >= wall && dist(b, q) >= wall && u[0] * w[0] + u[1] * w[1] > 0.97
+        });
+        let Some(i) = jog else { break };
+        let (a, b) = (out[i], out[(i + 1) % n]);
+        out[i] = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        out.remove((i + 1) % n);
+    }
+    out
+}
+
+/// Покрытие кровли без прозрачности — для [`render_outline`], что читает только
+/// цвет. У черепицы и шифера FA внизу плитки полоса в 60 точек без единой
+/// непрозрачной: край ряда в Dungeondraft ложится на следующий. Повтором плитки
+/// она давала белую черту поперёк ската и вдоль ендовы. Пустые края — прочь,
+/// полупрозрачное (зубчатый край ряда) — поверх тёмной щели.
+pub fn solid_cover(img: image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = img.dimensions();
+    let row = |y: u32| (0..w).map(|x| img.get_pixel(x, y).0[3] as u32).sum::<u32>() >= 128 * w;
+    let col = |x: u32| (0..h).map(|y| img.get_pixel(x, y).0[3] as u32).sum::<u32>() >= 128 * h;
+    let (Some(y0), Some(y1)) = ((0..h).find(|&y| row(y)), (0..h).rev().find(|&y| row(y))) else { return img };
+    let (Some(x0), Some(x1)) = ((0..w).find(|&x| col(x)), (0..w).rev().find(|&x| col(x))) else { return img };
+    let mut out = image::imageops::crop_imm(&img, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image();
+    if out.pixels().all(|p| p.0[3] == 255) {
+        return out;
+    }
+    // Щель — срединный цвет непрозрачного втрое темнее.
+    let mut seen: Vec<[u8; 3]> = out.pixels().filter(|p| p.0[3] == 255).map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
+    let gap: [f32; 3] = std::array::from_fn(|k| {
+        seen.sort_unstable_by_key(|c| c[k]);
+        seen.get(seen.len() / 2).map_or(0.0, |c| c[k] as f32 / 3.0)
+    });
+    for p in out.pixels_mut() {
+        let a = p.0[3] as f32 / 255.0;
+        for k in 0..3 {
+            p.0[k] = (p.0[k] as f32 * a + gap[k] * (1.0 - a)).round() as u8;
+        }
+        p.0[3] = 255;
+    }
+    out
+}
+
 /// Покрытие в точке `u`, `v` (доли плитки), с размытием между точками картинки.
 fn bilinear(tex: &image::RgbaImage, u: f32, v: f32) -> [f32; 3] {
     let (tw, th) = (tex.width() as f32, tex.height() as f32);
@@ -266,12 +328,15 @@ pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t i
     let mut img = image::RgbaImage::new(w, h);
     // Кольца без лишних узлов — раз на кусок: по ним и стыки, и скаты.
     let rings: Vec<Vec<Vec<[f32; 2]>>> = roof.pieces.iter().map(|k| k.rings.iter().map(|r| simplify_ring(r, OUTLINE_TOL)).filter(|r| r.len() >= 3).collect()).collect();
+    // Скаты — от колец без мелких уступов, край — по упрощённым.
+    let slopes: Vec<Vec<Vec<[f32; 2]>>> = rings.iter().map(|rs| rs.iter().map(|r| iron_jogs(r)).collect()).collect();
     // Высота видимого куска в каждой точке и чей он — для теней.
     let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize] };
     for (i, piece) in roof.pieces.iter().enumerate() {
         if let Some(t) = tex(&piece.paint) {
             let open = open_edges(&rings, &roof.pieces, i);
-            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, t, light, (&mut relief, i as u32));
+            let slope = (&slopes[i][..], open_edges(&slopes, &roof.pieces, i));
+            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, (slope.0, &slope.1), t, light, (&mut relief, i as u32));
         }
     }
     cast_shadows(&mut img, &relief, ppc, light);
@@ -443,7 +508,8 @@ fn gable_ridge(rings: &[Vec<[f32; 2]>], across: bool) -> Option<([f32; 2], [f32;
 /// длинной стороны, по краю парапет. Двор — дыра, к нему крыша тоже скатывается.
 /// Высоту своей поверхности кусок пишет в `relief` под номером `me`.
 #[allow(clippy::too_many_arguments)]
-fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], tex: &image::RgbaImage, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
+#[allow(clippy::too_many_arguments)]
+fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], (slope_rings, slope_open): (&[Vec<[f32; 2]>], &[bool]), tex: &image::RgbaImage, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
     /// Сторона квадрата точек, для которого стороны контура отбираются разом.
     const BLOCK: u32 = 16;
     let edges = edges_of(rings);
@@ -452,10 +518,30 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
     }
     // Свес — только по краю: к стыку с соседним куском ската нет. Кусок весь в
     // стыках (посреди такого же) — тогда ко всем сторонам.
-    let eaves: Vec<([f32; 2], [f32; 2])> = match edges.iter().zip(open).filter(|(_, o)| **o).map(|(e, _)| *e).collect::<Vec<_>>() {
-        e if e.is_empty() => edges.clone(),
+    let slope_edges = edges_of(slope_rings);
+    let eaves: Vec<([f32; 2], [f32; 2])> = match slope_edges.iter().zip(slope_open).filter(|(_, o)| **o).map(|(e, _)| *e).collect::<Vec<_>>() {
+        e if e.is_empty() => slope_edges.clone(),
         e => e,
     };
+    // Вогнутые углы между свесами: соседний свес у начала и у конца стороны. За
+    // таким углом точка ближе всего к самой вершине, и скаты шли дугой вокруг
+    // неё; у настоящей крыши там ендова — прямая по биссектрисе угла.
+    let turn: Vec<[Option<usize>; 2]> = eaves
+        .iter()
+        .map(|&(a, b)| {
+            let reflex = |prev: [f32; 2], v: [f32; 2], next: [f32; 2]| {
+                let (u, w) = ([prev[0] - v[0], prev[1] - v[1]], [next[0] - v[0], next[1] - v[1]]);
+                let (lu, lw) = (u[0].hypot(u[1]), w[0].hypot(w[1]));
+                let s = [u[0] / lu + w[0] / lw, u[1] / lu + w[1] / lw];
+                let ls = s[0].hypot(s[1]);
+                // Между сторонами внутри дома — угол выпуклый; снаружи — вогнутый.
+                ls > 0.05 && !inside_rings(slope_rings, [v[0] + s[0] / ls * 0.05, v[1] + s[1] / ls * 0.05])
+            };
+            let prev = eaves.iter().position(|e| e.1 == a).filter(|&j| reflex(eaves[j].0, a, b));
+            let next = eaves.iter().position(|e| e.0 == b).filter(|&j| reflex(a, b, eaves[j].1));
+            [prev, next]
+        })
+        .collect();
     let tile = tile_cells([tex.width(), tex.height()]);
     let (w, h) = (img.width(), img.height());
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
@@ -539,7 +625,7 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
             let (_, e2) = two(&eaves, c);
             let near: Vec<(&([f32; 2], [f32; 2]), bool)> = edges.iter().zip(open.iter().copied()).filter(|(e, _)| segment_distance(c, e.0, e.1) <= a1 + 2.0 * half).collect();
             let reach = e2.min(f32::MAX / 2.0) + 2.0 * half;
-            let cand: Vec<&([f32; 2], [f32; 2])> = eaves.iter().filter(|e| segment_distance(c, e.0, e.1) <= reach).collect();
+            let cand: Vec<usize> = (0..eaves.len()).filter(|&k| segment_distance(c, eaves[k].0, eaves[k].1) <= reach).collect();
             for y in by..(by + BLOCK).min(y1) {
                 let xs = &crossings[(y - y0) as usize];
                 for x in bx..(bx + BLOCK).min(x1) {
@@ -559,15 +645,33 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                         continue;
                     }
                     // Два ближайших края: расстояние, точка на стороне, сама сторона.
-                    let (mut d1, mut d2, mut q1, mut q2, mut e1) = (f32::MAX, f32::MAX, p, p, eaves[0]);
-                    for &&(a, b) in &cand {
+                    // `g1` — у ближайшего за вогнутым углом: насколько он дальше
+                    // соседнего свеса; около нуля — ендова.
+                    let (mut d1, mut d2, mut q1, mut q2, mut e1, mut g1) = (f32::MAX, f32::MAX, p, p, eaves[0], f32::MAX);
+                    for &k in &cand {
+                        let (a, b) = eaves[k];
                         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                        let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-                        let q = [a[0] + dx * t, a[1] + dy * t];
-                        let d = dist(p, q);
+                        let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy);
+                        let mut q = [a[0] + dx * t.clamp(0.0, 1.0), a[1] + dy * t.clamp(0.0, 1.0)];
+                        let mut d = dist(p, q);
+                        let mut g = f32::MAX;
+                        // За вогнутым углом — по прямой стороны, если до неё дальше,
+                        // чем до прямой соседа: грань доходит до биссектрисы угла.
+                        // Ближе — точка грани соседа (он тоже в кандидатах), а эта
+                        // сторона не в счёт: её расстоянием до вершины вдоль
+                        // продолжения соседа шёл ложный гребень.
+                        let beyond = if t < 0.0 { turn[k][0] } else if t > 1.0 { turn[k][1] } else { None };
+                        if let Some(j) = beyond {
+                            let line = |(a, b): ([f32; 2], [f32; 2])| ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])).abs() / dist(a, b);
+                            let (l, lj) = (line((a, b)), line(eaves[j]));
+                            if l < lj {
+                                continue;
+                            }
+                            (d, q, g) = (l, [a[0] + dx * t, a[1] + dy * t], l - lj);
+                        }
                         if d < d1 {
                             (d2, q2) = (d1, q1);
-                            (d1, q1, e1) = (d, q, (a, b));
+                            (d1, q1, e1, g1) = (d, q, (a, b), g);
                         } else if d < d2 {
                             (d2, q2) = (d, q);
                         }
@@ -641,10 +745,11 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                         let across = ((p[0] - a[0]) * n[0] + (p[1] - a[1]) * n[1]).abs();
                         let mut c = bilinear(tex, along / tile[0], -across / tile[1]).map(|k| k * roof_shade(n, light, false));
                         // Гребень — где две стороны одинаково близко (не у самой
-                        // вершины: там обе стороны сходятся в одну точку).
-                        if d2 - d1 < CAP / 2.0 && d1 > CAP && dist(q1, q2) > CAP {
+                        // вершины: там обе стороны сходятся в одну точку); ендова —
+                        // где за вогнутым углом сходятся две грани.
+                        if (d2 - d1 < CAP / 2.0 && d1 > CAP && dist(q1, q2) > CAP) || (g1 < CAP / 2.0 && d1 > CAP / 2.0) {
                             c = bilinear(tex, along / tile[0] * 2.0, across / tile[1]).map(|k| k * CAP_SHADE);
-                            if (CAP / 2.0 - (d2 - d1)) * ppc < 1.0 {
+                            if (CAP / 2.0 - (d2 - d1).min(g1)) * ppc < 1.0 {
                                 c = c.map(|k| k * 0.45);
                             }
                         }
@@ -798,6 +903,68 @@ mod tests {
         assert_eq!(at(5.5, 9.5), lit);
         // Сама верхняя ступень не затенена.
         assert!(at(5.0, 5.0) >= lit - 2);
+    }
+
+    /// Уступ стены в полметра между длинными стенами — в точку, даже когда
+    /// упрощение его оставило (кольцо начинается на уступе); уступ в клетку — нет.
+    /// Край крыши при этом — по стене, с уступом.
+    #[test]
+    fn half_metre_jog_in_a_long_wall_is_ironed_out() {
+        let ring = vec![[5.0, 4.0], [5.0, 4.4], [0.0, 4.4], [0.0, 0.0], [10.0, 0.0], [10.0, 4.0]];
+        let s = iron_jogs(&simplify_ring(&ring, OUTLINE_TOL));
+        assert_eq!(s.len(), 5, "{s:?}");
+        assert!((0..s.len()).all(|k| dist(s[k], s[(k + 1) % s.len()]) > 1.0), "{s:?}");
+        let step = vec![[5.0, 4.0], [5.0, 5.5], [0.0, 5.5], [0.0, 0.0], [10.0, 0.0], [10.0, 4.0]];
+        assert_eq!(iron_jogs(&simplify_ring(&step, OUTLINE_TOL)).len(), 6);
+        // Над уступом — крыша до самой стены.
+        let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
+        let paint = |_: &str| Some(&grey);
+        let piece = RoofPiece { rings: vec![ring], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
+        let (img, o) = render_outline(&OutlineRoof { pieces: vec![piece] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]));
+        let alpha = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0[3];
+        assert_eq!(alpha(2.0, 4.3), 255, "край крыши срезал уступ");
+        assert_eq!(alpha(7.0, 4.3), 0, "крыша за стеной");
+    }
+
+    /// Шифер FA: внизу плитки полоса без единой непрозрачной точки, над ней —
+    /// зубчатый край ряда. Без неё — ни белого, ни прозрачного.
+    #[test]
+    fn fa_roof_band_is_cut_and_never_white() {
+        let img = image::RgbaImage::from_fn(8, 12, |_, y| match y {
+            0..8 => image::Rgba([90, 90, 90, 255]),
+            8 => image::Rgba([90, 90, 90, 200]),
+            _ => image::Rgba([255, 255, 255, 0]),
+        });
+        let out = solid_cover(img);
+        assert_eq!(out.dimensions(), (8, 9));
+        assert!(out.pixels().all(|p| p.0[3] == 255 && p.0[0] <= 90), "белое или прозрачное в покрытии");
+    }
+
+    /// Г-образный дом: за вогнутым углом (4, 4) скаты сходятся прямой ендовой по
+    /// биссектрисе, а не дугой вокруг вершины, и край плитки (свес) не тянется
+    /// продолжением стороны внутрь крыши.
+    #[test]
+    fn concave_corner_has_a_straight_valley_not_an_arc() {
+        // Плитка в 4 клетки, низ — «свес» красный.
+        let tex = image::RgbaImage::from_fn(16, 1024, |_, y| if y >= 960 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([160, 160, 160, 255]) });
+        let paint = |_: &str| Some(&tex);
+        let l = RoofPiece { rings: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 4.0], [4.0, 4.0], [4.0, 10.0], [0.0, 10.0]]], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
+        let (img, o) = render_outline(&OutlineRoof { pieces: vec![l] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]));
+        let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0;
+        for (x, y) in [(2.5, 3.95), (1.5, 3.95), (3.95, 2.5), (3.95, 1.5)] {
+            assert!(at(x, y)[1] > 0, "свес тянется за угол в ({x}, {y}): {:?}", at(x, y));
+        }
+        // По ту сторону биссектрисы — грань нижней стороны, по эту — правой: дугой
+        // вокруг вершины весь угол был бы одной гранью. На самой биссектрисе — ендова.
+        let (low, right) = (at(6.0, 3.0)[1], at(3.0, 6.0)[1]);
+        assert_ne!(low, right);
+        for (x, y) in [(3.4, 3.0), (3.6, 2.8), (3.5, 2.6)] {
+            assert_eq!(at(x, y)[1], low, "({x}, {y}) не на грани нижней стороны");
+            assert_eq!(at(y, x)[1], right, "({y}, {x}) не на грани правой стороны");
+        }
+        for k in [3.0, 3.3, 3.6] {
+            assert!(at(k, k)[1] != low && at(k, k)[1] != right, "нет ендовы в ({k}, {k})");
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::map::{OutlineRoof, RoofForm, RoofPiece, segment_distance};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::f32::consts::{FRAC_PI_4, FRAC_PI_8};
 
 /// Метров в клетке D&D: 5 футов.
@@ -1363,13 +1363,27 @@ fn colour(v: &str) -> Option<[u8; 3]> {
 }
 
 /// Цвет крыши из тега OSM — приглушённый: там берут имена CSS, и `lightgreen`
-/// выходил кислотным, а `black` — дырой без рисунка покрытия.
+/// выходил кислотным, а `black` — дырой без рисунка покрытия. Имя — грубая
+/// категория: `green` на снимке — тусклая крашеная жесть, а чистый CSS-зелёный
+/// кислотный (дом на Ильинке); его глушим сильнее. Код `#617666` маппер подбирал
+/// сам — ему верим больше. Золото куполов и на снимке яркое.
+fn tag_roof(v: &str) -> Option<[u8; 3]> {
+    let c = colour(v)?;
+    let v = v.trim().to_ascii_lowercase();
+    Some(if v.starts_with('#') || v.contains("gold") { roof_rgb(c) } else { muted(c, 0.3, 0.3) })
+}
+
 fn roof_rgb(c: [u8; 3]) -> [u8; 3] {
+    muted(c, 0.6, 0.12)
+}
+
+/// Насыщенность не выше `smax`, светлота от `lmin` до 0,7 (HSL).
+fn muted(c: [u8; 3], smax: f32, lmin: f32) -> [u8; 3] {
     let [r, g, b] = c.map(|v| v as f32 / 255.0);
     let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
     let (l, d) = ((mx + mn) / 2.0, mx - mn);
     let s = if d < 1e-6 { 0.0 } else { d / (1.0 - (2.0 * l - 1.0).abs()).max(1e-6) };
-    let (s2, l2) = (s.min(0.6), l.clamp(0.12, 0.7));
+    let (s2, l2) = (s.min(smax), l.clamp(lmin, 0.7));
     if s2 == s && l2 == l {
         return c;
     }
@@ -1481,8 +1495,8 @@ fn part_height(t: &Tags) -> f32 {
 /// Крыша по контуру дома. Основа — весь дом: вид и покрытие из его тегов, нет —
 /// из самой большой части; цвет — со снимка, если ему можно верить
 /// ([`photo_roof`]), иначе из тега. Без тега вида — скатами; башня — шатром,
-/// низкая площадка (Лобное место), стройка, белая кровля и будка в городе —
-/// плоские. Поверх — части (`building:part`) снизу вверх по высоте, каждая своим
+/// низкая площадка (Лобное место), стройка, навес, белая кровля и будка в
+/// городе — плоские. Поверх — части (`building:part`) снизу вверх по высоте, каждая своим
 /// видом (без вида — плоская, как в OSM, а верх башни — шатром) и цветом.
 #[allow(clippy::too_many_arguments)]
 fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>, rooms: &Mask, weights: &[(usize, f32)], cell_m: f32, rural: bool) -> OutlineRoof {
@@ -1505,7 +1519,7 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
     let own_h = part_height(a.tags);
     // Высота для доверия снимку: без тегов — два этажа.
     let seen_h = if own_h > 0.0 { own_h } else { 6.0 };
-    let base_osm = colour(tag("roof:colour")).map(roof_rgb);
+    let base_osm = tag_roof(tag("roof:colour"));
     let base_photo = photo_roof(hint, weights, mw, outer * m2, seen_h);
     let base_rgb = base_photo.or(base_osm);
     let base_material = tag("roof:material");
@@ -1516,7 +1530,7 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
     let pale = base_photo.is_some_and(|c| c.iter().max().unwrap_or(&0) - c.iter().min().unwrap_or(&0) < 30 && luma(c) > 135.0);
     let default = if tower {
         RoofForm::Spire
-    } else if platform || get(a.tags, "building") == "construction" || (!rural && (pale || (bare && outer * m2 < 60.0))) {
+    } else if platform || matches!(get(a.tags, "building"), "construction" | "roof") || (!rural && (pale || (bare && outer * m2 < 60.0))) {
         RoofForm::Flat
     } else {
         RoofForm::Pitched
@@ -1537,6 +1551,10 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
     // Цвет частей — группами по тегу `roof:colour` (грани вальмы без тега — одной
     // группой): со снимка по всей группе, если ему можно верить, иначе из тега,
     // иначе цвет дома. По одной грани снимок дал бы её свет, а не цвет кровли.
+    // Верить ли — по самому крупному куску группы, где куски — части с общими
+    // узлами: грани одной вальмы Сената — одна кровля, а шесть главок «Красного
+    // звона» врозь — шесть мелких, и по сумме снимок отдавал им бирюзу кровли
+    // под ними.
     let group = |t: &Tags| match get(t, "roof:colour").trim() {
         "" if roof_form(get(t, "roof:shape"), "", RoofForm::Flat) == RoofForm::Shed => "~shed".to_owned(),
         "" => String::new(),
@@ -1547,18 +1565,42 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
         _ => own_h,
     };
     let samples: Vec<Vec<(usize, f32)>> = mine.iter().map(|p| coverage(rooms, &p.2.rings, 0.0)).collect();
-    let mut groups: HashMap<String, (Vec<(usize, f32)>, f32, f32)> = HashMap::new();
-    for (p, s) in mine.iter().zip(&samples) {
+    let mut groups: HashMap<String, (Vec<(usize, f32)>, Vec<usize>, f32)> = HashMap::new();
+    for (i, (p, s)) in mine.iter().zip(&samples).enumerate() {
         let k = group(p.2.tags);
         if !k.is_empty() {
             let g = groups.entry(k).or_default();
             g.0.extend_from_slice(s);
-            g.1 += p.0 * m2;
+            g.1.push(i);
             g.2 = g.2.max(height_of(p.2.tags));
         }
     }
+    // Самый крупный кусок группы, м²: части, связанные общими узлами, — вместе.
+    let largest = |members: &[usize]| {
+        let nodes: Vec<HashSet<i64>> = members.iter().map(|&i| mine[i].2.nodes.iter().flatten().copied().collect()).collect();
+        let mut root: Vec<usize> = (0..members.len()).collect();
+        fn find(root: &mut [usize], i: usize) -> usize {
+            if root[i] != i {
+                root[i] = find(root, root[i]);
+            }
+            root[i]
+        }
+        for a in 0..members.len() {
+            for b in a + 1..members.len() {
+                if !nodes[a].is_disjoint(&nodes[b]) {
+                    let (ra, rb) = (find(&mut root, a), find(&mut root, b));
+                    root[ra] = rb;
+                }
+            }
+        }
+        let mut area: HashMap<usize, f32> = HashMap::new();
+        for (k, &i) in members.iter().enumerate() {
+            *area.entry(find(&mut root, k)).or_default() += mine[i].0 * m2;
+        }
+        area.into_values().fold(0.0f32, f32::max)
+    };
     let seen = |h: f32| if h > 0.0 { h } else { seen_h };
-    let group_rgb: HashMap<String, Option<[u8; 3]>> = groups.into_iter().map(|(k, (s, area, h))| (k, photo_roof(hint, &s, mw, area, seen(h)))).collect();
+    let group_rgb: HashMap<String, Option<[u8; 3]>> = groups.into_iter().map(|(k, (s, members, h))| (k, photo_roof(hint, &s, mw, largest(&members), seen(h)))).collect();
     let top = mine.len().checked_sub(1);
     for (i, (p, s)) in mine.iter().zip(&samples).enumerate() {
         let t = p.2.tags;
@@ -1571,7 +1613,7 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
             k if k.is_empty() => photo_roof(hint, s, mw, p.0 * m2, seen(h)),
             k => group_rgb.get(&k).copied().flatten(),
         };
-        let rgb = photo.or_else(|| colour(get(t, "roof:colour")).map(roof_rgb)).or(base_rgb);
+        let rgb = photo.or_else(|| tag_roof(get(t, "roof:colour"))).or(base_rgb);
         let mut form = roof_form(get(t, "roof:shape"), material, RoofForm::Flat);
         // Верх башни без вида — шатром: у Сенатской башни вид в OSM не задан.
         if tower && Some(i) == top && get(t, "roof:shape").is_empty() {
@@ -2742,6 +2784,17 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         }
         houses.push(House { rings: a.rings.clone(), entrances, style, wood: wood && !fort, grand, doors: !wall_top });
     }
+    // Навес (`building=roof`) — крыша без стен и пола: над перроном, заправкой,
+    // залом «Зарядья». Под ним земля как есть, крыша гаснет над токеном.
+    for a in &areas {
+        if get(a.tags, "building") != "roof" {
+            continue;
+        }
+        let weights = coverage(&m.rooms, &a.rings, 0.0);
+        if !weights.is_empty() {
+            m.outline_roofs.push(outline_roof(a, &parts, hint.as_ref(), &m.rooms, &weights, cell, rural));
+        }
+    }
     // Зубцы — когда все дома на месте: за краем, где башня, их не ставить.
     for (rings, teeth) in &ramparts {
         battlements(&mut m, rings, teeth);
@@ -3762,8 +3815,59 @@ mod tests {
         assert_eq!(church.pieces[0].form, RoofForm::Pitched);
         assert!(church.pieces[0].paint.starts_with("tint:2e8b57:"), "{}", church.pieces[0].paint);
         assert_eq!(church.pieces[1].form, RoofForm::Dome);
-        let gold = roof_rgb(colour("gold").unwrap());
+        let gold = tag_roof("gold").unwrap();
         assert!(church.pieces[1].paint.starts_with(&format!("tint:{:02x}{:02x}{:02x}:", gold[0], gold[1], gold[2])), "{}", church.pieces[1].paint);
+    }
+
+    /// «Красный звон»: кровля и две главки одного тега `#617666`. На снимке под
+    /// главками — бирюза кровли (снимок сдвинут), главки вместе крупнее сдвига,
+    /// но каждая мельче: цвет главок — из тега, кровли — со снимка. Две грани
+    /// одной вальмы (общие узлы) каждая тоже мельче, но вместе — одна кровля:
+    /// им — снимок.
+    #[test]
+    fn small_domes_of_one_colour_keep_the_tag_not_the_roof_below() {
+        let xml = town(
+            r##"<way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="building" v="church"/><tag k="height" v="15"/><tag k="roof:colour" v="#617666"/></way>
+ <node id="41" lat="51.53035" lon="-0.12495"/>
+ <node id="42" lat="51.53035" lon="-0.124849"/>
+ <node id="43" lat="51.530287" lon="-0.124849"/>
+ <node id="44" lat="51.530287" lon="-0.12495"/>
+ <node id="51" lat="51.53025" lon="-0.12495"/>
+ <node id="52" lat="51.53025" lon="-0.124849"/>
+ <node id="53" lat="51.530187" lon="-0.124849"/>
+ <node id="54" lat="51.530187" lon="-0.12495"/>
+ <way id="40"><nd ref="41"/><nd ref="42"/><nd ref="43"/><nd ref="44"/><nd ref="41"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="onion"/><tag k="roof:colour" v="#617666"/><tag k="height" v="18"/></way>
+ <way id="50"><nd ref="51"/><nd ref="52"/><nd ref="53"/><nd ref="54"/><nd ref="51"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="onion"/><tag k="roof:colour" v="#617666"/><tag k="height" v="18"/></way>
+ <node id="61" lat="51.5303" lon="-0.12484"/>
+ <node id="62" lat="51.5303" lon="-0.124739"/>
+ <node id="63" lat="51.530237" lon="-0.124739"/>
+ <node id="64" lat="51.530237" lon="-0.12484"/>
+ <node id="65" lat="51.5303" lon="-0.124671"/>
+ <node id="66" lat="51.530237" lon="-0.124671"/>
+ <way id="60"><nd ref="61"/><nd ref="62"/><nd ref="63"/><nd ref="64"/><nd ref="61"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="skillion"/><tag k="roof:direction" v="W"/><tag k="roof:colour" v="#2e8b57"/><tag k="height" v="16"/><tag k="min_height" v="13"/></way>
+ <way id="70"><nd ref="62"/><nd ref="65"/><nd ref="66"/><nd ref="63"/><nd ref="62"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="skillion"/><tag k="roof:direction" v="E"/><tag k="roof:colour" v="#2e8b57"/><tag k="height" v="16"/><tag k="min_height" v="13"/></way>"##,
+        );
+        let teal = Cover::grid(82, 58, |_, _| Class::Earth).with_photo(image::RgbImage::from_pixel(82, 58, image::Rgb([103, 145, 128])));
+        let (m, _) = import_cover(&xml, &[], Some(&teal), Options::default()).unwrap();
+        let church = m.outline_roofs.iter().find(|r| r.pieces.len() == 5).expect("частей нет");
+        assert!(church.pieces[0].paint.starts_with("tint:679180:"), "кровля не со снимка: {}", church.pieces[0].paint);
+        for dome in church.pieces.iter().filter(|p| p.form == RoofForm::Dome) {
+            assert!(dome.paint.starts_with("tint:617666:"), "главка в цвет кровли под ней: {}", dome.paint);
+        }
+        for facet in church.pieces.iter().filter(|p| p.form == RoofForm::Shed) {
+            assert!(facet.paint.starts_with("tint:679180:"), "грань вальмы не со снимка: {}", facet.paint);
+        }
+    }
+
+    /// Навес (`building=roof`): крыша есть, плоская, а под ней ни комнаты, ни стен.
+    #[test]
+    fn canopy_has_a_flat_roof_and_no_rooms() {
+        let xml = town(r#"<way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/><tag k="building" v="roof"/></way>"#);
+        let (m, _) = import(&xml, Options::default()).unwrap();
+        assert_eq!(m.outline_roofs.len(), 2, "крыши навеса нет");
+        let canopy = m.outline_roofs.iter().find(|r| r.bounds().0[0] < 20.0).expect("навес не там");
+        assert_eq!(canopy.pieces[0].form, RoofForm::Flat);
+        assert_eq!(m.room_at(23, 10), 0, "под навесом комната");
     }
 
     /// Вальма Сената в OSM — грани-части `skillion` со своим `roof:direction`;
@@ -3794,12 +3898,18 @@ mod tests {
 
     #[test]
     fn css_roof_colours_are_muted() {
-        let black = roof_rgb(colour("black").unwrap());
+        let black = tag_roof("black").unwrap();
         assert!(luma(black) >= 25.0, "чёрная — дыра: {black:?}");
-        let green = roof_rgb(colour("lightgreen").unwrap());
+        let green = tag_roof("lightgreen").unwrap();
         assert!(luma(green) < luma(colour("lightgreen").unwrap()), "кислотная: {green:?}");
-        // Обычный цвет кровли — как есть.
-        assert_eq!(roof_rgb([26, 89, 71]), [26, 89, 71]);
+        // Обычный цвет кровли кодом — как есть.
+        assert_eq!(tag_roof("#1a5947"), Some([26, 89, 71]));
+        // Именной зелёный — тусклая крашеная жесть, а не кислотный CSS.
+        let plain = tag_roof("green").unwrap();
+        let (mx, mn) = (*plain.iter().max().unwrap() as f32, *plain.iter().min().unwrap() as f32);
+        assert!(mx - mn <= 0.3 * (mx + mn).min(510.0 - mx - mn) + 1.0 && luma(plain) >= 70.0, "кислотный зелёный: {plain:?}");
+        // Золото куполов — как прежде, яркое.
+        assert_eq!(tag_roof("gold"), colour("gold").map(roof_rgb));
         // «Тёмно-серая» темнее серой, как её понимают в OSM.
         assert!(luma(colour("darkgrey").unwrap()) < luma(colour("grey").unwrap()));
     }
