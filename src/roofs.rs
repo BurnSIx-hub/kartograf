@@ -266,13 +266,79 @@ pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t i
     let mut img = image::RgbaImage::new(w, h);
     // Кольца без лишних узлов — раз на кусок: по ним и стыки, и скаты.
     let rings: Vec<Vec<Vec<[f32; 2]>>> = roof.pieces.iter().map(|k| k.rings.iter().map(|r| simplify_ring(r, OUTLINE_TOL)).filter(|r| r.len() >= 3).collect()).collect();
+    // Высота видимого куска в каждой точке и чей он — для теней.
+    let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize] };
     for (i, piece) in roof.pieces.iter().enumerate() {
         if let Some(t) = tex(&piece.paint) {
             let open = open_edges(&rings, &roof.pieces, i);
-            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, t, light);
+            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, t, light, (&mut relief, i as u32));
         }
     }
+    cast_shadows(&mut img, &relief, ppc, light);
     (img, origin)
+}
+
+/// Высота солнца: клеток высоты на клетку тени (45°).
+pub const SUN_RISE: f32 = 1.0;
+/// Свет в полной тени высшего куска и полутень по высоте, в клетках.
+const CAST_SHADE: f32 = 0.55;
+const CAST_SOFT: f32 = 0.12;
+
+/// Крыша по высотам: верх видимого куска в точке картинки (клетки) и его номер.
+struct Relief {
+    top: Vec<f32>,
+    owner: Vec<u32>,
+}
+
+/// Тени высших кусков на низшие той же крыши: ступени Мавзолея, ярусы башни,
+/// барабаны собора. Без них ступени сливались в плоский узор. Проход от солнца:
+/// в каждой точке — высота луча, пришедшего от соседней точки к солнцу, минус
+/// спуск на шаг ([`SUN_RISE`]); луч выше крыши — тень. На своём же куске тени нет:
+/// скат уже темнит свет. На землю тень не ложится — картинка только крыша.
+fn cast_shadows(img: &mut image::RgbaImage, r: &Relief, ppc: f32, light: [f32; 2]) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let m = light[0].abs().max(light[1].abs());
+    if m < 1e-4 || w < 2 || h < 2 {
+        return;
+    }
+    // Шаг к солнцу: по одной оси ровно точка, по другой — доля.
+    let step = [light[0] / m, light[1] / m];
+    let drop = step[0].hypot(step[1]) / ppc * SUN_RISE;
+    let xs: Vec<i32> = if step[0] < 0.0 { (0..w).collect() } else { (0..w).rev().collect() };
+    let ys: Vec<i32> = if step[1] < 0.0 { (0..h).collect() } else { (0..h).rev().collect() };
+    let mut ray = vec![f32::MIN; (w * h) as usize];
+    let mut from = vec![u32::MAX; (w * h) as usize];
+    for &y in &ys {
+        for &x in &xs {
+            let k = (y * w + x) as usize;
+            // Точка к солнцу — между двумя уже пройденными соседями.
+            let (ux, uy) = (x as f32 + step[0], y as f32 + step[1]);
+            let (fx, fy) = (ux.floor(), uy.floor());
+            let (tx, ty) = (ux - fx, uy - fy);
+            let at = |xx: i32, yy: i32| if xx < 0 || yy < 0 || xx >= w || yy >= h { (f32::MIN, u32::MAX) } else { (ray[(yy * w + xx) as usize], from[(yy * w + xx) as usize]) };
+            let ((a, ao), (b, bo), t) = if tx.abs() < 1e-6 { (at(fx as i32, fy as i32), at(fx as i32, fy as i32 + 1), ty) } else { (at(fx as i32, fy as i32), at(fx as i32 + 1, fy as i32), tx) };
+            let (up, up_from) = match (a > f32::MIN, b > f32::MIN) {
+                (true, true) => (a * (1.0 - t) + b * t, if t < 0.5 { ao } else { bo }),
+                (true, false) => (a, ao),
+                (false, true) => (b, bo),
+                (false, false) => (f32::MIN, u32::MAX),
+            };
+            let cast = if up > f32::MIN { up - drop } else { f32::MIN };
+            let here = r.top[k];
+            if here > f32::MIN && cast > here && up_from != r.owner[k] {
+                let dark = ((cast - here) / CAST_SOFT).min(1.0);
+                let p = img.get_pixel_mut(x as u32, y as u32);
+                for c in 0..3 {
+                    p.0[c] = (p.0[c] as f32 * (1.0 - (1.0 - CAST_SHADE) * dark)).round() as u8;
+                }
+            }
+            if cast > here {
+                (ray[k], from[k]) = (cast, up_from);
+            } else {
+                (ray[k], from[k]) = (here, r.owner[k]);
+            }
+        }
+    }
 }
 
 /// Стороны колец по порядку, без нулевых.
@@ -301,8 +367,8 @@ fn inside_rings(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
 fn open_edges(rings: &[Vec<Vec<[f32; 2]>>], pieces: &[RoofPiece], i: usize) -> Vec<bool> {
     /// Насколько отступить от середины стороны наружу, в клетках.
     const STEP: f32 = 0.2;
-    /// Соседний кусок ниже на столько (м) — уже уступ.
-    const SAME: f32 = 0.5;
+    /// Соседний кусок ниже на столько (клетки, ~0,5 м) — уже уступ.
+    const SAME: f32 = 0.3;
     let boxes: Vec<([f32; 2], [f32; 2])> = rings
         .iter()
         .map(|rs| {
@@ -375,8 +441,9 @@ fn gable_ridge(rings: &[Vec<[f32; 2]>], across: bool) -> Option<([f32; 2], [f32;
 /// тому, куда она смотрит; где два края одинаково близко — гребень. Односкатный
 /// — одной плоскостью, двускатный и свод — от конька. Плоский — покрытие вдоль
 /// длинной стороны, по краю парапет. Двор — дыра, к нему крыша тоже скатывается.
+/// Высоту своей поверхности кусок пишет в `relief` под номером `me`.
 #[allow(clippy::too_many_arguments)]
-fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], tex: &image::RgbaImage, light: [f32; 2]) {
+fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], tex: &image::RgbaImage, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
     /// Сторона квадрата точек, для которого стороны контура отбираются разом.
     const BLOCK: u32 = 16;
     let edges = edges_of(rings);
@@ -440,6 +507,15 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
         RoofForm::Pitched => SLOPE_MAX,
         _ => f32::MAX,
     };
+    // Высота поверхности: от низа ската `ze` до верха `zt`. Вальме и шатру —
+    // по расстоянию до края; путь до макушки — радиус вписанного круга (2S/P).
+    let (zt, ze) = (piece.height, piece.eaves.min(piece.height));
+    let run = rings.first().map_or(1.0, |r| {
+        let per: f32 = (0..r.len()).map(|k| dist(r[k], r[(k + 1) % r.len()])).sum();
+        (2.0 * ring_area(r) / per.max(1e-4)).max(0.1)
+    });
+    let run = if form == RoofForm::Pitched { run.min(SLOPE_MAX) } else { run };
+    let span = shed.and_then(|dn| rings.first().map(|r| r.iter().map(|p| p[0] * dn[0] + p[1] * dn[1]).fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)))));
     // Две ближайшие к `c` стороны из `set`: расстояния.
     let two = |set: &[([f32; 2], [f32; 2])], c: [f32; 2]| {
         let (mut c1, mut c2) = (f32::MAX, f32::MAX);
@@ -583,6 +659,23 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                     let oa = cov + ua * (1.0 - cov);
                     let mix = |k: usize| ((c[k] * cov + under[k] as f32 * ua * (1.0 - cov)) / oa.max(1e-6)).round().clamp(0.0, 255.0) as u8;
                     img.put_pixel(x, y, image::Rgba([mix(0), mix(1), mix(2), (oa * 255.0).round() as u8]));
+                    if cov >= 0.5 {
+                        let z = match (form, shed, ridge, dome, span) {
+                            _ if flat_here => zt,
+                            (RoofForm::Shed, Some(dn), _, _, Some((lo, hi))) => zt - (zt - ze) * ((p[0] * dn[0] + p[1] * dn[1] - lo) / (hi - lo).max(1e-4)).clamp(0.0, 1.0),
+                            (RoofForm::Gabled | RoofForm::Round, _, Some((o, ax, half)), _, _) => {
+                                let s = (p[0] - o[0]) * -ax[1] + (p[1] - o[1]) * ax[0];
+                                ze + (zt - ze) * (1.0 - s.abs() / half.max(1e-4)).clamp(0.0, 1.0)
+                            }
+                            (RoofForm::Dome, _, _, Some((c0, rad)), _) => {
+                                let t = (dist(p, c0) / rad).min(1.0);
+                                ze + (zt - ze) * (1.0 - t * t).sqrt()
+                            }
+                            _ => ze + (zt - ze) * (d1 / run).min(1.0),
+                        };
+                        let k = (y * w + x) as usize;
+                        (relief.top[k], relief.owner[k]) = (z, me);
+                    }
                 }
             }
         }
@@ -686,6 +779,25 @@ mod tests {
         // от линии к северному узлу (у шатра там ребро) скачка нет.
         assert!(at(5.0, 2.0) > at(5.0, 8.0));
         assert!((at(4.9, 2.0) - at(5.1, 2.0)).abs() <= 3, "{} {}", at(4.9, 2.0), at(5.1, 2.0));
+    }
+
+    #[test]
+    fn higher_step_casts_a_shadow_on_the_lower() {
+        let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
+        let tex = |_: &str| Some(&grey);
+        // Ступень Мавзолея: площадка 10×10 высотой 1 клетка, на ней 4×4 высотой 3.
+        let roof = OutlineRoof {
+            pieces: vec![slab([0.0, 0.0], [10.0, 10.0], RoofForm::Flat, 1.0, 1.0, None), slab([3.0, 3.0], [7.0, 7.0], RoofForm::Flat, 3.0, 3.0, None)],
+        };
+        // Солнце с северо-запада: тень ложится на юго-восток от верхней ступени.
+        let (img, o) = render_outline(&roof, &tex, 10.0, [-0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0[0];
+        let (lit, shade) = (at(1.5, 5.0), at(5.5, 8.0));
+        assert!(shade < lit - 30, "у ступени нет тени: {shade} против {lit}");
+        // Дальше длины тени (2 клетки высоты — 2 клетки) снова светло.
+        assert_eq!(at(5.5, 9.5), lit);
+        // Сама верхняя ступень не затенена.
+        assert!(at(5.0, 5.0) >= lit - 2);
     }
 
     #[test]

@@ -1588,6 +1588,18 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
             across: get(t, "roof:orientation") == "across",
         });
     }
+    // Основа дома с частями видна только в щелях между ними, а её `height` — верх
+    // всего дома (у собора 67 м): из щели она клала бы тень на весь собор. Пусть
+    // будет не выше низа самой низкой части.
+    if let Some(low) = pieces.iter().skip(1).map(|p| p.eaves).reduce(f32::min) {
+        pieces[0].height = pieces[0].height.min(low);
+        pieces[0].eaves = pieces[0].eaves.min(pieces[0].height);
+    }
+    // Высоты — в клетки, как всё на карте: по ним тени.
+    for p in &mut pieces {
+        p.height /= cell_m;
+        p.eaves /= cell_m;
+    }
     OutlineRoof { pieces }
 }
 
@@ -3774,10 +3786,10 @@ mod tests {
         let shed = roof.pieces.iter().find(|p| p.form == RoofForm::Shed).expect("грань не односкатная");
         let d = shed.down.expect("у грани нет стороны");
         assert!(d[0] < -0.99 && d[1].abs() < 0.01, "W — не на запад: {d:?}");
-        assert_eq!(shed.eaves, 20.0);
+        assert!((shed.eaves * CELL_M - 20.0).abs() < 1e-3, "{}", shed.eaves);
         let vault = roof.pieces.iter().find(|p| p.form == RoofForm::Round).expect("свода нет");
         assert!(vault.across);
-        assert_eq!(vault.eaves, 20.0);
+        assert!((vault.eaves * CELL_M - 20.0).abs() < 1e-3, "{}", vault.eaves);
     }
 
     #[test]
