@@ -315,6 +315,51 @@ pub const VARY: &str = "vary:";
 /// по ним видно, сколько поля под размытие в долях объекта.
 pub const SHADOW: &str = "shadow:";
 const SHADOW_SIDE: u32 = 256;
+/// Ключ картинки в чужом цвете: `tint:rrggbb:<ключ картинки>`. Узор и светотень
+/// картинки остаются, средний цвет становится этим. Кирпича в цвет Кремля
+/// (`#ec8859`) в паках FA нет — их кирпич серый и бежевый.
+pub const TINT: &str = "tint:";
+
+/// Ключ картинки `key` в цвете `rgb`.
+pub fn tint_key(rgb: [u8; 3], key: &str) -> String {
+    format!("{TINT}{:02x}{:02x}{:02x}:{}", rgb[0], rgb[1], rgb[2], untint(key).1)
+}
+
+/// Цвет и сам ключ картинки, если ключ в цвете; иначе `None` и ключ как есть.
+pub fn untint(key: &str) -> (Option<[u8; 3]>, &str) {
+    let Some((hex, inner)) = key.strip_prefix(TINT).and_then(|rest| rest.split_once(':')) else { return (None, key) };
+    let byte = |i: usize| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+    match (hex.len(), byte(0), byte(2), byte(4)) {
+        (6, Some(r), Some(g), Some(b)) => (Some([r, g, b]), inner),
+        _ => (None, key),
+    }
+}
+
+/// Перекрасить картинку: срединная яркость непрозрачного (сам кирпич) ложится в
+/// `rgb`; темнее неё — темнее `rgb` во столько же раз (тени), светлее — к белому
+/// (швы). Множитель и для светлого обрезал швы яркого цвета о 255.
+fn tinted(img: &mut image::RgbaImage, rgb: [u8; 3]) {
+    let luma = |p: &image::Rgba<u8>| 0.299 * p.0[0] as f32 + 0.587 * p.0[1] as f32 + 0.114 * p.0[2] as f32;
+    let mut hist = [0u64; 256];
+    for p in img.pixels().filter(|p| p.0[3] > 0) {
+        hist[luma(p).round().clamp(0.0, 255.0) as usize] += 1;
+    }
+    let half = hist.iter().sum::<u64>().div_ceil(2);
+    let mut seen = 0;
+    let median = hist.iter().position(|&n| {
+        seen += n;
+        seen >= half.max(1)
+    });
+    let median = median.unwrap_or(128).max(1) as f32;
+    for p in img.pixels_mut() {
+        let k = luma(p) / median;
+        for (out, &v) in p.0.iter_mut().zip(&rgb) {
+            let v = v as f32;
+            let c = if k <= 1.0 { v * k } else { v + (255.0 - v) * ((k - 1.0) / (255.0 / median - 1.0).max(0.01)).min(1.0) };
+            *out = c.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
 /// Во сколько раз плитка с разнообразием больше исходной по каждой стороне.
 pub const VARY_TIMES: u32 = 3;
 /// Исходник для разнообразия не крупнее этого: большая плитка — втрое больше.
@@ -590,6 +635,7 @@ pub fn pack_key(pack: &Path, inner: &str) -> String {
 
 /// Короткое имя ассета по ключу — для подписей.
 pub fn label(key: &str) -> String {
+    let key = untint(key).1;
     if let Some(t) = builtin(key) {
         return t.0.to_owned();
     }
@@ -611,6 +657,7 @@ pub fn set_of(key: &str) -> Option<&str> {
 }
 
 fn read_source(key: &str, sources: &Sources) -> Result<Vec<u8>, String> {
+    let key = untint(key).1;
     if let Some(rel) = key.strip_prefix(SET) {
         crate::sets::SET_FILES.iter().find(|f| f.0 == rel).map(|f| f.1.to_vec()).ok_or_else(|| format!("нет картинки набора {key}"))
     } else if key.starts_with(BUILTIN) {
@@ -662,13 +709,25 @@ fn load_job(job: &Job, sources: &Sources) -> Result<(ColorImage, [u32; 2]), Stri
         let blur = blur.parse::<f32>().unwrap_or(3.0) / 10.0;
         read_source(inner, sources).and_then(|bytes| shadow_image(&bytes, blur))
     } else {
-        match job.key.strip_prefix(VARY) {
-            Some(inner) if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, sources).and_then(|bytes| decode(&bytes, FULL_SIDE)),
-            Some(inner) => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
-                let big = vary(&rgba, inner);
+        // `vary:` снаружи, `tint:` внутри: перекрашивается уже готовая плитка.
+        let (varied, rest) = match job.key.strip_prefix(VARY) {
+            Some(inner) => (true, inner),
+            None => (false, job.key.as_str()),
+        };
+        let (tint, inner) = untint(rest);
+        let paint = |mut rgba: image::RgbaImage| {
+            if let Some(c) = tint {
+                tinted(&mut rgba, c);
+            }
+            rgba
+        };
+        match varied {
+            true if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, FULL_SIDE)).map(|(rgba, size)| (to_color_image(&paint(rgba)), size)),
+            true => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
+                let big = paint(vary(&rgba, inner));
                 (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])
             }),
-            None => read_source(&job.key, sources).and_then(|bytes| decode(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })),
+            false => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })).map(|(rgba, size)| (to_color_image(&paint(rgba)), size)),
         }
     }
 }
@@ -864,10 +923,6 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
     ];
     // Браузер без размытия на холсте вернёт `false` — тогда тень считаем сами.
     crate::plat::web::call("kartografDecode", &args).is_ok_and(|v| v.as_bool() != Some(false))
-}
-
-fn decode(bytes: &[u8], max_side: u32) -> Result<(ColorImage, [u32; 2]), String> {
-    decode_rgba(bytes, max_side).map(|(rgba, size)| (to_color_image(&rgba), size))
 }
 
 /// Картинка не крупнее `max_side` и её настоящий размер.
@@ -1134,6 +1189,27 @@ impl Library {
 
 #[cfg(test)]
 mod tests {
+
+    /// Кирпич FA серый — перекрашенный, сам кирпич цвета тега, швы светлее, но
+    /// не обрезаны о 255.
+    #[test]
+    fn tinted_texture_keeps_its_pattern_in_the_new_colour() {
+        let key = "pack:E:/fa.dungeondraft_pack|textures/terrain/brick_floor_a_01.webp";
+        let red = tint_key([236, 136, 89], key);
+        assert_eq!(red, format!("tint:ec8859:{key}"));
+        assert_eq!(untint(&red), (Some([236, 136, 89]), key));
+        assert_eq!(untint(key), (None, key));
+        assert_eq!(tint_key([1, 2, 3], &red), format!("tint:010203:{key}"), "второй тон заменяет первый");
+        assert_eq!(label(&red), "brick_floor_a_01");
+        let mut img = image::RgbaImage::from_fn(8, 8, |x, _| if x % 4 == 0 { image::Rgba([200, 200, 195, 255]) } else { image::Rgba([140, 138, 130, 255]) });
+        tinted(&mut img, [236, 136, 89]);
+        let (seam, brick) = (img.get_pixel(0, 0).0, img.get_pixel(1, 0).0);
+        for (c, want) in [236i32, 136, 89].into_iter().enumerate() {
+            assert!((brick[c] as i32 - want).abs() <= 2, "кирпич, канал {c}: {} вместо {want}", brick[c]);
+            assert!(seam[c] > brick[c] || brick[c] == 255, "шов не светлее, канал {c}: {seam:?} {brick:?}");
+        }
+        assert!(seam[0] < 255 && seam[1] < 255, "шов обрезан: {seam:?}");
+    }
 
     #[test]
     fn fa_sill_gets_its_glass() {

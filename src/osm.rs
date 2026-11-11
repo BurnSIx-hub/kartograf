@@ -332,6 +332,29 @@ impl Hint<'_> {
         (n >= 50).then(|| Tone { value: (value / n as f64) as f32, chroma: (chroma / n as f64) as f32 })
     }
 
+    /// Средний цвет снимка по сэмплам маски, как у [`Hint::tone`].
+    fn colour(&self, samples: &[(usize, f32)], mw: usize) -> Option<[u8; 3]> {
+        let photo = self.cover.photo.as_ref()?;
+        let res = mask::RES as f32;
+        let (mut sum, mut n) = ([0.0f64; 3], 0u32);
+        for &(k, v) in samples {
+            if v < 0.5 {
+                continue;
+            }
+            let p = [((k % mw) as f32 + 0.5) / res, ((k / mw) as f32 + 0.5) / res];
+            let (x, y) = ((p[0] / self.span[0] * photo.width() as f32).floor(), (p[1] / self.span[1] * photo.height() as f32).floor());
+            if x < 0.0 || y < 0.0 || x >= photo.width() as f32 || y >= photo.height() as f32 {
+                continue;
+            }
+            let px = photo.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
+                sum[c] += px[c] as f64;
+            }
+            n += 1;
+        }
+        (n >= 50).then(|| sum.map(|s| (s / n as f64).round() as u8))
+    }
+
     /// Деревья снимка в клетках карты `w`×`h`: из анализа (`crowns.json`), а без
     /// него — найденные по классам ([`Hint::crowns`]); порода тогда не решена, а
     /// очередь на хвойную — куртинами ~25 м.
@@ -1263,6 +1286,100 @@ fn relay_plazas(areas: &[Area], m: &Map, hint: Option<&Hint>, sea: bool, warning
     out
 }
 
+/// Цвет из тега OSM: `#rgb`, `#rrggbb` или ходовое в OSM имя CSS.
+fn colour(v: &str) -> Option<[u8; 3]> {
+    let v = v.trim().to_lowercase();
+    if let Some(hex) = v.strip_prefix('#') {
+        let d: Vec<u8> = hex.chars().filter_map(|c| c.to_digit(16).map(|d| d as u8)).collect();
+        return match (hex.len(), d.len()) {
+            (3, 3) => Some([d[0] * 17, d[1] * 17, d[2] * 17]),
+            (6, 6) => Some([d[0] * 16 + d[1], d[2] * 16 + d[3], d[4] * 16 + d[5]]),
+            _ => None,
+        };
+    }
+    Some(match v.as_str() {
+        "white" => [255, 255, 255],
+        "ivory" => [255, 255, 240],
+        "beige" => [245, 245, 220],
+        "cream" => [255, 253, 208],
+        "yellow" => [255, 255, 0],
+        "gold" => [255, 215, 0],
+        "orange" => [255, 165, 0],
+        "tan" => [210, 180, 140],
+        "brown" => [165, 42, 42],
+        "sienna" => [160, 82, 45],
+        "maroon" => [128, 0, 0],
+        "darkred" => [139, 0, 0],
+        "red" => [255, 0, 0],
+        "firebrick" => [178, 34, 34],
+        "indianred" => [205, 92, 92],
+        "salmon" => [250, 128, 114],
+        "darksalmon" => [233, 150, 122],
+        "pink" => [255, 192, 203],
+        "grey" | "gray" => [128, 128, 128],
+        "darkgrey" | "darkgray" => [169, 169, 169],
+        "lightgrey" | "lightgray" => [211, 211, 211],
+        "silver" => [192, 192, 192],
+        "black" => [0, 0, 0],
+        "green" => [0, 128, 0],
+        "darkgreen" => [0, 100, 0],
+        "lightgreen" => [144, 238, 144],
+        "olive" => [128, 128, 0],
+        "blue" => [0, 0, 255],
+        "lightblue" => [173, 216, 230],
+        "navy" => [0, 0, 128],
+        "teal" => [0, 128, 128],
+        _ => return None,
+    })
+}
+
+/// Крепостная стена контуром (`building=wall`, `historic=citywalls`): сверху её
+/// видно целиком — боевой ход с зубцами, а не дом с дощатым полом и дверью.
+fn rampart(t: &Tags) -> bool {
+    get(t, "building") == "wall" || matches!(get(t, "historic"), "citywalls" | "city_wall")
+}
+
+/// Зубцы по краю боевого хода: низкие стенки 1,3 × 0,4 клетки с шагом 2,2 у самой
+/// кромки — через них не пройти, но видно. Заливкой пола они расплывались в
+/// пятна: в клетке четыре точки маски, а зубец — полторы. Край, за которым
+/// другой дом (башня, пристройка), — без зубцов.
+fn battlements(m: &mut Map, rings: &[Vec<[f32; 2]>], style: &WallStyle) {
+    const STEP: f32 = 2.2;
+    let res = mask::RES as f32;
+    let inset = 0.12 + style.width / 2.0;
+    let mut teeth: Vec<Wall> = Vec::new();
+    for r in rings {
+        for k in 0..r.len() {
+            let (a, b) = (r[k], r[(k + 1) % r.len()]);
+            let len = length(a, b);
+            if len < 1.6 {
+                continue;
+            }
+            let dir = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+            let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+            let mut n = [-dir[1], dir[0]];
+            if !inside(rings, [mid[0] + n[0] * 0.3, mid[1] + n[1] * 0.3]) {
+                n = [-n[0], -n[1]];
+            }
+            let out = [mid[0] - n[0] * 0.6, mid[1] - n[1] * 0.6];
+            if m.rooms.get((out[0] * res).floor() as isize, (out[1] * res).floor() as isize) >= 128 {
+                continue;
+            }
+            let count = ((len - 0.4) / STEP).floor().max(1.0) as usize;
+            let start = (len - (count as f32 - 1.0) * STEP) / 2.0;
+            for i in 0..count {
+                let s = start + i as f32 * STEP;
+                let at = |t: f32| [a[0] + dir[0] * t + n[0] * inset, a[1] + dir[1] * t + n[1] * inset];
+                let (p, q) = (at(s - 0.65), at(s + 0.65));
+                if m.contains(p[0].floor() as i32, p[1].floor() as i32) && m.contains(q[0].floor() as i32, q[1].floor() as i32) {
+                    teeth.push(Wall { points: vec![p, q], closed: false, bends: Vec::new(), low: true, style: Some(style.clone()) });
+                }
+            }
+        }
+    }
+    m.walls.extend(teeth);
+}
+
 /// Вид дома: пол, слот стены, деревянные ли двери.
 fn building_look(kind: &str, t: &Tags) -> (&'static str, &'static str, bool) {
     // Пол дома не должен совпадать с мостовой: у ГУМа и Мавзолея он был той же
@@ -1604,6 +1721,27 @@ impl Floors {
             k
         })
     }
+
+    /// Пол слота в цвете `rgb` (см. [`library::tint_key`]): тот же вариант
+    /// картинки, что у [`Floors::get`], перекрашенный.
+    fn tinted(&mut self, m: &mut Map, slot: &'static str, rgb: [u8; 3]) -> usize {
+        let k = self.get(m, slot);
+        let base = m.materials[k].clone();
+        let paint = match &base.paint {
+            Paint::Texture(key) => Paint::Texture(library::tint_key(rgb, key)),
+            Paint::Color(c) => Paint::Color([0, 1, 2].map(|i| ((c[i] as u32 + rgb[i] as u32) / 2) as u8)),
+        };
+        m.material_index(Material { paint, ..base }).unwrap_or(k)
+    }
+}
+
+/// Стена слота в цвете `rgb`, если он есть.
+fn wall_tinted(slot: &str, rgb: Option<[u8; 3]>) -> WallStyle {
+    let mut style = wall(slot);
+    if let (Some(c), Paint::Texture(key)) = (rgb, &style.paint) {
+        style.paint = Paint::Texture(library::tint_key(c, key));
+    }
+    style
 }
 
 /// Уличный предмет по точке OSM: фонарь, скамья, фонтан, памятник.
@@ -1842,6 +1980,8 @@ struct House {
     wood: bool,
     /// Большой дом с широкими дверьми: вокзал, храм, магазин.
     grand: bool,
+    /// Есть ли двери: у крепостной стены — нет.
+    doors: bool,
 }
 
 /// Линия, которая ляжет дорогой: этаж, порядок и сами дороги снизу вверх.
@@ -2266,6 +2406,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
 
     // Дома: комнаты по контуру.
     let mut houses: Vec<House> = Vec::new();
+    let mut ramparts: Vec<(Vec<Vec<[f32; 2]>>, WallStyle)> = Vec::new();
     let mut names: BTreeMap<String, ([f32; 2], f32)> = BTreeMap::new();
     for a in &areas {
         let Some(kind) = building(a.tags) else { continue };
@@ -2274,8 +2415,29 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             continue;
         }
         let (floor, slot, wood) = building_look(kind, a.tags);
-        let f = floors.get(&mut m, floor);
+        // Крепость — кирпич в своём цвете: стена — по цвету верха (тег, а нет —
+        // снимок), боевая башня — по цвету стен (сверху у неё крыша). Кремлёвская
+        // стена выходила домом с дощатым полом, хотя в OSM она `#ec8859`.
+        let wall_top = rampart(a.tags);
+        let fort = wall_top || get(a.tags, "tower:type") == "defensive";
+        let tag = |k: &str| colour(get(a.tags, k));
+        let tint = if wall_top {
+            tag("roof:colour").or_else(|| tag("building:colour")).or_else(|| hint.as_ref().and_then(|h| h.colour(&weights, m.rooms.w)))
+        } else if fort {
+            tag("building:colour")
+        } else {
+            None
+        };
+        let f = match (fort, tint) {
+            (true, Some(c)) => floors.tinted(&mut m, "brick_floor", c),
+            (true, None) => floors.get(&mut m, "brick_floor"),
+            _ => floors.get(&mut m, floor),
+        };
         m.paint(Layer::Rooms, f, &weights);
+        if wall_top {
+            let teeth = [0, 1, 2].map(|i| (tint.unwrap_or([150, 140, 125])[i] as f32 * 0.72) as u8);
+            ramparts.push((a.rings.clone(), WallStyle { width: 0.4, ..wall_tinted(slot, Some(teeth)) }));
+        }
         let entrances = a
             .nodes
             .iter()
@@ -2290,7 +2452,12 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         if !name.is_empty() && cells >= 40.0 && names.get(name).is_none_or(|n| n.1 < cells) {
             names.insert(name.to_owned(), (c, cells));
         }
-        houses.push(House { rings: a.rings.clone(), entrances, style: wall(slot), wood, grand });
+        let style = if fort { wall_tinted(slot, tag("building:colour").or(tint)) } else { wall(slot) };
+        houses.push(House { rings: a.rings.clone(), entrances, style, wood: wood && !fort, grand, doors: !wall_top });
+    }
+    // Зубцы — когда все дома на месте: за краем, где башня, их не ставить.
+    for (rings, teeth) in &ramparts {
+        battlements(&mut m, rings, teeth);
     }
     m.prune();
     // Названия озёр, лесов, пустошей.
@@ -3035,6 +3202,9 @@ fn walls_and_doors(m: &mut Map, houses: &[House], streets: &[Vec<[f32; 2]>], wal
         }
 
         // Двери: у отмеченных входов, иначе одна — к ближайшей улице.
+        if !house.doors {
+            continue;
+        }
         let doorable: Vec<Segment> = own.iter().copied().filter(|s| length(s.0, s.1) >= 1.4 && !on_border(s)).collect();
         if doorable.is_empty() {
             continue;
@@ -3236,6 +3406,53 @@ mod tests {
                 Paint::Color(_) => "color".into(),
             },
         }
+    }
+
+    #[test]
+    fn osm_colours_read_as_hex_and_names() {
+        assert_eq!(colour("#ec8859"), Some([236, 136, 89]));
+        assert_eq!(colour("#FFF"), Some([255, 255, 255]));
+        assert_eq!(colour(" Firebrick "), Some([178, 34, 34]));
+        assert_eq!(colour("grey"), colour("gray"));
+        assert_eq!(colour("#12345"), None);
+        assert_eq!(colour("кирпичный"), None);
+    }
+
+    /// Кремль в малом: стена в 3 клетки шириной (`building=wall`, верх `#ec8859`)
+    /// упирается в боевую башню. Стена — кирпич в своём цвете с зубцами, без
+    /// дверей; башня — кирпич в цвет стен, стена между ними — тоже в цвет.
+    #[test]
+    fn kremlin_wall_is_red_brick_with_teeth_and_no_doors() {
+        let xml = town(
+            r##"<node id="21" lat="51.53029" lon="-0.124956"/>
+ <node id="22" lat="51.53029" lon="-0.124429"/>
+ <node id="23" lat="51.530248" lon="-0.124429"/>
+ <node id="24" lat="51.530248" lon="-0.124956"/>
+ <way id="20"><nd ref="21"/><nd ref="22"/><nd ref="23"/><nd ref="24"/><nd ref="21"/><tag k="building" v="wall"/><tag k="building:material" v="brick"/><tag k="roof:colour" v="#ec8859"/></way>
+ <node id="31" lat="51.530317" lon="-0.124429"/>
+ <node id="32" lat="51.530317" lon="-0.124341"/>
+ <node id="33" lat="51.530221" lon="-0.124341"/>
+ <node id="34" lat="51.530221" lon="-0.124429"/>
+ <way id="30"><nd ref="31"/><nd ref="32"/><nd ref="33"/><nd ref="34"/><nd ref="31"/><tag k="building" v="yes"/><tag k="tower:type" v="defensive"/><tag k="building:colour" v="#ec8859"/><tag k="building:material" v="brick"/></way>"##,
+        );
+        let (m, _) = import(&xml, Options::default()).unwrap();
+        let room = |x: i32, y: i32| match m.room_at(x, y) {
+            0 => String::new(),
+            k => match &m.materials[k as usize - 1].paint {
+                Paint::Texture(t) => t.clone(),
+                Paint::Color(_) => "color".into(),
+            },
+        };
+        for (what, x) in [("стена", 14), ("башня", 28)] {
+            assert!(room(x, 9).starts_with("tint:ec8859:") && room(x, 9).contains("brick"), "{what}: {}", room(x, 9));
+        }
+        let teeth: Vec<&Wall> = m.walls.iter().filter(|w| w.low && matches!(&w.style, Some(s) if matches!(&s.paint, Paint::Texture(k) if k.starts_with("tint:a96140:")))).collect();
+        // Стена 23 клетки: по 10 зубцов с каждой длинной стороны; у башни — ни одного.
+        assert!(teeth.len() >= 18, "зубцов {}", teeth.len());
+        assert!(teeth.iter().flat_map(|w| &w.points).all(|p| p[0] < 25.9 && (7.9..11.4).contains(&p[1])), "зубец не на стене: {:?}", teeth.iter().map(|w| &w.points).collect::<Vec<_>>());
+        let on_wall = |p: [f32; 2]| (2.0..25.5).contains(&p[0]) && (7.5..11.5).contains(&p[1]);
+        assert!(m.portals.iter().all(|d| !on_wall(d.a) && !on_wall(d.b)), "дверь в стене: {:?}", m.portals.iter().map(|d| (d.a, d.b)).collect::<Vec<_>>());
+        assert!(m.walls.iter().any(|w| matches!(&w.style, Some(s) if matches!(&s.paint, Paint::Texture(k) if k.starts_with("tint:ec8859:")))), "стена между стеной и башней не в цвет");
     }
 
     /// Кремлёвский парк в малом: парк на всю левую часть, на снимке трава лишь
