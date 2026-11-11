@@ -50,6 +50,16 @@ pub struct Cover {
     /// Кроны из анализа снимка (`tools/osm/trees.py`, `<имя>.crowns.json`):
     /// место, размер и порода каждого дерева. Нет — ищутся по классам подсказки.
     crowns: Option<Vec<Crown>>,
+    /// Сам снимок по той же рамке — сверить покрытие OSM с видом сверху. Есть
+    /// только у анализа в программе: у `.cover.png` скриптов снимка рядом нет.
+    photo: Option<image::RgbImage>,
+}
+
+/// Вид участка на снимке: средняя яркость и насыщенность (размах каналов), 0..255.
+#[derive(Clone, Copy, Debug)]
+struct Tone {
+    value: f32,
+    chroma: f32,
 }
 
 /// Крона из `<имя>.crowns.json`: центр в долях рамки, радиус в метрах, порода.
@@ -128,13 +138,19 @@ impl Cover {
                 Self::COLORS.iter().enumerate().min_by_key(|(_, (c, _))| d(*c)).map_or(0, |(k, _)| k as u8)
             })
             .collect();
-        Ok(Self { w, h, data, crowns: None })
+        Ok(Self { w, h, data, crowns: None, photo: None })
     }
 
     /// Из классов анализа снимка в программе (`place.rs`): номер класса — место
     /// в `COLORS`, по строкам.
     pub fn from_classes(w: usize, h: usize, data: Vec<u8>, crowns: Vec<Crown>) -> Self {
-        Self { w, h, data, crowns: Some(crowns) }
+        Self { w, h, data, crowns: Some(crowns), photo: None }
+    }
+
+    /// Со снимком, по которому считались классы.
+    pub fn with_photo(mut self, photo: image::RgbImage) -> Self {
+        self.photo = Some(photo);
+        self
     }
 
     /// Положить рядом с выгрузкой `place.cover.png` и `place.crowns.json` — те же
@@ -189,12 +205,17 @@ impl Cover {
     #[cfg(test)]
     fn grid(w: usize, h: usize, at: impl Fn(usize, usize) -> Class) -> Self {
         let data = (0..w * h).map(|k| Self::COLORS.iter().position(|c| c.1 == at(k % w, k / w)).unwrap_or(0) as u8).collect();
-        Self { w, h, data, crowns: None }
+        Self { w, h, data, crowns: None, photo: None }
     }
 
     /// Доля класса в круге радиуса `r` вокруг точки; `u`, `v`, `r` — в долях рамки по x и y.
     fn share(&self, u: f32, v: f32, ru: f32, rv: f32, class: Class) -> f32 {
-        let k = Self::COLORS.iter().position(|c| c.1 == class).unwrap_or(0) as u8;
+        self.share_of(u, v, ru, rv, |c| c == class)
+    }
+
+    /// Доля классов, что подходят под `pick`, в круге — как [`Cover::share`].
+    fn share_of(&self, u: f32, v: f32, ru: f32, rv: f32, pick: impl Fn(Class) -> bool) -> f32 {
+        let hit_of: Vec<bool> = Self::COLORS.iter().map(|c| pick(c.1)).collect();
         let (cx, cy) = (u * self.w as f32, v * self.h as f32);
         let (rx, ry) = ((ru * self.w as f32).max(0.5), (rv * self.h as f32).max(0.5));
         let (mut hit, mut all) = (0u32, 0u32);
@@ -205,10 +226,22 @@ impl Cover {
                     continue;
                 }
                 all += 1;
-                hit += (self.data[y as usize * self.w + x as usize] == k) as u32;
+                hit += hit_of.get(self.data[y as usize * self.w + x as usize] as usize).copied().unwrap_or(false) as u32;
             }
         }
         if all == 0 { 0.0 } else { hit as f32 / all as f32 }
+    }
+
+    /// Пиксель снимка в точке `u`, `v` (доли рамки): яркость и размах каналов.
+    fn tone_at(&self, u: f32, v: f32) -> Option<Tone> {
+        let photo = self.photo.as_ref()?;
+        let (x, y) = ((u * photo.width() as f32).floor(), (v * photo.height() as f32).floor());
+        if x < 0.0 || y < 0.0 || x >= photo.width() as f32 || y >= photo.height() as f32 {
+            return None;
+        }
+        let p = photo.get_pixel(x as u32, y as u32).0;
+        let (hi, lo) = (p.iter().max().copied().unwrap_or(0) as f32, p.iter().min().copied().unwrap_or(0) as f32);
+        Some(Tone { value: hi, chroma: hi - lo })
     }
 
     /// Доля класса на суше всего снимка (вода не в счёт).
@@ -268,6 +301,35 @@ impl Hint<'_> {
 
     fn at(&self, p: [f32; 2]) -> Option<Class> {
         self.cover.at(p[0] / self.span[0], p[1] / self.span[1])
+    }
+
+    /// Зелень на снимке в круге радиуса `r` клеток: доля травы, крон, бурого и
+    /// сухого среди всего, что не вода (тень дома и кроны снимок путает с водой).
+    /// Одна вода — не видно, 1.
+    fn green(&self, p: [f32; 2], r: f32) -> f32 {
+        let (u, v, ru, rv) = (p[0] / self.span[0], p[1] / self.span[1], r / self.span[0], r / self.span[1]);
+        let green = self.cover.share_of(u, v, ru, rv, |c| matches!(c, Class::Grass | Class::Trees | Class::Brown | Class::Dry | Class::Bog));
+        let seen = 1.0 - self.cover.share_of(u, v, ru, rv, |c| c == Class::Water);
+        if seen < 0.2 { 1.0 } else { (green / seen).min(1.0) }
+    }
+
+    /// Средний вид сэмплов маски (`k` — номер сэмпла, вес больше половины) на
+    /// снимке; `mw` — ширина маски. Меньше 50 сэмплов на снимке — не судить.
+    fn tone(&self, samples: &[(usize, f32)], mw: usize) -> Option<Tone> {
+        let res = mask::RES as f32;
+        let (mut value, mut chroma, mut n) = (0.0f64, 0.0f64, 0u32);
+        for &(k, v) in samples {
+            if v < 0.5 {
+                continue;
+            }
+            let p = [((k % mw) as f32 + 0.5) / res, ((k / mw) as f32 + 0.5) / res];
+            if let Some(t) = self.cover.tone_at(p[0] / self.span[0], p[1] / self.span[1]) {
+                value += t.value as f64;
+                chroma += t.chroma as f64;
+                n += 1;
+            }
+        }
+        (n >= 50).then(|| Tone { value: (value / n as f64) as f32, chroma: (chroma / n as f64) as f32 })
     }
 
     /// Деревья снимка в клетках карты `w`×`h`: из анализа (`crowns.json`), а без
@@ -1158,6 +1220,49 @@ fn plaza(t: &Tags) -> bool {
     get(t, "railway") == "platform" || (get(t, "highway") == "pedestrian" && get(t, "area") == "yes") || get(t, "place") == "square" || t.contains_key("area:highway")
 }
 
+/// Парк или сад, чью траву решает только `leisure`: газон и луг у него не
+/// отмечены. Такой контур в городе обнимает и дорожки, и мощёные площадки.
+fn park_only(t: &Tags) -> bool {
+    matches!(get(t, "leisure"), "park" | "garden") && get(t, "landuse").is_empty() && get(t, "natural").is_empty()
+}
+
+/// Площади, что в OSM «грунт» (`surface=dirt` и подобное), а на снимке выглядят
+/// как мощёные площади той же карты, — мостовой самой большой из них: номер
+/// контура и текстура. Правка StreetComplete от 24.08.2026, сделанная на глаз
+/// (одна правка от Киева до Москвы), положила грунт на Васильевский спуск и
+/// Соборную площадь, а на снимке 2025 года там брусчатка. Мерило — мощёное этого
+/// же снимка, а не «серость»: светлая земля пустыни на снимке серее асфальта.
+fn relay_plazas(areas: &[Area], m: &Map, hint: Option<&Hint>, sea: bool, warnings: &mut Vec<String>) -> HashMap<usize, &'static str> {
+    let mut out = HashMap::new();
+    let Some(hint) = hint else { return out };
+    let paved = |t: &Tags| matches!(get(t, "surface"), "asphalt" | "paved" | "concrete" | "concrete:plates" | "paving_stones" | "sett" | "cobblestone" | "unhewn_cobblestone" | "granite" | "chipseal");
+    let unpaved = |t: &Tags| matches!(get(t, "surface"), "dirt" | "ground" | "earth" | "unpaved" | "mud");
+    let mw = m.rooms.w;
+    let reference: Vec<(usize, Vec<(usize, f32)>)> = areas
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| plaza(a.tags) && paved(a.tags) && building(a.tags).is_none())
+        .map(|(k, a)| (k, coverage(&m.rooms, &a.rings, 0.0)))
+        .filter(|(_, c)| !c.is_empty())
+        .collect();
+    let Some(largest) = reference.iter().max_by_key(|r| r.1.len()) else { return out };
+    let all: Vec<(usize, f32)> = reference.iter().flat_map(|r| r.1.iter().copied()).collect();
+    let Some(norm) = hint.tone(&all, mw) else { return out };
+    let tex = ground(areas[largest.0].tags, sea).map_or("street", |g| g.0);
+    for (k, a) in areas.iter().enumerate().filter(|(_, a)| plaza(a.tags) && unpaved(a.tags) && building(a.tags).is_none()) {
+        let Some(seen) = hint.tone(&coverage(&m.rooms, &a.rings, 0.0), mw) else { continue };
+        if (seen.chroma - norm.chroma).abs() < 8.0 && (0.7..1.45).contains(&(seen.value / norm.value.max(1.0))) {
+            out.insert(k, tex);
+            let name = match get(a.tags, "name") {
+                "" => "площадь",
+                n => n,
+            };
+            warnings.push(format!("{name}: в OSM грунт (surface={}), а на снимке как мощёное рядом — положена мостовая", get(a.tags, "surface")));
+        }
+    }
+    out
+}
+
 /// Вид дома: пол, слот стены, деревянные ли двери.
 fn building_look(kind: &str, t: &Tags) -> (&'static str, &'static str, bool) {
     // Пол дома не должен совпадать с мостовой: у ГУМа и Мавзолея он был той же
@@ -1863,8 +1968,10 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let waters: Vec<usize> = grounds.iter().map(|g| g.1).filter(|&k| matches!(ground(areas[k].tags), Some(("water_deep", _)))).collect();
     let mut water_done = false;
     let mut rock_mats: Vec<usize> = Vec::new();
+    let relaid = relay_plazas(&areas, &m, hint.as_ref(), sea, &mut warnings);
     for (_, k) in grounds {
         let (tex, _) = ground(areas[k].tags).unwrap_or(("flagstones", 0));
+        let tex = relaid.get(&k).copied().unwrap_or(tex);
         // Ледник, что на снимке белый (фирн Мёнхсйоха), — снег: иначе по краю
         // ледника OSM оставалась ступенчатая полоса серого льда.
         let tex = if cold && tex.starts_with("rock_") {
@@ -1882,6 +1989,23 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             continue;
         }
         let weights = coverage(&m.rooms, &areas[k].rings, 0.0);
+        // Парк и сад — травой только там, где она есть на снимке: в контуре парка
+        // лежат и мощёные площадки. В Кремле газоном выходила площадь у белой
+        // дорожки, а газоны OSM внутри того же парка со снимком совпадали.
+        let weights = match &hint {
+            Some(h) if park_only(areas[k].tags) => {
+                let (mw, res) = (m.rooms.w, mask::RES as f32);
+                weights
+                    .into_iter()
+                    .filter_map(|(i, v)| {
+                        let p = [((i % mw) as f32 + 0.5) / res, ((i / mw) as f32 + 0.5) / res];
+                        let t = ((h.green(p, 0.8) - 0.3) / 0.4).clamp(0.0, 1.0);
+                        (t > 0.0).then_some((i, v * t * t * (3.0 - 2.0 * t)))
+                    })
+                    .collect()
+            }
+            _ => weights,
+        };
         if !weights.is_empty() {
             // Бассейн и фонтан — на плитке: вода FA полупрозрачна, по траве
             // бассейн выходил тёмной кляксой.
@@ -2421,16 +2545,37 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
 
     // Деревья по снимку — первыми, по дереву на крону и размером с неё (см.
     // [`Hint::crowns`]): в лесу и за его краем, на лугу и у реки. В OSM одиноких
-    // деревьев и редколесья по склонам почти нет. Только за городом: в городе
-    // тёмное — тени домов.
+    // деревьев и редколесья по склонам почти нет. В городе тёмное на снимке — и
+    // тени домов, так что там кроны встают только на зелёном OSM (лес, парк,
+    // газон) и не на мощёном. Без них в городском лесу не росло ни дерева: лес со
+    // снимком деревьев не сажает, ждёт крон (Тайницкий сад Кремля был газоном).
     let mut planted_crowns: Vec<([f32; 2], f32)> = Vec::new();
-    if let Some(hint) = hint.as_ref().filter(|_| rural) {
+    let town_green: Option<Vec<bool>> = (!rural && hint.is_some()).then(|| {
+        let mut green = vec![false; m.rooms.w * m.rooms.h];
+        let leafy = |t: &Tags| growth(t).is_some() || matches!(ground(t), Some((g, _)) if matches!(g, "meadow" | "rough_grass" | "straw_grass"));
+        let hard = |t: &Tags| plaza(t) || building(t).is_some() || matches!(ground(t), Some((g, _)) if matches!(g, "stone_tiles" | "street" | "flagstones"));
+        for (on, a) in areas.iter().filter_map(|a| if leafy(a.tags) { Some((true, a)) } else { None }).chain(areas.iter().filter(|a| hard(a.tags)).map(|a| (false, a))) {
+            for (k, v) in coverage(&m.rooms, &a.rings, 0.0) {
+                if v > 0.5 {
+                    green[k] = on;
+                }
+            }
+        }
+        green
+    });
+    if let Some(hint) = hint.as_ref() {
         let mut rng = Rng::new("osm/cover-trees");
         let woods: Vec<&Area> = areas.iter().filter(|a| growth(a.tags).is_some_and(|g| g.litter)).collect();
         let orchards: Vec<&Area> = areas.iter().filter(|a| get(a.tags, "landuse") == "orchard").collect();
         let mut crowns: Vec<Spot> = Vec::new();
+        let res = mask::RES as f32;
         for Spot { q, mut r, conifer, queue } in hint.trees(w as usize, h as usize, cell) {
             if blocked.at(q) || hint.share(q, r.min(2.0), Class::Water) > 0.3 {
+                continue;
+            }
+            if let Some(green) = &town_green
+                && !green[(q[1] * res) as usize * m.rooms.w + (q[0] * res) as usize]
+            {
                 continue;
             }
             // Крона нависает над дорогой и оградой (на снимке полог над дорогой
@@ -3053,6 +3198,103 @@ mod tests {
         assert!(walk.iter().flat_map(|p| p.points.iter()).all(|q| q[0] > 22.0), "дорожка легла по площади: {:?}", walk.iter().map(|p| &p.points).collect::<Vec<_>>());
         // Пол лавки — дерево, не плитка мостовой.
         assert!(m.room_floor.iter().any(|c| tex(c.material as usize).contains("wood_planks")), "{:?}", m.room_floor.iter().map(|c| tex(c.material as usize)).collect::<Vec<_>>());
+    }
+
+    /// Город в малом (41×29 клеток): дом в углу справа сверху (больше 6 % рамки) и
+    /// улица внизу, а слева — то, что подставит проверка (`{}`).
+    fn town(left: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+ <bounds minlat="51.5300" minlon="-0.1250" maxlat="51.5304" maxlon="-0.1241"/>
+ <node id="901" lat="51.5304" lon="-0.12430"/>
+ <node id="902" lat="51.5304" lon="-0.1241"/>
+ <node id="903" lat="51.53026" lon="-0.1241"/>
+ <node id="904" lat="51.53026" lon="-0.12430"/>
+ <way id="900"><nd ref="901"/><nd ref="902"/><nd ref="903"/><nd ref="904"/><nd ref="901"/><tag k="building" v="yes"/></way>
+ <node id="911" lat="51.530055" lon="-0.1250"/>
+ <node id="912" lat="51.530055" lon="-0.1241"/>
+ <way id="910"><nd ref="911"/><nd ref="912"/><tag k="highway" v="residential"/></way>
+ <node id="1" lat="51.5304" lon="-0.1250"/>
+ <node id="2" lat="51.5304" lon="-0.124671"/>
+ <node id="3" lat="51.53012" lon="-0.124671"/>
+ <node id="4" lat="51.53012" lon="-0.1250"/>
+ <node id="5" lat="51.5304" lon="-0.124649"/>
+ <node id="6" lat="51.5304" lon="-0.12434"/>
+ <node id="7" lat="51.53012" lon="-0.12434"/>
+ <node id="8" lat="51.53012" lon="-0.124649"/>
+ {left}
+</osm>"#
+        )
+    }
+
+    fn floor_tex(m: &Map, x: i32, y: i32) -> String {
+        match m.floor_at(x, y) {
+            0 => String::new(),
+            k => match &m.materials[k as usize - 1].paint {
+                Paint::Texture(t) => t.clone(),
+                Paint::Color(_) => "color".into(),
+            },
+        }
+    }
+
+    /// Кремлёвский парк в малом: парк на всю левую часть, на снимке трава лишь
+    /// в левой трети — справа мощёная площадка. Трава парка — только по снимку.
+    #[test]
+    fn park_is_grass_only_where_the_photo_is_green() {
+        let xml = town(r#"<way id="10"><nd ref="1"/><nd ref="6"/><nd ref="7"/><nd ref="4"/><nd ref="1"/><tag k="leisure" v="park"/></way>"#);
+        let (bare, _) = import(&xml, Options::default()).unwrap();
+        assert!(floor_tex(&bare, 25, 10).contains("grass"), "без снимка парк — трава: {}", floor_tex(&bare, 25, 10));
+        let cover = Cover::grid(82, 58, |x, _| if x < 30 { Class::Grass } else { Class::Earth });
+        let (m, _) = import_cover(&xml, &[], Some(&cover), Options::default()).unwrap();
+        assert!(floor_tex(&m, 5, 10).contains("grass"), "газон парка: {}", floor_tex(&m, 5, 10));
+        assert!(!floor_tex(&m, 25, 10).contains("grass"), "мощёное в парке стало газоном: {}", floor_tex(&m, 25, 10));
+    }
+
+    /// Васильевский спуск: в OSM грунт, а на снимке — как брусчатая площадь рядом.
+    /// Бурое на снимке под той же площадью — и правда грунт.
+    #[test]
+    fn dirt_square_that_looks_like_the_paving_next_to_it_is_paved() {
+        let xml = town(
+            r#"<way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="highway" v="pedestrian"/><tag k="area" v="yes"/><tag k="surface" v="sett"/></way>
+ <way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/><tag k="highway" v="pedestrian"/><tag k="area" v="yes"/><tag k="surface" v="dirt"/><tag k="name" v="Спуск"/></way>"#,
+        );
+        let photo = |dirt: image::Rgb<u8>| image::RgbImage::from_fn(82, 58, move |x, _| if x < 32 { image::Rgb([96, 98, 100]) } else { dirt });
+        let grey = Cover::grid(82, 58, |_, _| Class::Earth).with_photo(photo(image::Rgb([118, 120, 117])));
+        let (m, r) = import_cover(&xml, &[], Some(&grey), Options::default()).unwrap();
+        assert!(floor_tex(&m, 22, 10).contains("cobblestone"), "серая «грунтовая» площадь: {}", floor_tex(&m, 22, 10));
+        assert!(r.warnings.iter().any(|w| w.contains("Спуск") && w.contains("dirt")), "{:?}", r.warnings);
+        let brown = Cover::grid(82, 58, |_, _| Class::Earth).with_photo(photo(image::Rgb([150, 112, 72])));
+        let (m, _) = import_cover(&xml, &[], Some(&brown), Options::default()).unwrap();
+        assert!(floor_tex(&m, 22, 10).contains("dirt"), "бурая площадь: {}", floor_tex(&m, 22, 10));
+        // Без снимка — как в OSM.
+        let (m, _) = import(&xml, Options::default()).unwrap();
+        assert!(floor_tex(&m, 22, 10).contains("dirt"), "без снимка: {}", floor_tex(&m, 22, 10));
+    }
+
+    /// Город: крона снимка в лесу — дерево, на брусчатой площади — нет (там на
+    /// снимке тёмное — и тени домов). В городском лесу без крон не росло ни дерева.
+    #[test]
+    fn town_crowns_grow_in_the_wood_but_not_on_the_square() {
+        let xml = town(
+            r#"<way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="natural" v="wood"/></way>
+ <way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/><tag k="highway" v="pedestrian"/><tag k="area" v="yes"/><tag k="surface" v="sett"/></way>"#,
+        );
+        let (bare, _) = import(&xml, Options::default()).unwrap();
+        let (w, h) = (bare.width as f32, bare.height as f32);
+        let (wood, square) = ([7.0, 9.0], [23.0, 9.0]);
+        let json = format!(
+            r#"{{"crowns": [{{"u": {}, "v": {}, "r": 5.0, "kind": "broad", "src": "none", "queue": 0.5}}, {{"u": {}, "v": {}, "r": 5.0, "kind": "broad", "src": "none", "queue": 0.5}}]}}"#,
+            wood[0] / w,
+            wood[1] / h,
+            square[0] / w,
+            square[1] / h
+        );
+        let cover = Cover::grid(82, 58, |_, _| Class::Grass).with_crowns(&json).unwrap();
+        let (m, _) = import_cover(&xml, &[], Some(&cover), Options::default()).unwrap();
+        let crowns = crowns_of(&m);
+        assert!(crowns.iter().any(|c| length(c.0, wood) < 1.0), "в лесу нет дерева: {crowns:?}");
+        assert!(crowns.iter().all(|c| length(c.0, square) > 3.0), "дерево на площади: {crowns:?}");
     }
 
     /// Природа: лес слева, озеро справа, гравийная тропа через лес, каменная

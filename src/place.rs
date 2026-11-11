@@ -963,7 +963,7 @@ fn analyse(agent: Option<&ureq::Agent>, frame: &Frame, files: &Files, step: &dyn
     let cls = classify(&img, biome, forest.as_deref());
     let crowns = crowns(&img, &cls, frame, dlt.as_deref(), nfi.as_ref());
     let summary = format!("{biome:?}, снимок z{z}, {w}×{h}, крон {}", crowns.len());
-    Ok((Cover::from_classes(w, h, cls, crowns), summary))
+    Ok((Cover::from_classes(w, h, cls, crowns).with_photo(img), summary))
 }
 
 /// Собрать место по координатам: всё скачанное — в папку места `cache/<широта>_<долгота>_<W>x<H>`
