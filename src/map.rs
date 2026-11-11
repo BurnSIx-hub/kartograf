@@ -656,6 +656,50 @@ impl RoofShape {
     }
 }
 
+/// Крыша по контуру дома из OSM: многоугольник с дворами (кольца в клетках).
+/// Каждая точка ската сходит к ближайшей стороне контура — так у любого
+/// многоугольника выходят вальмы и коньки; плоская — с парапетом. Прямоугольная
+/// [`Roof`] на повёрнутые дома и дворы не ложится.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutlineRoof {
+    /// Первый кусок — весь дом, дальше его части (`building:part`) снизу вверх:
+    /// купола собора, шатры башен, своды пассажа — каждая своим цветом и видом.
+    pub pieces: Vec<RoofPiece>,
+}
+
+/// Кусок крыши по контуру: кольца в клетках (внутренние — дворы), вид и покрытие.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoofPiece {
+    pub rings: Vec<Vec<[f32; 2]>>,
+    pub form: RoofForm,
+    /// Картинка покрытия, бывает в цвете (`tint:`).
+    pub paint: String,
+}
+
+/// Как сходит кусок крыши.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoofForm {
+    /// Ровная, с парапетом по краю.
+    Flat,
+    /// Скатами к каждой стороне; у широкого дома скат не длиннее
+    /// [`crate::roofs::SLOPE_MAX`], выше — плоский верх.
+    Pitched,
+    /// Скатами до самой макушки: шатёр, шпиль, купол.
+    Spire,
+}
+
+impl OutlineRoof {
+    /// Левый верхний и правый нижний углы, в клетках.
+    pub fn bounds(&self) -> ([f32; 2], [f32; 2]) {
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in self.pieces.iter().flat_map(|k| k.rings.iter().flatten()) {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        (lo, hi)
+    }
+}
+
 /// Крыша над прямоугольником клеток.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Roof {
@@ -1142,6 +1186,9 @@ pub struct Map {
     pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roofs: Vec<Roof>,
+    /// Крыши по контурам домов из OSM (см. [`OutlineRoof`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outline_roofs: Vec<OutlineRoof>,
     /// Имя этажа; пусто — «Этаж N».
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -1270,6 +1317,7 @@ impl Map {
             relief: None,
             labels: Vec::new(),
             roofs: Vec::new(),
+            outline_roofs: Vec::new(),
             name: String::new(),
             levels: Vec::new(),
         }

@@ -424,6 +424,11 @@ pub struct App {
     /// Образец новой крыши, вид крыш, протяжка новой и перенос стоящей.
     pub roof_style: map::Roof,
     pub roof_view: RoofView,
+    /// Крыши по контуру, уже нарисованные точками: по отпечатку крыши и света —
+    /// картинка, левый верхний угол и размер в клетках.
+    outline_cache: std::collections::HashMap<u64, (egui::TextureHandle, [f32; 2], [f32; 2])>,
+    /// Покрытия крыш по контуру точками (в цвете ключа).
+    cover_cache: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>>,
     roof_from: Option<(i32, i32)>,
     tap_from: Option<Pos2>,
     groups: Vec<Vec<usize>>,
@@ -614,6 +619,8 @@ impl App {
                 2 => RoofView::Hidden,
                 _ => RoofView::Auto,
             },
+            outline_cache: std::collections::HashMap::new(),
+            cover_cache: std::collections::HashMap::new(),
             roof_from: None,
             tap_from: None,
             groups: Vec::new(),
@@ -4328,6 +4335,7 @@ impl App {
                 }
             }
             if roof_alpha > 0.0 {
+                self.draw_outline_roofs(painter, canvas, view, roof_alpha, shadows.light());
                 for (i, r) in roofs.iter().enumerate() {
                     self.draw_roof(painter, canvas, r, roof_alpha, shadows.light());
                     if self.sel == Some(Sel::Roof(i)) {
@@ -4749,6 +4757,80 @@ impl App {
 
     /// Крыша: скаты своей картинкой, каждый со своей освещённостью; гребни на
     /// коньке и рёбрах — ряд того же покрытия вдоль линии; тёмная кромка свеса.
+    /// Покрытие крыши точками, в цвете ключа; пак ещё не подключён — `None`.
+    fn cover_rgba(&mut self, key: &str) -> Option<std::sync::Arc<image::RgbaImage>> {
+        if let Some(img) = self.cover_cache.get(key) {
+            return Some(img.clone());
+        }
+        let bytes = self.textures.bytes(key).ok()?;
+        let img = std::sync::Arc::new(library::decode_tinted(key, &bytes).ok()?);
+        self.cover_cache.insert(key.to_owned(), img.clone());
+        Some(img)
+    }
+
+    /// Крыши по контуру (из OSM): картинкой, нарисованной точками по
+    /// [`roofs::render_outline`], — их скаты сходят к любой стороне, мешем egui
+    /// так не нарисовать. Новых за кадр — несколько, остальные в следующих.
+    fn draw_outline_roofs(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, alpha: f32, light: [f32; 2]) {
+        use std::hash::{Hash, Hasher};
+        const NEW_PER_FRAME: usize = 6;
+        let roofs = std::mem::take(&mut self.map.outline_roofs);
+        let mut fresh = 0;
+        let mut pending = false;
+        for r in &roofs {
+            let (lo, hi) = r.bounds();
+            if hi[0] < view.min.x || hi[1] < view.min.y || lo[0] > view.max.x || lo[1] > view.max.y {
+                continue;
+            }
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            for piece in &r.pieces {
+                for p in piece.rings.iter().flatten() {
+                    p[0].to_bits().hash(&mut hs);
+                    p[1].to_bits().hash(&mut hs);
+                }
+                (piece.form as u8, &piece.paint).hash(&mut hs);
+            }
+            (light[0].to_bits(), light[1].to_bits()).hash(&mut hs);
+            let key = hs.finish();
+            if !self.outline_cache.contains_key(&key) {
+                if fresh >= NEW_PER_FRAME {
+                    pending = true;
+                    continue;
+                }
+                let mut covers: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>> = std::collections::HashMap::new();
+                for piece in &r.pieces {
+                    if let Some(img) = self.cover_rgba(&piece.paint) {
+                        covers.insert(piece.paint.clone(), img);
+                    }
+                }
+                if covers.len() < r.pieces.iter().map(|k| &k.paint).collect::<std::collections::BTreeSet<_>>().len() {
+                    continue;
+                }
+                fresh += 1;
+                let span = (hi[0].min(self.map.width as f32) - lo[0].max(0.0)).max(hi[1].min(self.map.height as f32) - lo[1].max(0.0)).max(1.0);
+                let ppc = (2048.0 / span).clamp(4.0, 24.0);
+                let (img, origin) = roofs::render_outline(r, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]));
+                let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
+                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                let handle = painter.ctx().load_texture(format!("outline-roof-{key}"), ci, egui::TextureOptions::LINEAR);
+                self.outline_cache.insert(key, (handle, origin, size));
+            }
+            if let Some((handle, origin, size)) = self.outline_cache.get(&key) {
+                let a = self.cam.to_screen(canvas, *origin);
+                let b = self.cam.to_screen(canvas, [origin[0] + size[0], origin[1] + size[1]]);
+                painter.image(handle.id(), Rect::from_min_max(a, b), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0).round() as u8));
+            }
+        }
+        // Старые картинки (крыша правилась, свет повернулся) — выбросить разом.
+        if self.outline_cache.len() > roofs.len() * 2 + 16 {
+            self.outline_cache.clear();
+        }
+        self.map.outline_roofs = roofs;
+        if pending {
+            painter.ctx().request_repaint();
+        }
+    }
+
     fn draw_roof(&mut self, painter: &egui::Painter, canvas: Rect, roof: &map::Roof, alpha: f32, light: [f32; 2]) {
         let cam = self.cam;
         let (tex, tile) = match self.textures.get(&roof.paint, false) {
@@ -5598,6 +5680,7 @@ impl App {
         let mut covers: std::collections::HashMap<String, (image::RgbaImage, [f32; 2])> = std::collections::HashMap::new();
         let mut roof_tiles: Vec<Vec<export::RoofTile>> = Vec::new();
         let mut roof_count = 0;
+        let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
@@ -5631,6 +5714,39 @@ impl App {
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), ..Default::default() });
+            }
+            // Крыши по контуру (из OSM) — тоже по одной, в масштабе сцены: их сотни.
+            for r in &map.outline_roofs {
+                for piece in &r.pieces {
+                    if !outline_covers.contains_key(&piece.paint) {
+                        let bytes = self.textures.bytes(&piece.paint)?;
+                        outline_covers.insert(piece.paint.clone(), library::decode_tinted(&piece.paint, &bytes)?);
+                    }
+                }
+                let ppc = e.px as f32;
+                let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]));
+                if img.width() <= 1 {
+                    continue;
+                }
+                roof_count += 1;
+                let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
+                files.push((file.clone(), export::webp_bytes(&img, 88.0)));
+                tiles.push(export::RoofTile {
+                    src: export::foundry_src(&file),
+                    rect: [(origin[0] * ppc).round() as i64, (origin[1] * ppc).round() as i64, img.width() as i64, img.height() as i64],
+                    rotation: 0.0,
+                    shelter: true,
+                    fade: true,
+                    leaves: false,
+                    low: false,
+                    wind: 1.0,
+                    rope: false,
+                    web: None,
+                    chest: None,
+                    living: None,
+                    scuppers: Vec::new(),
+                    ..Default::default()
+                });
             }
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {

@@ -335,6 +335,16 @@ pub fn untint(key: &str) -> (Option<[u8; 3]>, &str) {
     }
 }
 
+/// Картинка по ключу из её байтов, в цвете ключа (`tint:`), если он есть: для
+/// того, что рисуется не видеокартой, а точками (крыши по контуру).
+pub fn decode_tinted(key: &str, bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    let mut img = image::load_from_memory(bytes).map_err(|e| format!("{}: {e}", label(key)))?.to_rgba8();
+    if let Some(c) = untint(key).0 {
+        tinted(&mut img, c);
+    }
+    Ok(img)
+}
+
 /// Перекрасить картинку: срединная яркость непрозрачного (сам кирпич) ложится в
 /// `rgb`; темнее неё — темнее `rgb` во столько же раз (тени), светлее — к белому
 /// (швы). Множитель и для светлого обрезал швы яркого цвета о 255.

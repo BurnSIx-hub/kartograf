@@ -15,7 +15,7 @@
 //!   Навесы над платформами (`building=roof`) — тоже: под ними должно быть видно рельсы.
 
 use super::*;
-use crate::map::segment_distance;
+use crate::map::{OutlineRoof, RoofForm, RoofPiece, segment_distance};
 use std::collections::{BTreeSet, HashMap};
 use std::f32::consts::{FRAC_PI_4, FRAC_PI_8};
 
@@ -1333,10 +1333,80 @@ fn colour(v: &str) -> Option<[u8; 3]> {
     })
 }
 
+/// Площадь кольца, клетки².
+fn ring_area(r: &[[f32; 2]]) -> f32 {
+    (0..r.len()).map(|i| r[i][0] * r[(i + 1) % r.len()][1] - r[(i + 1) % r.len()][0] * r[i][1]).sum::<f32>().abs() / 2.0
+}
+
+/// Вид крыши по `roof:shape` (и плоские покрытия по `roof:material`); пусто — `default`.
+fn roof_form(shape: &str, material: &str, default: RoofForm) -> RoofForm {
+    match shape {
+        "flat" => RoofForm::Flat,
+        "" if matches!(material, "tar_paper" | "concrete" | "asphalt" | "gravel") => RoofForm::Flat,
+        "" => default,
+        "pyramidal" | "cone" | "conical" | "dome" | "onion" | "round" | "spherical" | "tent" => RoofForm::Spire,
+        _ => RoofForm::Pitched,
+    }
+}
+
+/// Покрытие крыши по `roof:material`; без него — в городе жесть, за городом черепица.
+fn roof_slot(material: &str, rural: bool) -> &'static str {
+    match material {
+        "roof_tiles" | "tile" | "tiles" | "clay" | "ceramic" => "roof_clay_red",
+        "slate" => "roof_slate_gray",
+        "copper" => "roof_copper",
+        "thatch" | "reed" | "straw" => "roof_thatch",
+        "wood" | "wooden" | "shingle" | "shingles" => "roof_shingle",
+        "metal" | "tin" | "steel" | "zinc" | "metal_sheet" | "glass" | "concrete" | "tar_paper" | "asphalt" => "roof_metal",
+        _ if rural => "roof_clay_red",
+        _ => "roof_metal",
+    }
+}
+
+/// Высота части, м: `height`, нет — этажи по 3 м.
+fn part_height(t: &Tags) -> f32 {
+    let num = |k: &str| get(t, k).split_whitespace().next().and_then(|v| v.parse::<f32>().ok());
+    num("height").or_else(|| num("building:levels").map(|l| l * 3.0)).unwrap_or(0.0)
+}
+
+/// Крыша по контуру дома. Основа — весь дом: вид, покрытие и цвет из его тегов,
+/// нет — из самой большой части, цвет ещё и со снимка; без тегов вида — скатами.
+/// Поверх — части (`building:part`) снизу вверх по высоте, каждая своим цветом и
+/// видом (без вида — плоская, как в OSM): купола собора, шатры башен.
+fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>, weights: &[(usize, f32)], mw: usize, rural: bool) -> OutlineRoof {
+    let mut mine: Vec<&(f32, [f32; 2], &Area)> = parts.iter().filter(|p| inside(&a.rings, p.1)).collect();
+    // Теги основы — у части, что и есть тело дома (не меньше половины): купол
+    // церкви вида основе не даёт.
+    let body = a.rings.first().map_or(0.0, |r| ring_area(r)) * 0.5;
+    let main = mine.iter().filter(|p| p.0 >= body).max_by(|x, y| x.0.total_cmp(&y.0)).map(|p| p.2.tags);
+    let tag = |k: &str| match get(a.tags, k) {
+        "" => main.map_or("", |t| get(t, k)),
+        v => v,
+    };
+    let paint = |slot: &str, rgb: Option<[u8; 3]>| {
+        let key = asset(slot).key;
+        rgb.map_or_else(|| key.clone(), |c| library::tint_key(c, &key))
+    };
+    let base_rgb = colour(tag("roof:colour")).or_else(|| hint.and_then(|h| h.colour(weights, mw)));
+    let base_material = tag("roof:material");
+    let mut pieces = vec![RoofPiece { rings: a.rings.clone(), form: roof_form(tag("roof:shape"), base_material, RoofForm::Pitched), paint: paint(roof_slot(base_material, rural), base_rgb) }];
+    mine.sort_by(|x, y| part_height(x.2.tags).total_cmp(&part_height(y.2.tags)));
+    for (_, _, part) in mine {
+        let t = part.tags;
+        let material = match get(t, "roof:material") {
+            "" => base_material,
+            m => m,
+        };
+        pieces.push(RoofPiece { rings: part.rings.clone(), form: roof_form(get(t, "roof:shape"), material, RoofForm::Flat), paint: paint(roof_slot(material, rural), colour(get(t, "roof:colour")).or(base_rgb)) });
+    }
+    OutlineRoof { pieces }
+}
+
 /// Крепостная стена контуром (`building=wall`, `historic=citywalls`): сверху её
 /// видно целиком — боевой ход с зубцами, а не дом с дощатым полом и дверью.
+/// Башня на линии стен (`historic=citywalls` с `tower:type`) — дом с крышей.
 fn rampart(t: &Tags) -> bool {
-    get(t, "building") == "wall" || matches!(get(t, "historic"), "citywalls" | "city_wall")
+    get(t, "building") == "wall" || (matches!(get(t, "historic"), "citywalls" | "city_wall") && get(t, "tower:type").is_empty() && get(t, "man_made") != "tower")
 }
 
 /// Зубцы по краю боевого хода: низкие стенки 1,3 × 0,4 клетки с шагом 2,2 у самой
@@ -2407,6 +2477,16 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // Дома: комнаты по контуру.
     let mut houses: Vec<House> = Vec::new();
     let mut ramparts: Vec<(Vec<Vec<[f32; 2]>>, WallStyle)> = Vec::new();
+    // Части зданий: площадь, середина, теги — для крыш домов без своих тегов крыши.
+    let parts: Vec<(f32, [f32; 2], &Area)> = areas
+        .iter()
+        .filter(|a| a.tags.contains_key("building:part") && building(a.tags).is_none())
+        .filter_map(|a| {
+            let r = a.rings.first().filter(|r| !r.is_empty())?;
+            let c = r.iter().fold([0.0, 0.0], |s, p| [s[0] + p[0], s[1] + p[1]]);
+            Some((ring_area(r), [c[0] / r.len() as f32, c[1] / r.len() as f32], a))
+        })
+        .collect();
     let mut names: BTreeMap<String, ([f32; 2], f32)> = BTreeMap::new();
     for a in &areas {
         let Some(kind) = building(a.tags) else { continue };
@@ -2453,6 +2533,10 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             names.insert(name.to_owned(), (c, cells));
         }
         let style = if fort { wall_tinted(slot, tag("building:colour").or(tint)) } else { wall(slot) };
+        // Крыша — у всего, что сверху закрыто: у стены и трибуны её нет.
+        if !wall_top && kind != "grandstand" {
+            m.outline_roofs.push(outline_roof(a, &parts, hint.as_ref(), &weights, m.rooms.w, rural));
+        }
         houses.push(House { rings: a.rings.clone(), entrances, style, wood: wood && !fort, grand, doors: !wall_top });
     }
     // Зубцы — когда все дома на месте: за краем, где башня, их не ставить.
@@ -3453,6 +3537,29 @@ mod tests {
         let on_wall = |p: [f32; 2]| (2.0..25.5).contains(&p[0]) && (7.5..11.5).contains(&p[1]);
         assert!(m.portals.iter().all(|d| !on_wall(d.a) && !on_wall(d.b)), "дверь в стене: {:?}", m.portals.iter().map(|d| (d.a, d.b)).collect::<Vec<_>>());
         assert!(m.walls.iter().any(|w| matches!(&w.style, Some(s) if matches!(&s.paint, Paint::Texture(k) if k.starts_with("tint:ec8859:")))), "стена между стеной и башней не в цвет");
+    }
+
+    /// Дом с зелёной крышей и золотым куполом-частью, трибуна и стена: крыша —
+    /// у дома (основа и купол поверх), у трибуны и стены — нет.
+    #[test]
+    fn houses_get_outline_roofs_with_parts_on_top() {
+        let xml = town(
+            r##"<way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/><tag k="building" v="church"/><tag k="roof:colour" v="#2E8B57"/></way>
+ <node id="41" lat="51.53032" lon="-0.12485"/>
+ <node id="42" lat="51.53032" lon="-0.12475"/>
+ <node id="43" lat="51.53024" lon="-0.12475"/>
+ <node id="44" lat="51.53024" lon="-0.12485"/>
+ <way id="40"><nd ref="41"/><nd ref="42"/><nd ref="43"/><nd ref="44"/><nd ref="41"/><tag k="building:part" v="yes"/><tag k="roof:shape" v="onion"/><tag k="roof:colour" v="gold"/><tag k="height" v="30"/></way>
+ <way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/><tag k="building" v="grandstand"/></way>"##,
+        );
+        let (m, _) = import(&xml, Options::default()).unwrap();
+        // Дом в углу (900) и церковь; трибуны нет.
+        assert_eq!(m.outline_roofs.len(), 2, "{:?}", m.outline_roofs.iter().map(|r| r.pieces.len()).collect::<Vec<_>>());
+        let church = m.outline_roofs.iter().find(|r| r.pieces.len() == 2).expect("у церкви нет купола-части");
+        assert_eq!(church.pieces[0].form, RoofForm::Pitched);
+        assert!(church.pieces[0].paint.starts_with("tint:2e8b57:"), "{}", church.pieces[0].paint);
+        assert_eq!(church.pieces[1].form, RoofForm::Spire);
+        assert!(church.pieces[1].paint.starts_with("tint:ffd700:"), "{}", church.pieces[1].paint);
     }
 
     /// Кремлёвский парк в малом: парк на всю левую часть, на снимке трава лишь
