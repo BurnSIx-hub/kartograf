@@ -738,7 +738,7 @@ pub fn outline(roof: &OutlineRoof) -> Vec<(Vec<[f32; 2]>, bool)> {
 }
 
 /// Внутри ли колец точка (по чётности: двор — снаружи).
-fn inside_rings(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
+pub(crate) fn inside_rings(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
     let mut c = false;
     for r in rings {
         for k in 0..r.len() {

@@ -713,6 +713,71 @@ pub enum RoofForm {
     Dome,
 }
 
+impl RoofForm {
+    /// Порядок на панели: как у прямоугольных ([`RoofShape::ALL`]), потом своды.
+    pub const ALL: [RoofForm; 7] = [RoofForm::Gabled, RoofForm::Pitched, RoofForm::Shed, RoofForm::Flat, RoofForm::Spire, RoofForm::Round, RoofForm::Dome];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoofForm::Gabled => "Двускатная",
+            RoofForm::Pitched => "Вальмовая",
+            RoofForm::Shed => "Односкатная",
+            RoofForm::Flat => "Плоская",
+            RoofForm::Spire => "Шатёр",
+            RoofForm::Round => "Свод",
+            RoofForm::Dome => "Купол",
+        }
+    }
+
+    /// Поворачивается ли клавишей R: конёк поперёк или скат в другую сторону.
+    pub fn turns(self) -> bool {
+        matches!(self, RoofForm::Gabled | RoofForm::Round | RoofForm::Shed)
+    }
+}
+
+impl RoofPiece {
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        crate::roofs::inside_rings(&self.rings, p)
+    }
+
+    /// Односкатной без стороны ската — скат от самой длинной стороны внешнего
+    /// кольца внутрь: иначе она рисуется вальмой.
+    pub fn fit_form(&mut self) {
+        if self.form != RoofForm::Shed || self.down.is_some() {
+            return;
+        }
+        let Some(r) = self.rings.first().filter(|r| r.len() >= 3) else { return };
+        let len = |k: usize| {
+            let (a, b) = (r[k], r[(k + 1) % r.len()]);
+            (b[0] - a[0]).hypot(b[1] - a[1])
+        };
+        let k = (0..r.len()).max_by(|&x, &y| len(x).total_cmp(&len(y))).unwrap_or(0);
+        let (a, b) = (r[k], r[(k + 1) % r.len()]);
+        let l = len(k).max(1e-6);
+        let mut n = [(a[1] - b[1]) / l, (b[0] - a[0]) / l];
+        // К середине кольца, а не наружу.
+        let c = r.iter().fold([0.0, 0.0], |s, p| [s[0] + p[0] / r.len() as f32, s[1] + p[1] / r.len() as f32]);
+        if (c[0] - a[0]) * n[0] + (c[1] - a[1]) * n[1] < 0.0 {
+            n = [-n[0], -n[1]];
+        }
+        self.down = Some(n);
+    }
+
+    /// Клавиша R: у двускатной и свода конёк поперёк, у односкатной скат на
+    /// четверть по часовой. Остальные не поворачиваются — `false`.
+    pub fn turn(&mut self) -> bool {
+        match self.form {
+            RoofForm::Gabled | RoofForm::Round => self.across = !self.across,
+            RoofForm::Shed => {
+                self.fit_form();
+                self.down = self.down.map(|d| [-d[1], d[0]]);
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
 impl OutlineRoof {
     /// Левый верхний и правый нижний углы, в клетках.
     pub fn bounds(&self) -> ([f32; 2], [f32; 2]) {

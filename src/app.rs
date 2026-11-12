@@ -206,6 +206,8 @@ pub enum Sel {
     Path(usize),
     Label(usize),
     Roof(usize),
+    /// Крыша по контуру из OSM и её кусок: 0 — весь дом, дальше части.
+    Outline(usize, usize),
     /// Стена комнаты: ключ отрезка и весь ли контур.
     Edge((i32, i32), bool),
 }
@@ -820,6 +822,7 @@ impl App {
             Sel::Path(i) => i < self.map.paths.len(),
             Sel::Label(i) => i < self.map.labels.len(),
             Sel::Roof(i) => i < self.map.roofs.len(),
+            Sel::Outline(i, k) => self.map.outline_roofs.get(i).is_some_and(|r| k < r.pieces.len()),
         }
     }
 
@@ -1107,6 +1110,13 @@ impl App {
             Sel::Roof(i) => {
                 self.map.roofs.remove(i);
             }
+            // Весь дом — вся крыша с частями; часть — только она.
+            Sel::Outline(i, 0) => {
+                self.map.outline_roofs.remove(i);
+            }
+            Sel::Outline(i, k) => {
+                self.map.outline_roofs[i].pieces.remove(k);
+            }
             // Стена комнаты стирается вместе с комнатой.
             Sel::Edge(..) => {}
         }
@@ -1128,6 +1138,16 @@ impl App {
             return None;
         }
         self.map.roofs.iter().rposition(|r| r.contains(w))
+    }
+
+    /// Крыша OSM и её кусок под точкой, если её сейчас можно взять: верхняя
+    /// крыша, а в ней верхняя часть.
+    fn outline_at(&self, w: [f32; 2]) -> Option<Sel> {
+        if self.roof_alpha() < 1.0 && self.tool != Tool::Roof {
+            return None;
+        }
+        let roofs = &self.map.outline_roofs;
+        roofs.iter().enumerate().rev().find_map(|(i, r)| r.pieces.iter().rposition(|p| p.contains(w)).map(|k| Sel::Outline(i, k)))
     }
 
     /// Крыша над прямоугольником клеток `a`–`b` (включительно), по образцу.
@@ -1246,6 +1266,9 @@ impl App {
         // Видимая крыша закрывает всё, что под ней.
         if let Some(i) = self.roof_at(w) {
             return Some(Sel::Roof(i));
+        }
+        if let Some(s) = self.outline_at(w) {
+            return Some(s);
         }
         // Щелчок берёт видимый сверху: последний в порядке рисования.
         if let Some(&i) = self.prop_order().iter().rev().find(|&&i| self.map.props[i].contains(w)) {
@@ -1371,6 +1394,13 @@ impl App {
             self.checkpoint();
             let r = &mut self.map.roofs[i];
             r.turn = (r.turn + 1) % 4;
+            return;
+        }
+        if let Some(Sel::Outline(i, k)) = self.sel {
+            if self.map.outline_roofs[i].pieces[k].form.turns() {
+                self.checkpoint();
+                self.map.outline_roofs[i].pieces[k].turn();
+            }
             return;
         }
         if self.tool == Tool::Roof {
@@ -2834,6 +2864,34 @@ impl App {
 
     /// Строка над картой: настройки инструмента и выбранного. Высота постоянная:
     /// иначе карта прыгала бы под курсором; что не влезло — прокруткой вбок.
+    /// Выбранный кусок крыши OSM: вид, поворот, покрытие (на полке). Импорт
+    /// ошибается — нарисовал скатную вместо плоской, — правится тут.
+    fn outline_panel(&mut self, ui: &mut egui::Ui, i: usize, k: usize) {
+        let mut st = self.map.outline_roofs[i].pieces[k].clone();
+        ui.strong(if k == 0 { "Крыша дома из OSM" } else { "Часть крыши из OSM" });
+        let was = st.form;
+        ui.horizontal_wrapped(|ui| {
+            for form in map::RoofForm::ALL {
+                ui.selectable_value(&mut st.form, form, form.label());
+            }
+        });
+        // Только при смене вида: выбор крыши сам её не меняет.
+        if st.form != was {
+            st.fit_form();
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(st.form.turns(), egui::Button::new("Повернуть   R")).clicked() {
+                st.turn();
+            }
+            ui.label(format!("Покрытие: {}", library::label(&st.paint)));
+        });
+        ui.weak(if k == 0 { "Delete — убрать крышу дома с частями" } else { "Delete — убрать эту часть" });
+        if st != self.map.outline_roofs[i].pieces[k] {
+            self.checkpoint();
+            self.map.outline_roofs[i].pieces[k] = st;
+        }
+    }
+
     fn options_bar(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().id_salt("options").auto_shrink([false, false]).show(ui, |ui| {
             ui.vertical(|ui| {
@@ -2931,6 +2989,11 @@ impl App {
                                 ui.label(library::label(k));
                             }
                         });
+                    }
+                    Tool::Roof if matches!(self.sel, Some(Sel::Outline(..))) => {
+                        if let Some(Sel::Outline(i, k)) = self.sel {
+                            self.outline_panel(ui, i, k);
+                        }
                     }
                     Tool::Roof => {
                         let chosen = match self.sel {
@@ -3273,6 +3336,7 @@ impl App {
             Kind::Object => self.object_asset.clone(),
             Kind::Roof => Some(match self.sel {
                 Some(Sel::Roof(i)) => self.map.roofs[i].paint.clone(),
+                Some(Sel::Outline(i, k)) => self.map.outline_roofs[i].pieces[k].paint.clone(),
                 _ => self.roof_style.paint.clone(),
             }),
         };
@@ -3387,6 +3451,17 @@ impl App {
                     {
                         self.checkpoint();
                         self.map.roofs[i].paint = key.clone();
+                    }
+                    // Крыше OSM — только ей: образец новых прямоугольных не трогаем.
+                    if let Some(Sel::Outline(i, k)) = self.sel {
+                        if self.map.outline_roofs[i].pieces[k].paint != key {
+                            self.checkpoint();
+                            self.map.outline_roofs[i].pieces[k].paint = key;
+                        }
+                        if self.tool != Tool::Roof {
+                            self.set_tool(Tool::Roof);
+                        }
+                        return;
                     }
                     self.roof_style.paint = key;
                     if self.tool != Tool::Roof {
@@ -3751,7 +3826,8 @@ impl App {
                 } else if resp.clicked()
                     && let Some(p) = pointer
                 {
-                    self.sel = self.roof_at(self.cam.to_world(rect, p)).map(Sel::Roof);
+                    let w = self.cam.to_world(rect, p);
+                    self.sel = self.roof_at(w).map(Sel::Roof).or_else(|| self.outline_at(w));
                 }
             }
             Tool::Text => {
@@ -4344,6 +4420,14 @@ impl App {
             }
             if roof_alpha > 0.0 {
                 self.draw_outline_roofs(painter, canvas, view, roof_alpha, shadows.light());
+                if let Some(Sel::Outline(i, k)) = self.sel
+                    && let Some(piece) = self.map.outline_roofs.get(i).and_then(|r| r.pieces.get(k))
+                {
+                    for ring in &piece.rings {
+                        let q: Vec<Pos2> = ring.iter().map(|&p| cam.to_screen(canvas, p)).collect();
+                        painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));
+                    }
+                }
                 for (i, r) in roofs.iter().enumerate() {
                     self.draw_roof(painter, canvas, r, roof_alpha, shadows.light());
                     if self.sel == Some(Sel::Roof(i)) {

@@ -787,11 +787,51 @@ impl SelfTest {
                 app.set_tool(Tool::Select);
                 let solid = matches!(app.pick([12.0, 7.0]), Some(Sel::Roof(0)));
                 self.check("крыша видна в «Выборе» и прозрачна для стен", ghost && solid, &format!("ghost {ghost} solid {solid}"));
-                app.sel = None;
+                // Крыша OSM у правого края: Г-образный дом вальмой и шатёр-часть на нём.
+                let slate = format!("{}roof_slate_blue", crate::library::BUILTIN);
+                let piece = |ring: Vec<[f32; 2]>, form, height| map::RoofPiece { rings: vec![ring], form, paint: slate.clone(), height, eaves: 1.0, down: None, across: false };
+                let house = vec![[17.0, 4.0], [20.0, 4.0], [20.0, 11.0], [18.5, 11.0], [18.5, 8.0], [17.0, 8.0]];
+                let tower = vec![[17.5, 5.0], [19.5, 5.0], [19.5, 7.0], [17.5, 7.0]];
+                app.map.outline_roofs.push(map::OutlineRoof { pieces: vec![piece(house, map::RoofForm::Pitched, 2.0), piece(tower, map::RoofForm::Spire, 4.0)] });
+                let n = app.map.outline_roofs.len() - 1;
+                let picked = (app.pick([19.5, 10.0]), app.pick([18.5, 6.0]));
+                app.set_tool(Tool::Wall);
+                let through = app.pick([19.5, 10.0]);
+                app.set_tool(Tool::Roof);
+                let ok = picked == (Some(Sel::Outline(n, 0)), Some(Sel::Outline(n, 1))) && !matches!(through, Some(Sel::Outline(..)));
+                self.check("крыша OSM и её часть выбираются, для стен прозрачны", ok, &format!("{picked:?} {through:?}"));
+                // Вид меняется, односкатная получает скат, R его поворачивает.
+                app.sel = Some(Sel::Outline(n, 0));
+                app.rotate();
+                let still = app.map.outline_roofs[n].pieces[0].clone();
+                app.map.outline_roofs[n].pieces[0].form = map::RoofForm::Shed;
+                app.map.outline_roofs[n].pieces[0].fit_form();
+                let d0 = app.map.outline_roofs[n].pieces[0].down;
+                app.rotate();
+                let d1 = app.map.outline_roofs[n].pieces[0].down;
+                // Самая длинная сторона — правая (7 клеток): скат от неё влево, после R — вверх.
+                let near = |d: Option<[f32; 2]>, e: [f32; 2]| d.is_some_and(|d| (d[0] - e[0]).abs() < 1e-4 && (d[1] - e[1]).abs() < 1e-4);
+                let ok = still.form == map::RoofForm::Pitched && !still.across && near(d0, [-1.0, 0.0]) && near(d1, [0.0, -1.0]);
+                self.check("вальма не вертится, у односкатной скат от длинной стороны и R его поворачивает", ok, &format!("{d0:?} → {d1:?}"));
+                app.map.outline_roofs[n].pieces[0] = still;
+                // Delete на части убирает только её, на доме — крышу целиком; правка откатывается.
+                app.sel = Some(Sel::Outline(n, 1));
+                app.delete_selected();
+                let parts = app.map.outline_roofs.get(n).map(|r| r.pieces.len());
+                app.sel = Some(Sel::Outline(n, 0));
+                app.delete_selected();
+                let gone = app.map.outline_roofs.len() == n;
+                app.undo();
+                app.undo();
+                let back = app.map.outline_roofs.get(n).map(|r| r.pieces.len());
+                self.check("Delete убирает часть крыши OSM или крышу целиком, отмена возвращает", parts == Some(1) && gone && back == Some(2), &format!("{parts:?} {gone} {back:?}"));
+                // На снимке — выбранная крыша OSM и её панель.
+                app.sel = Some(Sel::Outline(n, 0));
                 self.resume_at = now + 0.4;
             }
             63 => self.snap(ctx, "крыши"),
             64 => {
+                app.sel = None;
                 // Стрелка ячейки «Кисть» открывает её режимы.
                 let h = (app.canvas.height() / 7.0).floor();
                 self.click(egui::pos2(56.0, app.canvas.top() + h * 1.5));
