@@ -2576,6 +2576,93 @@ fn cliff_relief(lines: &[(Vec<[f32; 2]>, f32)], w: u32, h: u32) -> Option<crate:
     Some(r)
 }
 
+/// Осыпь под обрывом: шаг между кучками вдоль подножия, клетки, и насколько
+/// дальше от него ложатся одиночки на ярус перепада.
+const SCREE_STEP: f32 = 2.6;
+const SCREE_REACH: f32 = 0.35;
+/// Камней осыпи на карту не больше примерно этого: каждый в Foundry — свой тайл.
+/// Длинные обрывы гор — реже, а не без конца.
+const SCREE_MAX: f32 = 500.0;
+
+/// Осыпь под обрывами рельефа: камни породы участка у подножия кучками — глыба у
+/// самой стенки, мелочь вокруг неё, — и редкие одиночки дальше; у высокого обрыва
+/// гуще и шире, к свободному концу реже. Без них стенка читалась каменной оградой:
+/// полоса, тень — и сразу ровная трава. Ровная россыпь мелочи читалась гравием, а
+/// каждый камень в Foundry — свой тайл. Мимо домов и воды (`hard`), дорог, оград и
+/// чужих стенок.
+fn cliff_scree(m: &mut Map, hard: &Blocked, tone: &str) {
+    let Some(r) = m.relief.clone() else { return };
+    if missing("boulder") {
+        return;
+    }
+    let stone = asset_toned("boulder", tone);
+    let lines: Vec<(Vec<[f32; 2]>, f32)> = m.paths.iter().map(|p| (p.curve(), p.width / 2.0 + 0.3)).chain(m.walls.iter().map(|wl| (wl.points.clone(), 0.5))).collect();
+    let (w, h) = (m.width as f32, m.height as f32);
+    let mut placed: Vec<([f32; 2], f32)> = Vec::new();
+    let edges: Vec<crate::relief::Edge> = crate::relief::edges(&r).into_iter().filter(|e| e.kind == crate::relief::EdgeKind::Cliff).collect();
+    let runs: Vec<Vec<f32>> = edges
+        .iter()
+        .map(|e| {
+            let mut along = vec![0.0f32; e.points.len()];
+            for k in 1..e.points.len() {
+                along[k] = along[k - 1] + length(e.points[k - 1], e.points[k]);
+            }
+            along
+        })
+        .collect();
+    // В среднем кучка с одиночкой — около трёх камней на шаг.
+    let all: f32 = runs.iter().filter_map(|a| a.last()).sum();
+    let budget = (SCREE_MAX / (all / SCREE_STEP * 3.0).max(1.0)).min(1.0);
+    for (n, (e, along)) in edges.iter().zip(&runs).enumerate() {
+        let mut rng = Rng::new(&format!("osm/scree/{n}"));
+        let pts = &e.points;
+        let total = along.last().copied().unwrap_or(0.0);
+        let mut next = rng.random() as f32 * SCREE_STEP;
+        for k in 0..pts.len() {
+            if along[k] < next {
+                continue;
+            }
+            next = along[k] + SCREE_STEP * (0.6 + rng.random() as f32 * 0.8);
+            // У свободного конца стенка сходит на нет — и осыпь с ней.
+            let to_end = [along[k], total - along[k]];
+            let taper = (0..2).map(|s| if e.free[s] { (to_end[s] / 3.0).min(1.0) } else { 1.0 }).fold(1.0f32, f32::min);
+            let rich = (e.drop[k] / 3.0).clamp(0.5, 1.6) * taper * budget;
+            let (p, up) = (pts[k], e.up(k));
+            let at = |d: f32, s: f32| [p[0] - up[0] * d - up[1] * s, p[1] - up[1] * d + up[0] * s];
+            let mut stones: Vec<([f32; 2], f32)> = Vec::new();
+            // Кучка: глыба у самой стенки, мелочь вокруг неё — больше вниз по склону.
+            if rng.chance((0.75 * rich).min(0.95) as f64) {
+                let d = e.width[k] + 0.25 + rng.random() as f32 * 0.35;
+                let big = 0.7 + rng.random() as f32 * 0.5;
+                stones.push((at(d, (rng.random() as f32 - 0.5) * 0.6), big));
+                for _ in 0..rng.int(2, 4) {
+                    let q = at(d + (rng.random() as f32 - 0.15) * big, (rng.random() as f32 - 0.5) * 1.6 * big);
+                    stones.push((q, 0.3 + rng.random() as f32 * 0.2));
+                }
+            }
+            // Одиночка подальше; у высокого обрыва дальше.
+            if rng.chance((0.5 * rich).min(0.9) as f64) {
+                let d = e.width[k] + 0.4 + rng.random() as f32 * (0.6 + SCREE_REACH * e.drop[k]);
+                stones.push((at(d, (rng.random() as f32 - 0.5) * 1.5), 0.35 + rng.random() as f32 * 0.3));
+            }
+            for (q, size) in stones {
+                let off = q[0] < 0.3 || q[1] < 0.3 || q[0] > w - 0.3 || q[1] > h - 0.3;
+                if off || hard.at(q) || r.steepest(q, 0.25) >= crate::relief::CLIFF {
+                    continue;
+                }
+                if lines.iter().any(|(l, half)| l.windows(2).map(|s| segment_distance(q, s[0], s[1])).fold(f32::INFINITY, f32::min) < *half) {
+                    continue;
+                }
+                if placed.iter().any(|&(o, s)| length(o, q) < (s + size) * 0.34) {
+                    continue;
+                }
+                drop_pick(m, &stone, q, rng.int(0, 359) as f32, size);
+                placed.push((q, size));
+            }
+        }
+    }
+}
+
 /// Проход в ограде и его ширина в клетках: ворота, калитка, перелаз.
 fn gate(t: &Tags) -> Option<f32> {
     match get(t, "barrier") {
@@ -3836,6 +3923,13 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             drop_pick(&mut m, &asset_toned("boulder", tone), p, rng.int(0, 359) as f32, scale);
         }
     }
+    // Осыпь под обрывами — той же породы; тег породы у самого обрыва главнее.
+    let cliff_tone = osm
+        .ways
+        .values()
+        .find(|way| get(&way.tags, "natural") == "cliff" && ["rock", "geological", "surface"].iter().any(|k| !get(&way.tags, k).is_empty()))
+        .map_or(tone, |way| rock_kind(&way.tags).1);
+    cliff_scree(&mut m, &hard, cliff_tone);
 
     // Деревья: отдельные и рядами вдоль улиц.
     let mut trees: Vec<(i64, [f32; 2])> = osm.nodes.iter().filter(|(_, n)| get(&n.tags, "natural") == "tree" && !unseen(&n.tags)).map(|(id, n)| (*id, proj.at(n.lat, n.lon))).collect();
@@ -4711,6 +4805,34 @@ mod tests {
         assert!(r.at([20.0, 15.0]).abs() < 0.1 && (r.at([20.0, 11.0]) + 4.0).abs() < 0.1, "{} {}", r.at([20.0, 15.0]), r.at([20.0, 11.0]));
         // Обрыв — рельеф, а не тёмная стена.
         assert!(m.walls.is_empty(), "{:?}", m.walls);
+    }
+
+    #[test]
+    fn cliff_foot_gets_scree_on_the_low_side() {
+        let (m, _) = import(CLIFF, Options::default()).unwrap();
+        let stones: Vec<&crate::map::Prop> = m.props.iter().filter(|q| q.asset.contains("boulder")).collect();
+        assert!(stones.len() >= 20, "осыпи мало: {}", stones.len());
+        // Кромка на y ≈ 13, низ на юге: камни под стенкой, не на ней, не наверху и
+        // не дальше пары клеток от подножия.
+        let r = m.relief.as_ref().unwrap();
+        for q in &stones {
+            assert!(q.pos[1] > 13.5 && q.pos[1] < 17.0, "камень не у подножия: {:?}", q.pos);
+            assert!(r.steepest(q.pos, 0.2) < crate::relief::CLIFF, "камень на стенке: {:?}", q.pos);
+        }
+        // Крупные у стенки и мелочь.
+        assert!(stones.iter().any(|q| q.scale > 0.6) && stones.iter().any(|q| q.scale < 0.4));
+        // Через дорогу у подножия осыпь не ложится.
+        let road = CLIFF.replace(
+            "</osm>",
+            r#" <node id="20" lat="51.53019" lon="-0.12495"/><node id="21" lat="51.53019" lon="-0.12415"/>
+ <way id="30"><nd ref="20"/><nd ref="21"/><tag k="highway" v="residential"/></way>
+</osm>"#,
+        );
+        let (m, _) = import(&road, Options::default()).unwrap();
+        let path = m.paths.iter().find(|p| p.width > 0.5).expect("дороги нет");
+        for q in m.props.iter().filter(|q| q.asset.contains("boulder")) {
+            assert!(path.distance(q.pos) > path.width / 2.0, "камень на дороге: {:?}", q.pos);
+        }
     }
 
     #[test]
