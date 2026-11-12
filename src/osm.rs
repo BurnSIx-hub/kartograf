@@ -1744,8 +1744,23 @@ fn roof_form(shape: &str, material: &str, default: RoofForm) -> RoofForm {
         "skillion" | "lean_to" => RoofForm::Shed,
         "gabled" | "gambrel" | "saltbox" => RoofForm::Gabled,
         "round" | "barrel" => RoofForm::Round,
+        // Пила — ряды односкатных; сверху читается теми же полосами.
+        "sawtooth" => RoofForm::Rows,
         _ => RoofForm::Pitched,
     }
+}
+
+/// Зал от этой площади, м², крыт рядами скатов ([`hall`]).
+const HALL_MIN_M2: f32 = 800.0;
+
+/// Рынок, вокзал, склад, цех, ангар: большой пролёт крыт не одной вальмой, а
+/// рядами скатов. Вальмой с плоским верхом Центральный рынок Валенсии выходил
+/// бурым полем с каймой, а на снимке у него полосы коньков.
+fn hall(t: &Tags) -> bool {
+    matches!(get(t, "building"), "marketplace" | "train_station" | "transportation" | "warehouse" | "industrial" | "factory" | "manufacture" | "hangar")
+        || get(t, "amenity") == "marketplace"
+        || get(t, "railway") == "station"
+        || get(t, "public_transport") == "station"
 }
 
 /// Покрытие крыши по `roof:material`; без него — в городе жесть, за городом черепица.
@@ -1922,10 +1937,15 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
     // строят по старому образцу и теперь.
     let sacred = matches!(get(a.tags, "building"), "church" | "chapel" | "cathedral" | "temple" | "mosque" | "synagogue" | "shrine" | "monastery") || get(a.tags, "amenity") == "place_of_worship";
     let modern = !sacred && own_h >= 9.0 && built(a.tags).is_some_and(|y| y >= 1960);
+    // Большой зал — рядами скатов, если снимок не говорит о плоской мембране, а
+    // год — о модернизме.
+    let big_hall = hall(a.tags) && outer * m2 >= HALL_MIN_M2 && !pale && !modern;
     let default = if tower {
         RoofForm::Spire
     } else if platform || matches!(get(a.tags, "building"), "construction" | "roof") {
         RoofForm::Flat
+    } else if big_hall {
+        RoofForm::Rows
     } else if lit {
         RoofForm::Pitched
     } else if !rural && (pale || modern || (bare && outer * m2 < 60.0)) {
@@ -4490,6 +4510,27 @@ mod tests {
         assert!(lit(&hipped), "вальма не узнана");
         assert!(!lit(&skylights), "полоса фонарей — скаты");
         assert!(!lit(&even), "ровная кровля — скаты");
+    }
+
+    /// Большой рынок, вокзал, склад без вида крыши — рядами скатов; простой дом
+    /// того же размера, маленький склад и рынок с видом в тегах — нет.
+    #[test]
+    fn big_halls_get_rows_of_ridges() {
+        // Большой — 46×31 м (1400 м²), малый — 21×31 м (670 м²).
+        let form = |big: bool, tags: &str| {
+            let nodes = if big { r#"<nd ref="1"/><nd ref="6"/><nd ref="7"/><nd ref="4"/><nd ref="1"/>"# } else { r#"<nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/>"# };
+            let xml = town(&format!(r#"<way id="20">{nodes}{tags}</way>"#));
+            let (m, _) = import(&xml, Options::default()).unwrap();
+            m.outline_roofs.iter().find(|r| r.bounds().0[0] < 20.0).expect("крыши нет").pieces[0].form
+        };
+        assert_eq!(form(true, r#"<tag k="building" v="marketplace"/>"#), RoofForm::Rows);
+        assert_eq!(form(true, r#"<tag k="building" v="yes"/><tag k="amenity" v="marketplace"/><tag k="building:levels" v="2"/>"#), RoofForm::Rows);
+        assert_eq!(form(true, r#"<tag k="building" v="warehouse"/>"#), RoofForm::Rows);
+        assert_eq!(form(true, r#"<tag k="building" v="train_station"/>"#), RoofForm::Rows);
+        assert_eq!(form(true, r#"<tag k="building" v="yes"/>"#), RoofForm::Pitched);
+        assert_eq!(form(true, r#"<tag k="building" v="marketplace"/><tag k="roof:shape" v="flat"/>"#), RoofForm::Flat);
+        assert_eq!(form(true, r#"<tag k="building" v="industrial"/><tag k="building:levels" v="4"/><tag k="start_date" v="1975"/>"#), RoofForm::Flat);
+        assert_eq!(form(false, r#"<tag k="building" v="warehouse"/>"#), RoofForm::Pitched);
     }
 
     /// Без вида крыши в OSM: дом 1966 года в четыре этажа — плоский, дом 1890

@@ -686,7 +686,7 @@ pub struct RoofPiece {
     /// Куда смотрит односкатная ([`RoofForm::Shed`]): вниз по скату, в клетках.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down: Option<[f32; 2]>,
-    /// Конёк двускатной и свода — поперёк длинной стороны (`roof:orientation=across`).
+    /// Конёк двускатной, свода и рядов — поперёк длинной стороны (`roof:orientation=across`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub across: bool,
 }
@@ -711,11 +711,16 @@ pub enum RoofForm {
     /// Купол: свет плавно по кругу от макушки, ряды покрытия — меридианами.
     /// Гранями, как шатёр, он выходил пёстрым зонтиком.
     Dome,
+    /// Ряды двускатных бок о бок, коньки вдоль длинной стороны, между рядами
+    /// ендовы: так крыты рынки, вокзалы, склады. Вальмой такой зал выходил
+    /// ровным полем с каймой.
+    Rows,
 }
 
 impl RoofForm {
-    /// Порядок на панели: как у прямоугольных ([`RoofShape::ALL`]), потом своды.
-    pub const ALL: [RoofForm; 7] = [RoofForm::Gabled, RoofForm::Pitched, RoofForm::Shed, RoofForm::Flat, RoofForm::Spire, RoofForm::Round, RoofForm::Dome];
+    /// Порядок на панели: как у прямоугольных ([`RoofShape::ALL`]), потом своды,
+    /// потом ряды.
+    pub const ALL: [RoofForm; 8] = [RoofForm::Gabled, RoofForm::Pitched, RoofForm::Shed, RoofForm::Flat, RoofForm::Spire, RoofForm::Round, RoofForm::Dome, RoofForm::Rows];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -726,12 +731,13 @@ impl RoofForm {
             RoofForm::Spire => "Шатёр",
             RoofForm::Round => "Свод",
             RoofForm::Dome => "Купол",
+            RoofForm::Rows => "Ряды скатов",
         }
     }
 
     /// Поворачивается ли клавишей R: конёк поперёк или скат в другую сторону.
     pub fn turns(self) -> bool {
-        matches!(self, RoofForm::Gabled | RoofForm::Round | RoofForm::Shed)
+        matches!(self, RoofForm::Gabled | RoofForm::Round | RoofForm::Shed | RoofForm::Rows)
     }
 }
 
@@ -763,11 +769,11 @@ impl RoofPiece {
         self.down = Some(n);
     }
 
-    /// Клавиша R: у двускатной и свода конёк поперёк, у односкатной скат на
-    /// четверть по часовой. Остальные не поворачиваются — `false`.
+    /// Клавиша R: у двускатной, свода и рядов коньки поперёк, у односкатной скат
+    /// на четверть по часовой. Остальные не поворачиваются — `false`.
     pub fn turn(&mut self) -> bool {
         match self.form {
-            RoofForm::Gabled | RoofForm::Round => self.across = !self.across,
+            RoofForm::Gabled | RoofForm::Round | RoofForm::Rows => self.across = !self.across,
             RoofForm::Shed => {
                 self.fit_form();
                 self.down = self.down.map(|d| [-d[1], d[0]]);
