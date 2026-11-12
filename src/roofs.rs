@@ -310,7 +310,7 @@ fn bilinear(tex: &image::RgbaImage, u: f32, v: f32) -> [f32; 3] {
 /// ГУМа сплошная вальма давала крест коньков через весь квартал.
 pub const SLOPE_MAX: f32 = 4.0;
 /// Допуск упрощения контура, в клетках: выступы фасада меньше него не режут свес в пилу.
-const OUTLINE_TOL: f32 = 0.35;
+pub const OUTLINE_TOL: f32 = 0.35;
 
 /// Картинка крыши по контуру ([`OutlineRoof`]): `ppc` точек на клетку, только в
 /// пределах `clip` (левый верхний и правый нижний углы карты, в клетках): дом,
@@ -507,7 +507,6 @@ fn gable_ridge(rings: &[Vec<[f32; 2]>], across: bool) -> Option<([f32; 2], [f32;
 /// — одной плоскостью, двускатный и свод — от конька. Плоский — покрытие вдоль
 /// длинной стороны, по краю парапет. Двор — дыра, к нему крыша тоже скатывается.
 /// Высоту своей поверхности кусок пишет в `relief` под номером `me`.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], (slope_rings, slope_open): (&[Vec<[f32; 2]>], &[bool]), tex: &image::RgbaImage, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
     /// Сторона квадрата точек, для которого стороны контура отбираются разом.

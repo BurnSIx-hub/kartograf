@@ -291,9 +291,33 @@ struct Hint<'a> {
     cover: &'a Cover,
     /// Ширина и высота рамки выгрузки в клетках (карта — с округлением вверх).
     span: [f32; 2],
+    /// Наклон снимка ([`photo_lean`]): на сколько клеток крыша на снимке сдвинута
+    /// от контура на клетку высоты (x — восток, y — юг). Нет — не найден.
+    lean: Option<[f32; 2]>,
+    /// Куда в плане светит солнце снимка ([`photo_sun`]): единичный вектор к нему.
+    sun: Option<[f32; 2]>,
 }
 
 impl Hint<'_> {
+    /// Сдвиг на снимке того, что на высоте `h` клеток.
+    fn shift(&self, h: f32) -> [f32; 2] {
+        self.lean.map_or([0.0, 0.0], |l| [l[0] * h, l[1] * h])
+    }
+
+    /// Яркость снимка в точке `p` (клетки), между пикселями — по четырём соседним.
+    fn luma_at(&self, p: [f32; 2]) -> Option<f32> {
+        let photo = self.cover.photo.as_ref()?;
+        let (w, h) = (photo.width() as f32, photo.height() as f32);
+        let (x, y) = (p[0] / self.span[0] * w - 0.5, p[1] / self.span[1] * h - 0.5);
+        if x < 0.0 || y < 0.0 || x >= w - 1.0 || y >= h - 1.0 {
+            return None;
+        }
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |dx: u32, dy: u32| luma(photo.get_pixel(x0 as u32 + dx, y0 as u32 + dy).0);
+        Some((at(0, 0) * (1.0 - fx) + at(1, 0) * fx) * (1.0 - fy) + (at(0, 1) * (1.0 - fx) + at(1, 1) * fx) * fy)
+    }
+
     /// Доля класса в круге радиуса `r` клеток вокруг `p`.
     fn share(&self, p: [f32; 2], r: f32, class: Class) -> f32 {
         self.cover.share(p[0] / self.span[0], p[1] / self.span[1], r / self.span[0], r / self.span[1], class)
@@ -333,28 +357,36 @@ impl Hint<'_> {
     }
 
     /// Цвет снимка по сэмплам маски, как у [`Hint::tone`]: срединный по каждому
-    /// каналу — блик стекла и тень трубы его не сдвигают.
-    fn colour(&self, samples: &[(usize, f32)], mw: usize) -> Option<[u8; 3]> {
+    /// каналу — блик стекла и тень трубы его не сдвигают. `shift` — сдвиг на
+    /// снимке в клетках: крыша высокого дома лежит на нём не над контуром.
+    /// `sunlit` — без тени: точки темнее половины верхней четверти яркости не в
+    /// счёт, если их меньше половины. Для цвета кровли так нельзя — тёмная жесть
+    /// рядом со светлым фонарём тоже «тень» (тёмная плоская кровля у Никольской
+    /// выходила светло-бирюзовой), — а светлую кровлю в тени крыла узнать можно.
+    fn colour(&self, samples: &[(usize, f32)], mw: usize, shift: [f32; 2], sunlit: bool) -> Option<[u8; 3]> {
         let photo = self.cover.photo.as_ref()?;
         let res = mask::RES as f32;
-        let mut seen: [Vec<u8>; 3] = Default::default();
+        let mut px: Vec<[u8; 3]> = Vec::new();
         for &(k, v) in samples {
             if v < 0.5 {
                 continue;
             }
-            let p = [((k % mw) as f32 + 0.5) / res, ((k / mw) as f32 + 0.5) / res];
+            let p = [((k % mw) as f32 + 0.5) / res + shift[0], ((k / mw) as f32 + 0.5) / res + shift[1]];
             let (x, y) = ((p[0] / self.span[0] * photo.width() as f32).floor(), (p[1] / self.span[1] * photo.height() as f32).floor());
             if x < 0.0 || y < 0.0 || x >= photo.width() as f32 || y >= photo.height() as f32 {
                 continue;
             }
-            let px = photo.get_pixel(x as u32, y as u32).0;
-            for c in 0..3 {
-                seen[c].push(px[c]);
-            }
+            px.push(photo.get_pixel(x as u32, y as u32).0);
         }
-        if seen[0].len() < 50 {
+        if px.len() < 50 {
             return None;
         }
+        let mut lumas: Vec<f32> = px.iter().map(|&c| luma(c)).collect();
+        let q = lumas.len() * 3 / 4;
+        let bright = *lumas.select_nth_unstable_by(q, f32::total_cmp).1;
+        let lit: Vec<[u8; 3]> = px.iter().copied().filter(|&c| luma(c) >= 0.5 * bright).collect();
+        let pick = if sunlit && lit.len() * 2 >= px.len() { lit } else { px };
+        let mut seen: [Vec<u8>; 3] = std::array::from_fn(|c| pick.iter().map(|p| p[c]).collect());
         Some(std::array::from_fn(|c| {
             let v = &mut seen[c];
             let mid = v.len() / 2;
@@ -1431,12 +1463,257 @@ fn roof_down(v: &str) -> Option<[f32; 2]> {
 /// брал бы по контуру землю и тень рядом. Совсем тёмное (яркость меньше 40 —
 /// Царская башня под кронами) — тень, а не кровля. Темнее цвета из тега снимок
 /// почти всегда: гранит Мавзолея в 2,3 раза, тёмно-зелёная жесть Средних рядов в
-/// 2,1 — по отношению тень от кровли не отличить.
-fn photo_roof(hint: Option<&Hint>, samples: &[(usize, f32)], mw: usize, area: f32, height: f32) -> Option<[u8; 3]> {
+/// 2,1 — по отношению тень от кровли не отличить. С найденным наклоном снимка
+/// ([`photo_lean`]) цвет берётся там, куда крыша сдвинута; мерка доверия та же:
+/// ошибка высоты главки (этажи по 3 м, высота купола на глаз) больше её самой —
+/// с мягкой меркой золотая главка у Зарядья по снимку выходила серой.
+fn photo_roof(hint: Option<&Hint>, samples: &[(usize, f32)], mw: usize, area: f32, height: f32, cell_m: f32, sunlit: bool) -> Option<[u8; 3]> {
+    let hint = hint?;
     if area.max(0.0).sqrt() < 0.5 * height {
         return None;
     }
-    hint?.colour(samples, mw).filter(|&c| luma(c) >= 40.0)
+    hint.colour(samples, mw, hint.shift(height / cell_m), sunlit).filter(|&c| luma(c) >= 40.0)
+}
+
+/// Наклон снимка, клеток сдвига на клетку высоты (x — восток, y — юг). Снимок
+/// снят не строго сверху: крыша дома высотой `h` лежит на нём со сдвигом
+/// `наклон × h` от контура (Китай-город — 0,29 м на метр к западу-юго-западу).
+/// Наклон свой у каждого снимка, а на рамке карты — один. Ищется перебором: контуры `pieces` (кольца и высота в клетках,
+/// от трёх этажей) при верном наклоне ложатся на края крыш, и перепад яркости
+/// поперёк контура наибольший. Пик узкий — у дома в 20 клеток шаг наклона 0,1
+/// уводит контур на две клетки, — поэтому три прохода: сперва щуп поперёк
+/// контура широкий и шаг крупный, потом всё уже. Меньше пяти домов, мало точек
+/// или выигрыш против «строго сверху» меньше 20% — не найден: у Красной площади
+/// он 11%, пик пологий, и два направления в полсотни градусов врозь дают один
+/// счёт (у Китай-города — 53%).
+fn photo_lean(hint: &Hint, pieces: &[(&[Vec<[f32; 2]>], f32)]) -> Option<[f32; 2]> {
+    const STEP: f32 = 0.25;
+    // Точки контуров: место, наружу, высота.
+    let mut pts: Vec<([f32; 2], [f32; 2], f32)> = Vec::new();
+    let mut used = 0;
+    for &(rings, h) in pieces {
+        let before = pts.len();
+        for (a, b, n) in outward_edges(rings) {
+            let count = (length(a, b) / STEP).ceil() as usize;
+            for i in 0..count {
+                let t = (i as f32 + 0.5) / count as f32;
+                let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                // Выгрузка шире рамки: контуры за снимком не в счёт.
+                if p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= hint.span[0] && p[1] <= hint.span[1] {
+                    pts.push((p, n, h));
+                }
+            }
+        }
+        if pts.len() > before {
+            used += 1;
+        }
+    }
+    if used < 5 || pts.len() < 400 {
+        return None;
+    }
+    let score = |l: [f32; 2], across: f32| {
+        let (mut sum, mut n) = (0.0f64, 0u32);
+        for &(p, d, h) in &pts {
+            let q = [p[0] + l[0] * h, p[1] + l[1] * h];
+            if let (Some(o), Some(i)) = (hint.luma_at([q[0] + d[0] * across, q[1] + d[1] * across]), hint.luma_at([q[0] - d[0] * across, q[1] - d[1] * across])) {
+                sum += (o - i).abs() as f64;
+                n += 1;
+            }
+        }
+        (n as usize * 2 >= pts.len()).then(|| (sum / n as f64) as f32)
+    };
+    let best_of = |c: [f32; 2], span: f32, step: f32, across: f32| {
+        let k = (span / step).round() as i32;
+        let mut best: Option<([f32; 2], f32)> = None;
+        for i in -k..=k {
+            for j in -k..=k {
+                let l = [c[0] + i as f32 * step, c[1] + j as f32 * step];
+                if let Some(s) = score(l, across)
+                    && best.is_none_or(|b| s > b.1)
+                {
+                    best = Some((l, s));
+                }
+            }
+        }
+        best
+    };
+    let (coarse, _) = best_of([0.0, 0.0], 1.0, 0.1, 1.5)?;
+    let (middle, _) = best_of(coarse, 0.1, 0.025, 0.6)?;
+    let (lean, top) = best_of(middle, 0.03, 0.01, 0.3)?;
+    let flat = score([0.0, 0.0], 0.3)?;
+    (top >= flat * 1.2 && top >= flat + 2.0).then_some(lean)
+}
+
+/// Стороны колец (концы и единичная нормаль наружу — от того, что внутри колец).
+fn outward_edges(rings: &[Vec<[f32; 2]>]) -> Vec<([f32; 2], [f32; 2], [f32; 2])> {
+    let mut edges = Vec::new();
+    for r in rings {
+        for k in 0..r.len() {
+            let (a, b) = (r[k], r[(k + 1) % r.len()]);
+            let len = length(a, b);
+            if len < 1e-3 {
+                continue;
+            }
+            let mut n = [(b[1] - a[1]) / len, -(b[0] - a[0]) / len];
+            let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+            if inside(rings, [mid[0] + n[0] * 0.05, mid[1] + n[1] * 0.05]) {
+                n = [-n[0], -n[1]];
+            }
+            edges.push((a, b, n));
+        }
+    }
+    edges
+}
+
+/// Свет крыши на снимке, будь она вальмой по контуру: яркость точки, под которой
+/// скат смотрит в сторону `n` (наружу от ближайшей стороны контура), — примерно
+/// `mean + gain·n`. У скатной крыши скат к солнцу светлее, и `gain` смотрит на
+/// солнце; у плоской он около нуля (тень парапета даже темнит край к солнцу).
+#[derive(Clone, Copy, Debug)]
+struct Light {
+    gain: [f32; 2],
+    mean: f32,
+    /// Ковариация `gain` (соседние точки снимка не независимы — она занижена).
+    cov: [[f32; 2]; 2],
+    /// То же по одним перепадам на стыках скатов (конёк, рёбра): пары точек по
+    /// разные стороны стыка, `Δяркость ≈ step·Δn`. Раскладка плоской кровли
+    /// (светлая полоса фонарей у одного края, тёмная у другого — Ипатьевский
+    /// переулок, 9 с1) даёт `gain`, но не перепад на стыке.
+    step: [f32; 2],
+    step_cov: [[f32; 2]; 2],
+}
+
+/// [`Light`] крыши по контуру `rings` и сэмплам маски; `shift` — сдвиг крыши на
+/// снимке, клетки. Кромка — метр от стены — не в счёт: туда при ошибке высоты
+/// попадает фасад или земля. Скаты — как у отрисовки: по ближайшей стороне
+/// упрощённого контура. Меньше 40 точек — не судить.
+fn roof_light(hint: &Hint, rings: &[Vec<[f32; 2]>], samples: &[(usize, f32)], mw: usize, shift: [f32; 2], cell_m: f32) -> Option<Light> {
+    let rings: Vec<Vec<[f32; 2]>> = rings.iter().map(|r| crate::roofs::iron_jogs(&crate::roofs::simplify_ring(r, crate::roofs::OUTLINE_TOL))).filter(|r| r.len() >= 3).collect();
+    let edges = outward_edges(&rings);
+    let res = mask::RES as f32;
+    let rim = 1.0 / cell_m;
+    let (mut xtx, mut xty, mut yy, mut count) = ([[0.0f64; 3]; 3], [0.0f64; 3], 0.0f64, 0usize);
+    // Сэмпл маски → скат, куда он смотрит, яркость.
+    let mut seen: HashMap<usize, (usize, [f32; 2], f32)> = HashMap::new();
+    for &(k, v) in samples {
+        if v < 0.5 {
+            continue;
+        }
+        let p = [((k % mw) as f32 + 0.5) / res, ((k / mw) as f32 + 0.5) / res];
+        let Some((d, n, e)) = edges.iter().enumerate().map(|(i, e)| (segment_distance(p, e.0, e.1), e.2, i)).min_by(|x, y| x.0.total_cmp(&y.0)) else { continue };
+        if d < rim {
+            continue;
+        }
+        let Some(y) = hint.luma_at([p[0] + shift[0], p[1] + shift[1]]) else { continue };
+        seen.insert(k, (e, n, y));
+        let x = [1.0, n[0] as f64, n[1] as f64];
+        for i in 0..3 {
+            for j in 0..3 {
+                xtx[i][j] += x[i] * x[j];
+            }
+            xty[i] += x[i] * y as f64;
+        }
+        yy += (y as f64).powi(2);
+        count += 1;
+    }
+    if count < 40 {
+        return None;
+    }
+    let inv = invert3(xtx)?;
+    let beta: [f64; 3] = std::array::from_fn(|i| (0..3).map(|j| inv[i][j] * xty[j]).sum());
+    let rss = (yy - (0..3).map(|i| beta[i] * xty[i]).sum::<f64>()).max(0.0);
+    let s2 = rss / (count - 3) as f64;
+    // Перепады на стыках: пары точек через две клетки (по полтора метра от
+    // стыка) — промах наклона на метр их не путает, а через полклетки обе точки
+    // ложились на один настоящий скат.
+    let gap = 2 * mask::RES;
+    let (mut a, mut v, mut bb, mut pairs) = ([[0.0f64; 2]; 2], [0.0f64; 2], 0.0f64, 0usize);
+    for (&k, &(e, n, y)) in &seen {
+        for q in [k + gap, k + gap * mw] {
+            let Some(&(f, m, z)) = seen.get(&q) else { continue };
+            if f == e || (q == k + gap && q / mw != k / mw) {
+                continue;
+            }
+            let (dn, db) = ([(n[0] - m[0]) as f64, (n[1] - m[1]) as f64], (y - z) as f64);
+            for i in 0..2 {
+                for j in 0..2 {
+                    a[i][j] += dn[i] * dn[j];
+                }
+                v[i] += dn[i] * db;
+            }
+            bb += db * db;
+            pairs += 1;
+        }
+    }
+    let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    let (step, step_cov) = if pairs >= 10 && det.abs() > 1e-6 {
+        let ai = [[a[1][1] / det, -a[0][1] / det], [-a[1][0] / det, a[0][0] / det]];
+        let g = [ai[0][0] * v[0] + ai[0][1] * v[1], ai[1][0] * v[0] + ai[1][1] * v[1]];
+        let s2 = ((bb - g[0] * v[0] - g[1] * v[1]) / (pairs - 2) as f64).max(0.0);
+        ([g[0] as f32, g[1] as f32], ai.map(|r| r.map(|x| (x * s2) as f32)))
+    } else {
+        ([0.0, 0.0], [[f32::INFINITY, 0.0], [0.0, f32::INFINITY]])
+    };
+    Some(Light {
+        gain: [beta[1] as f32, beta[2] as f32],
+        mean: (xty[0] / count as f64) as f32,
+        cov: [[(s2 * inv[1][1]) as f32, (s2 * inv[1][2]) as f32], [(s2 * inv[2][1]) as f32, (s2 * inv[2][2]) as f32]],
+        step,
+        step_cov,
+    })
+}
+
+/// Обратная 3×3; вырожденная (все скаты в одну сторону) — нет.
+fn invert3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let c = |i: usize, j: usize| {
+        let (r0, r1) = ((i + 1) % 3, (i + 2) % 3);
+        let (c0, c1) = ((j + 1) % 3, (j + 2) % 3);
+        m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
+    };
+    let det = m[0][0] * c(0, 0) + m[0][1] * c(0, 1) + m[0][2] * c(0, 2);
+    (det.abs() > 1e-9 * m[0][0].powi(3).max(1.0)).then(|| std::array::from_fn(|i| std::array::from_fn(|j| c(j, i) / det)))
+}
+
+/// Откуда солнце на снимке: куда в среднем смотрит `gain` ([`Light`]) крыш, что в
+/// OSM скатные. Меньше трёх таких крыш или они светятся вразнобой — не понять.
+fn photo_sun(lights: &[Light]) -> Option<[f32; 2]> {
+    let units: Vec<[f32; 2]> = lights
+        .iter()
+        .filter_map(|l| {
+            let g = (l.gain[0].powi(2) + l.gain[1].powi(2)).sqrt();
+            (g > 0.0).then(|| [l.gain[0] / g, l.gain[1] / g])
+        })
+        .collect();
+    if units.len() < 3 {
+        return None;
+    }
+    let sum = units.iter().fold([0.0, 0.0], |s, u| [s[0] + u[0], s[1] + u[1]]);
+    let r = (sum[0].powi(2) + sum[1].powi(2)).sqrt();
+    (r >= 0.4 * units.len() as f32).then(|| [sum[0] / r, sum[1] / r])
+}
+
+/// Видно ли на снимке, что крыша скатная ([`Light`] при солнце `sun`): скат к
+/// солнцу светлее противоположного не меньше чем на 8% средней яркости, и
+/// перепад есть на самих стыках скатов — не меньше 6%; оба — втрое больше своей
+/// ошибки. Обратное не верно: светлая кровля на снимке засвечена, скаты вдоль
+/// солнца светятся одинаково — и без перепада крыша бывает скатной (половина
+/// скатных крыш Китай-города перепада не дала).
+fn pitched_by_light(l: &Light, sun: [f32; 2]) -> bool {
+    let mean = l.mean.max(1.0);
+    let along = |g: [f32; 2], c: [[f32; 2]; 2]| {
+        let var = sun[0] * sun[0] * c[0][0] + 2.0 * sun[0] * sun[1] * c[0][1] + sun[1] * sun[1] * c[1][1];
+        ((g[0] * sun[0] + g[1] * sun[1]) / mean, var.max(0.0).sqrt() / mean)
+    };
+    let (k, se) = along(l.gain, l.cov);
+    let (s, sse) = along(l.step, l.step_cov);
+    k >= 0.08 && s >= 0.06 && k >= 3.0 * se && s >= 3.0 * sse
+}
+
+/// Год постройки по `start_date` (`1966`, `1966-05-01`, `~1966`, `1960s`); век
+/// (`C19`) и прочее — нет.
+fn built(t: &Tags) -> Option<i32> {
+    let digits: String = get(t, "start_date").chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 4 { digits.parse().ok() } else { None }
 }
 
 /// Низ ската, м ([`RoofPiece::eaves`]): верх `height` без высоты крыши
@@ -1495,8 +1772,9 @@ fn part_height(t: &Tags) -> f32 {
 /// Крыша по контуру дома. Основа — весь дом: вид и покрытие из его тегов, нет —
 /// из самой большой части; цвет — со снимка, если ему можно верить
 /// ([`photo_roof`]), иначе из тега. Без тега вида — скатами; башня — шатром,
-/// низкая площадка (Лобное место), стройка, навес, белая кровля и будка в
-/// городе — плоские. Поверх — части (`building:part`) снизу вверх по высоте, каждая своим
+/// низкая площадка (Лобное место), стройка, навес — плоские; в городе плоские
+/// и белая кровля, будка, дом от трёх этажей с 1960-х, если скаты не видны на
+/// снимке ([`pitched_by_light`]). Поверх — части (`building:part`) снизу вверх по высоте, каждая своим
 /// видом (без вида — плоская, как в OSM, а верх башни — шатром) и цветом.
 #[allow(clippy::too_many_arguments)]
 fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>, rooms: &Mask, weights: &[(usize, f32)], cell_m: f32, rural: bool) -> OutlineRoof {
@@ -1520,17 +1798,36 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
     // Высота для доверия снимку: без тегов — два этажа.
     let seen_h = if own_h > 0.0 { own_h } else { 6.0 };
     let base_osm = tag_roof(tag("roof:colour"));
-    let base_photo = photo_roof(hint, weights, mw, outer * m2, seen_h);
+    let base_photo = photo_roof(hint, weights, mw, outer * m2, seen_h, cell_m, false);
     let base_rgb = base_photo.or(base_osm);
     let base_material = tag("roof:material");
     let bare = get(a.tags, "building:levels").is_empty() && get(a.tags, "height").is_empty();
     let platform = own_h > 0.0 && own_h <= 4.0 && get(a.tags, "building:levels").is_empty();
     // Светлая серая кровля на снимке — плоская: скатные — жесть, черепица, медь,
     // а светлое серое — мембрана и бетон (будки в Кремле).
-    let pale = base_photo.is_some_and(|c| c.iter().max().unwrap_or(&0) - c.iter().min().unwrap_or(&0) < 30 && luma(c) > 135.0);
+    // Без тени: низкую постройку во дворе на Варварке крыло затеняло на 40%, и
+    // срединный цвет из светло-серого становился тёмным.
+    let pale = [base_photo, base_photo.and_then(|_| photo_roof(hint, weights, mw, outer * m2, seen_h, cell_m, true))]
+        .into_iter()
+        .flatten()
+        .any(|c| c.iter().max().unwrap_or(&0) - c.iter().min().unwrap_or(&0) < 30 && luma(c) > 135.0);
+    // Скаты видны на снимке — скатная, что бы ни подсказывали цвет и год.
+    let lit = match hint {
+        Some(h) if mine.is_empty() && !tower && !platform && tag("roof:shape").is_empty() => h.sun.is_some_and(|sun| roof_light(h, &a.rings, weights, mw, h.shift(seen_h / cell_m), cell_m).is_some_and(|l| pitched_by_light(&l, sun))),
+        _ => false,
+    };
+    // Дом от трёх этажей с 1960-х — советский модернизм и позже, с плоской
+    // кровлей (Ипатьевский переулок, 9 с1 — 1966). Церковь — нет: часовню
+    // строят по старому образцу и теперь.
+    let sacred = matches!(get(a.tags, "building"), "church" | "chapel" | "cathedral" | "temple" | "mosque" | "synagogue" | "shrine" | "monastery") || get(a.tags, "amenity") == "place_of_worship";
+    let modern = !sacred && own_h >= 9.0 && built(a.tags).is_some_and(|y| y >= 1960);
     let default = if tower {
         RoofForm::Spire
-    } else if platform || matches!(get(a.tags, "building"), "construction" | "roof") || (!rural && (pale || (bare && outer * m2 < 60.0))) {
+    } else if platform || matches!(get(a.tags, "building"), "construction" | "roof") {
+        RoofForm::Flat
+    } else if lit {
+        RoofForm::Pitched
+    } else if !rural && (pale || modern || (bare && outer * m2 < 60.0)) {
         RoofForm::Flat
     } else {
         RoofForm::Pitched
@@ -1600,7 +1897,7 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
         area.into_values().fold(0.0f32, f32::max)
     };
     let seen = |h: f32| if h > 0.0 { h } else { seen_h };
-    let group_rgb: HashMap<String, Option<[u8; 3]>> = groups.into_iter().map(|(k, (s, members, h))| (k, photo_roof(hint, &s, mw, largest(&members), seen(h)))).collect();
+    let group_rgb: HashMap<String, Option<[u8; 3]>> = groups.into_iter().map(|(k, (s, members, h))| (k, photo_roof(hint, &s, mw, largest(&members), seen(h), cell_m, false))).collect();
     let top = mine.len().checked_sub(1);
     for (i, (p, s)) in mine.iter().zip(&samples).enumerate() {
         let t = p.2.tags;
@@ -1610,7 +1907,7 @@ fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Option<&Hint>,
         };
         let h = height_of(t);
         let photo = match group(t) {
-            k if k.is_empty() => photo_roof(hint, s, mw, p.0 * m2, seen(h)),
+            k if k.is_empty() => photo_roof(hint, s, mw, p.0 * m2, seen(h), cell_m, false),
             k => group_rgb.get(&k).copied().flatten(),
         };
         let rgb = photo.or_else(|| tag_roof(get(t, "roof:colour"))).or(base_rgb);
@@ -2343,7 +2640,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     // 40×30 клеток выходила 40,04×30,04 и на карте — 41×31 с полоской).
     let (w, h) = (((wm / cell - 0.1).ceil() as u32).max(8), ((hm / cell - 0.1).ceil() as u32).max(8));
     let proj = Proj { north, west, kx: mx / cell as f64, ky: my / cell as f64 };
-    let hint = cover.map(|c| Hint { cover: c, span: [wm / cell, hm / cell] });
+    let mut hint = cover.map(|c| Hint { cover: c, span: [wm / cell, hm / cell], lean: None, sun: None });
     let m_to_cells = |metres: f32| metres / cell;
     let mut m = Map::new(w, h);
     let sea_tags: Tags = [("natural", "water"), ("water", "sea")].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
@@ -2732,6 +3029,26 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
             Some((ring_area(r), [c[0] / r.len() as f32, c[1] / r.len() as f32], a))
         })
         .collect();
+    // Наклон и солнце снимка — по всем домам сразу, до крыш. Дом с частями —
+    // частями: его контур с высотой самой высокой части лёг бы мимо.
+    if let Some(h) = hint.as_ref() {
+        let whole = |a: &Area| building(a.tags).is_some() && !parts.iter().any(|p| inside(&a.rings, p.1));
+        let tall: Vec<(&[Vec<[f32; 2]>], f32)> = areas
+            .iter()
+            .filter(|a| whole(a) || (a.tags.contains_key("building:part") && building(a.tags).is_none()))
+            .filter(|a| part_height(a.tags) >= 9.0)
+            .map(|a| (&a.rings[..], part_height(a.tags) / cell))
+            .collect();
+        let lean = photo_lean(h, &tall);
+        let leant = Hint { cover: h.cover, span: h.span, lean, sun: None };
+        let lights: Vec<Light> = areas
+            .iter()
+            .filter(|a| whole(a) && matches!(roof_form(get(a.tags, "roof:shape"), "", RoofForm::Flat), RoofForm::Pitched | RoofForm::Gabled | RoofForm::Spire))
+            .filter_map(|a| roof_light(&leant, &a.rings, &coverage(&m.rooms, &a.rings, 0.0), m.rooms.w, leant.shift(part_height(a.tags).max(6.0) / cell), cell))
+            .collect();
+        let sun = photo_sun(&lights);
+        hint = Some(Hint { sun, ..leant });
+    }
     let mut names: BTreeMap<String, ([f32; 2], f32)> = BTreeMap::new();
     for a in &areas {
         let Some(kind) = building(a.tags) else { continue };
@@ -2747,7 +3064,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         let fort = wall_top || get(a.tags, "tower:type") == "defensive";
         let tag = |k: &str| colour(get(a.tags, k));
         let tint = if wall_top {
-            tag("roof:colour").or_else(|| tag("building:colour")).or_else(|| hint.as_ref().and_then(|h| h.colour(&weights, m.rooms.w)))
+            tag("roof:colour").or_else(|| tag("building:colour")).or_else(|| hint.as_ref().and_then(|h| h.colour(&weights, m.rooms.w, h.shift(part_height(a.tags) / cell), false)))
         } else if fort {
             tag("building:colour")
         } else {
@@ -3868,6 +4185,114 @@ mod tests {
         let canopy = m.outline_roofs.iter().find(|r| r.bounds().0[0] < 20.0).expect("навес не там");
         assert_eq!(canopy.pieces[0].form, RoofForm::Flat);
         assert_eq!(m.room_at(23, 10), 0, "под навесом комната");
+    }
+
+    /// Снимок 100×100 клеток (3 пикселя на клетку): земля тёмная, основание дома
+    /// серое, крыша светлая и сдвинута на `lean × высоту`.
+    fn leaning_photo(houses: &[([f32; 2], f32, f32)], lean: [f32; 2]) -> Cover {
+        let img = image::RgbImage::from_fn(300, 300, |x, y| {
+            let p = [(x as f32 + 0.5) / 3.0, (y as f32 + 0.5) / 3.0];
+            let within = |o: [f32; 2], side: f32| p[0] >= o[0] && p[0] < o[0] + side && p[1] >= o[1] && p[1] < o[1] + side;
+            let roof = houses.iter().any(|&(o, side, h)| within([o[0] + lean[0] * h, o[1] + lean[1] * h], side));
+            let base = houses.iter().any(|&(o, side, _)| within(o, side));
+            let v = if roof { 200 } else if base { 110 } else { 60 };
+            image::Rgb([v, v, v])
+        });
+        Cover::grid(100, 100, |_, _| Class::Earth).with_photo(img)
+    }
+
+    fn square(o: [f32; 2], side: f32) -> Vec<Vec<[f32; 2]>> {
+        vec![vec![o, [o[0] + side, o[1]], [o[0] + side, o[1] + side], [o[0], o[1] + side]]]
+    }
+
+    /// Крыши на снимке сдвинуты на запад-юго-запад, как в Китай-городе: наклон
+    /// находится по краям крыш. На ровном снимке без домов — не находится.
+    #[test]
+    fn photo_lean_is_found_from_roof_edges() {
+        let lean = [-0.25, 0.15];
+        let houses: Vec<([f32; 2], f32, f32)> = (0..9).map(|i| ([12.0 + (i % 3) as f32 * 28.0, 12.0 + (i / 3) as f32 * 28.0], 12.0, 6.0 + i as f32 * 2.0)).collect();
+        let cover = leaning_photo(&houses, lean);
+        let hint = Hint { cover: &cover, span: [100.0, 100.0], lean: None, sun: None };
+        let rings: Vec<Vec<Vec<[f32; 2]>>> = houses.iter().map(|&(o, side, _)| square(o, side)).collect();
+        let pieces: Vec<(&[Vec<[f32; 2]>], f32)> = rings.iter().zip(&houses).map(|(r, h)| (&r[..], h.2)).collect();
+        let found = photo_lean(&hint, &pieces).expect("наклон не найден");
+        assert!((found[0] - lean[0]).abs() <= 0.03 && (found[1] - lean[1]).abs() <= 0.03, "{found:?}");
+        let flat = Cover::grid(100, 100, |_, _| Class::Earth).with_photo(image::RgbImage::from_pixel(300, 300, image::Rgb([90, 90, 90])));
+        let hint = Hint { cover: &flat, span: [100.0, 100.0], lean: None, sun: None };
+        assert_eq!(photo_lean(&hint, &pieces), None);
+    }
+
+    /// Цвет крыши высокого дома — там, куда её сдвинул наклон, а не над контуром.
+    #[test]
+    fn roof_colour_is_taken_where_the_lean_put_it() {
+        let houses = [([40.0, 40.0], 12.0, 20.0)];
+        let lean = [-0.25, 0.15];
+        let cover = leaning_photo(&houses, lean);
+        let m = Map::new(100, 100);
+        let rings = square(houses[0].0, 12.0);
+        let samples = coverage(&m.rooms, &rings, 0.0);
+        let flat = Hint { cover: &cover, span: [100.0, 100.0], lean: None, sun: None };
+        let leant = Hint { lean: Some(lean), ..flat };
+        // 20 клеток высоты — 30 м; крыша 18 м в поперечнике — снимку верить.
+        let colour = |h: &Hint| photo_roof(Some(h), &samples, m.rooms.w, 18.3 * 18.3, 20.0 * CELL_M, CELL_M, false);
+        assert_eq!(colour(&leant), Some([200, 200, 200]));
+        assert_ne!(colour(&flat), Some([200, 200, 200]), "без наклона — та же крыша");
+    }
+
+    /// Вальма под солнцем с юга: южный скат светлее, северный темнее — скатная.
+    /// Плоская кровля с полосой светлых фонарей у южного края светлее к солнцу
+    /// тоже, но перепада на стыках скатов у неё нет — не скатная. Ровная — тоже.
+    #[test]
+    fn lit_slopes_tell_a_pitched_roof_from_a_flat_one() {
+        let (o, size) = ([30.0f32, 30.0f32], [30.0f32, 16.0f32]);
+        let rings = vec![vec![o, [o[0] + size[0], o[1]], [o[0] + size[0], o[1] + size[1]], [o[0], o[1] + size[1]]]];
+        let noise = |x: u32, y: u32| ((x.wrapping_mul(7919) ^ y.wrapping_mul(104_729)) % 13) as f32 - 6.0;
+        let photo = |roof: &dyn Fn([f32; 2]) -> f32| {
+            let img = image::RgbImage::from_fn(300, 300, |x, y| {
+                let p = [(x as f32 + 0.5) / 3.0, (y as f32 + 0.5) / 3.0];
+                let v = if inside(&rings, p) { roof(p) + noise(x, y) } else { 60.0 };
+                let v = v.clamp(0.0, 255.0) as u8;
+                image::Rgb([v, v, v])
+            });
+            Cover::grid(100, 100, |_, _| Class::Earth).with_photo(img)
+        };
+        // Скат — по ближайшей стороне: север, юг, запад, восток.
+        let hipped = |p: [f32; 2]| {
+            let d = [p[1] - o[1], o[1] + size[1] - p[1], p[0] - o[0], o[0] + size[0] - p[0]];
+            let i = (0..4).min_by(|&a, &b| d[a].total_cmp(&d[b])).unwrap();
+            [80.0, 160.0, 120.0, 120.0][i]
+        };
+        let skylights = |p: [f32; 2]| if p[1] > o[1] + size[1] - 4.0 { 175.0 } else { 120.0 };
+        let even = |_: [f32; 2]| 120.0;
+        let m = Map::new(100, 100);
+        let samples = coverage(&m.rooms, &rings, 0.0);
+        let sun = [0.0, 1.0];
+        let lit = |roof: &dyn Fn([f32; 2]) -> f32| {
+            let cover = photo(roof);
+            let hint = Hint { cover: &cover, span: [100.0, 100.0], lean: None, sun: Some(sun) };
+            roof_light(&hint, &rings, &samples, m.rooms.w, [0.0, 0.0], CELL_M).is_some_and(|l| pitched_by_light(&l, sun))
+        };
+        assert!(lit(&hipped), "вальма не узнана");
+        assert!(!lit(&skylights), "полоса фонарей — скаты");
+        assert!(!lit(&even), "ровная кровля — скаты");
+    }
+
+    /// Без вида крыши в OSM: дом 1966 года в четыре этажа — плоский, дом 1890
+    /// года — скатный, часовня 1994 года — тоже скатная.
+    #[test]
+    fn modern_houses_without_roof_shape_are_flat() {
+        let form = |tags: &str| {
+            let xml = town(&format!(r#"<way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/>{tags}</way>"#));
+            let (m, _) = import(&xml, Options::default()).unwrap();
+            m.outline_roofs.iter().find(|r| r.bounds().0[0] < 20.0).expect("крыши нет").pieces[0].form
+        };
+        assert_eq!(form(r#"<tag k="building" v="yes"/><tag k="building:levels" v="4"/><tag k="start_date" v="1966"/>"#), RoofForm::Flat);
+        assert_eq!(form(r#"<tag k="building" v="yes"/><tag k="building:levels" v="4"/><tag k="start_date" v="1890"/>"#), RoofForm::Pitched);
+        assert_eq!(form(r#"<tag k="building" v="chapel"/><tag k="building:levels" v="3"/><tag k="start_date" v="1994"/>"#), RoofForm::Pitched);
+        let year = |v: &str| built(&[("start_date".to_owned(), v.to_owned())].into_iter().collect());
+        assert_eq!(year("1966-05-01"), Some(1966));
+        assert_eq!(year("~1960s"), Some(1960));
+        assert_eq!(year("C19"), None);
     }
 
     /// Вальма Сената в OSM — грани-части `skillion` со своим `roof:direction`;
