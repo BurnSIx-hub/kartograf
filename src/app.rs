@@ -262,10 +262,20 @@ struct PlaceJob {
     start: Option<(f64, f64, [u32; 2])>,
     /// Досадить рощи при импорте собранного места.
     trees: f32,
+    /// В модуле: место, для которого фоном качается нужное (`plat::net_prefetch`).
+    #[cfg(target_arch = "wasm32")]
+    fetch: Option<(f64, f64, [u32; 2])>,
+    /// В модуле: всё скачано — собрать следующим кадром, одним куском.
+    #[cfg(target_arch = "wasm32")]
+    analyse: Option<(f64, f64, [u32; 2])>,
 }
 
 impl PlaceJob {
     fn busy(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        if self.fetch.is_some() || self.analyse.is_some() {
+            return true;
+        }
         self.rx.is_some() || self.ready.is_some() || self.start.is_some()
     }
 }
@@ -1683,6 +1693,36 @@ impl App {
                 ctx.request_repaint();
             });
         }
+        // В модуле потоков нет: сначала фоном качается всё, что сборке заведомо
+        // нужно, потом она идёт одним куском — кадром позже, чтобы окно успело
+        // сказать «Разбор снимка…».
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some((lat, lon, cells)) = self.place.analyse.take() {
+                let cache = self.data_dir.join("местность");
+                match crate::place::build(lat, lon, cells, &cache, &|_| {}) {
+                    Ok(place) => self.place.ready = Some(place),
+                    Err(e) => self.place.error = Some(e),
+                }
+            }
+            if let Some((lat, lon, cells)) = self.place.start.take() {
+                crate::plat::net_prefetch(&crate::place::urls(lat, lon, cells));
+                self.place.error = None;
+                self.place.fetch = Some((lat, lon, cells));
+            }
+            if let Some(job) = self.place.fetch {
+                let (done, total) = crate::plat::net_state();
+                if done >= total {
+                    self.place.fetch = None;
+                    self.place.analyse = Some(job);
+                    self.place.step = "analysis".into();
+                    ctx.request_repaint();
+                } else {
+                    self.place.step = format!("net:{done}:{total}");
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
         if let Some(rx) = &self.place.rx {
             let mut finished = false;
             while let Ok(msg) = rx.try_recv() {
@@ -1745,11 +1785,16 @@ impl App {
             }
             if busy {
                 let step = match self.place.step.as_str() {
-                    "osm" => "Выгрузка OpenStreetMap…",
-                    "photo" => "Снимок…",
-                    "layers" => "Карты лесов и болот…",
-                    "analysis" => "Разбор снимка…",
-                    _ => "Готовлю…",
+                    "osm" => "Выгрузка OpenStreetMap…".to_owned(),
+                    "photo" => "Снимок…".to_owned(),
+                    "layers" => "Карты лесов и болот…".to_owned(),
+                    "analysis" => "Разбор снимка…".to_owned(),
+                    // В модуле: фоном качается выгрузка, плитки снимка и слои.
+                    s if s.starts_with("net:") => {
+                        let n: Vec<&str> = s.split(':').collect();
+                        format!("Скачиваю: {} из {}", n.get(1).unwrap_or(&"0"), n.get(2).unwrap_or(&"0"))
+                    }
+                    _ => "Готовлю…".to_owned(),
                 };
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -2558,12 +2603,14 @@ impl App {
                 {
                     self.build_from_file(&path);
                 }
+                // В модуле файл .osm не выбрать (окно браузера знает только паки), а
+                // пункт молча ничего не делал; там есть «по координатам».
+                #[cfg(not(target_arch = "wasm32"))]
                 if item(ui, "Местность из OpenStreetMap…", "")
                     && let Some(path) = crate::plat::FileDialog::new().add_filter("Выгрузка OpenStreetMap", &["osm"]).pick_file()
                 {
                     self.import_osm_file(&path);
                 }
-                #[cfg(not(target_arch = "wasm32"))]
                 if item(ui, "Местность по координатам…", "") {
                     self.place_form.get_or_insert(PlaceForm { text: String::new(), cells: [40, 30], trees: 0.0 });
                 }

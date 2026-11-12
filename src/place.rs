@@ -751,6 +751,8 @@ pub struct Place {
 mod net {
     use std::time::Duration;
 
+    pub type Agent = ureq::Agent;
+
     pub fn agent() -> ureq::Agent {
         ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(10))).timeout_global(Some(Duration::from_secs(90))).build().into()
     }
@@ -762,10 +764,25 @@ mod net {
     }
 }
 
+/// В модуле сеть — браузерная: `kartografFetch` в `foundry/scripts/main.js` берёт
+/// заранее скачанное ([`urls`]), а нет — качает синхронно.
+#[cfg(target_arch = "wasm32")]
+mod net {
+    pub struct Agent;
+
+    pub fn agent() -> Agent {
+        Agent
+    }
+
+    pub fn get(_: &Agent, url: &str) -> Result<Vec<u8>, String> {
+        crate::plat::net_fetch(url).map_err(|e| format!("{url}: {e}"))
+    }
+}
+
 /// Файл из папки места, а нет — из сети (`agent`), и сразу в папку. Без сети —
-/// только то, что уже лежит.
-#[cfg(not(target_arch = "wasm32"))]
-fn cached(agent: Option<&ureq::Agent>, path: &Path, url: &str) -> Result<Vec<u8>, String> {
+/// только то, что уже лежит. В модуле папок нет (`std::fs` там отвечает
+/// ошибкой) — всегда сеть.
+fn cached(agent: Option<&net::Agent>, path: &Path, url: &str) -> Result<Vec<u8>, String> {
     if let Ok(b) = std::fs::read(path) {
         return Ok(b);
     }
@@ -778,9 +795,12 @@ fn cached(agent: Option<&ureq::Agent>, path: &Path, url: &str) -> Result<Vec<u8>
     Ok(b)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn tile(agent: Option<&ureq::Agent>, cache: &Path, z: u32, tx: i64, ty: i64) -> Result<RgbImage, String> {
-    let b = cached(agent, &cache.join(format!("{z}_{tx}_{ty}.jpg")), &format!("{TILE_URL}/{z}/{ty}/{tx}"))?;
+fn tile_url(z: u32, tx: i64, ty: i64) -> String {
+    format!("{TILE_URL}/{z}/{ty}/{tx}")
+}
+
+fn tile(agent: Option<&net::Agent>, cache: &Path, z: u32, tx: i64, ty: i64) -> Result<RgbImage, String> {
+    let b = cached(agent, &cache.join(format!("{z}_{tx}_{ty}.jpg")), &tile_url(z, tx, ty))?;
     image::load_from_memory(&b).map(|i| i.to_rgb8()).map_err(|e| format!("плитка {z}/{ty}/{tx}: {e}"))
 }
 
@@ -791,25 +811,35 @@ fn span(frame: &Frame, z: u32) -> (f64, f64, f64, f64) {
     (x0, y0, x1, y1)
 }
 
-/// Самый крупный масштаб, где у рамки есть снимок (все плитки — не заглушки).
-#[cfg(not(target_arch = "wasm32"))]
-fn zoom(agent: Option<&ureq::Agent>, cache: &Path, frame: &Frame) -> Result<u32, String> {
+/// Все плитки рамки на масштабе `z`.
+fn tiles_of(frame: &Frame, z: u32) -> Vec<(i64, i64)> {
+    let (x0, y0, x1, y1) = span(frame, z);
+    ((y0 / 256.0) as i64..=(y1 / 256.0) as i64).flat_map(|ty| ((x0 / 256.0) as i64..=(x1 / 256.0) as i64).map(move |tx| (tx, ty))).collect()
+}
+
+/// Масштабы, из которых [`zoom`] выбирает: крупные — только боевым участкам и
+/// не больше 64 плиток.
+fn zooms(frame: &Frame) -> Vec<u32> {
     if frame.width_m().max(frame.height_m()) > BATTLE_M {
-        return Ok(18);
+        return vec![18];
     }
-    for z in [20, 19, 18] {
+    [20, 19, 18].into_iter().filter(|&z| z == 18 || tiles_of(frame, z).len() <= 64).collect()
+}
+
+/// Самый крупный масштаб, где у рамки есть снимок (все плитки — не заглушки).
+fn zoom(agent: Option<&net::Agent>, cache: &Path, frame: &Frame) -> Result<u32, String> {
+    for z in zooms(frame) {
+        if z == 18 {
+            return Ok(18);
+        }
         let (x0, y0, x1, y1) = span(frame, z);
         // Без сети и без плитки этого масштаба в кеше — масштаб пропускается.
         let Ok(mid) = tile(agent, cache, z, ((x0 + x1) / 2.0 / 256.0) as i64, ((y0 + y1) / 2.0 / 256.0) as i64) else { continue };
         if blank(&mid) {
             continue;
         }
-        let tiles: Vec<(i64, i64)> = ((y0 / 256.0) as i64..=(y1 / 256.0) as i64).flat_map(|ty| ((x0 / 256.0) as i64..=(x1 / 256.0) as i64).map(move |tx| (tx, ty))).collect();
-        if tiles.len() > 64 && z > 18 {
-            continue;
-        }
         let mut ok = true;
-        for (tx, ty) in tiles {
+        for (tx, ty) in tiles_of(frame, z) {
             if blank(&tile(agent, cache, z, tx, ty)?) {
                 ok = false;
                 break;
@@ -823,8 +853,7 @@ fn zoom(agent: Option<&ureq::Agent>, cache: &Path, frame: &Frame) -> Result<u32,
 }
 
 /// Снимок по рамке: самый крупный масштаб, ужатый до 0,3 м, если он мельче.
-#[cfg(not(target_arch = "wasm32"))]
-fn photo(agent: Option<&ureq::Agent>, cache: &Path, frame: &Frame) -> Result<(RgbImage, u32), String> {
+fn photo(agent: Option<&net::Agent>, cache: &Path, frame: &Frame) -> Result<(RgbImage, u32), String> {
     let z = zoom(agent, cache, frame)?;
     let (x0, y0, x1, y1) = span(frame, z);
     let (tx0, ty0, tx1, ty1) = ((x0 / 256.0) as i64, (y0 / 256.0) as i64, (x1 / 256.0) as i64, (y1 / 256.0) as i64);
@@ -848,15 +877,22 @@ fn photo(agent: Option<&ureq::Agent>, cache: &Path, frame: &Frame) -> Result<(Rg
 /// Слой Copernicus HRL 2018 (eu.py) по рамке, растянутый до `w`×`h` ближайшим
 /// соседом: `dlt` — порода (1 лиственное, 2 хвойное), `waw` — вода и мокрые земли.
 /// Пустые плитки TIFF (над лесом в Альпах) — «нет данных» (255).
-#[cfg(not(target_arch = "wasm32"))]
-fn copernicus(agent: Option<&ureq::Agent>, file: &Path, frame: &Frame, layer: &str, w: usize, h: usize) -> Result<Vec<u8>, String> {
+fn copernicus_size(frame: &Frame) -> (usize, usize) {
+    (((frame.width_m() / 2.0).round() as usize).max(4), ((frame.height_m() / 2.0).round() as usize).max(4))
+}
+
+fn copernicus_url(frame: &Frame, layer: &str) -> String {
     let service = if layer == "dlt" { "HRL_DominantLeafType2018" } else { "HRL_WaterWetness_2018" };
-    let (sw, sh) = (((frame.width_m() / 2.0).round() as usize).max(4), ((frame.height_m() / 2.0).round() as usize).max(4));
-    let url = format!(
+    let (sw, sh) = copernicus_size(frame);
+    format!(
         "https://image.discomap.eea.europa.eu/arcgis/rest/services/GioLandPublic/{service}/ImageServer/exportImage?bbox={},{},{},{}&bboxSR=4326&imageSR=4326&size={sw},{sh}&format=tiff&pixelType=U8&compression=None&interpolation=RSP_NearestNeighbor&f=image",
         frame.west, frame.south, frame.east, frame.north
-    );
-    let b = cached(agent, file, &url)?;
+    )
+}
+
+fn copernicus(agent: Option<&net::Agent>, file: &Path, frame: &Frame, layer: &str, w: usize, h: usize) -> Result<Vec<u8>, String> {
+    let (sw, sh) = copernicus_size(frame);
+    let b = cached(agent, file, &copernicus_url(frame, layer))?;
     let src = image::load_from_memory_with_format(&b, image::ImageFormat::Tiff).map(|i| i.to_luma8());
     let src = match src {
         Ok(img) => img,
@@ -878,16 +914,18 @@ fn in_england(frame: &Frame) -> bool {
 }
 
 /// Леса NFI England 2022 по рамке (nfi.py), в пикселях снимка `w`×`h`.
-#[cfg(not(target_arch = "wasm32"))]
-fn nfi(agent: Option<&ureq::Agent>, file: &Path, frame: &Frame, w: usize, h: usize) -> Result<Option<Nfi>, String> {
+fn nfi_url(frame: &Frame) -> String {
+    format!(
+        "https://services2.arcgis.com/mHXjwgl3OARRqqD4/arcgis/rest/services/National_Forest_Inventory_England_2022/FeatureServer/0/query?where=1%3D1&geometry={},{},{},{}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=IFT_IOA,CATEGORY&outSR=4326&f=geojson",
+        frame.west, frame.south, frame.east, frame.north
+    )
+}
+
+fn nfi(agent: Option<&net::Agent>, file: &Path, frame: &Frame, w: usize, h: usize) -> Result<Option<Nfi>, String> {
     if !in_england(frame) {
         return Ok(None);
     }
-    let url = format!(
-        "https://services2.arcgis.com/mHXjwgl3OARRqqD4/arcgis/rest/services/National_Forest_Inventory_England_2022/FeatureServer/0/query?where=1%3D1&geometry={},{},{},{}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=IFT_IOA,CATEGORY&outSR=4326&f=geojson",
-        frame.west, frame.south, frame.east, frame.north
-    );
-    let b = cached(agent, file, &url)?;
+    let b = cached(agent, file, &nfi_url(frame))?;
     let json: serde_json::Value = serde_json::from_slice(&b).map_err(|e| format!("NFI: {e}"))?;
     let merc = |lat: f64| {
         let s = lat.to_radians().sin();
@@ -937,7 +975,6 @@ fn nfi(agent: Option<&ureq::Agent>, file: &Path, frame: &Frame, w: usize, h: usi
 }
 
 /// Где лежит скачанное для одного места.
-#[cfg(not(target_arch = "wasm32"))]
 struct Files {
     tiles: PathBuf,
     dlt: PathBuf,
@@ -946,8 +983,7 @@ struct Files {
 }
 
 /// Подсказка со снимка по рамке: снимок, слои, биом, классы, кроны.
-#[cfg(not(target_arch = "wasm32"))]
-fn analyse(agent: Option<&ureq::Agent>, frame: &Frame, files: &Files, step: &dyn Fn(&str)) -> Result<(Cover, String), String> {
+fn analyse(agent: Option<&net::Agent>, frame: &Frame, files: &Files, step: &dyn Fn(&str)) -> Result<(Cover, String), String> {
     step("photo");
     let (img, z) = photo(agent, &files.tiles, frame)?;
     let (w, h) = (img.width() as usize, img.height() as usize);
@@ -955,7 +991,7 @@ fn analyse(agent: Option<&ureq::Agent>, frame: &Frame, files: &Files, step: &dyn
     let nfi = nfi(agent, &files.nfi, frame, w, h).unwrap_or(None);
     let dlt = if nfi.is_none() { copernicus(agent, &files.dlt, frame, "dlt", w, h).ok() } else { None };
     // Мокрые земли — в родном размере слоя, как в photo.py.
-    let (lw, lh) = (((frame.width_m() / 2.0).round() as usize).max(4), ((frame.height_m() / 2.0).round() as usize).max(4));
+    let (lw, lh) = copernicus_size(frame);
     let waw = if in_england(frame) { None } else { copernicus(agent, &files.waw, frame, "waw", lw, lh).ok() };
     step("analysis");
     let biome = biome(&img, waw.as_deref());
@@ -966,22 +1002,50 @@ fn analyse(agent: Option<&ureq::Agent>, frame: &Frame, files: &Files, step: &dyn
     Ok((Cover::from_classes(w, h, cls, crowns).with_photo(img), summary))
 }
 
+/// Выгрузка OSM по рамке — с запасом вокруг: API отдаёт только линии с точкой
+/// внутри запрошенного, и мост через реку у Болтона, чьи концы за рамкой в 60 м,
+/// в карту не попадал. Рамка карты — прежняя (`<bounds>` заменяется).
+fn osm_url(want: &Frame) -> String {
+    let pad = (want.width_m().max(want.height_m()) * 0.25).max(30.0);
+    let (plat, plon) = (pad / 110_574.0, pad / (111_320.0 * want.mid_lat().to_radians().cos()));
+    format!("https://api.openstreetmap.org/api/0.6/map?bbox={:.7},{:.7},{:.7},{:.7}", want.west - plon, want.south - plat, want.east + plon, want.north + plat)
+}
+
+/// Что [`build`] заведомо скачает для места: выгрузку OSM, плитки снимка всех
+/// масштабов, из которых он выбирает, слои лесов и мокрых земель. Модуль качает
+/// это фоном заранее: сама сборка в браузере идёт одним куском, и сеть в ней
+/// вешала бы окно. Докачку неполных контуров заранее не узнать — её сборка
+/// тянет сама.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn urls(lat: f64, lon: f64, cells: [u32; 2]) -> Vec<String> {
+    let want = Frame::around(lat, lon, cells);
+    // Та рамка, что выйдет из `<bounds>` выгрузки, — до седьмого знака, иначе
+    // адреса слоёв не совпадут.
+    let frame = Frame::of_osm(&with_bounds("<osm>", &want)).unwrap_or(want);
+    let mut out = vec![osm_url(&want)];
+    for z in zooms(&frame) {
+        out.extend(tiles_of(&frame, z).into_iter().map(|(tx, ty)| tile_url(z, tx, ty)));
+    }
+    if in_england(&frame) {
+        out.push(nfi_url(&frame));
+    } else {
+        out.push(copernicus_url(&frame, "dlt"));
+        out.push(copernicus_url(&frame, "waw"));
+    }
+    out
+}
+
 /// Собрать место по координатам: всё скачанное — в папку места `cache/<широта>_<долгота>_<W>x<H>`
-/// (повторно сеть не трогается), плитки снимка — в общий `cache/sat_tiles`.
-#[cfg(not(target_arch = "wasm32"))]
+/// (повторно сеть не трогается), плитки снимка — в общий `cache/sat_tiles`. В
+/// модуле папок нет: скачанное держит в памяти `main.js`.
 pub fn build(lat: f64, lon: f64, cells: [u32; 2], cache: &Path, step: &dyn Fn(&str)) -> Result<Place, String> {
     let agent = net::agent();
     let folder = cache.join(format!("{lat:.5}_{lon:.5}_{}x{}", cells[0], cells[1]));
+    #[cfg(not(target_arch = "wasm32"))]
     std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
     let want = Frame::around(lat, lon, cells);
     step("osm");
-    // Выгрузка — с запасом вокруг рамки: API отдаёт только линии с точкой внутри
-    // запрошенного, и мост через реку у Болтона, чьи концы за рамкой в 60 м, в
-    // карту не попадал. Рамка карты — прежняя (`<bounds>` заменяется).
-    let pad = (want.width_m().max(want.height_m()) * 0.25).max(30.0);
-    let (plat, plon) = (pad / 110_574.0, pad / (111_320.0 * want.mid_lat().to_radians().cos()));
-    let url = format!("https://api.openstreetmap.org/api/0.6/map?bbox={:.7},{:.7},{:.7},{:.7}", want.west - plon, want.south - plat, want.east + plon, want.north + plat);
-    let full = String::from_utf8(cached(Some(&agent), &folder.join("place_full.osm"), &url)?).map_err(|e| format!("OSM: {e}"))?;
+    let full = String::from_utf8(cached(Some(&agent), &folder.join("place_full.osm"), &osm_url(&want))?).map_err(|e| format!("OSM: {e}"))?;
     let xml = with_bounds(&full, &want);
     let _ = std::fs::write(folder.join("place.osm"), &xml);
     let frame = Frame::of_osm(&xml).unwrap_or(want);
@@ -1039,6 +1103,30 @@ pub fn compare(osms: &[PathBuf]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Модуль качает заранее ровно то, что спросит сборка: та же выгрузка, те же
+    /// слои по рамке из `<bounds>` (до седьмого знака), плитки выбранного масштаба.
+    #[test]
+    fn prefetch_list_matches_what_build_asks_for() {
+        for (lat, lon, cells) in [(39.4735, -0.37893, [40, 30]), (53.98, -1.89, [60, 40]), (46.0, 7.0, [256, 256])] {
+            let list = urls(lat, lon, cells);
+            let want = Frame::around(lat, lon, cells);
+            assert_eq!(list[0], osm_url(&want));
+            // Как в `build`: выгрузка с чужой рамкой, у которой `<bounds>` заменён.
+            let xml = with_bounds(r#"<osm version="0.6"><bounds minlat="1" minlon="2" maxlat="3" maxlon="4"/></osm>"#, &want);
+            let frame = Frame::of_osm(&xml).unwrap();
+            if in_england(&frame) {
+                assert!(list.contains(&nfi_url(&frame)));
+            } else {
+                assert!(list.contains(&copernicus_url(&frame, "dlt")) && list.contains(&copernicus_url(&frame, "waw")), "слои не совпали");
+            }
+            for z in zooms(&frame) {
+                assert!(tiles_of(&frame, z).iter().all(|&(x, y)| list.contains(&tile_url(z, x, y))), "плитки z{z}");
+            }
+        }
+        // Большой участок — только z18.
+        assert_eq!(zooms(&Frame::around(46.0, 7.0, [256, 256])), vec![18]);
+    }
 
     #[test]
     fn coordinates_come_from_numbers_and_map_links() {

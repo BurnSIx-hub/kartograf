@@ -181,6 +181,30 @@ pub fn open(path: &std::path::Path) -> std::io::Result<web::RangeFile> {
     web::RangeFile::open(path)
 }
 
+/// Сеть в браузере (`kartografFetch` в `foundry/scripts/main.js`): заранее
+/// скачанное ([`net_prefetch`]) или синхронный запрос.
+#[cfg(target_arch = "wasm32")]
+pub fn net_fetch(url: &str) -> Result<Vec<u8>, String> {
+    let v = web::call("kartografFetch", &[wasm_bindgen::JsValue::from_str(url)]).map_err(|e| e.to_string())?;
+    Ok(js_sys::Uint8Array::new(&v).to_vec())
+}
+
+/// Скачать фоном, по нескольку разом; ход — [`net_state`].
+#[cfg(target_arch = "wasm32")]
+pub fn net_prefetch(urls: &[String]) {
+    let list: js_sys::Array = urls.iter().map(|u| wasm_bindgen::JsValue::from_str(u)).collect();
+    let _ = web::call("kartografNetPrefetch", &[list.into()]);
+}
+
+/// Сколько из начатого [`net_prefetch`] уже пришло (или не пришло) — и всего.
+#[cfg(target_arch = "wasm32")]
+pub fn net_state() -> (u32, u32) {
+    let Ok(v) = web::call("kartografNetState", &[]) else { return (0, 0) };
+    let a = js_sys::Array::from(&v);
+    let n = |i: u32| a.get(i).as_f64().unwrap_or(0.0) as u32;
+    (n(0), n(1))
+}
+
 /// Что выбрали в окне браузера с прошлого кадра.
 #[cfg(target_arch = "wasm32")]
 pub fn take_picked() -> Vec<std::path::PathBuf> {

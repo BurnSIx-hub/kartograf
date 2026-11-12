@@ -596,6 +596,62 @@ function fetchSync(path) {
   return out;
 }
 
+// ----- сеть для «Местности по координатам» -----
+// Сборка места в wasm идёт одним куском на главном потоке, а сеть там — только
+// синхронным запросом, который вешает окно. Поэтому всё, что ей заведомо нужно
+// (выгрузка OSM, плитки снимка, слои), сперва качается здесь фоном, по шесть
+// запросов разом, а сборка берёт готовое из `netCache`. Чего заранее не узнать
+// (докачка неполных контуров), она тянет синхронно.
+const NET_PARALLEL = 6;
+// Скачанное держится в памяти вкладки: повторная сборка того же места не ходит
+// в сеть. Старое вытесняется — плитка ≈20 КБ, 600 штук ≈12 МБ.
+const NET_KEEP = 600;
+const netCache = new Map();
+let netJob = { done: 0, total: 0 };
+
+function netKeep(url, bytes) {
+  netCache.delete(url);
+  netCache.set(url, bytes);
+  while (netCache.size > NET_KEEP) netCache.delete(netCache.keys().next().value);
+}
+
+function netPrefetch(urls) {
+  const all = [...new Set(urls)];
+  const todo = all.filter((u) => !netCache.has(u));
+  const job = { done: all.length - todo.length, total: all.length };
+  netJob = job;
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const url = todo[next++];
+      try {
+        const r = await fetch(url);
+        // Отказ не держим: сборка спросит ещё раз и скажет, что не так.
+        if (r.ok) netKeep(url, new Uint8Array(await r.arrayBuffer()));
+      } catch (err) {
+        console.warn(`${MODULE_ID} | не скачалось ${url}`, err);
+      }
+      job.done++;
+    }
+  };
+  for (let k = 0; k < NET_PARALLEL; k++) worker();
+}
+
+function netFetch(url) {
+  const hit = netCache.get(url);
+  if (hit) return hit;
+  const x = new XMLHttpRequest();
+  x.open("GET", url, false);
+  x.overrideMimeType("text/plain; charset=x-user-defined");
+  x.send();
+  const s = x.responseText;
+  if (x.status !== 200) throw new Error(`${x.status} ${s.slice(0, 200)}`.trim());
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+  netKeep(url, out);
+  return out;
+}
+
 async function dataPreload() {
   const FP = foundry.applications.apps.FilePicker.implementation;
   const walk = async (dir) => {
@@ -812,6 +868,9 @@ Hooks.once("init", () => {
     return p ? data.has(p) && (data.get(p) === null || data.get(p).length > 0) : files.has(path);
   };
   window.kartografTree = treeOf;
+  window.kartografFetch = netFetch;
+  window.kartografNetPrefetch = netPrefetch;
+  window.kartografNetState = () => [netJob.done, netJob.total];
   window.kartografHold = hold;
   window.kartografAlive = alive;
   window.kartografRelease = release;
