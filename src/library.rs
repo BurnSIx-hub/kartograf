@@ -617,7 +617,18 @@ fn kind_of(inner: &str, from_pack: bool) -> Option<Kind> {
     })
 }
 
+/// Картинки в папке и её подпапках, по алфавиту. В модуле — из папки, выбранной
+/// в окне браузера, или из данных Foundry (`plat::fs`).
+#[cfg(target_arch = "wasm32")]
+pub fn scan(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = crate::plat::fs::tree(dir).into_iter().filter(|p| p.extension().is_some_and(|x| IMAGE_EXTS.contains(&x.to_string_lossy().to_lowercase().as_str()))).collect();
+    out.sort();
+    out.truncate(MAX_FILES);
+    out
+}
+
 /// Картинки в папке и её подпапках, по алфавиту.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn scan(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_owned()];
@@ -677,7 +688,7 @@ fn read_source(key: &str, sources: &Sources) -> Result<Vec<u8>, String> {
         let (file, offset, size) = src.ok_or("пак с этой картинкой не подключён")?;
         pck::read_bytes(&file, offset, size)
     } else {
-        std::fs::read(key).map_err(|e| e.to_string())
+        crate::plat::fs::read(Path::new(key)).map_err(|e| e.to_string())
     }
 }
 
@@ -917,10 +928,19 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
         Some((blur, inner)) => (inner, SHADOW_SIDE, blur.parse::<f32>().unwrap_or(3.0) / 10.0),
         None => (job.key.as_str(), if job.thumb { THUMB_SIDE } else { FULL_SIDE }, 0.0),
     };
-    if !inner.starts_with("pack:") {
-        return false;
-    }
-    let Some((file, offset, size)) = sources.read().ok().and_then(|s| s.get(inner).cloned()) else { return false };
+    // Своя папка в модуле — файлы из окна браузера: их тоже раскрывает браузер.
+    let own = || -> Option<(PathBuf, u64, u64)> {
+        let size = crate::plat::web::call("kartografFileSize", &[JsValue::from_str(inner)]).ok()?.as_f64()?;
+        Some((PathBuf::from(inner), 0, size as u64))
+    };
+    let found = if inner.starts_with("pack:") {
+        sources.read().ok().and_then(|s| s.get(inner).cloned())
+    } else if inner.starts_with('/') {
+        own()
+    } else {
+        None
+    };
+    let Some((file, offset, size)) = found else { return false };
     let args = [
         JsValue::from_str(&job.key),
         JsValue::from_bool(job.thumb),

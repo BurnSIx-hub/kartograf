@@ -53,7 +53,10 @@ export async function open() {
     const status = root.querySelector("#kartograf-status");
     status.textContent = "загрузка…";
     const t = performance.now();
-    started = import(`../pkg/kartograf.js`)
+    // Настройки и автосейв редактор читает при запуске — сначала список данных.
+    started = dataPreload()
+      .catch((err) => console.warn(`${MODULE_ID} | данные редактора не подгрузились`, err))
+      .then(() => import(`../pkg/kartograf.js`))
       .then((m) => m.default({ module_or_path: `modules/${MODULE_ID}/pkg/kartograf_bg.wasm` }))
       .then(() => { status.textContent = `загружен за ${((performance.now() - t) / 1000).toFixed(1)} с`; })
       .catch((err) => { status.textContent = "не загрузился, подробности в консоли"; console.error(`${MODULE_ID} |`, err); started = null; });
@@ -92,7 +95,8 @@ async function toScene(files, update) {
     const dir = f.path.split("/").slice(0, -1).join("/");
     if (name.endsWith(".json")) { scene = JSON.parse(new TextDecoder().decode(f.bytes)); continue; }
     const type = name.endsWith(".webp") ? "image/webp" : name.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
-    await FP.upload("data", dir, new File([f.bytes], name, { type }), {}, { notify: false });
+    const body = type === "image/webp" ? await lossy(f.bytes) : f.bytes;
+    await FP.upload("data", dir, new File([body], name, { type }), {}, { notify: false });
   }
   if (!scene) return;
   delete scene._id;
@@ -110,6 +114,26 @@ async function toScene(files, update) {
   await game.settings.set(MODULE_ID, "lastScene", doc.id);
   await chests(doc).catch((err) => console.error(`${MODULE_ID} | сундуки`, err));
   return doc;
+}
+
+// WebP из wasm — без потерь: libwebp в браузерную сборку не входит. Сжимает с
+// потерями сам браузер, с тем же качеством, что программа (88): фон 4200×2800
+// весил 11,7 МБ. Прозрачность кодировщик браузера держит без потерь. Не вышло
+// (браузер не умеет WebP, картинка больше холста) или вышло не легче — как было.
+const WEBP_QUALITY = 0.88;
+
+async function lossy(bytes) {
+  try {
+    const bmp = await createImageBitmap(new Blob([bytes], { type: "image/webp" }), { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+    const c = new OffscreenCanvas(bmp.width, bmp.height);
+    c.getContext("2d").drawImage(bmp, 0, 0);
+    bmp.close();
+    const blob = await c.convertToBlob({ type: "image/webp", quality: WEBP_QUALITY });
+    return blob.type === "image/webp" && blob.size < bytes.length ? blob : bytes;
+  } catch (err) {
+    console.warn(`${MODULE_ID} | WebP не сжался, кладу без потерь`, err);
+    return bytes;
+  }
 }
 
 // Сундук с сокровищем приходит тайлом с пометкой `chest` (картинки открытого и
@@ -355,15 +379,42 @@ async function kept() {
   });
 }
 
-// Паки, выбранные раньше: зовётся из нажатия кнопки, чтобы браузер мог спросить разрешение.
+// Бывает, что окно `showOpenFilePicker` есть, а читать выбранный файл браузер не даёт
+// (`getFile` → NotAllowedError) — так во встроенном браузере приложения Claude.
+// Тогда раз и навсегда для этого браузера переходим на обычное окно выбора файла.
+const NO_FSA_KEY = `${MODULE_ID}.noFileSystemAccess`;
+function fsaUsable() {
+  if (!window.showOpenFilePicker) return false;
+  try { return localStorage.getItem(NO_FSA_KEY) !== "1"; } catch { return true; }
+}
+function fsaBlocked() {
+  try { localStorage.setItem(NO_FSA_KEY, "1"); } catch { /* не запомнится — спросим снова */ }
+}
+
+async function unkeep(name) {
+  const d = await db();
+  await new Promise((ok, no) => {
+    const t = d.transaction("packs", "readwrite");
+    t.objectStore("packs").delete(name);
+    t.oncomplete = ok;
+    t.onerror = () => no(t.error);
+  });
+}
+
+// Паки и своя папка, выбранные раньше: зовётся из нажатия кнопки, чтобы браузер мог
+// спросить разрешение.
 async function restore() {
-  if (!window.showOpenFilePicker) return;
+  if (!fsaUsable()) return;
   for (const [name, h] of await kept()) {
     if (files.has(name)) continue;
     try {
       let p = await h.queryPermission({ mode: "read" });
       if (p === "prompt") p = await h.requestPermission({ mode: "read" });
       if (p !== "granted") continue;
+      if (h.kind === "directory") {
+        if (![...files.keys()].some((k) => k.startsWith(`/${h.name}/`))) await openFolderHandle(h);
+        continue;
+      }
       files.set(name, await h.getFile());
       picked.push(name);
     } catch (err) {
@@ -384,7 +435,7 @@ async function pickHandles(accept, multiple) {
 }
 
 function pick(accept, multiple) {
-  if (window.showOpenFilePicker) {
+  if (fsaUsable()) {
     pickHandles(accept, multiple)
       .then(async (handles) => {
         for (const h of handles) {
@@ -394,9 +445,24 @@ function pick(accept, multiple) {
           keep(f.name, h).catch((err) => console.warn(`${MODULE_ID} | пак не запомнился`, err));
         }
       })
-      .catch((err) => { if (err.name !== "AbortError") console.error(`${MODULE_ID} | выбор пака`, err); });
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        if (err.name !== "NotAllowedError" && err.name !== "SecurityError") {
+          console.error(`${MODULE_ID} | выбор пака`, err);
+          return;
+        }
+        console.warn(`${MODULE_ID} | браузер не даёт читать файлы из нового окна выбора — дальше обычное окно`, err);
+        fsaBlocked();
+        // Пока жест пользователя ещё действует, сразу открываем обычное окно; иначе просим нажать ещё раз.
+        if (navigator.userActivation?.isActive) pickInput(accept, multiple);
+        else ui.notifications?.warn("Картограф: этот браузер не даёт читать паки через новое окно выбора. Нажмите «добавить пак» ещё раз — откроется обычное окно.");
+      });
     return;
   }
+  pickInput(accept, multiple);
+}
+
+function pickInput(accept, multiple) {
   const input = document.createElement("input");
   input.type = "file";
   input.accept = accept;
@@ -426,6 +492,226 @@ function readSync(name, offset, size) {
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+// Своя папка картинок — выбранная в окне браузера папка с диска Мастера. Файлы
+// ложатся в тот же список, что паки, под путём `/<папка>/<путь внутри>`: Rust
+// читает их так же кусками, браузер так же раскрывает. Ручка папки, как у паков,
+// помнится в IndexedDB (ключ `dir:<имя>`); где нового окна нет — обычное окно
+// выбора папки, и её выбирают заново.
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp"];
+const isImage = (name) => IMAGE_EXTS.includes(name.split(".").pop().toLowerCase());
+
+async function walkDir(handle, prefix, out) {
+  for await (const [name, h] of handle.entries()) {
+    if (h.kind === "directory") await walkDir(h, `${prefix}/${name}`, out);
+    else if (isImage(name)) out.push([`${prefix}/${name}`, await h.getFile()]);
+  }
+}
+
+/** Папка выбрана: прежнюю своя папку убрать, файлы новой — в список. */
+function takeFolder(root, entries) {
+  for (const k of [...files.keys()]) if (k.startsWith("/")) files.delete(k);
+  for (const [path, f] of entries) files.set(path, f);
+  picked.push(`dir:/${root}`);
+}
+
+async function forgetFolders() {
+  for (const [name] of await kept()) if (name.startsWith("dir:")) await unkeep(name);
+}
+
+async function openFolderHandle(h) {
+  const entries = [];
+  await walkDir(h, `/${h.name}`, entries);
+  takeFolder(h.name, entries);
+}
+
+function pickFolder() {
+  if (fsaUsable() && window.showDirectoryPicker) {
+    window.showDirectoryPicker({ mode: "read" })
+      .then(async (h) => {
+        await openFolderHandle(h);
+        await forgetFolders();
+        keep(`dir:${h.name}`, h).catch((err) => console.warn(`${MODULE_ID} | папка не запомнилась`, err));
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        console.warn(`${MODULE_ID} | новое окно выбора папки не сработало — обычное`, err);
+        if (err.name === "NotAllowedError" || err.name === "SecurityError") fsaBlocked();
+        if (navigator.userActivation?.isActive) pickFolderInput();
+        else ui.notifications?.warn("Картограф: выберите папку ещё раз — откроется обычное окно.");
+      });
+    return;
+  }
+  pickFolderInput();
+}
+
+function pickFolderInput() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.webkitdirectory = true;
+  input.addEventListener("change", () => {
+    const all = [...input.files];
+    if (!all.length) return;
+    const root = all[0].webkitRelativePath.split("/")[0];
+    takeFolder(root, all.filter((f) => isImage(f.name)).map((f) => [`/${f.webkitRelativePath}`, f]));
+  });
+  input.click();
+}
+
+// Файлы редактора — настройки, автосейв, карты, объединённые объекты — лежат в
+// данных Foundry, в папке `kartograf-editor`: переживают и закрытую вкладку, и
+// другой браузер. Rust видит их как `/kartograf-editor/…` и работает синхронно
+// (`plat::fs`): список и мелкие `.json` подгружаются до запуска редактора, крупное
+// читается по запросу синхронным запросом, запись уходит на сервер в фоне — по
+// одной за раз на файл, последняя версия побеждает. Удалить файл Foundry не даёт:
+// удалённый остаётся пустым, а пустой считается несуществующим.
+const DATA = "kartograf-editor";
+const data = new Map(); // путь без «/» → байты; null — есть на сервере, ещё не прочитан
+const uploads = new Map();
+const madeDirs = new Set();
+
+const dataPath = (p) => (p.startsWith(`/${DATA}/`) ? p.slice(1) : null);
+
+// Foundry принимает файлы только знакомых видов (`CONST.UPLOADABLE_FILE_EXTENSIONS`),
+// `.karta` среди них нет. Карта — JSON, на сервере она `<имя>.karta.json`; Rust
+// видит прежнее имя.
+const uploadable = (p) => p.includes(".") && p.split(".").pop().toLowerCase() in CONST.UPLOADABLE_FILE_EXTENSIONS;
+const onServer = (p) => (uploadable(p) ? p : `${p}.json`);
+function fromServer(p) {
+  const inner = p.endsWith(".json") ? p.slice(0, -5) : null;
+  return inner && inner.split("/").pop().includes(".") && !uploadable(inner) ? inner : p;
+}
+const urlOf = (p) => `${foundry.utils.getRoute(onServer(p).split("/").map(encodeURIComponent).join("/"))}?t=${Date.now()}`;
+
+function fetchSync(path) {
+  const x = new XMLHttpRequest();
+  x.open("GET", urlOf(path), false);
+  x.overrideMimeType("text/plain; charset=x-user-defined");
+  x.send();
+  if (x.status !== 200) return new Uint8Array(0);
+  const s = x.responseText;
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+  return out;
+}
+
+async function dataPreload() {
+  const FP = foundry.applications.apps.FilePicker.implementation;
+  const walk = async (dir) => {
+    let r;
+    try { r = await FP.browse("data", dir); } catch { return; }
+    madeDirs.add(dir);
+    for (const f of r.files) {
+      const p = fromServer(decodeURIComponent(f));
+      if (!data.has(p)) data.set(p, null);
+    }
+    for (const d of r.dirs) await walk(decodeURIComponent(d));
+  };
+  await walk(DATA);
+  // Настройки и описания копий автосейва нужны редактору сразу при запуске.
+  await Promise.all([...data.entries()].filter(([p, b]) => b === null && p.endsWith(".json")).map(async ([p]) => {
+    try {
+      const r = await fetch(urlOf(p));
+      data.set(p, r.ok ? new Uint8Array(await r.arrayBuffer()) : new Uint8Array(0));
+    } catch {
+      data.set(p, new Uint8Array(0));
+    }
+  }));
+}
+
+function dataGet(p) {
+  if (!data.has(p)) return null;
+  let b = data.get(p);
+  if (b === null) { b = fetchSync(p); data.set(p, b); }
+  return b.length ? b : null;
+}
+
+async function upload(p, bytes) {
+  const FP = foundry.applications.apps.FilePicker.implementation;
+  const parts = onServer(p).split("/");
+  const name = parts.pop();
+  for (let i = 1; i <= parts.length; i++) {
+    const d = parts.slice(0, i).join("/");
+    if (madeDirs.has(d)) continue;
+    try { await FP.createDirectory("data", d); } catch { /* уже есть */ }
+    madeDirs.add(d);
+  }
+  const type = name.endsWith(".json") ? "application/json" : name.endsWith(".png") ? "image/png" : "application/octet-stream";
+  // Отказ Foundry не бросает, а возвращает false.
+  const r = await FP.upload("data", parts.join("/"), new File([bytes], name, { type }), {}, { notify: false });
+  if (!r || r.status === "error") throw new Error(r?.message ?? "Foundry не принял файл");
+}
+
+function dataPut(p, bytes) {
+  data.set(p, bytes);
+  const u = uploads.get(p) ?? { busy: false, again: false };
+  uploads.set(p, u);
+  u.again = true;
+  if (u.busy) return;
+  u.busy = true;
+  (async () => {
+    while (u.again) {
+      u.again = false;
+      try {
+        await upload(p, data.get(p) ?? new Uint8Array(0));
+      } catch (err) {
+        console.error(`${MODULE_ID} | ${p} не записался`, err);
+        ui.notifications?.error(`Картограф: файл ${p} не записался в данные Foundry, подробности в консоли`);
+      }
+    }
+    u.busy = false;
+  })();
+}
+
+/** Файл по пути Rust: из данных Foundry или из выбранной папки. */
+function readAny(path) {
+  const p = dataPath(path);
+  if (p) return dataGet(p);
+  const f = files.get(path);
+  return f ? readSync(path, 0, f.size) : null;
+}
+
+function treeOf(dir) {
+  const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+  const out = [];
+  const p = dataPath(prefix);
+  if (p !== null) {
+    for (const [k, b] of data) if (k.startsWith(p) && (b === null || b.length)) out.push(`/${k}`);
+  } else {
+    for (const k of files.keys()) if (k.startsWith(prefix)) out.push(k);
+  }
+  return out;
+}
+
+// Замок окна для автосейва: живая вкладка раз в несколько секунд отмечается в
+// localStorage. Копия, чья отметка давно не обновлялась, — от закрытой вкладки.
+const ALIVE = `${MODULE_ID}.alive.`;
+const ALIVE_EVERY = 5000;
+const ALIVE_STALE = 20000;
+const holding = new Map();
+
+function hold(id) {
+  const beat = () => { try { localStorage.setItem(ALIVE + id, String(Date.now())); } catch { /* без отметки — копию предложат вернуть */ } };
+  beat();
+  holding.set(id, setInterval(beat, ALIVE_EVERY));
+  // Отметки давно закрытых вкладок не копятся.
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k?.startsWith(ALIVE) && Date.now() - Number(localStorage.getItem(k)) > 86400000) localStorage.removeItem(k);
+    }
+  } catch { /* нет хранилища */ }
+}
+
+function alive(id) {
+  try { return Date.now() - Number(localStorage.getItem(ALIVE + id) ?? 0) < ALIVE_STALE; } catch { return false; }
+}
+
+function release(id) {
+  clearInterval(holding.get(id));
+  holding.delete(id);
+  try { localStorage.removeItem(ALIVE + id); } catch { /* нет хранилища */ }
 }
 
 // Картинки из паков раскрывает браузер: `createImageBitmap` работает вне основного
@@ -510,12 +796,32 @@ Hooks.once("init", () => {
   window.kartografTakePicked = () => picked.splice(0);
   window.kartografFileSize = (name) => files.get(name)?.size;
   window.kartografReadSync = readSync;
+  window.kartografPickFolder = pickFolder;
+  window.kartografRead = readAny;
+  window.kartografWrite = (path, bytes) => {
+    const p = dataPath(path);
+    if (!p) throw new Error(`${path}: писать можно только в данные редактора`);
+    dataPut(p, bytes.slice());
+  };
+  window.kartografRemove = (path) => {
+    const p = dataPath(path);
+    if (p && data.has(p)) dataPut(p, new Uint8Array(0));
+  };
+  window.kartografExists = (path) => {
+    const p = dataPath(path);
+    return p ? data.has(p) && (data.get(p) === null || data.get(p).length > 0) : files.has(path);
+  };
+  window.kartografTree = treeOf;
+  window.kartografHold = hold;
+  window.kartografAlive = alive;
+  window.kartografRelease = release;
   game.settings.register(MODULE_ID, "lastScene", { scope: "world", config: false, type: String, default: "" });
   window.kartografLastScene = () => lastScene()?.name ?? null;
   window.kartografToScene = (files, update) => {
     toScene(files, update).catch((err) => { console.error(`${MODULE_ID} | на сцену`, err); ui.notifications.error("Картограф: сцена не создалась, подробности в консоли"); });
   };
-  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs, rebuildSwitches, toggleLight };
+  // `takeFolder(имя, [[путь, File]…])` — своя папка без окна выбора (для проверок и макросов).
+  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs, rebuildSwitches, toggleLight, takeFolder };
 });
 
 Hooks.on("canvasReady", rebuildWebs);

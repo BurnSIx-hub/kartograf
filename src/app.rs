@@ -509,6 +509,8 @@ pub struct App {
 
     pub recovery: Recovery,
     pub orphans: Vec<Orphan>,
+    /// Модуль: карты в данных Foundry для окна «Открыть» (окна файлов у браузера нет).
+    open_list: Option<Vec<PathBuf>>,
     pub generator: Option<Options>,
     new_map: Option<NewMap>,
     export: Option<Export>,
@@ -525,7 +527,7 @@ pub struct App {
 
 pub fn default_data_dir() -> PathBuf {
     #[cfg(target_arch = "wasm32")]
-    return PathBuf::from("/kartograf");
+    return PathBuf::from(crate::plat::DATA_ROOT);
     #[cfg(not(target_arch = "wasm32"))]
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Kartograf")
 }
@@ -560,7 +562,7 @@ impl App {
         apply_theme(&cc.egui_ctx);
         let data_dir = args.data.or_else(|| args.selftest.as_ref().map(|d| d.join("data"))).unwrap_or_else(default_data_dir);
         let _ = std::fs::create_dir_all(&data_dir);
-        let settings: Settings = std::fs::read(data_dir.join("settings.json"))
+        let settings: Settings = crate::plat::fs::read(&data_dir.join("settings.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b)).ok())
             .unwrap_or_default();
@@ -681,6 +683,7 @@ impl App {
             object_scale: 1.0,
             recovery,
             orphans,
+            open_list: None,
             generator: None,
             new_map: None,
             export: None,
@@ -1368,12 +1371,14 @@ impl App {
             bake_prop(&mut out, &img, &p, lo, PPC);
         }
         let dir = self.data_dir.join("baked");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let (cw, ch) = (w as f32 / PPC, h as f32 / PPC);
         let num = |v: f32| format!("{v:.2}").trim_end_matches('0').trim_end_matches('.').to_owned();
-        let n = (1..).find(|n| !std::fs::read_dir(&dir).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&format!("Объединённый {n}_")))).unwrap_or(false)).unwrap_or(1);
+        let taken = crate::plat::fs::list(&dir);
+        let n = (1..).find(|n| !taken.iter().any(|p| p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(&format!("Объединённый {n}_"))))).unwrap_or(1);
         let file = dir.join(format!("Объединённый {n}_{}x{}.png", num(cw), num(ch)));
-        out.save(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let mut png = Vec::new();
+        out.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| format!("{}: {e}", file.display()))?;
+        crate::plat::fs::write(&file, &png).map_err(|e| format!("{}: {e}", file.display()))?;
         self.library.set_baked(&dir);
         self.checkpoint();
         let at = idx[0];
@@ -1795,7 +1800,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: &Path) -> bool {
-        match std::fs::write(path, self.project().to_json()) {
+        match crate::plat::fs::write(path, self.project().to_json().as_bytes()) {
             Ok(()) => {
                 self.path = Some(path.to_owned());
                 self.dirty = false;
@@ -1810,7 +1815,8 @@ impl App {
     }
 
     pub fn open_path(&mut self, path: &Path) -> bool {
-        match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Map::from_json(&t)) {
+        let text = crate::plat::fs::read(path).map_err(|e| e.to_string()).and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+        match text.and_then(|t| Map::from_json(&t)) {
             Ok(map) => {
                 self.reset_doc(map, Some(path.to_owned()));
                 true
@@ -1832,20 +1838,57 @@ impl App {
     }
 
     fn save_as(&mut self) {
-        let dialog = crate::plat::FileDialog::new().add_filter("Карта", &[map::EXT]).set_file_name(format!("{}.{}", self.name(), map::EXT));
-        if let Some(path) = dialog.save_file() {
-            self.save_to(&path);
+        // В модуле окна сохранения нет: карта ложится в данные Foundry под своим именем.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let path = self.free_map_path();
+            if self.save_to(&path) {
+                self.notice = Some(format!("Сохранено в данные Foundry: {}", path.to_string_lossy().trim_start_matches('/')));
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dialog = crate::plat::FileDialog::new().add_filter("Карта", &[map::EXT]).set_file_name(format!("{}.{}", self.name(), map::EXT));
+            if let Some(path) = dialog.save_file() {
+                self.save_to(&path);
+            }
         }
     }
 
+    /// Папка карт модуля в данных Foundry.
+    fn maps_dir(&self) -> PathBuf {
+        self.data_dir.join("maps")
+    }
+
+    /// Файл для карты в данных Foundry: по имени, без знаков, которые Foundry не
+    /// примет в имени файла; чужая карта с тем же именем не затирается — номер.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn free_map_path(&self) -> PathBuf {
+        let clean: String = self.name().chars().map(|c| if c.is_alphanumeric() || " -_()".contains(c) { c } else { '_' }).collect();
+        let clean = clean.trim().to_owned();
+        let base = if clean.is_empty() { "Карта".to_owned() } else { clean };
+        let dir = self.maps_dir();
+        (1..)
+            .map(|n| dir.join(if n == 1 { format!("{base}.{}", map::EXT) } else { format!("{base} {n}.{}", map::EXT) }))
+            .find(|p| self.path.as_deref() == Some(p.as_path()) || !crate::plat::fs::exists(p))
+            .unwrap_or_else(|| dir.join(format!("{base}.{}", map::EXT)))
+    }
+
     fn open(&mut self) {
+        // В модуле — окно со списком карт из данных Foundry.
+        if cfg!(target_arch = "wasm32") {
+            let mut maps: Vec<PathBuf> = crate::plat::fs::list(&self.maps_dir()).into_iter().filter(|p| p.extension().is_some_and(|e| e == map::EXT)).collect();
+            maps.sort();
+            self.open_list = Some(maps);
+            return;
+        }
         if let Some(path) = crate::plat::FileDialog::new().add_filter("Карта", &[map::EXT]).pick_file() {
             self.open_path(&path);
         }
     }
 
     fn save_settings(&self) {
-        let _ = std::fs::write(self.data_dir.join("settings.json"), serde_json::to_vec_pretty(&self.settings).unwrap_or_default());
+        let _ = crate::plat::fs::write(&self.data_dir.join("settings.json"), &serde_json::to_vec_pretty(&self.settings).unwrap_or_default());
     }
 
     pub fn set_textures_dir(&mut self, dir: PathBuf) {
@@ -2051,6 +2094,29 @@ impl App {
             } else if let Some(i) = drop {
                 let o = self.orphans.remove(i);
                 self.recovery.discard(&o);
+            }
+        }
+
+        if let Some(maps) = self.open_list.take() {
+            let mut open = true;
+            let mut chosen = None;
+            egui::Window::new("Открыть карту").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                if maps.is_empty() {
+                    ui.label("В данных Foundry пока нет сохранённых карт.");
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for p in &maps {
+                        let name = p.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                        if ui.button(name).clicked() {
+                            chosen = Some(p.clone());
+                        }
+                    }
+                });
+            });
+            if let Some(p) = chosen {
+                self.open_path(&p);
+            } else if open {
+                self.open_list = Some(maps);
             }
         }
 
@@ -6081,7 +6147,9 @@ impl eframe::App for App {
         // В модуле выбранное в окне браузера приходит не сразу, а кадром позже.
         #[cfg(target_arch = "wasm32")]
         for f in crate::plat::take_picked() {
-            if f.extension().is_some_and(|e| e == "dungeondraft_pack") {
+            if let Some(dir) = f.to_str().and_then(|s| s.strip_prefix("dir:")) {
+                self.set_textures_dir(PathBuf::from(dir));
+            } else if f.extension().is_some_and(|e| e == "dungeondraft_pack") {
                 self.add_pack(f);
             }
         }

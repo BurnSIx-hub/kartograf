@@ -8,10 +8,15 @@
 //!
 //! У каждого окна свой файл-замок, который окно держит открытым. Замок, который удаётся
 //! открыть, остался от упавшей программы, — значит, и копия при нём ничья.
+//!
+//! В модуле Foundry файлы — в данных Foundry (`plat::fs`), а замок — отметка вкладки
+//! браузера (`plat::hold`): закрытая вкладка её не обновляет, и копия становится ничьей.
+//! Вкладку модуль не закрывает «по-хорошему», так что копия несохранённой карты ждёт
+//! следующего открытия Картографа.
 
 use crate::map::Map;
+use crate::plat::fs;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Не чаще чем раз в столько секунд.
@@ -33,10 +38,15 @@ pub struct Orphan {
     pub meta: Meta,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type Lock = std::fs::File;
+#[cfg(target_arch = "wasm32")]
+type Lock = ();
+
 pub struct Recovery {
     dir: PathBuf,
     id: String,
-    lock: Option<File>,
+    lock: Option<Lock>,
     saved_rev: u64,
     last: f64,
 }
@@ -46,7 +56,8 @@ pub fn now_unix() -> u64 {
 }
 
 /// Открывает файл так, чтобы никто другой не смог открыть его, пока он открыт у нас.
-fn open_exclusive(path: &Path) -> std::io::Result<File> {
+#[cfg(not(target_arch = "wasm32"))]
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(windows)]
@@ -58,21 +69,62 @@ fn open_exclusive(path: &Path) -> std::io::Result<File> {
 }
 
 /// Запись через временный файл: оборванная запись не портит прежнюю копию.
+#[cfg(not(target_arch = "wasm32"))]
 fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
 
+/// В модуле файл на сервере Foundry заменяется целиком.
+#[cfg(target_arch = "wasm32")]
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
+}
+
+/// Взять замок окна.
+#[cfg(not(target_arch = "wasm32"))]
+fn take_lock(path: &Path, _id: &str) -> Option<Lock> {
+    open_exclusive(path).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn take_lock(_path: &Path, id: &str) -> Option<Lock> {
+    crate::plat::hold(id).then_some(())
+}
+
+/// Хозяин копии ещё работает: его замок не открыть.
+#[cfg(not(target_arch = "wasm32"))]
+fn owner_alive(path: &Path, _id: &str) -> bool {
+    path.exists() && open_exclusive(path).is_err()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn owner_alive(_path: &Path, id: &str) -> bool {
+    crate::plat::alive(id)
+}
+
+/// Отпустить свой замок.
+#[cfg(not(target_arch = "wasm32"))]
+fn release_lock(path: &Path, _id: &str) {
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn release_lock(_path: &Path, id: &str) {
+    crate::plat::release(id);
+}
+
 impl Recovery {
     pub fn new(data_dir: &Path) -> Self {
         let dir = data_dir.join("recovery");
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = std::fs::create_dir_all(&dir);
         // Счётчик — на случай двух копий в одном процессе за одну секунду.
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("{}-{}-{n}", crate::plat::pid(), now_unix());
-        let lock = open_exclusive(&dir.join(format!("{id}.lock"))).ok();
+        let lock = take_lock(&dir.join(format!("{id}.lock")), &id);
         Self { dir, id, lock, saved_rev: 0, last: f64::NEG_INFINITY }
     }
 
@@ -95,28 +147,29 @@ impl Recovery {
 
     /// Карта сохранена или от правок отказались: копия больше не нужна.
     pub fn clear(&mut self) {
-        let _ = std::fs::remove_file(self.file(&self.id, "karta"));
-        let _ = std::fs::remove_file(self.file(&self.id, "json"));
+        // Пустые пути — ничего не трогать: копии и не было (в модуле удаление — запись).
+        if self.has_copy() {
+            fs::remove(&self.file(&self.id, "karta"));
+            fs::remove(&self.file(&self.id, "json"));
+        }
         self.saved_rev = 0;
     }
 
     pub fn has_copy(&self) -> bool {
-        self.file(&self.id, "karta").exists()
+        fs::exists(&self.file(&self.id, "karta"))
     }
 
     /// Окно закрывается как положено: убрать и копию, и замок.
     pub fn close(&mut self) {
         self.clear();
         self.lock = None;
-        let _ = std::fs::remove_file(self.file(&self.id, "lock"));
+        release_lock(&self.file(&self.id, "lock"), &self.id);
     }
 
     /// Копии, хозяева которых уже не работают.
     pub fn orphans(&self) -> Vec<Orphan> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
         let mut out = Vec::new();
-        for e in entries.flatten() {
-            let path = e.path();
+        for path in fs::list(&self.dir) {
             if path.extension().is_none_or(|x| x != "json") {
                 continue;
             }
@@ -125,13 +178,12 @@ impl Recovery {
                 continue;
             }
             // Замок не открывается — хозяин жив. Открылся — сразу отпускаем.
-            let lock = self.file(&id, "lock");
-            if lock.exists() && open_exclusive(&lock).is_err() {
+            if owner_alive(&self.file(&id, "lock"), &id) {
                 continue;
             }
-            let meta = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok());
+            let meta = fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok());
             if let Some(meta) = meta
-                && self.file(&id, "karta").exists()
+                && fs::exists(&self.file(&id, "karta"))
             {
                 out.push(Orphan { id, meta });
             }
@@ -141,18 +193,21 @@ impl Recovery {
     }
 
     pub fn load(&self, orphan: &Orphan) -> Result<Map, String> {
-        std::fs::read_to_string(self.file(&orphan.id, "karta")).map_err(|e| e.to_string()).and_then(|t| Map::from_json(&t))
+        fs::read(&self.file(&orphan.id, "karta")).map_err(|e| e.to_string()).and_then(|b| String::from_utf8(b).map_err(|e| e.to_string())).and_then(|t| Map::from_json(&t))
     }
 
     pub fn discard(&self, orphan: &Orphan) {
-        for ext in ["karta", "json", "lock"] {
-            let _ = std::fs::remove_file(self.file(&orphan.id, ext));
+        for ext in ["karta", "json"] {
+            fs::remove(&self.file(&orphan.id, ext));
         }
+        release_lock(&self.file(&orphan.id, "lock"), &orphan.id);
     }
 
     /// Для самопроверки: отпустить замок, как будто программа упала.
     pub fn drop_lock(&mut self) -> String {
         self.lock = None;
+        #[cfg(target_arch = "wasm32")]
+        crate::plat::release(&self.id);
         self.id.clone()
     }
 }

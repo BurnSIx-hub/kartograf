@@ -49,6 +49,117 @@ pub fn to_scene(files: &[(std::path::PathBuf, Vec<u8>)], update: bool) -> Result
     f.call2(&wasm_bindgen::JsValue::NULL, &list, &update.into()).map(|_| ()).map_err(|e| format!("{e:?}"))
 }
 
+/// Файлы редактора: настройки, автосейв, карты, запечённые объекты, своя папка
+/// картинок. В программе — диск. В модуле — данные Foundry (папка [`DATA_ROOT`])
+/// и файлы, выбранные в окне браузера (`foundry/scripts/main.js`): список и мелкие
+/// файлы подгружены до запуска, крупные читаются по запросу, запись уходит на
+/// сервер в фоне. Удалять файлы Foundry не даёт — удалённый остаётся пустым.
+pub mod fs {
+    use std::io::Result;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read(path: &Path) -> Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, bytes)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn remove(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn exists(path: &Path) -> bool {
+        path.exists()
+    }
+
+    /// Файлы в папке и её подпапках, без порядка.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tree(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_owned()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() { stack.push(p) } else { out.push(p) }
+            }
+        }
+        out
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn js(path: &Path) -> wasm_bindgen::JsValue {
+        wasm_bindgen::JsValue::from_str(&path.to_string_lossy().replace('\\', "/"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn read(path: &Path) -> Result<Vec<u8>> {
+        let v = super::web::call("kartografRead", &[js(path)])?;
+        if v.is_null() || v.is_undefined() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{}: нет файла", path.display())));
+        }
+        Ok(js_sys::Uint8Array::new(&v).to_vec())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
+        super::web::call("kartografWrite", &[js(path), js_sys::Uint8Array::from(bytes).into()]).map(|_| ())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn remove(path: &Path) {
+        let _ = super::web::call("kartografRemove", &[js(path)]);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn exists(path: &Path) -> bool {
+        super::web::call("kartografExists", &[js(path)]).is_ok_and(|v| v.as_bool() == Some(true))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn tree(dir: &Path) -> Vec<PathBuf> {
+        let Ok(v) = super::web::call("kartografTree", &[js(dir)]) else { return Vec::new() };
+        js_sys::Array::from(&v).iter().filter_map(|x| x.as_string()).map(PathBuf::from).collect()
+    }
+
+    /// Прямые файлы папки.
+    pub fn list(dir: &Path) -> Vec<PathBuf> {
+        tree(dir).into_iter().filter(|p| p.parent() == Some(dir)).collect()
+    }
+}
+
+/// Папка данных редактора в модуле — в данных Foundry.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const DATA_ROOT: &str = "/kartograf-editor";
+
+/// Замок окна для автосейва (`recovery`): чужую копию предлагаем вернуть, только
+/// если её окно уже не работает. В программе это файл, открытый без права делить
+/// его с другими; в модуле — отметка вкладки в браузере, которую она обновляет,
+/// пока жива.
+#[cfg(target_arch = "wasm32")]
+pub fn hold(id: &str) -> bool {
+    web::call("kartografHold", &[wasm_bindgen::JsValue::from_str(id)]).is_ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn alive(id: &str) -> bool {
+    web::call("kartografAlive", &[wasm_bindgen::JsValue::from_str(id)]).is_ok_and(|v| v.as_bool() == Some(true))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn release(id: &str) {
+    let _ = web::call("kartografRelease", &[wasm_bindgen::JsValue::from_str(id)]);
+}
+
 /// Работа в фоне: в программе — свой поток, в браузере потоков нет, и она идёт сразу.
 pub fn spawn<F: FnOnce() + Send + 'static>(f: F) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -144,9 +255,10 @@ pub mod web {
     }
 }
 
-/// В браузере системных окон нет. Окно выбора пака — браузерное: выбранное приходит
-/// через `take_picked` кадром позже, а здесь всегда «ничего не выбрали».
-/// Папки, сохранение и прочие файлы — пока нет.
+/// В браузере системных окон нет. Окна выбора пака и папки — браузерные: выбранное
+/// приходит через `take_picked` кадром позже, а здесь всегда «ничего не выбрали».
+/// Карты сохраняются и открываются в данных Foundry без окна (`App::save_as`,
+/// `App::open`); прочие файлы — пока нет.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 pub struct FileDialog {
@@ -184,7 +296,10 @@ impl FileDialog {
         self.browse(true);
         None
     }
+    /// Папка выбирается окном браузера; что выбрали, придёт через `take_picked`
+    /// строкой `dir:/<имя папки>`.
     pub fn pick_folder(self) -> Option<std::path::PathBuf> {
+        let _ = web::call("kartografPickFolder", &[]);
         None
     }
     pub fn save_file(self) -> Option<std::path::PathBuf> {
