@@ -411,6 +411,23 @@ fn edges_of(rings: &[Vec<[f32; 2]>]) -> Vec<([f32; 2], [f32; 2])> {
     rings.iter().flat_map(|r| (0..r.len()).map(move |k| (r[k], r[(k + 1) % r.len()]))).filter(|(a, b)| dist(*a, *b) > 1e-4).collect()
 }
 
+/// Контур крыши для Foundry: кольца всего дома (первого куска), в клетках, и
+/// двор ли кольцо — лежит ли оно внутри остальных по чётности. По нему «Wild
+/// Canvas» видит крышу с улицы целиком и не прячет значок двери в наружной стене:
+/// прямоугольник тайла у повёрнутого дома захватывает и улицу, и чужие дворы.
+pub fn outline(roof: &OutlineRoof) -> Vec<(Vec<[f32; 2]>, bool)> {
+    let Some(base) = roof.pieces.first() else { return Vec::new() };
+    let rings: Vec<&Vec<[f32; 2]>> = base.rings.iter().filter(|r| r.len() >= 3).collect();
+    rings
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let others: Vec<Vec<[f32; 2]>> = rings.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, o)| (*o).clone()).collect();
+            ((*r).clone(), inside_rings(&others, r[0]))
+        })
+        .collect()
+}
+
 /// Внутри ли колец точка (по чётности: двор — снаружи).
 fn inside_rings(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
     let mut c = false;
@@ -817,6 +834,17 @@ mod tests {
         let outer = vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]];
         let yard = vec![[3.0, 3.0], [5.0, 3.0], [5.0, 5.0], [3.0, 5.0]];
         OutlineRoof { pieces: vec![RoofPiece { rings: vec![outer, yard], form, paint: "grey".into(), height: 0.0, eaves: 0.0, down: None, across: false }] }
+    }
+
+    #[test]
+    fn outline_for_foundry_marks_the_yard_as_a_hole() {
+        let rings = outline(&yard_house(RoofForm::Flat));
+        assert_eq!(rings.iter().map(|r| r.1).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(rings[0].0[2], [8.0, 8.0]);
+        let mut two = yard_house(RoofForm::Flat);
+        two.pieces[0].rings.push(vec![[10.0, 0.0], [12.0, 0.0], [12.0, 2.0]]);
+        assert_eq!(outline(&two).iter().map(|r| r.1).collect::<Vec<_>>(), [false, true, false], "второй корпус — не двор");
+        assert!(outline(&OutlineRoof { pieces: Vec::new() }).is_empty());
     }
 
     #[test]

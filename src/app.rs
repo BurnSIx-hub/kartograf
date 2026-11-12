@@ -5745,6 +5745,7 @@ impl App {
                     chest: None,
                     living: None,
                     scuppers: Vec::new(),
+                    outline: roofs::outline(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * ppc, v[1] * ppc]).collect(), hole)).collect(),
                     ..Default::default()
                 });
             }

@@ -622,6 +622,10 @@ pub struct RoofTile {
     pub above: bool,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
+    /// Контур крыши OSM в точках сцены, двор — `true` ([`crate::roofs::outline`]).
+    /// В тайл он уходит долями тайла: Мастер подвинет или растянет тайл — контур
+    /// поедет с ним. Без контура «Wild Canvas» берёт весь прямоугольник тайла.
+    pub outline: Vec<(Vec<[f32; 2]>, bool)>,
 }
 
 /// Впечатать предмет в картинку (для Universal VTT, где тайлов нет): середина
@@ -743,6 +747,16 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 // Сливы крыши: середина и поворот; размер — клетка сцены.
                 let s: Vec<Value> = r.scuppers.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();
                 tile["flags"] = json!({LIVE_MODULE: {"scuppers": s, "scupperSize": px}});
+            }
+            if !r.outline.is_empty() && w > 0 && h > 0 {
+                // Доли тайла от левого верхнего угла, 4 знака: у тайла в 8000 точек — меньше точки.
+                let frac = |v: f32, o: i64, s: i64| ((v as f64 - o as f64) / s as f64 * 1e4).round() / 1e4;
+                let rings: Vec<Value> = r
+                    .outline
+                    .iter()
+                    .map(|(ring, hole)| json!({"points": ring.iter().flat_map(|v| [frac(v[0], x, w), frac(v[1], y, h)]).collect::<Vec<_>>(), "hole": hole}))
+                    .collect();
+                tile["flags"][LIVE_MODULE]["outline"] = json!(rings);
             }
             tiles.push(tag(tile));
         }
@@ -1074,6 +1088,27 @@ mod tests {
         let xs: Vec<f32> = cuts[0].loops[0].0.iter().map(|v| v[0]).collect();
         // Повёрнуто на 90°: поперёк по x — клетка, а не две.
         assert!(xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min) < 1.0);
+    }
+
+    #[test]
+    fn osm_roof_tile_carries_its_outline_in_tile_fractions() {
+        let a = Map::new(6, 4);
+        let la = layout(&a, &a.room_edges());
+        let roof = RoofTile {
+            src: "k/r.webp".into(),
+            rect: [100, 200, 400, 200],
+            shelter: true,
+            fade: true,
+            outline: vec![(vec![[100.0, 200.0], [500.0, 200.0], [300.0, 400.0]], false), (vec![[250.0, 250.0], [350.0, 250.0], [300.0, 300.0]], true)],
+            ..Default::default()
+        };
+        let plain = RoofTile { src: "k/q.webp".into(), rect: [0, 0, 100, 100], shelter: true, fade: true, ..Default::default() };
+        let scene = foundry_levels(&a, "Дом", &[SceneLevel { name: "Дом".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![roof, plain] }], 100, &Default::default());
+        let o = &scene["tiles"][0]["flags"][LIVE_MODULE]["outline"];
+        assert_eq!(o[0]["points"], json!([0.0, 0.0, 1.0, 0.0, 0.5, 1.0]));
+        assert_eq!((o[0]["hole"].as_bool(), o[1]["hole"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(o[1]["points"][1].as_f64(), Some(0.25));
+        assert!(scene["tiles"][1].get("flags").is_none(), "у своей крыши Картографа контура нет — берётся прямоугольник");
     }
 
     #[test]
