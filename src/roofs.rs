@@ -316,8 +316,9 @@ pub const OUTLINE_TOL: f32 = 0.35;
 /// пределах `clip` (левый верхний и правый нижний углы карты, в клетках): дом,
 /// уходящий за рамку, иначе давал картинку в 10 000 точек. Куски — по очереди,
 /// поверх друг друга; покрытие куска — `tex` по его ключу (нет — кусок пропущен).
+/// `near` — что вокруг бросает на крышу тень ([`Casters::near`]): высшие соседи и кроны.
 /// Возвращает картинку и её левый верхний угол в клетках.
-pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t image::RgbaImage>, ppc: f32, light: [f32; 2], clip: ([f32; 2], [f32; 2])) -> (image::RgbaImage, [f32; 2]) {
+pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t image::RgbaImage>, ppc: f32, light: [f32; 2], clip: ([f32; 2], [f32; 2]), near: &Near) -> (image::RgbaImage, [f32; 2]) {
     let (lo, hi) = roof.bounds();
     let (lo, hi) = ([lo[0].max(clip.0[0]), lo[1].max(clip.0[1])], [hi[0].min(clip.1[0]), hi[1].min(clip.1[1])]);
     let origin = [(lo[0] * ppc).floor() / ppc, (lo[1] * ppc).floor() / ppc];
@@ -339,8 +340,186 @@ pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t i
             paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, (slope.0, &slope.1), t, light, (&mut relief, i as u32));
         }
     }
-    cast_shadows(&mut img, &relief, ppc, light);
+    let mut dark = cast_shadows(&relief, w as i32, h as i32, ppc, light);
+    // Дом без высоты в OSM — как у тени на земле: верх ската над 6 м.
+    let base = if roof.pieces.first().is_some_and(|p| p.height <= 0.0) { DEFAULT_TOP } else { 0.0 };
+    cast_near(&mut dark, &relief, (w as usize, h as usize), origin, ppc, light, near, base);
+    for (k, p) in img.pixels_mut().enumerate() {
+        let f = dark[k];
+        if f > 0.0 {
+            for c in 0..3 {
+                p.0[c] = (p.0[c] as f32 * (1.0 - f)).round() as u8;
+            }
+        }
+    }
     (img, origin)
+}
+
+/// Дом без высоты в OSM — 6 м в клетках, как у его крыши и тени на земле.
+pub const DEFAULT_TOP: f32 = 6.0 / crate::procgen::osm::CELL_M;
+/// Сетка теней соседей и крон на крыше — точек на клетку: тени мягкие, а
+/// картинка крыши в выгрузке — 140 точек на клетку.
+const NEAR_RES: f32 = 8.0;
+/// Тень соседа длиннее не считается, в клетках, как у тени на земле.
+const NEAR_REACH: f32 = 40.0;
+
+/// Что бросает тень на крышу снаружи: высшие соседи (кольца и верх в клетках) и
+/// кроны деревьев.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct Near {
+    pub houses: Vec<(Vec<Vec<[f32; 2]>>, f32)>,
+    pub crowns: Vec<Crown>,
+}
+
+/// Крона: середина, поперечник в клетках, голая ли.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crown {
+    pub pos: [f32; 2],
+    pub d: f32,
+    pub bare: bool,
+}
+
+/// Верх куска для тени на соседей: плоская — свой верх, скатная — середина
+/// между свесом и коньком (конёк узкий); без высоты — [`DEFAULT_TOP`].
+fn caster_top(p: &RoofPiece) -> f32 {
+    if p.height <= 0.0 {
+        return DEFAULT_TOP;
+    }
+    match p.form {
+        RoofForm::Flat => p.height,
+        _ => (p.height + p.eaves.min(p.height)) / 2.0,
+    }
+}
+
+/// Кусок крыши, бросающий тень: чей, рамка, верх, кольца.
+type Caster<'a> = (usize, [f32; 2], [f32; 2], f32, &'a [Vec<[f32; 2]>]);
+
+/// Всё, что бросает тень на крыши, с рамками — раз на кадр, а не на каждую крышу.
+pub struct Casters<'a> {
+    houses: Vec<Caster<'a>>,
+    crowns: Vec<Crown>,
+}
+
+impl<'a> Casters<'a> {
+    pub fn new(roofs: &'a [OutlineRoof], props: &[map::Prop]) -> Self {
+        let mut houses = Vec::new();
+        for (j, r) in roofs.iter().enumerate() {
+            for p in &r.pieces {
+                let (mut a, mut b) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for q in p.rings.iter().flatten() {
+                    a = [a[0].min(q[0]), a[1].min(q[1])];
+                    b = [b[0].max(q[0]), b[1].max(q[1])];
+                }
+                if a[0] <= b[0] {
+                    houses.push((j, a, b, caster_top(p), &p.rings[..]));
+                }
+            }
+        }
+        let crowns = props
+            .iter()
+            .filter(|p| p.is_canopy() && p.casts_shadow())
+            .filter_map(|p| {
+                let d = p.size[0].max(p.size[1]) * p.scale;
+                (d > 0.0).then(|| Crown { pos: p.pos, d, bare: map::is_bare_tree(&p.asset) })
+            })
+            .collect();
+        Self { houses, crowns }
+    }
+
+    /// Что из этого дотягивается тенью до рамки крыши `k` ([`OutlineRoof::bounds`]).
+    pub fn near(&self, k: usize, (lo, hi): ([f32; 2], [f32; 2])) -> Near {
+        let reaches = |a: [f32; 2], b: [f32; 2], reach: f32| b[0] >= lo[0] - reach && a[0] <= hi[0] + reach && b[1] >= lo[1] - reach && a[1] <= hi[1] + reach;
+        Near {
+            houses: self.houses.iter().filter(|h| h.0 != k && reaches(h.1, h.2, (h.3 / SUN_RISE).min(NEAR_REACH))).map(|h| (h.4.to_vec(), h.3)).collect(),
+            crowns: self.crowns.iter().copied().filter(|c| reaches(c.pos, c.pos, c.d * TREE_HEIGHT / SUN_RISE + c.d)).collect(),
+        }
+    }
+}
+
+/// Тени соседей и крон на крыше — в долю затемнения `dark` точек картинки (`w ×
+/// h`, левый верхний угол `origin`), по наибольшей с тенями ярусов. Соседи — на
+/// сетке [`NEAR_RES`] с полем к солнцу: проход [`sun_rays`] по их верху, тень —
+/// где луч выше ската. Крона — шар на высоте поперечника: на скате высоты `z`
+/// её тень сдвинута от солнца на `(высота кроны − z)`; ниже ската кроны тени нет.
+/// `base` — подъём крыши без высоты в OSM.
+#[allow(clippy::too_many_arguments)]
+fn cast_near(dark: &mut [f32], r: &Relief, (w, h): (usize, usize), origin: [f32; 2], ppc: f32, light: [f32; 2], near: &Near, base: f32) {
+    if near.houses.is_empty() && near.crowns.is_empty() {
+        return;
+    }
+    let size = [w as f32 / ppc, h as f32 / ppc];
+    let tallest = near.houses.iter().map(|x| x.1).fold(0.0f32, f32::max);
+    let reach = (tallest / SUN_RISE).min(NEAR_REACH).ceil();
+    // Поле — только со стороны солнца: оттуда приходит тень.
+    let pad = |s: f32| if s < -1e-4 { reach } else { 0.0 };
+    let g0 = [origin[0] - pad(light[0]), origin[1] - pad(light[1])];
+    let g1 = [origin[0] + size[0] + pad(-light[0]), origin[1] + size[1] + pad(-light[1])];
+    let (gw, gh) = (((g1[0] - g0[0]) * NEAR_RES).ceil() as usize + 1, ((g1[1] - g0[1]) * NEAR_RES).ceil() as usize + 1);
+    let at = |i: usize, j: usize| [g0[0] + (i as f32 + 0.5) / NEAR_RES, g0[1] + (j as f32 + 0.5) / NEAR_RES];
+    // Верх соседей на сетке.
+    let mut top = vec![0.0f32; gw * gh];
+    for (rings, z) in &near.houses {
+        let (mut a, mut b) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for q in rings.iter().flatten() {
+            a = [a[0].min(q[0]), a[1].min(q[1])];
+            b = [b[0].max(q[0]), b[1].max(q[1])];
+        }
+        let span = |lo: f32, hi: f32, o: f32, n: usize| ((((lo - o) * NEAR_RES).floor().max(0.0)) as usize, (((hi - o) * NEAR_RES).ceil().max(0.0) as usize).min(n));
+        let ((i0, i1), (j0, j1)) = (span(a[0], b[0], g0[0], gw), span(a[1], b[1], g0[1], gh));
+        for j in j0..j1 {
+            for i in i0..i1 {
+                if top[j * gw + i] < *z && inside_rings(rings, at(i, j)) {
+                    top[j * gw + i] = *z;
+                }
+            }
+        }
+    }
+    let ray = if near.houses.is_empty() { Vec::new() } else { sun_rays(&top, gw, gh, light, SUN_RISE / NEAR_RES) };
+    let dir = [-light[0], -light[1]];
+    let crowns: Vec<(Crown, f32, f32, f32)> = near
+        .crowns
+        .iter()
+        .map(|c| {
+            let rad = c.d * 0.42;
+            (*c, c.d * TREE_HEIGHT, rad, c.d * 0.16)
+        })
+        .collect();
+    // Сетка — в точку картинки: билинейно для луча, ближайшая для крон.
+    for y in 0..h {
+        for x in 0..w {
+            let k = y * w + x;
+            if r.top[k] <= f32::MIN {
+                continue;
+            }
+            let z = r.top[k] + base;
+            let p = [origin[0] + (x as f32 + 0.5) / ppc, origin[1] + (y as f32 + 0.5) / ppc];
+            let mut f = dark[k];
+            if !ray.is_empty() {
+                let (u, v) = ((p[0] - g0[0]) * NEAR_RES - 0.5, (p[1] - g0[1]) * NEAR_RES - 0.5);
+                let (iu, iv) = (u.floor().clamp(0.0, (gw - 1) as f32) as usize, v.floor().clamp(0.0, (gh - 1) as f32) as usize);
+                let (iu1, iv1) = ((iu + 1).min(gw - 1), (iv + 1).min(gh - 1));
+                let (tu, tv) = ((u - iu as f32).clamp(0.0, 1.0), (v - iv as f32).clamp(0.0, 1.0));
+                let g = |i: usize, j: usize| ray[j * gw + i];
+                let up = (g(iu, iv) * (1.0 - tu) + g(iu1, iv) * tu) * (1.0 - tv) + (g(iu, iv1) * (1.0 - tu) + g(iu1, iv1) * tu) * tv;
+                if up > z {
+                    f = f.max((1.0 - CAST_SHADE) * ((up - z) / CAST_SOFT).min(1.0));
+                }
+            }
+            for &(c, hc, rad, soft) in &crowns {
+                if hc <= z {
+                    continue;
+                }
+                let s = (hc - z) / SUN_RISE;
+                let q = [c.pos[0] + dir[0] * s, c.pos[1] + dir[1] * s];
+                let e = dist(p, q);
+                if e < rad + soft {
+                    let shade = if c.bare { TREE_BARE } else { TREE_SHADE };
+                    f = f.max(shade * ((rad + soft - e) / (2.0 * soft)).clamp(0.0, 1.0));
+                }
+            }
+            dark[k] = f;
+        }
+    }
 }
 
 /// Высота солнца: клеток высоты на клетку тени (45°).
@@ -360,11 +539,12 @@ struct Relief {
 /// в каждой точке — высота луча, пришедшего от соседней точки к солнцу, минус
 /// спуск на шаг ([`SUN_RISE`]); луч выше крыши — тень. На своём же куске тени нет:
 /// скат уже темнит свет. На землю тень не ложится — картинка только крыша.
-fn cast_shadows(img: &mut image::RgbaImage, r: &Relief, ppc: f32, light: [f32; 2]) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
+/// Возвращает долю затемнения каждой точки картинки `w × h`.
+fn cast_shadows(r: &Relief, w: i32, h: i32, ppc: f32, light: [f32; 2]) -> Vec<f32> {
+    let mut dark = vec![0.0f32; (w.max(0) * h.max(0)) as usize];
     let m = light[0].abs().max(light[1].abs());
     if m < 1e-4 || w < 2 || h < 2 {
-        return;
+        return dark;
     }
     // Шаг к солнцу: по одной оси ровно точка, по другой — доля.
     let step = [light[0] / m, light[1] / m];
@@ -391,11 +571,7 @@ fn cast_shadows(img: &mut image::RgbaImage, r: &Relief, ppc: f32, light: [f32; 2
             let cast = if up > f32::MIN { up - drop } else { f32::MIN };
             let here = r.top[k];
             if here > f32::MIN && cast > here && up_from != r.owner[k] {
-                let dark = ((cast - here) / CAST_SOFT).min(1.0);
-                let p = img.get_pixel_mut(x as u32, y as u32);
-                for c in 0..3 {
-                    p.0[c] = (p.0[c] as f32 * (1.0 - (1.0 - CAST_SHADE) * dark)).round() as u8;
-                }
+                dark[k] = (1.0 - CAST_SHADE) * ((cast - here) / CAST_SOFT).min(1.0);
             }
             if cast > here {
                 (ray[k], from[k]) = (cast, up_from);
@@ -404,6 +580,139 @@ fn cast_shadows(img: &mut image::RgbaImage, r: &Relief, ppc: f32, light: [f32; 2
             }
         }
     }
+    dark
+}
+
+/// Высота солнечного луча над каждой точкой сетки `w × h`: большее из верха в
+/// точке и луча от соседа к солнцу минус спуск на шаг. `drop` — спуск луча на
+/// точку пути; за краем сетки — земля. Луч выше верха точки — точка в тени,
+/// и тем глубже, чем выше луч. Тот же проход, что у теней ярусов
+/// ([`cast_shadows`]), только без хозяев кусков: для теней на земле.
+pub fn sun_rays(top: &[f32], w: usize, h: usize, light: [f32; 2], drop: f32) -> Vec<f32> {
+    let mut ray = top.to_vec();
+    let m = light[0].abs().max(light[1].abs());
+    if m < 1e-4 || w < 2 || h < 2 || top.len() != w * h {
+        return ray;
+    }
+    let step = [light[0] / m, light[1] / m];
+    let fall = step[0].hypot(step[1]) * drop;
+    let (wi, hi) = (w as i32, h as i32);
+    let xs: Vec<i32> = if step[0] < 0.0 { (0..wi).collect() } else { (0..wi).rev().collect() };
+    let ys: Vec<i32> = if step[1] < 0.0 { (0..hi).collect() } else { (0..hi).rev().collect() };
+    for &y in &ys {
+        for &x in &xs {
+            let k = (y * wi + x) as usize;
+            let (ux, uy) = (x as f32 + step[0], y as f32 + step[1]);
+            let (fx, fy) = (ux.floor(), uy.floor());
+            let (tx, ty) = (ux - fx, uy - fy);
+            let at = |xx: i32, yy: i32| if xx < 0 || yy < 0 || xx >= wi || yy >= hi { 0.0 } else { ray[(yy * wi + xx) as usize] };
+            let up = if tx.abs() < 1e-6 { at(fx as i32, fy as i32) * (1.0 - ty) + at(fx as i32, fy as i32 + 1) * ty } else { at(fx as i32, fy as i32) * (1.0 - tx) + at(fx as i32 + 1, fy as i32) * tx };
+            ray[k] = ray[k].max(up - fall);
+        }
+    }
+    ray
+}
+
+/// Тень кроны: доля чёрного (листва пропускает свет); у голого дерева — ветки.
+const TREE_SHADE: f32 = 0.32;
+const TREE_BARE: f32 = 0.12;
+/// Середина кроны над землёй — в поперечниках кроны: дерево в 10 м с кроной в 6.
+const TREE_HEIGHT: f32 = 1.0;
+
+/// Тени крон на земле (маска карты, темнота 0..255): тень кроны — круг чуть
+/// меньше кроны, сдвинутый от солнца на высоту её середины ([`TREE_HEIGHT`],
+/// солнце — [`SUN_RISE`], как у домов), и от дерева к ней — тень ствола.
+/// Под крышами (своими и OSM) тени нет: пол там под крышей, а дерево у стены
+/// клало тень в комнату. Где уже лежит нарисованная тень (дома, кисть), крона
+/// темнит лишь до своей силы, а не поверх: тень в тени не гуще.
+pub fn tree_shade(m: &map::Map) -> Option<crate::mask::Mask> {
+    let sh = &m.shadows;
+    if !sh.on {
+        return None;
+    }
+    let res = crate::mask::RES as f32;
+    let (w, h) = (m.rooms.w, m.rooms.h);
+    let light = sh.light();
+    let dir = [-light[0], -light[1]];
+    let mut acc = vec![0f32; w * h];
+    let mut any = false;
+    // Кисть по точкам маски в рамке [lo, hi] клеток: сила в точке — max.
+    let mut paint = |lo: [f32; 2], hi: [f32; 2], f: &dyn Fn([f32; 2]) -> f32| {
+        let span = |a: f32, b: f32, n: usize| (((a * res - 0.5).floor().max(0.0)) as usize, ((b * res + 0.5).ceil().max(0.0) as usize).min(n));
+        let ((i0, i1), (j0, j1)) = (span(lo[0], hi[0], w), span(lo[1], hi[1], h));
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let v = f([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res]);
+                if v > acc[j * w + i] {
+                    acc[j * w + i] = v;
+                    any = true;
+                }
+            }
+        }
+    };
+    for p in m.props.iter().filter(|p| p.is_canopy() && p.casts_shadow()) {
+        let d = p.size[0].max(p.size[1]) * p.scale;
+        if d <= 0.0 {
+            continue;
+        }
+        let dark = if map::is_bare_tree(&p.asset) { TREE_BARE } else { TREE_SHADE };
+        let reach = d * TREE_HEIGHT / SUN_RISE;
+        let c = [p.pos[0] + dir[0] * reach, p.pos[1] + dir[1] * reach];
+        let (r, soft) = (d * 0.42, d * 0.16);
+        let o = r + soft;
+        paint([c[0] - o, c[1] - o], [c[0] + o, c[1] + o], &|q| dark * ((o - dist(q, c)) / (2.0 * soft)).clamp(0.0, 1.0));
+        // Ствол: полоска от дерева до тени кроны, к кроне тает в неё.
+        let half = (d * 0.04).max(0.08);
+        let (a, b) = (p.pos, [c[0] - dir[0] * r * 0.5, c[1] - dir[1] * r * 0.5]);
+        let (lo, hi) = ([a[0].min(b[0]) - half - 0.3, a[1].min(b[1]) - half - 0.3], [a[0].max(b[0]) + half + 0.3, a[1].max(b[1]) + half + 0.3]);
+        paint(lo, hi, &|q| {
+            let (ab, aq) = ([b[0] - a[0], b[1] - a[1]], [q[0] - a[0], q[1] - a[1]]);
+            let t = ((ab[0] * aq[0] + ab[1] * aq[1]) / (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6)).clamp(0.0, 1.0);
+            let e = dist(q, [a[0] + ab[0] * t, a[1] + ab[1] * t]);
+            dark * 1.2 * ((half + 0.06 - e) / 0.12).clamp(0.0, 1.0)
+        });
+    }
+    if !any {
+        return None;
+    }
+    // Под крышами — ни тени: прямоугольные крыши и крыши OSM по контуру дома.
+    let mut roofed = vec![false; w * h];
+    let mut cover = |lo: [f32; 2], hi: [f32; 2], inside: &dyn Fn([f32; 2]) -> bool| {
+        let span = |a: f32, b: f32, n: usize| ((a * res).floor().max(0.0) as usize, ((b * res).ceil().max(0.0) as usize).min(n));
+        let ((i0, i1), (j0, j1)) = (span(lo[0], hi[0], w), span(lo[1], hi[1], h));
+        for j in j0..j1 {
+            for i in i0..i1 {
+                if acc[j * w + i] > 0.0 && inside([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res]) {
+                    roofed[j * w + i] = true;
+                }
+            }
+        }
+    };
+    for r in &m.roofs {
+        let (lo, hi) = ([r.a[0].min(r.b[0]), r.a[1].min(r.b[1])], [r.a[0].max(r.b[0]), r.a[1].max(r.b[1])]);
+        cover(lo, hi, &|q| r.contains(q));
+    }
+    for r in &m.outline_roofs {
+        let Some(base) = r.pieces.first() else { continue };
+        let (lo, hi) = r.bounds();
+        cover(lo, hi, &|q| inside_rings(&base.rings, q));
+    }
+    let data = acc
+        .iter()
+        .zip(&roofed)
+        .enumerate()
+        .map(|(k, (&t, &under))| {
+            if under || t <= 0.0 {
+                return 0;
+            }
+            let s = m.shade.as_ref().map_or(0.0, |s| s.data.get(k).copied().unwrap_or(0) as f32 / 255.0);
+            let t = t.min(0.95);
+            // Итог как max(тень, крона): поверх нарисованной — лишь недостающее.
+            let add = if t <= s { 0.0 } else { (t - s) / (1.0 - s) };
+            (add * 255.0).round() as u8
+        })
+        .collect();
+    Some(crate::mask::Mask { w, h, data })
 }
 
 /// Стороны колец по порядку, без нулевых.
@@ -837,6 +1146,68 @@ mod tests {
     }
 
     #[test]
+    fn taller_neighbours_and_crowns_shade_the_roof() {
+        let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
+        let tex = |_: &str| Some(&grey);
+        let sq = |a: f32, b: f32| vec![vec![[a, a], [b, a], [b, b], [a, b]]];
+        let roof = OutlineRoof { pieces: vec![RoofPiece { rings: sq(0.0, 6.0), form: RoofForm::Flat, paint: "grey".into(), height: 2.0, eaves: 2.0, down: None, across: false }] };
+        let light = [-0.6, -0.8];
+        let draw = |near: &Near| render_outline(&roof, &tex, 10.0, light, ([-10.0, -10.0], [50.0, 50.0]), near);
+        let (plain, o) = draw(&Near::default());
+        let luma = |img: &image::RgbaImage, x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0[0];
+        let tall = Near { houses: vec![(sq(-6.0, -1.0), 10.0)], crowns: Vec::new() };
+        let (img, _) = draw(&tall);
+        assert!(luma(&img, 0.5, 0.5) < luma(&plain, 0.5, 0.5) - 30, "высокий сосед не затенил угол");
+        assert_eq!(luma(&img, 5.5, 5.5), luma(&plain, 5.5, 5.5), "тень соседа дальше его высоты");
+        let low = Near { houses: vec![(sq(-6.0, -1.0), 1.5)], crowns: Vec::new() };
+        assert_eq!(draw(&low).0, plain, "сосед ниже крыши её затенил");
+        let tree = Near { houses: Vec::new(), crowns: vec![Crown { pos: [-3.0, 1.0], d: 6.0, bare: false }] };
+        let (img, _) = draw(&tree);
+        assert!(luma(&img, 1.0, 4.2) < luma(&plain, 1.0, 4.2) - 20, "крона не затенила крышу");
+        let bush = Near { houses: Vec::new(), crowns: vec![Crown { pos: [-3.0, 1.0], d: 1.5, bare: false }] };
+        assert_eq!(draw(&bush).0, plain, "низкая крона легла на крышу");
+    }
+
+    #[test]
+    fn tree_shadow_lies_beside_the_crown_and_not_under_roofs() {
+        let mut m = map::Map::new(30, 30);
+        let tree = |pos: [f32; 2]| map::Prop { asset: crate::library::TREE.into(), pos, size: [4.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        m.props.push(tree([6.0, 6.0]));
+        m.props.push(tree([18.0, 6.0]));
+        // Дом с плоской крышей там, куда легла бы тень второго дерева.
+        let wall = vec![vec![[19.0, 7.0], [26.0, 7.0], [26.0, 14.0], [19.0, 14.0]]];
+        m.outline_roofs.push(OutlineRoof { pieces: vec![RoofPiece { rings: wall, form: RoofForm::Flat, paint: "grey".into(), height: 3.0, eaves: 3.0, down: None, across: false }] });
+        let s = tree_shade(&m).expect("тени крон нет");
+        let res = crate::mask::RES as f32;
+        let at = |x: f32, y: f32| s.data[(y * res) as usize * s.w + (x * res) as usize];
+        let dir = { let l = m.shadows.light(); [-l[0], -l[1]] };
+        let c = [6.0 + dir[0] * 4.0, 6.0 + dir[1] * 4.0];
+        assert!(at(c[0], c[1]) as f32 >= TREE_SHADE * 255.0 - 2.0, "тень кроны не там: {}", at(c[0], c[1]));
+        assert_eq!(at(6.0 - dir[0] * 3.0, 6.0 - dir[1] * 3.0), 0, "тень к солнцу");
+        assert_eq!(at(18.0 + dir[0] * 4.0, 6.0 + dir[1] * 4.0), 0, "тень под крышей");
+        // Нарисованная тень гуще кроны — крона её не темнит.
+        let mut shaded = m.clone();
+        shaded.shade = Some(crate::mask::Mask { data: vec![200; m.rooms.data.len()], ..m.rooms.clone() });
+        assert_eq!(tree_shade(&shaded).map_or(0, |s| s.data.iter().copied().max().unwrap_or(0)), 0);
+        m.shadows.on = false;
+        assert!(tree_shade(&m).is_none());
+    }
+
+    #[test]
+    fn sun_rays_fall_off_the_tower_by_its_height() {
+        // Столб высотой 4 точки в (2, 2), свет слева сверху по диагонали: луч
+        // спускается на √2 за шаг и гаснет к третьему шагу.
+        let (w, h) = (10, 10);
+        let mut top = vec![0.0; w * h];
+        top[2 * w + 2] = 4.0;
+        let ray = sun_rays(&top, w, h, [-0.6, -0.6], 1.0);
+        assert!((ray[3 * w + 3] - (4.0 - 2f32.sqrt())).abs() < 1e-4);
+        assert!(ray[5 * w + 5] <= 0.0 && ray[4 * w + 4] > 0.0, "луч дошёл не туда");
+        assert_eq!(ray[w + 1], 0.0, "со стороны солнца тени нет");
+        assert_eq!(ray[2 * w + 2], 4.0);
+    }
+
+    #[test]
     fn outline_for_foundry_marks_the_yard_as_a_hole() {
         let rings = outline(&yard_house(RoofForm::Flat));
         assert_eq!(rings.iter().map(|r| r.1).collect::<Vec<_>>(), [false, true]);
@@ -851,7 +1222,7 @@ mod tests {
     fn outline_roof_slopes_to_every_side_and_leaves_the_yard_open() {
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let tex = |_: &str| Some(&grey);
-        let (img, origin) = render_outline(&yard_house(RoofForm::Pitched), &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, origin) = render_outline(&yard_house(RoofForm::Pitched), &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - origin[0]) * 10.0) as u32, ((y - origin[1]) * 10.0) as u32).0;
         assert_eq!(at(4.0, 4.0)[3], 0, "двор закрыт");
         assert_eq!(at(1.5, 4.0)[3], 255, "скат дырявый");
@@ -873,7 +1244,7 @@ mod tests {
         let light = [0.0, -1.0];
         let shade = |down: [f32; 2]| {
             let roof = OutlineRoof { pieces: vec![slab([0.0, 0.0], [6.0, 6.0], RoofForm::Shed, 5.0, 2.0, Some(down))] };
-            let (img, o) = render_outline(&roof, &tex, 10.0, light, ([-5.0, -5.0], [50.0, 50.0]));
+            let (img, o) = render_outline(&roof, &tex, 10.0, light, ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
             let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0[0];
             // Одна плоскость: у краёв и посередине — одного света, гребня нет.
             assert_eq!(at(1.0, 1.0), at(5.0, 5.0));
@@ -888,7 +1259,7 @@ mod tests {
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let tex = |_: &str| Some(&grey);
         let roof = OutlineRoof { pieces: vec![slab([0.0, 0.0], [10.0, 4.0], RoofForm::Gabled, 8.0, 5.0, None)] };
-        let (img, o) = render_outline(&roof, &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, o) = render_outline(&roof, &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0[0];
         assert_ne!(at(5.0, 1.0), at(5.0, 3.0), "скаты одного света");
         // Торец — щипец: у западного края тот же северный скат, а не вальма.
@@ -905,7 +1276,7 @@ mod tests {
             [5.0 + 4.0 * a.cos(), 5.0 + 4.0 * a.sin()]
         }).collect();
         let roof = OutlineRoof { pieces: vec![RoofPiece { rings: vec![ring], form: RoofForm::Dome, paint: "grey".into(), height: 30.0, eaves: 26.0, down: None, across: false }] };
-        let (img, o) = render_outline(&roof, &tex, 20.0, [0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, o) = render_outline(&roof, &tex, 20.0, [0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0[0] as i32;
         // Свет с северо-востока: северный бок светлее южного, а по обе стороны
         // от линии к северному узлу (у шатра там ребро) скачка нет.
@@ -922,7 +1293,7 @@ mod tests {
             pieces: vec![slab([0.0, 0.0], [10.0, 10.0], RoofForm::Flat, 1.0, 1.0, None), slab([3.0, 3.0], [7.0, 7.0], RoofForm::Flat, 3.0, 3.0, None)],
         };
         // Солнце с северо-запада: тень ложится на юго-восток от верхней ступени.
-        let (img, o) = render_outline(&roof, &tex, 10.0, [-0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, o) = render_outline(&roof, &tex, 10.0, [-0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0[0];
         let (lit, shade) = (at(1.5, 5.0), at(5.5, 8.0));
         assert!(shade < lit - 30, "у ступени нет тени: {shade} против {lit}");
@@ -947,7 +1318,7 @@ mod tests {
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let paint = |_: &str| Some(&grey);
         let piece = RoofPiece { rings: vec![ring], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
-        let (img, o) = render_outline(&OutlineRoof { pieces: vec![piece] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, o) = render_outline(&OutlineRoof { pieces: vec![piece] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let alpha = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0[3];
         assert_eq!(alpha(2.0, 4.3), 255, "край крыши срезал уступ");
         assert_eq!(alpha(7.0, 4.3), 0, "крыша за стеной");
@@ -976,7 +1347,7 @@ mod tests {
         let tex = image::RgbaImage::from_fn(16, 1024, |_, y| if y >= 960 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([160, 160, 160, 255]) });
         let paint = |_: &str| Some(&tex);
         let l = RoofPiece { rings: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 4.0], [4.0, 4.0], [4.0, 10.0], [0.0, 10.0]]], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
-        let (img, o) = render_outline(&OutlineRoof { pieces: vec![l] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, o) = render_outline(&OutlineRoof { pieces: vec![l] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0;
         for (x, y) in [(2.5, 3.95), (1.5, 3.95), (3.95, 2.5), (3.95, 1.5)] {
             assert!(at(x, y)[1] > 0, "свес тянется за угол в ({x}, {y}): {:?}", at(x, y));
@@ -1006,7 +1377,7 @@ mod tests {
                     slab([5.0, 0.0], [10.0, 6.0], RoofForm::Shed, 23.0, second_eaves, Some([-1.0, 0.0])),
                 ],
             };
-            let (img, o) = render_outline(&roof, &tex, 10.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]));
+            let (img, o) = render_outline(&roof, &tex, 10.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
             let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 10.0) as u32, ((y - o[1]) * 10.0) as u32).0;
             (at(5.05, 3.0), at(6.5, 3.0))
         };
@@ -1021,11 +1392,11 @@ mod tests {
     fn flat_outline_roof_has_a_parapet_and_stays_in_the_map() {
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let tex = |_: &str| Some(&grey);
-        let (img, origin) = render_outline(&yard_house(RoofForm::Flat), &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]));
+        let (img, origin) = render_outline(&yard_house(RoofForm::Flat), &tex, 10.0, [0.6, 0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - origin[0]) * 10.0) as u32, ((y - origin[1]) * 10.0) as u32).0;
         assert!(at(0.15, 4.0)[0] > at(1.5, 4.0)[0], "парапета нет");
         // Дом за краем карты — картинка только до края.
-        let (cut, o) = render_outline(&yard_house(RoofForm::Flat), &tex, 10.0, [0.6, 0.8], ([0.0, 0.0], [4.0, 4.0]));
+        let (cut, o) = render_outline(&yard_house(RoofForm::Flat), &tex, 10.0, [0.6, 0.8], ([0.0, 0.0], [4.0, 4.0]), &Near::default());
         assert!(o[0] >= 0.0 && cut.width() <= 41 && cut.height() <= 41, "{o:?} {}×{}", cut.width(), cut.height());
     }
 

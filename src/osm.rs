@@ -1769,6 +1769,107 @@ fn part_height(t: &Tags) -> f32 {
     num("height").or_else(|| num("building:levels").map(|l| l * 3.0)).unwrap_or(0.0)
 }
 
+/// Насколько темна тень дома на земле: доля чёрного.
+const HOUSE_SHADE: f32 = 0.42;
+/// На сколько клеток высоты луча над землёй тень тает к концу.
+const HOUSE_SHADE_SOFT: f32 = 0.6;
+/// Тень дальше этого не считается, клеток: башня в 100 м легла бы на полкарты.
+const HOUSE_SHADE_REACH: f32 = 40.0;
+
+/// Тело, что бросает тень: кольца в клетках, высота в клетках, навес ли.
+type Solid<'a> = (&'a [Vec<[f32; 2]>], f32, bool);
+
+/// Тени домов на земле — в нарисованную тень карты ([`Map::shade`]): Мастер
+/// сотрёт лишнее той же кистью. Солнце — то же, что у теней стен и ярусов крыш:
+/// с той стороны, что [`crate::map::Shadows::light`], на высоте
+/// [`crate::roofs::SUN_RISE`]; длина тени — по высоте дома и его частей (нет
+/// высоты — 6 м, как у крыши). Дома за краем карты тоже бросают тень на неё.
+/// В доме тени нет — там пол под крышей, а под навесом — тень целиком.
+fn house_shadows(m: &mut Map, areas: &[Area], cell_m: f32) {
+    if !m.shadows.on || cell_m <= 0.0 {
+        return;
+    }
+    let solids: Vec<Solid> = areas
+        .iter()
+        .filter_map(|a| {
+            let canopy = get(a.tags, "building") == "roof";
+            let part = !matches!(get(a.tags, "building:part"), "" | "no");
+            if !(canopy || part || building(a.tags).is_some()) {
+                return None;
+            }
+            let h = match part_height(a.tags) {
+                h if h > 0.0 => h,
+                _ if canopy => 4.0,
+                _ => 6.0,
+            };
+            Some((&a.rings[..], h / cell_m, canopy))
+        })
+        .collect();
+    let shade = shadow_mask(&solids, m.rooms.w, m.rooms.h, m.shadows.light());
+    if shade.iter().all(|&v| v == 0) {
+        return;
+    }
+    let template = &m.rooms;
+    let out = m.shade.get_or_insert_with(|| Mask { data: vec![0; template.data.len()], ..template.clone() });
+    for (d, s) in out.data.iter_mut().zip(shade) {
+        *d = (*d).max(s);
+    }
+}
+
+/// Тень тел (кольца в клетках, высота в клетках, навес ли) на маске карты
+/// `w × h` точек: темнота 0..255. Высоты — на сетке с полями за краем карты на
+/// длину самой длинной тени, луч от солнца — [`crate::roofs::sun_rays`].
+fn shadow_mask(solids: &[Solid], w: usize, h: usize, light: [f32; 2]) -> Vec<u8> {
+    let res = mask::RES as f32;
+    let tallest = solids.iter().map(|s| s.1).fold(0.0f32, f32::max);
+    let pad = (tallest / crate::roofs::SUN_RISE).min(HOUSE_SHADE_REACH).ceil() as usize + 1;
+    let (pw, ph) = (w + 2 * pad * mask::RES, h + 2 * pad * mask::RES);
+    let grid = Mask { w: pw, h: ph, data: Vec::new() };
+    let mut top = vec![0.0f32; pw * ph];
+    let mut indoor = vec![false; pw * ph];
+    let mut under = vec![false; pw * ph];
+    for &(rings, height, canopy) in solids {
+        let shifted: Vec<Vec<[f32; 2]>> = rings.iter().map(|r| r.iter().map(|p| [p[0] + pad as f32, p[1] + pad as f32]).collect()).collect();
+        for (i, v) in coverage(&grid, &shifted, 0.0) {
+            if v < 0.5 {
+                continue;
+            }
+            top[i] = top[i].max(height);
+            if canopy {
+                under[i] = true;
+            } else {
+                indoor[i] = true;
+            }
+        }
+    }
+    let ray = crate::roofs::sun_rays(&top, pw, ph, light, crate::roofs::SUN_RISE / res);
+    let o = pad * mask::RES;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let k = (y + o) * pw + x + o;
+            if indoor[k] {
+                continue;
+            }
+            let dark = if under[k] { 1.0 } else { ((ray[k] - top[k]) / HOUSE_SHADE_SOFT).clamp(0.0, 1.0) };
+            out[y * w + x] = (dark * HOUSE_SHADE * 255.0).round() as u8;
+        }
+    }
+    // Край тени — мягче на точку, кроме самих домов.
+    let mut soft = out.clone();
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let k = (y + o) * pw + x + o;
+            if indoor[k] {
+                continue;
+            }
+            let sum: u32 = [-1i32, 0, 1].iter().flat_map(|&dy| [-1i32, 0, 1].map(move |dx| (dx, dy))).map(|(dx, dy)| out[(y as i32 + dy) as usize * w + (x as i32 + dx) as usize] as u32).sum();
+            soft[y * w + x] = (sum / 9) as u8;
+        }
+    }
+    soft
+}
+
 /// Крыша по контуру дома. Основа — весь дом: вид и покрытие из его тегов, нет —
 /// из самой большой части; цвет — со снимка, если ему можно верить
 /// ([`photo_roof`]), иначе из тега. Без тега вида — скатами; башня — шатром,
@@ -3116,6 +3217,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     for (rings, teeth) in &ramparts {
         battlements(&mut m, rings, teeth);
     }
+    house_shadows(&mut m, &areas, cell);
     m.prune();
     // Названия озёр, лесов, пустошей.
     for a in &areas {
@@ -4185,6 +4287,25 @@ mod tests {
         let canopy = m.outline_roofs.iter().find(|r| r.bounds().0[0] < 20.0).expect("навес не там");
         assert_eq!(canopy.pieces[0].form, RoofForm::Flat);
         assert_eq!(m.room_at(23, 10), 0, "под навесом комната");
+    }
+
+    #[test]
+    fn houses_cast_shadows_away_from_the_sun_as_long_as_they_are_tall() {
+        let sq = |x0: f32, y0: f32, s: f32| vec![vec![[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s]]];
+        let (house, beyond, shed) = (sq(5.0, 5.0, 4.0), sq(-6.0, -6.0, 5.0), sq(14.0, 2.0, 3.0));
+        let solids: Vec<Solid> = vec![(&house, 3.0, false), (&beyond, 5.0, false), (&shed, 2.0, true)];
+        let (w, h) = (20 * mask::RES, 20 * mask::RES);
+        let light = crate::map::Shadows::default().light();
+        let out = shadow_mask(&solids, w, h, light);
+        let at = |cx: f32, cy: f32| out[(cy * mask::RES as f32) as usize * w + (cx * mask::RES as f32) as usize];
+        let full = (HOUSE_SHADE * 255.0).round() as u8;
+        assert!(light[0] < 0.0 && light[1] < 0.0, "солнце не слева сверху");
+        assert!(at(10.5, 10.5) > full / 2, "у угла дома тени нет: {}", at(10.5, 10.5));
+        assert_eq!(at(14.0, 14.0), 0, "тень длиннее дома");
+        assert_eq!(at(7.0, 7.0), 0, "тень в доме");
+        assert_eq!(at(4.0, 4.0), 0, "тень со стороны солнца");
+        assert!(at(0.5, 0.5) > full / 2, "дом за краем тени не дал");
+        assert_eq!(at(15.5, 3.5), full, "под навесом не тень");
     }
 
     /// Снимок 100×100 клеток (3 пикселя на клетку): земля тёмная, основание дома

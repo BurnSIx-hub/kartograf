@@ -397,6 +397,8 @@ pub struct App {
     edges_dirty: bool,
     /// Выведенное из рельефа для отрисовки — по отпечатку высот и солнца.
     relief_look: Option<(u64, std::rc::Rc<crate::relief::Look>)>,
+    /// Тени крон на земле ([`roofs::tree_shade`]) — по отпечатку деревьев, крыш и солнца.
+    tree_shade: Option<(u64, Option<std::rc::Rc<Mask>>)>,
     /// Объект, который тащат, и за что взяли.
     moving: Option<(usize, Grip)>,
     pub bending: Option<Bend>,
@@ -593,6 +595,7 @@ impl App {
             edges: Vec::new(),
             edges_dirty: true,
             relief_look: None,
+            tree_shade: None,
             moving: None,
             picked: Vec::new(),
             band_from: None,
@@ -4072,6 +4075,11 @@ impl App {
             self.draw_mask(painter, canvas, &black, &shade, &[], None, view);
             self.map.shade = Some(shade);
         }
+        // Тени крон — там же: на полу, под предметами и стенами.
+        if let Some(trees) = self.tree_shade() {
+            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto };
+            self.draw_mask(painter, canvas, &black, &trees, &[], None, view);
+        }
 
         let exporting = self.export.is_some();
         // Протянутая заливка — рамкой, пока кнопку не отпустили.
@@ -4777,12 +4785,24 @@ impl App {
         let roofs = std::mem::take(&mut self.map.outline_roofs);
         let mut fresh = 0;
         let mut pending = false;
-        for r in &roofs {
+        let casters = roofs::Casters::new(&roofs, &self.map.props);
+        for (idx, r) in roofs.iter().enumerate() {
             let (lo, hi) = r.bounds();
             if hi[0] < view.min.x || hi[1] < view.min.y || lo[0] > view.max.x || lo[1] > view.max.y {
                 continue;
             }
+            // Тень на крышу от высших соседей и крон: сдвинули дерево — крыша новая.
+            let near = casters.near(idx, (lo, hi));
             let mut hs = std::collections::hash_map::DefaultHasher::new();
+            for (rings, z) in &near.houses {
+                z.to_bits().hash(&mut hs);
+                for p in rings.iter().flatten() {
+                    (p[0].to_bits(), p[1].to_bits()).hash(&mut hs);
+                }
+            }
+            for c in &near.crowns {
+                (c.pos[0].to_bits(), c.pos[1].to_bits(), c.d.to_bits(), c.bare).hash(&mut hs);
+            }
             for piece in &r.pieces {
                 for p in piece.rings.iter().flatten() {
                     p[0].to_bits().hash(&mut hs);
@@ -4809,7 +4829,7 @@ impl App {
                 fresh += 1;
                 let span = (hi[0].min(self.map.width as f32) - lo[0].max(0.0)).max(hi[1].min(self.map.height as f32) - lo[1].max(0.0)).max(1.0);
                 let ppc = (2048.0 / span).clamp(4.0, 24.0);
-                let (img, origin) = roofs::render_outline(r, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]));
+                let (img, origin) = roofs::render_outline(r, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]), &near);
                 let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
                 let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                 let handle = painter.ctx().load_texture(format!("outline-roof-{key}"), ci, egui::TextureOptions::LINEAR);
@@ -5151,6 +5171,44 @@ impl App {
     /// гуляет по своему шуму, как берег. Текстура — по сетке, как пол, или вдоль.
     /// Свет, тень и обрывы рельефа; считаются заново, только когда поменялись
     /// высоты или солнце.
+    /// Тени крон: считаются заново, только когда сменились деревья, крыши,
+    /// солнце или нарисованная тень.
+    fn tree_shade(&mut self) -> Option<std::rc::Rc<Mask>> {
+        use std::hash::{Hash, Hasher};
+        let m = &self.map;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (m.rooms.w, m.rooms.h, m.shadows.on, m.shadows.angle.to_bits()).hash(&mut h);
+        for p in m.props.iter().filter(|p| p.is_canopy()) {
+            p.asset.hash(&mut h);
+            (p.shadow, p.canopy).hash(&mut h);
+            for v in [p.pos[0], p.pos[1], p.size[0], p.size[1], p.scale] {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        for r in &m.roofs {
+            for v in [r.a[0], r.a[1], r.b[0], r.b[1]] {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        m.outline_roofs.len().hash(&mut h);
+        for r in &m.outline_roofs {
+            let (lo, hi) = r.bounds();
+            for v in [lo[0], lo[1], hi[0], hi[1]] {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        m.shade.as_ref().map(|s| &s.data).hash(&mut h);
+        let key = h.finish();
+        if let Some((k, trees)) = &self.tree_shade
+            && *k == key
+        {
+            return trees.clone();
+        }
+        let trees = roofs::tree_shade(m).map(std::rc::Rc::new);
+        self.tree_shade = Some((key, trees.clone()));
+        trees
+    }
+
     fn relief_look(&mut self) -> Option<std::rc::Rc<crate::relief::Look>> {
         use std::hash::{Hash, Hasher};
         let r = self.map.relief.as_ref()?;
@@ -5323,7 +5381,8 @@ impl App {
         let props = std::mem::take(&mut self.map.props);
         let shadows = self.map.shadows.clone();
         if shadows.on {
-            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow()) {
+            // Тень кроны — своя, сдвинутая на высоту дерева ([`roofs::tree_shade`]).
+            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow() && !p.is_canopy()) {
                 let c = prop.corners();
                 let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
                 if bounds.intersects(view) {
@@ -5716,7 +5775,8 @@ impl App {
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), ..Default::default() });
             }
             // Крыши по контуру (из OSM) — тоже по одной, в масштабе сцены: их сотни.
-            for r in &map.outline_roofs {
+            let casters = roofs::Casters::new(&map.outline_roofs, &map.props);
+            for (idx, r) in map.outline_roofs.iter().enumerate() {
                 for piece in &r.pieces {
                     if !outline_covers.contains_key(&piece.paint) {
                         let bytes = self.textures.bytes(&piece.paint)?;
@@ -5724,7 +5784,8 @@ impl App {
                     }
                 }
                 let ppc = e.px as f32;
-                let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]));
+                let near = casters.near(idx, r.bounds());
+                let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
                 if img.width() <= 1 {
                     continue;
                 }
