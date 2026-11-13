@@ -30,6 +30,69 @@ pub fn parapet_sides(lo: [f32; 2], hi: [f32; 2], w: f32) -> Vec<([[f32; 2]; 4], 
     ]
 }
 
+/// Разрывы перил: где к краю плоской крыши `lo`..`hi` подходит трап или
+/// лестница (`climbs` — их видимые рамки в клетках). Разрыв — на ширину трапа,
+/// поперёк — на полосу перил с тенью.
+pub fn rail_gaps(lo: [f32; 2], hi: [f32; 2], climbs: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    const NEAR: f32 = 0.15;
+    let band = PARAPET + PARAPET_SHADOW + 0.02;
+    let meets = |a0: f32, a1: f32, from: f32, to: f32| a0 <= to && a1 >= from;
+    let mut out = Vec::new();
+    for b in climbs {
+        let over_x = b[0] < hi[0] && b[2] > lo[0];
+        let over_y = b[1] < hi[1] && b[3] > lo[1];
+        let (x0, x1, y0, y1) = (b[0].max(lo[0]), b[2].min(hi[0]), b[1].max(lo[1]), b[3].min(hi[1]));
+        if over_x && meets(b[1], b[3], lo[1] - NEAR, lo[1] + band) {
+            out.push([x0, lo[1] - 0.01, x1, lo[1] + band]);
+        }
+        if over_x && meets(b[1], b[3], hi[1] - band, hi[1] + NEAR) {
+            out.push([x0, hi[1] - band, x1, hi[1] + 0.01]);
+        }
+        if over_y && meets(b[0], b[2], lo[0] - NEAR, lo[0] + band) {
+            out.push([lo[0] - 0.01, y0, lo[0] + band, y1]);
+        }
+        if over_y && meets(b[0], b[2], hi[0] - band, hi[0] + NEAR) {
+            out.push([hi[0] - band, y0, hi[0] + 0.01, y1]);
+        }
+    }
+    out
+}
+
+/// Стороны парапета ([`parapet_sides`]) с разрывами `gaps`: у разрыва срез
+/// прямой, косой остаётся только в углу.
+pub fn rail_pieces(lo: [f32; 2], hi: [f32; 2], w: f32, gaps: &[[f32; 4]]) -> Vec<([[f32; 2]; 4], [f32; 2], [f32; 2], [f32; 2])> {
+    let mut out = Vec::new();
+    for (poly, o, along, down) in parapet_sides(lo, hi, w) {
+        let len = if along[0] != 0.0 { hi[0] - lo[0] } else { hi[1] - lo[1] };
+        let (bl, bh) = poly.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), q| ([l[0].min(q[0]), l[1].min(q[1])], [h[0].max(q[0]), h[1].max(q[1])]));
+        let mut cuts: Vec<(f32, f32)> = gaps
+            .iter()
+            .filter(|g| g[0] < bh[0] && g[2] > bl[0] && g[1] < bh[1] && g[3] > bl[1])
+            .map(|g| if along[0] != 0.0 { (g[0] - o[0], g[2] - o[0]) } else { (g[1] - o[1], g[3] - o[1]) })
+            .collect();
+        cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut spans = Vec::new();
+        let mut t = 0.0f32;
+        for (a, b) in cuts {
+            if a > t {
+                spans.push((t, a.min(len)));
+            }
+            t = t.max(b);
+        }
+        if t < len {
+            spans.push((t, len));
+        }
+        let at = |t: f32, d: f32| [o[0] + along[0] * t + down[0] * d, o[1] + along[1] * t + down[1] * d];
+        let inner = |t: f32| t.clamp(w.min(len / 2.0), (len - w).max(len / 2.0));
+        for (t0, t1) in spans {
+            if t1 - t0 > 1e-3 {
+                out.push(([at(t0, 0.0), at(t1, 0.0), at(inner(t1), w), at(inner(t0), w)], o, along, down));
+            }
+        }
+    }
+    out
+}
+
 /// Картинка крыши: `ppc` точек на клетку. Возвращает картинку и её левый
 /// верхний угол в клетках.
 /// Предмет на крыше: картинка, середина, поворот (по часовой) и размер в клетках.
@@ -76,7 +139,7 @@ pub fn snow_cover(p: [f32; 2], edge: f32) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, light: [f32; 2], parapet: Option<&image::RgbaImage>, fixtures: &[Fixture], snow: bool) -> (image::RgbaImage, [f32; 2]) {
+pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, light: [f32; 2], parapet: Option<&image::RgbaImage>, climbs: &[[f32; 4]], fixtures: &[Fixture], snow: bool) -> (image::RgbaImage, [f32; 2]) {
     let out = roof.outline();
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for p in &out {
@@ -96,6 +159,8 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
     let mut img = image::RgbaImage::new(w.max(1), h.max(1));
     let (planes, lines) = roof.geometry();
     let flat = roof.shape == RoofShape::Flat;
+    // Где к краю подходит трап — в перилах проход.
+    let gaps = if parapet.is_some() { rail_gaps(lo, hi, climbs) } else { Vec::new() };
     let sample_of = |tex: &image::RgbaImage, u: f32, v: f32| -> [f32; 3] {
         let (tw, th) = (tex.width() as f32, tex.height() as f32);
         let (x, y) = ((u * tw).rem_euclid(tw) - 0.5, (v * th).rem_euclid(th) - 0.5);
@@ -162,7 +227,9 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
             }
             // Парапет: полоса по краю, в углах косой срез (горизонтальные поверх),
             // от него на кровлю — тень.
-            if let Some(pt) = parapet.filter(|_| flat) {
+            if let Some(pt) = parapet.filter(|_| flat)
+                && !gaps.iter().any(|g| (g[0]..=g[2]).contains(&p[0]) && (g[1]..=g[3]).contains(&p[1]))
+            {
                 let (dl, dr, dt, db) = (p[0] - lo[0], hi[0] - p[0], p[1] - lo[1], hi[1] - p[1]);
                 let (dh, dv) = (dt.min(db), dl.min(dr));
                 let m = dh.min(dv);
@@ -1495,14 +1562,45 @@ mod tests {
     }
 
     #[test]
+    fn quarterdeck_rail_opens_at_the_ladder() {
+        // Шканцы 12×6 с перилами из досок; трап подходит к переднему краю слева.
+        let mut roof = Roof::new([12.0, 34.0], [24.0, 40.0], RoofShape::Flat, "builtin:roof_wood".into());
+        roof.overhang = 0.0;
+        assert!(roof.parapet().is_none(), "у простой плоской крыши края нет");
+        roof.rail = Some("set:planks".into());
+        assert_eq!(roof.parapet(), Some("set:planks"));
+        assert!(roof.fixtures().is_empty(), "у перил нет стальных сливов");
+        let (lo, hi) = (roof.outline()[0], roof.outline()[2]);
+        let ladder = [13.0, 32.5, 14.0, 34.1];
+        let hatch = [20.1, 31.9, 21.5, 33.3];
+        let gaps = rail_gaps(lo, hi, &[ladder, hatch]);
+        assert_eq!(gaps.len(), 1, "люк в стороне перил не рвёт: {gaps:?}");
+        assert!((gaps[0][0] - 13.0).abs() < 1e-4 && (gaps[0][2] - 14.0).abs() < 1e-4 && gaps[0][1] < 34.0 && gaps[0][3] > 34.0 + PARAPET);
+        // Передняя сторона — два куска: до трапа и после; прочие целые.
+        let pieces = rail_pieces(lo, hi, PARAPET, &gaps);
+        assert_eq!(pieces.len(), 5);
+        let front: Vec<_> = pieces.iter().filter(|p| p.2 == [1.0, 0.0] && p.1[1] == 34.0).collect();
+        assert_eq!(front.len(), 2);
+        assert!((front[0].0[1][0] - 13.0).abs() < 1e-4 && (front[1].0[0][0] - 14.0).abs() < 1e-4);
+        // На картинке посреди разрыва — кровля, у края в стороне от трапа — перила.
+        let mut tex = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 160, 110, 255]));
+        tex.put_pixel(0, 0, image::Rgba([201, 160, 110, 255]));
+        let pt = image::RgbaImage::from_pixel(8, 8, image::Rgba([40, 30, 20, 255]));
+        let (img, origin) = render(&roof, &tex, [1.0, 1.0], 20.0, [0.0, -1.0], Some(&pt), &[ladder], &[], false);
+        let px = |x: f32, y: f32| img.get_pixel(((x - origin[0]) * 20.0) as u32, ((y - origin[1]) * 20.0) as u32).0;
+        assert!(px(13.5, 34.1)[0] > 150, "в разрыве — кровля");
+        assert!(px(16.0, 34.1)[0] < 60, "рядом — перила");
+    }
+
+    #[test]
     fn flat_cyber_roof_gets_steel_parapet() {
         let load = |rel: &str| image::load_from_memory(crate::sets::SET_FILES.iter().find(|f| f.0 == rel).unwrap().1).unwrap().to_rgba8();
         let (tex, pt) = (load("cyberpunk/roofs/Roof_Flat_Membrane_A.webp"), load("cyberpunk/walls/Roof_Parapet_Steel_A.webp"));
         let roof = Roof { overhang: 0.0, ..Roof::new([0.0, 0.0], [6.0, 4.0], RoofShape::Flat, "set:cyberpunk/roofs/Roof_Flat_Membrane_A.webp".into()) };
         assert!(roof.parapet().is_some());
         let tile = tile_cells([tex.width(), tex.height()]);
-        let (img, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &[], false);
-        let (plain, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &[], false);
+        let (img, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &[], &[], false);
+        let (plain, _) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &[], &[], false);
         // По краю — отлив, а не мембрана; посередине — та же кровля.
         assert_ne!(img.get_pixel(150, 8).0, plain.get_pixel(150, 8).0);
         assert_eq!(img.get_pixel(192, 128).0, plain.get_pixel(192, 128).0);
@@ -1515,12 +1613,12 @@ mod tests {
         // Предмет 2×2 (дымоход) закрашивает свои две клетки, а не одну.
         let red = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
         let big: [Fixture; 1] = [(&red, [3.0, 2.0], 0.0, [2.0, 2.0])];
-        let (with, o2) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &big, false);
+        let (with, o2) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &[], &big, false);
         let px = |p: [f32; 2]| with.get_pixel(((p[0] - o2[0]) * 64.0) as u32, ((p[1] - o2[1]) * 64.0) as u32).0;
         assert_eq!(px([3.9, 2.9]), [255, 0, 0, 255]);
         assert_eq!(px([2.1, 1.1]), [255, 0, 0, 255]);
         assert_ne!(px([4.2, 2.0]), [255, 0, 0, 255]);
-        let (full, origin) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &items, false);
+        let (full, origin) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &[], &items, false);
         assert!(origin[1] < 0.0 && full.height() > img.height());
         if let Ok(out) = std::env::var("KARTOGRAF_PARAPET_PNG") {
             full.save(out).unwrap();
@@ -1541,7 +1639,7 @@ mod tests {
         let tex = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 100, 80, 255]));
         let roof = Roof { overhang: 0.0, ..Roof::new([0.0, 0.0], [4.0, 2.0], RoofShape::Gable, String::new()) };
         // Свет сверху: северный скат светлее южного.
-        let (img, origin) = render(&roof, &tex, [1.0, 1.0], 50.0, [0.0, -1.0], None, &[], false);
+        let (img, origin) = render(&roof, &tex, [1.0, 1.0], 50.0, [0.0, -1.0], None, &[], &[], false);
         assert_eq!(origin, [0.0, 0.0]);
         assert!(img.width() >= 200 && img.height() >= 100);
         let (n, s) = (img.get_pixel(100, 20).0, img.get_pixel(100, 80).0);

@@ -292,7 +292,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, r)| inside(area, [(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0]))
                 .take(limit)
-                .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "name": library::label(&r.paint)}))
+                .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "name": library::label(&r.paint), "rail": r.rail}))
                 .collect();
             out.insert("roofs".into(), json!(list));
             if !m.outline_roofs.is_empty() {
@@ -592,8 +592,13 @@ impl App {
         }
         let paint = self.asset_key(a["paint"].as_str().unwrap_or("builtin:roof_metal"))?;
         let shape = roof_shape(a["shape"].as_str().unwrap_or("gable"))?;
+        let rail = match a["rail"].as_str() {
+            None | Some("") => None,
+            Some(k) => Some(self.asset_key(k)?),
+        };
         self.checkpoint();
         let mut roof = map::Roof::new([r[0], r[1]], [r[2], r[3]], shape, paint);
+        roof.rail = rail;
         if let Some(t) = a["turn"].as_u64() {
             roof.turn = (t % 4) as u8;
         }
@@ -617,8 +622,16 @@ impl App {
             None => None,
             Some(s) => Some(roof_shape(s)?),
         };
+        let rail = match a["rail"].as_str() {
+            None => None,
+            Some("") => Some(None),
+            Some(k) => Some(Some(self.asset_key(k)?)),
+        };
         self.checkpoint();
         let r = &mut self.map.roofs[i];
+        if let Some(v) = rail {
+            r.rail = v;
+        }
         if let Some(p) = paint {
             r.paint = p;
         }
@@ -628,7 +641,7 @@ impl App {
         if let Some(t) = a["turn"].as_u64() {
             r.turn = (t % 4) as u8;
         }
-        Ok(json!({"index": i, "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "turn": r.turn}))
+        Ok(json!({"index": i, "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "turn": r.turn, "rail": r.rail}))
     }
 
     fn tool_add_path(&mut self, a: &Value) -> Res {

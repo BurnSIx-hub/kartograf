@@ -249,9 +249,11 @@ impl App {
         let mut roof_count = 0;
         let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut seen = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let light = map.shadows.light();
+            let climbs = super::draw_ground::climb_rects(&map.props, &self.textures.sources, &mut seen);
             let mut tiles = Vec::new();
             for r in &map.roofs {
                 if !covers.contains_key(&r.paint) {
@@ -283,7 +285,7 @@ impl App {
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
                 let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &items, map.weather == "snow");
+                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &climbs, &items, map.weather == "snow");
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
@@ -435,6 +437,9 @@ impl App {
             .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
         let mut scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
+        // Пути картинок — с меткой содержимого: Foundry не покажет прежнюю под тем же именем.
+        let tags: std::collections::HashMap<String, String> = files.iter().map(|(p, b)| (export::foundry_src(p), export::content_tag(b))).collect();
+        export::tag_sources(&mut scene, &tags);
         // Сцена открывается на том этаже, что открыт в редакторе: у корабля — палуба, а не трюм.
         if n > 1 {
             scene["initialLevel"] = serde_json::json!(export::level_id(self.level));

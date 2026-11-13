@@ -558,6 +558,29 @@ pub fn passage_by_name(key: &str) -> bool {
         && !["shade", "overlay", "railing", "fallen", "aframe", "bed_ladder", "broken"].iter().any(|w| k.contains(w))
 }
 
+/// Лестница или трап, по которым поднимаются: у края плоской крыши они
+/// размыкают перила. Люк — не подъём: он в полу.
+pub fn climb_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    passage_by_name(key) && !["hatch", "trapdoor", "люк"].iter().any(|w| k.contains(w))
+}
+
+/// Рамка предмета на карте в клетках с поворотом: по видимой части картинки
+/// (`visible` — доли холста от середины, см. `library::visible_box`) или по всему холсту.
+pub fn prop_rect(p: &Prop, visible: Option<[f32; 4]>) -> [f32; 4] {
+    let v = visible.unwrap_or([-0.5, -0.5, 0.5, 0.5]);
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let (s, c) = p.rot.to_radians().sin_cos();
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for (u, t) in [(v[0], v[1]), (v[2], v[1]), (v[2], v[3]), (v[0], v[3])] {
+        let (x, y) = (u * w, t * h);
+        let q = [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
+        lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+        hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+    }
+    [lo[0], lo[1], hi[0], hi[1]]
+}
+
 /// Гамак: в Foundry «Wild Canvas» качает его, как качка судна, — крюки стоят, полотно ходит.
 pub fn swing_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
@@ -825,6 +848,9 @@ impl OutlineRoof {
     }
 }
 
+/// Стальной отлив по краю плоской крыши «Киберпанка».
+pub const CYBER_PARAPET: &str = "set:cyberpunk/walls/Roof_Parapet_Steel_A.webp";
+
 /// Крыша над прямоугольником клеток.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Roof {
@@ -839,6 +865,10 @@ pub struct Roof {
     pub turn: u8,
     /// Насколько крыша выходит за стены, в клетках.
     pub overhang: f32,
+    /// Перила по краю плоской крыши — картинка стены (шканцы корабля, балкон).
+    /// Нет — у покрытия «Киберпанка» стальной отлив, у прочих края нет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail: Option<String>,
 }
 
 /// Скат крыши: выпуклый многоугольник и как на нём лежит покрытие —
@@ -881,7 +911,7 @@ pub fn convex_depth(poly: &[[f32; 2]], p: [f32; 2]) -> f32 {
 impl Roof {
     pub fn new(a: [f32; 2], b: [f32; 2], shape: RoofShape, paint: String) -> Self {
         let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
-        Self { a: lo, b: hi, shape, paint, turn: 0, overhang: 0.25 }
+        Self { a: lo, b: hi, shape, paint, turn: 0, overhang: 0.25, rail: None }
     }
 
     /// Прямоугольник со свесом.
@@ -918,10 +948,16 @@ impl Roof {
         convex_depth(&self.outline(), p) >= 0.0
     }
 
-    /// Парапет по краю: у плоской крыши с покрытием из набора «Киберпанк» —
-    /// стальной отлив (полоса 2 × 0,25 клетки).
-    pub fn parapet(&self) -> Option<&'static str> {
-        (self.shape == RoofShape::Flat && crate::library::set_of(&self.paint) == Some("cyberpunk")).then_some("set:cyberpunk/walls/Roof_Parapet_Steel_A.webp")
+    /// Парапет по краю плоской крыши: свои перила (`rail`), иначе у покрытия из
+    /// набора «Киберпанк» — стальной отлив (полоса 2 × 0,25 клетки).
+    pub fn parapet(&self) -> Option<&str> {
+        if self.shape != RoofShape::Flat {
+            return None;
+        }
+        match &self.rail {
+            Some(k) => Some(k.as_str()),
+            None => (crate::library::set_of(&self.paint) == Some("cyberpunk")).then_some(CYBER_PARAPET),
+        }
     }
 
     /// Сливы и воронки крыши с парапетом: картинка, середина, поворот. Слив
@@ -931,7 +967,7 @@ impl Roof {
     pub fn fixtures(&self) -> Vec<(&'static str, [f32; 2], f32)> {
         const SCUPPER: &str = "set:cyberpunk/objects/Roof_Scupper_A_1x1.webp";
         const DRAIN: &str = "set:cyberpunk/objects/Roof_Drain_A_1x1.webp";
-        if self.parapet().is_none() {
+        if self.parapet() != Some(CYBER_PARAPET) {
             return Vec::new();
         }
         let (lo, hi) = self.outer();

@@ -348,10 +348,11 @@ impl App {
         // Парапет плоской крыши: тень на кровлю, потом сам отлив.
         if let Some(pk) = roof.parapet() {
             let (lo, hi) = (roof.outline()[0], roof.outline()[2]);
+            let gaps = roofs::rail_gaps(lo, hi, &climb_rects(&self.map.props, &self.textures.sources, &mut self.visible_boxes));
             let w = roofs::PARAPET;
             let mut shade = egui::Mesh::default();
             let dim = Color32::from_rgba_premultiplied(0, 0, 0, (alpha * (1.0 - roofs::PARAPET_SHADE) * 255.0) as u8);
-            for (poly, ..) in roofs::parapet_sides([lo[0] + w, lo[1] + w], [hi[0] - w, hi[1] - w], roofs::PARAPET_SHADOW) {
+            for (poly, ..) in roofs::rail_pieces([lo[0] + w, lo[1] + w], [hi[0] - w, hi[1] - w], roofs::PARAPET_SHADOW, &gaps) {
                 let base = shade.vertices.len() as u32;
                 for (k, p) in poly.iter().enumerate() {
                     shade.colored_vertex(cam.to_screen(canvas, *p), if k < 2 { dim } else { Color32::TRANSPARENT });
@@ -363,7 +364,7 @@ impl App {
             if let Some((t, _)) = self.textures.get(pk, false) {
                 let mut band = egui::Mesh::with_texture(t.id());
                 let color = tint(1.0);
-                for (poly, o, along, down) in roofs::parapet_sides(lo, hi, w) {
+                for (poly, o, along, down) in roofs::rail_pieces(lo, hi, w, &gaps) {
                     let base = band.vertices.len() as u32;
                     for p in poly {
                         let d = [p[0] - o[0], p[1] - o[1]];
@@ -474,4 +475,17 @@ impl App {
         }
         painter.add(Shape::mesh(mesh));
     }
+}
+
+/// Рамки лестниц и трапов этажа по видимой части картинки (кэш `seen` — по
+/// ассету): у края плоской крыши они размыкают перила.
+pub(super) fn climb_rects(props: &[map::Prop], sources: &library::Sources, seen: &mut std::collections::HashMap<String, Option<[f32; 4]>>) -> Vec<[f32; 4]> {
+    props
+        .iter()
+        .filter(|p| map::climb_by_name(&p.asset))
+        .map(|p| {
+            let v = *seen.entry(p.asset.clone()).or_insert_with(|| library::visible_box(sources, &p.asset));
+            map::prop_rect(p, v)
+        })
+        .collect()
 }

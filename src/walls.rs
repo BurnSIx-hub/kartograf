@@ -420,9 +420,9 @@ pub(super) fn town_wall(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<Str
     for t in towers.iter().filter(|t| !t.open) {
         let shape = if t.round { RoofShape::Tent } else { RoofShape::Hip };
         let r = t.rect(wy);
-        m.roofs.push(Roof { a: [r.x as f32, r.y as f32], b: [(r.x + r.w) as f32, (r.y + r.h) as f32], shape, paint: rk.clone(), turn: 0, overhang: 0.3 });
+        m.roofs.push(Roof { a: [r.x as f32, r.y as f32], b: [(r.x + r.w) as f32, (r.y + r.h) as f32], shape, paint: rk.clone(), turn: 0, overhang: 0.3, rail: None });
     }
-    m.roofs.push(Roof { a: [gate.x as f32, gate.y as f32], b: [(gate.x + gate.w) as f32, (gate.y + gate.h) as f32], shape: RoofShape::Hip, paint: rk.clone(), turn: 0, overhang: 0.3 });
+    m.roofs.push(Roof { a: [gate.x as f32, gate.y as f32], b: [(gate.x + gate.w) as f32, (gate.y + gate.h) as f32], shape: RoofShape::Hip, paint: rk.clone(), turn: 0, overhang: 0.3, rail: None });
 
     // ----- тень стены по высотам -----
     shade_wall(m, wy, &towers, gate, y_in);

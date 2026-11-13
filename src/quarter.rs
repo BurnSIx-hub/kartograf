@@ -780,7 +780,7 @@ fn build_house(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &Plot, st: &str
     let h = plot.house;
     let squareish = h.w.min(h.h) * 5 >= h.w.max(h.h) * 4 && h.w.min(h.h) >= 9;
     let shape = if squareish { RoofShape::Hip } else { RoofShape::Gable };
-    m.roofs.push(Roof { a: [h.x as f32, h.y as f32], b: [(h.x + h.w) as f32, (h.y + h.h) as f32], shape, paint: key(roof), turn: u8::from(h.h > h.w), overhang: 0.3 });
+    m.roofs.push(Roof { a: [h.x as f32, h.y as f32], b: [(h.x + h.w) as f32, (h.y + h.h) as f32], shape, paint: key(roof), turn: u8::from(h.h > h.w), overhang: 0.3, rail: None });
     outer
 }
 
@@ -1257,7 +1257,7 @@ fn outbuilding(m: &mut Map, sp: &mut Spots, rng: &mut Rng, plot: &mut Plot, take
         _ => furnish(m, sp, rng, shed, Role::Storage),
     }
     let roof = pick(rng, &["roof_thatch", "roof_shingle", "roof_shingle"]);
-    m.roofs.push(Roof { a: [shed.x as f32, shed.y as f32], b: [(shed.x + shed.w) as f32, (shed.y + shed.h) as f32], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(shed.h > shed.w), overhang: 0.25 });
+    m.roofs.push(Roof { a: [shed.x as f32, shed.y as f32], b: [(shed.x + shed.w) as f32, (shed.y + shed.h) as f32], shape: RoofShape::Gable, paint: key(roof), turn: u8::from(shed.h > shed.w), overhang: 0.25, rail: None });
     Some((shed, style))
 }
 

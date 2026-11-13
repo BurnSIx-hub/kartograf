@@ -580,7 +580,7 @@ pub(super) fn church(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String
     let rk = key(roof);
     let rect = |r: Room| ([r.x as f32, r.y as f32], [(r.x + r.w) as f32, (r.y + r.h) as f32]);
     let push = |m: &mut Map, (a, b): ([f32; 2], [f32; 2]), shape: RoofShape, turn: u8| {
-        m.roofs.push(Roof { a, b, shape, paint: rk.clone(), turn, overhang: 0.3 });
+        m.roofs.push(Roof { a, b, shape, paint: rk.clone(), turn, overhang: 0.3, rail: None });
     };
     for &(part, r) in &lay.pieces {
         match part {

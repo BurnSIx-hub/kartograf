@@ -313,7 +313,7 @@ pub(super) fn jarl(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>)
         Some(r) => r,
         None => pick(rng, &["roof_thatch", "roof_shingle", "roof_shingle"]),
     };
-    m.roofs.push(Roof { a: [f(bx), f(by)], b: [f(x1), f(y1)], shape: RoofShape::Gable, paint: key(roof), turn: 0, overhang: 0.4 });
+    m.roofs.push(Roof { a: [f(bx), f(by)], b: [f(x1), f(y1)], shape: RoofShape::Gable, paint: key(roof), turn: 0, overhang: 0.4, rail: None });
     7
 }
 

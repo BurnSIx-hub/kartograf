@@ -2427,7 +2427,7 @@ fn interior(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usi
         // Почти квадратный большой зал — шатром на четыре ската, остальное — два ската.
         let squareish = b.w.min(b.h) * 5 >= b.w.max(b.h) * 4 && b.w.min(b.h) >= 8;
         let shape = if squareish { RoofShape::Hip } else { RoofShape::Gable };
-        m.roofs.push(Roof { a: [b.x as f32, b.y as f32], b: [(b.x + b.w) as f32, (b.y + b.h) as f32], shape, paint: roof_key.clone(), turn: u8::from(b.h > b.w), overhang: 0.3 });
+        m.roofs.push(Roof { a: [b.x as f32, b.y as f32], b: [(b.x + b.w) as f32, (b.y + b.h) as f32], shape, paint: roof_key.clone(), turn: u8::from(b.h > b.w), overhang: 0.3, rail: None });
     }
 
     // Перегородки: общие стены соседей, слитые в прямые линии.

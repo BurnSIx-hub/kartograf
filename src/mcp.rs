@@ -63,11 +63,13 @@ fn tools() -> Value {
         tool("add_roof", "Put a roof over a house: the rectangle of its walls in cells. Players see the roof from outside; it fades when they walk in.", json!({
             "area": area, "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"], "description": "Default gable"},
-            "turn": int("Quarter turns of the ridge, 0..3"), "overhang": num("Cells over the walls, default 0.25")
+            "turn": int("Quarter turns of the ridge, 0..3"), "overhang": num("Cells over the walls, default 0.25"),
+            "rail": text("Railing along the edge of a flat roof (a ship's quarterdeck, a balcony): a wall asset key from find_assets (kind wall). It opens where a ladder or stairs object reaches the edge")
         }), &["area"]),
         tool("edit_roof", "Change a roof by index (see describe with roofs): covering picture, shape, ridge direction.", json!({
             "index": int("Roof index"), "paint": text("Roof covering asset key from find_assets (kind roof), e.g. builtin:roof_copper"),
-            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"]}, "turn": int("Quarter turns of the ridge, 0..3")
+            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"]}, "turn": int("Quarter turns of the ridge, 0..3"),
+            "rail": text("Railing along the edge of a flat roof: a wall asset key (kind wall); empty string removes it. It opens where a ladder or stairs object reaches the edge")
         }), &["index"]),
         tool("remove", "Remove items by indices: objects, walls, doors, labels, paths or roofs. Indices of later items shift down.", json!({
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]},

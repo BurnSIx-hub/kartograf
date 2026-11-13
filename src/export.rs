@@ -1063,6 +1063,34 @@ pub fn foundry_src(image: &std::path::Path) -> String {
     image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Метка содержимого файла: 8 знаков хэша его байтов (FNV-1a).
+pub fn content_tag(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (h >> 32) as u32 ^ h as u32)
+}
+
+/// Дописать к путям картинок в сцене `?v=` и метку содержимого: всякая строка,
+/// равная пути из `tags`, — в фоне, тайле, пометке сундука. Файлы выгрузки
+/// названы по порядку (`_предмет_7`): убрали предмет — номера съехали, а Foundry
+/// держит картинки по пути и показал бы под старым именем прежнюю: на месте
+/// парусов — марс. С меткой новая картинка — новый путь; файл на диске тот же.
+pub fn tag_sources(v: &mut Value, tags: &std::collections::HashMap<String, String>) {
+    match v {
+        Value::String(s) => {
+            if let Some(t) = tags.get(s.as_str()) {
+                *s = format!("{s}?v={t}");
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| tag_sources(x, tags)),
+        Value::Object(o) => o.values_mut().for_each(|x| tag_sources(x, tags)),
+        _ => {}
+    }
+}
+
 /// Папка Data Foundry этого компьютера — из его настроек, если он стоит.
 pub fn foundry_data_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
@@ -1137,6 +1165,24 @@ mod tests {
         assert_eq!(r["behaviors"][0]["system"]["difficulties"]["walk"], 2);
         assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
         assert_eq!(r["shapes"][0]["type"], "polygon");
+    }
+
+    #[test]
+    fn changed_picture_gets_new_path() {
+        // Тот же файл `_предмет_1`, другая картинка — другой путь в сцене; та же — тот же.
+        let (sail, nest) = (content_tag(b"sail"), content_tag(b"crows nest"));
+        assert_ne!(sail, nest);
+        assert_eq!(sail, content_tag(b"sail"));
+        assert_eq!(sail.len(), 8);
+        let mut scene = json!({"name": "x", "background": {"src": "k/x_1.webp"}, "tiles": [{"texture": {"src": "k/x_1.webp"}, "flags": {"m": {"chest": ["k/x_2.webp", "k/other.webp"]}}}]});
+        let tags = std::collections::HashMap::from([("k/x_1.webp".to_owned(), sail.clone()), ("k/x_2.webp".to_owned(), nest.clone())]);
+        tag_sources(&mut scene, &tags);
+        let want = format!("k/x_1.webp?v={sail}");
+        assert_eq!(scene["background"]["src"], want.as_str());
+        assert_eq!(scene["tiles"][0]["texture"]["src"], want.as_str());
+        assert_eq!(scene["tiles"][0]["flags"]["m"]["chest"], json!([format!("k/x_2.webp?v={nest}"), "k/other.webp"]));
+        // Foundry пропускает путь с хвостом запроса: `(\.webp)(\?.*)?$`.
+        assert!(want.ends_with(&format!(".webp?v={sail}")));
     }
 
     #[test]

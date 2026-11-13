@@ -512,6 +512,8 @@ pub struct App {
     filter_key: (Kind, String, usize, usize),
     /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
     window_bands: std::collections::HashMap<String, f32>,
+    /// Видимые рамки лестниц и трапов по ассету: размыкают перила у крыши.
+    visible_boxes: std::collections::HashMap<String, Option<[f32; 4]>>,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
     window_glass: std::collections::HashMap<(String, bool), Option<String>>,
     /// Библиотека показывает только то, что уже стоит на карте.
@@ -687,6 +689,7 @@ impl App {
             filtered: Vec::new(),
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
             window_bands: std::collections::HashMap::new(),
+            visible_boxes: std::collections::HashMap::new(),
             window_glass: std::collections::HashMap::new(),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
