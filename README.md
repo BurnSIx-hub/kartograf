@@ -103,3 +103,21 @@ cargo build --release
 | `src/mcp.rs`, `src/control.rs` | сервер MCP и канал к окну |
 | `src/library.rs`, `src/pck.rs` | библиотека ассетов, паки Dungeondraft |
 | `foundry/` | обёртка модуля Foundry |
+
+## Лицензия
+
+Код и встроенные ассеты — [PolyForm Noncommercial 1.0.0](LICENSE). Пользоваться,
+менять и раздавать можно в любых некоммерческих целях: игры, хобби, учёба.
+Продавать программу, её части или переделки и пользоваться ею в коммерческих
+целях нельзя. Кто раздаёт копию, передаёт с ней `LICENSE` (или ссылку на него)
+и строку `Required Notice`.
+
+Чужое:
+
+- Звуки сундука (`foundry/sounds`) собраны из набора
+  [RPG Audio](https://kenney.nl/assets/rpg-audio) Kenney, CC0.
+- Шрифты интерфейса из egui (`epaint_default_fonts`) — OFL-1.1 и Ubuntu Font Licence.
+- Библиотеки Rust — под своими лицензиями (MIT, Apache-2.0 и подобные), список — в `Cargo.lock`.
+- Местность строится по данным [OpenStreetMap](https://www.openstreetmap.org/copyright)
+  (ODbL), снимкам Esri World Imagery и слоям покрова Esri и Copernicus. Карту,
+  сделанную по OSM, при публикации подписывайте «© участники OpenStreetMap».

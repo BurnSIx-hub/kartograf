@@ -1,0 +1,6 @@
+chest-open.mp3, chest-close.mp3
+
+Made from "RPG Audio" by Kenney (https://kenney.nl/assets/rpg-audio):
+open  = doorOpen_1 + creak3 (quiet), low-passed;
+close = doorClose_4 + bookClose, low-passed.
+License: CC0 1.0 (https://creativecommons.org/publicdomain/zero/1.0/).
