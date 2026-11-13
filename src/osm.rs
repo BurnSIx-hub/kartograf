@@ -53,6 +53,10 @@ pub struct Cover {
     /// Сам снимок по той же рамке — сверить покрытие OSM с видом сверху. Есть
     /// только у анализа в программе: у `.cover.png` скриптов снимка рядом нет.
     photo: Option<image::RgbImage>,
+    /// Вода снимка, что кладётся и там, где в OSM её нет ([`photo_water`]), — по
+    /// пикселям снимка. Есть только вне Европы, где снимок сверен с покровом Esri:
+    /// в Амазонии в OSM пусто, и озеро на снимке выходило сушей.
+    wild: Option<Vec<bool>>,
 }
 
 /// Вид участка на снимке: средняя яркость и насыщенность (размах каналов), 0..255.
@@ -138,13 +142,40 @@ impl Cover {
                 Self::COLORS.iter().enumerate().min_by_key(|(_, (c, _))| d(*c)).map_or(0, |(k, _)| k as u8)
             })
             .collect();
-        Ok(Self { w, h, data, crowns: None, photo: None })
+        Ok(Self { w, h, data, crowns: None, photo: None, wild: None })
     }
 
     /// Из классов анализа снимка в программе (`place.rs`): номер класса — место
     /// в `COLORS`, по строкам.
     pub fn from_classes(w: usize, h: usize, data: Vec<u8>, crowns: Vec<Crown>) -> Self {
-        Self { w, h, data, crowns: Some(crowns), photo: None }
+        Self { w, h, data, crowns: Some(crowns), photo: None, wild: None }
+    }
+
+    /// С водой снимка там, где в OSM её нет: маска по пикселям, как `data`.
+    pub fn with_wild_water(mut self, mask: Vec<bool>) -> Self {
+        if mask.len() == self.w * self.h {
+            self.wild = Some(mask);
+        }
+        self
+    }
+
+    /// Доля такой воды в круге — как [`Cover::share`].
+    fn wild_share(&self, u: f32, v: f32, ru: f32, rv: f32) -> f32 {
+        let Some(mask) = &self.wild else { return 0.0 };
+        let (cx, cy) = (u * self.w as f32, v * self.h as f32);
+        let (rx, ry) = ((ru * self.w as f32).max(0.5), (rv * self.h as f32).max(0.5));
+        let (mut hit, mut all) = (0u32, 0u32);
+        for y in (cy - ry).floor() as i64..=(cy + ry).ceil() as i64 {
+            for x in (cx - rx).floor() as i64..=(cx + rx).ceil() as i64 {
+                let (dx, dy) = ((x as f32 + 0.5 - cx) / rx, (y as f32 + 0.5 - cy) / ry);
+                if dx * dx + dy * dy > 1.0 || x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+                    continue;
+                }
+                all += 1;
+                hit += mask[y as usize * self.w + x as usize] as u32;
+            }
+        }
+        if all == 0 { 0.0 } else { hit as f32 / all as f32 }
     }
 
     /// Со снимком, по которому считались классы.
@@ -205,7 +236,7 @@ impl Cover {
     #[cfg(test)]
     fn grid(w: usize, h: usize, at: impl Fn(usize, usize) -> Class) -> Self {
         let data = (0..w * h).map(|k| Self::COLORS.iter().position(|c| c.1 == at(k % w, k / w)).unwrap_or(0) as u8).collect();
-        Self { w, h, data, crowns: None, photo: None }
+        Self { w, h, data, crowns: None, photo: None, wild: None }
     }
 
     /// Доля класса в круге радиуса `r` вокруг точки; `u`, `v`, `r` — в долях рамки по x и y.
@@ -895,11 +926,65 @@ const SEA_SHELF: f32 = 24.0;
 /// Шаг камней-переходов в клетках: человеку — шаг, фигурке — клетка.
 const STEPPING: f32 = 0.9;
 
+/// Самое малое пятно воды снимка, что ложится водой, клеток²: меньше — тень
+/// или лужа.
+const PHOTO_POND: f32 = 6.0;
+
+/// Вода снимка по сетке маски, 0..1: доля воды в круге в три четверти клетки,
+/// пятна меньше [`PHOTO_POND`] — нет.
+fn photo_water(m: &Map, hint: &Hint) -> Vec<f32> {
+    let (mw, mh) = (m.rooms.w, m.rooms.h);
+    let res = mask::RES as f32;
+    let mut v: Vec<f32> = (0..mw * mh)
+        .map(|i| {
+            let p = [((i % mw) as f32 + 0.5) / res, ((i / mw) as f32 + 0.5) / res];
+            let (u, v, r) = (p[0] / hint.span[0], p[1] / hint.span[1], 0.75);
+            ((hint.cover.wild_share(u, v, r / hint.span[0], r / hint.span[1]) - 0.35) / 0.3).clamp(0.0, 1.0)
+        })
+        .collect();
+    // Пятна по связности (4 соседа) над половиной; малые — вон.
+    let mut seen = vec![false; mw * mh];
+    for s in 0..mw * mh {
+        if seen[s] || v[s] < 0.5 {
+            continue;
+        }
+        let mut blob = vec![s];
+        seen[s] = true;
+        let mut k = 0;
+        while k < blob.len() {
+            let i = blob[k];
+            k += 1;
+            let (x, y) = (i % mw, i / mw);
+            for (nx, ny) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+                if nx < mw && ny < mh && !seen[ny * mw + nx] && v[ny * mw + nx] >= 0.5 {
+                    seen[ny * mw + nx] = true;
+                    blob.push(ny * mw + nx);
+                }
+            }
+        }
+        if (blob.len() as f32) < PHOTO_POND * res * res {
+            for i in blob {
+                v[i] = 0.0;
+            }
+        }
+    }
+    // Края у выкинутых пятен (ниже половины) — тоже вон: без ядра это рябь.
+    let keep: Vec<bool> = (0..mw * mh).map(|i| v[i] >= 0.5).collect();
+    let near = |i: usize| {
+        let (x, y) = ((i % mw) as i64, (i / mw) as i64);
+        (-2..=2).any(|dy| (-2..=2).any(|dx| {
+            let (nx, ny) = (x + dx, y + dy);
+            nx >= 0 && ny >= 0 && (nx as usize) < mw && (ny as usize) < mh && keep[ny as usize * mw + nx as usize]
+        }))
+    };
+    (0..mw * mh).map(|i| if v[i] > 0.0 && (keep[i] || near(i)) { v[i] } else { 0.0 }).collect()
+}
+
 /// Озёра и реки одним слоем: мелководье по всей воде, глубина — дальше
 /// `WATER_EDGE` от берега общей воды. Река из нескольких кусков в OSM иначе
 /// получала мели поперёк русла на стыках; край карты берегом не считается —
 /// вода уходит за него.
-fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area], bog: bool) {
+fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area], bog: bool, extra: &[f32]) {
     let (mw, mh) = (m.rooms.w, m.rooms.h);
     // Сумма, а не наибольшее: на общем крае двух кусков каждый даёт половину,
     // и по наибольшему вдоль шва оставалась полоса суши в полводы.
@@ -908,6 +993,10 @@ fn water(m: &mut Map, floors: &mut Floors, parts: &[&Area], bog: bool) {
         for (i, v) in coverage(&m.rooms, &a.rings, 0.0) {
             union[i] = (union[i] + v).min(1.0);
         }
+    }
+    // Вода снимка, которой нет в OSM, — в ту же воду: общий берег и глубина.
+    for (u, &v) in union.iter_mut().zip(extra) {
+        *u = u.max(v);
     }
     let weights: Vec<(usize, f32)> = union.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, v)| (i, *v)).collect();
     if weights.is_empty() {
@@ -2926,6 +3015,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let mut grounds: Vec<(u8, usize)> = areas.iter().enumerate().filter_map(|(k, a)| ground(a.tags).map(|(_, o)| (o, k))).collect();
     grounds.sort();
     let waters: Vec<usize> = grounds.iter().map(|g| g.1).filter(|&k| matches!(ground(areas[k].tags), Some(("water_deep", _)))).collect();
+    let wild = hint.as_ref().filter(|h| h.cover.wild.is_some()).map(|h| photo_water(&m, h)).unwrap_or_default();
     let mut water_done = false;
     let mut rock_mats: Vec<usize> = Vec::new();
     let relaid = relay_plazas(&areas, &m, hint.as_ref(), sea, &mut warnings);
@@ -2943,7 +3033,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         };
         if tex == "water_deep" {
             if !water_done {
-                water(&mut m, &mut floors, &waters.iter().map(|&k| &areas[k]).collect::<Vec<_>>(), bog);
+                water(&mut m, &mut floors, &waters.iter().map(|&k| &areas[k]).collect::<Vec<_>>(), bog, &wild);
                 water_done = true;
             }
             continue;
@@ -2979,6 +3069,9 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
                 rock_mats.push(t);
             }
         }
+    }
+    if !water_done && wild.iter().any(|&v| v > 0.0) {
+        water(&mut m, &mut floors, &[], bog, &wild);
     }
     // Отмели рек и озёр — по снимку: в OSM галечник у излучины чаще внутри
     // контура реки, и на карте там выходило мелководье по траве, серое, а на

@@ -321,7 +321,7 @@ pub enum Biome {
 
 /// Биом снимка (photo.py): доли растительности, сухого, серого, снега и льда на
 /// суше; болото — по мокрым землям Copernicus (`waw`, коды 3 и 4).
-fn biome(img: &RgbImage, waw: Option<&[u8]>) -> Biome {
+fn biome(img: &RgbImage, waw: Option<&[u8]>, snow_ok: bool) -> Biome {
     let (h, s, v) = hsv(img);
     let (vb, sb) = (gauss(&v, 1.5), gauss(&s, 1.5));
     let gv3 = gauss(&v, 3.0);
@@ -338,7 +338,7 @@ fn biome(img: &RgbImage, waw: Option<&[u8]>) -> Biome {
     let snow_at = |k: usize| vb.d[k] > 0.78 && sb.d[k] < 0.12;
     let snow = share(&snow_at);
     let ice = share(&|k| vb.d[k] > 0.55 && sb.d[k] < 0.16 && (80.0..=230.0).contains(&h.d[k]) && !snow_at(k));
-    let mut out = if ice + snow > 0.2 {
+    let mut out = if ice + snow > 0.2 && snow_ok {
         Biome::Ice
     } else if grey > 0.5 && green < 0.2 {
         Biome::Barren
@@ -586,12 +586,18 @@ struct Nfi {
 /// Кроны с породой (trees.py `run`): размер, место, порода по NFI (Англия) или
 /// Copernicus (вне Англии), очередь на хвойную — тёмные и холодные среди явной
 /// зелени и куртинами.
-fn crowns(img: &RgbImage, cls: &[u8], frame: &Frame, dlt: Option<&[u8]>, nfi: Option<&Nfi>) -> Vec<Crown> {
+fn crowns(img: &RgbImage, cls: &[u8], frame: &Frame, dlt: Option<&[u8]>, nfi: Option<&Nfi>, lc: Option<&[u8]>) -> Vec<Crown> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let n = w * h;
     let mpp = (frame.width_m() / w as f64) as f32;
     let trees: Vec<bool> = cls.iter().map(|&c| c == TREES).collect();
     let (mut needles, mut dense) = (None, None);
+    // Вне Европы густой полог — где покров Esri видит лес.
+    if let (None, None, Some(lc)) = (dlt, nfi, lc) {
+        let win = ((20.0 / mpp).round() as usize).max(3);
+        let forest = uniform(&Grid { w, h, d: lc.iter().map(|&c| (c == LC_TREES) as u8 as f32).collect() }, win);
+        dense = Some((0..n).map(|k| forest.d[k] > 0.5).collect::<Vec<bool>>());
+    }
     if let (Some(dlt), None) = (dlt, nfi) {
         let win = ((20.0 / mpp).round() as usize).max(3);
         let forest = uniform(&Grid { w, h, d: dlt.iter().map(|&c| matches!(c, 1 | 2) as u8 as f32).collect() }, win);
@@ -711,6 +717,10 @@ fn crowns(img: &RgbImage, cls: &[u8], frame: &Frame, dlt: Option<&[u8]>, nfi: Op
 
 /// Снимок мельче 0,3 м ужимается до 0,3: правила мерены на 0,35–0,48 м.
 const REF_MPP: f64 = 0.3;
+/// Грубее этого снимок растягивается до [`COARSE_TO`]: размытия разбора заданы
+/// в точках, и на z17 (1,2 м) протока в 6 м тонула в соседнем лесу.
+const COARSE_MPP: f64 = 0.6;
+const COARSE_TO: f64 = 0.5;
 /// Крупный масштаб — только боевым участкам (сторона до 200 м).
 const BATTLE_M: f64 = 200.0;
 pub(crate) const TILE_URL: &str = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile";
@@ -817,21 +827,21 @@ fn tiles_of(frame: &Frame, z: u32) -> Vec<(i64, i64)> {
     ((y0 / 256.0) as i64..=(y1 / 256.0) as i64).flat_map(|ty| ((x0 / 256.0) as i64..=(x1 / 256.0) as i64).map(move |tx| (tx, ty))).collect()
 }
 
-/// Масштабы, из которых [`zoom`] выбирает: крупные — только боевым участкам и
-/// не больше 64 плиток.
+/// Мельче этого снимок не ищется: z12 — 38 м на точку, дальше рамка — пара точек.
+const ZOOM_LOW: u32 = 12;
+
+/// Масштабы, из которых [`zoom`] выбирает, крупные первыми. Крупнее 18 — только
+/// боевым участкам и не больше 64 плиток. Мельче 18 — где Esri на крупных отдаёт
+/// заглушку «нет снимка»: в Амазонии снимок есть только с z17, и заглушку разбор
+/// принимал за снег.
 fn zooms(frame: &Frame) -> Vec<u32> {
-    if frame.width_m().max(frame.height_m()) > BATTLE_M {
-        return vec![18];
-    }
-    [20, 19, 18].into_iter().filter(|&z| z == 18 || tiles_of(frame, z).len() <= 64).collect()
+    let battle = frame.width_m().max(frame.height_m()) <= BATTLE_M;
+    (ZOOM_LOW..=20).rev().filter(|&z| z <= 18 || (battle && tiles_of(frame, z).len() <= 64)).collect()
 }
 
 /// Самый крупный масштаб, где у рамки есть снимок (все плитки — не заглушки).
 fn zoom(agent: Option<&net::Agent>, cache: &Path, frame: &Frame) -> Result<u32, String> {
     for z in zooms(frame) {
-        if z == 18 {
-            return Ok(18);
-        }
         let (x0, y0, x1, y1) = span(frame, z);
         // Без сети и без плитки этого масштаба в кеше — масштаб пропускается.
         let Ok(mid) = tile(agent, cache, z, ((x0 + x1) / 2.0 / 256.0) as i64, ((y0 + y1) / 2.0 / 256.0) as i64) else { continue };
@@ -867,9 +877,16 @@ fn photo(agent: Option<&net::Agent>, cache: &Path, frame: &Frame) -> Result<(Rgb
     let (bw, bh) = (((x1 - tx0 as f64 * 256.0) as u32).saturating_sub(bx).max(8), ((y1 - ty0 as f64 * 256.0) as u32).saturating_sub(by).max(8));
     let mut img = image::imageops::crop_imm(&canvas, bx, by, bw, bh).to_image();
     let m = mpp_at(frame.mid_lat(), z);
-    if m < REF_MPP {
-        let k = m / REF_MPP;
-        img = image::imageops::resize(&img, ((img.width() as f64 * k).round() as u32).max(1), ((img.height() as f64 * k).round() as u32).max(1), image::imageops::FilterType::Lanczos3);
+    let k = if m < REF_MPP {
+        m / REF_MPP
+    } else if m > COARSE_MPP {
+        m / COARSE_TO
+    } else {
+        1.0
+    };
+    if k != 1.0 {
+        let filter = if k < 1.0 { image::imageops::FilterType::Lanczos3 } else { image::imageops::FilterType::Triangle };
+        img = image::imageops::resize(&img, ((img.width() as f64 * k).round() as u32).max(1), ((img.height() as f64 * k).round() as u32).max(1), filter);
     }
     Ok((img, z))
 }
@@ -898,14 +915,95 @@ fn copernicus(agent: Option<&net::Agent>, file: &Path, frame: &Frame, layer: &st
         Ok(img) => img,
         Err(_) => image::GrayImage::from_pixel(sw as u32, sh as u32, image::Luma([255])),
     };
+    Ok(nearest(&src, w, h))
+}
+
+/// Слой, растянутый до `w`×`h` ближайшим соседом.
+fn nearest(src: &image::GrayImage, w: usize, h: usize) -> Vec<u8> {
     let (iw, ih) = (src.width() as usize, src.height() as usize);
-    Ok((0..w * h)
+    (0..w * h)
         .map(|k| {
             let (x, y) = (k % w, k / w);
             let (sx, sy) = (((x as f32 + 0.5) * iw as f32 / w as f32) as usize, ((y as f32 + 0.5) * ih as f32 / h as f32) as usize);
             src.get_pixel(sx.min(iw - 1) as u32, sy.min(ih - 1) as u32).0[0]
         })
-        .collect())
+        .collect()
+}
+
+/// Земной покров Esri (Sentinel-2, 10 м, весь мир): 1 — вода, 2 — деревья,
+/// 4 — затопленная зелень, 5 — поля, 7 — застройка, 8 — голая земля, 9 — снег и
+/// лёд, 10 — облака, 11 — луга и кусты; 0 — нет данных.
+const LC_TREES: u8 = 2;
+const LC_SNOW: u8 = 9;
+
+fn landcover_url(frame: &Frame) -> String {
+    let (sw, sh) = copernicus_size(frame);
+    format!(
+        "https://ic.imagery1.arcgis.com/arcgis/rest/services/Sentinel2_10m_LandCover/ImageServer/exportImage?bbox={},{},{},{}&bboxSR=4326&imageSR=4326&size={sw},{sh}&format=tiff&pixelType=U8&interpolation=RSP_NearestNeighbor&f=image",
+        frame.west, frame.south, frame.east, frame.north
+    )
+}
+
+/// Покров по рамке в пикселях снимка `w`×`h`; нет данных у большей части — `None`.
+fn landcover(agent: Option<&net::Agent>, file: &Path, frame: &Frame, w: usize, h: usize) -> Option<Vec<u8>> {
+    let b = cached(agent, file, &landcover_url(frame)).ok()?;
+    let src = image::load_from_memory_with_format(&b, image::ImageFormat::Tiff).ok()?.to_luma8();
+    let lc = nearest(&src, w, h);
+    (lc.iter().filter(|&&c| c != 0).count() * 2 > lc.len()).then_some(lc)
+}
+
+/// Вода, а не тень, — темнее этого (яркость 0..1) и серее [`GREY_WATER`]: озеро
+/// в Амазонии — 0,07–0,09 и насыщенность 0,34; тень в пологе у Манауса бывает и
+/// темнее (0,03), но густо-зелёная (0,65–0,9).
+const DARK_WATER: f32 = 0.12;
+const GREY_WATER: f32 = 0.5;
+
+/// Лес по покрову, кроме того, что похоже на воду ([`dark_water`]) и вдвое
+/// темнее самого леса: озеро у протоки в Амазонии — вода, хоть покров в 10 м
+/// его не видит.
+fn cover_forest(img: &RgbImage, lc: &[u8]) -> Vec<bool> {
+    let (vs, water) = dark_water(img);
+    let canopy: Vec<f32> = (0..lc.len()).filter(|&k| lc[k] == LC_TREES).map(|k| vs[k]).collect();
+    let med = if canopy.is_empty() { 0.0 } else { percentile(&canopy, 50.0) };
+    (0..lc.len()).map(|k| lc[k] == LC_TREES && !(water[k] && vs[k] < 0.5 * med)).collect()
+}
+
+/// Яркость снимка, чуть размытая (σ 1,5 точки), и где она похожа на тёмную воду:
+/// темна и сера.
+fn dark_water(img: &RgbImage) -> (Vec<f32>, Vec<bool>) {
+    let (_, s, v) = hsv(img);
+    let (vs, ss) = (gauss(&v, 1.5).d, gauss(&s, 1.5).d);
+    let water = vs.iter().zip(&ss).map(|(&v, &s)| v < DARK_WATER && s < GREY_WATER).collect();
+    (vs, water)
+}
+
+/// LC_BUILT — застройка: тень дома там не вода.
+const LC_BUILT: u8 = 7;
+
+/// Вода снимка, что ложится и без OSM: класс «вода», тёмная и серая
+/// ([`dark_water`]) и не на застройке по покрову.
+fn wild_water(img: &RgbImage, cls: &[u8], lc: &[u8]) -> Vec<bool> {
+    let (_, water) = dark_water(img);
+    (0..cls.len()).map(|k| cls[k] == WATER && water[k] && lc[k] != LC_BUILT).collect()
+}
+
+/// Где покров видит лес, а снимок кроны почти не различает (грубый снимок,
+/// ровный полог джунглей), — лес сплошь. Иначе джунгли у Манауса выходили лугом
+/// с двумя десятками деревьев: кроной считается лишь тень темнее 0,72 середины.
+fn fill_canopy(cls: &mut [u8], lc: &[u8]) {
+    let forest: Vec<usize> = (0..cls.len()).filter(|&k| lc[k] == LC_TREES).collect();
+    if forest.len() * 10 < cls.len() {
+        return;
+    }
+    let seen = forest.iter().filter(|&&k| cls[k] == TREES).count();
+    if seen * 10 >= forest.len() * 4 {
+        return;
+    }
+    for k in forest {
+        if cls[k] != WATER {
+            cls[k] = TREES;
+        }
+    }
 }
 
 /// Англия — грубая рамка: NFI есть только там.
@@ -980,6 +1078,7 @@ struct Files {
     dlt: PathBuf,
     waw: PathBuf,
     nfi: PathBuf,
+    lc: PathBuf,
 }
 
 /// Подсказка со снимка по рамке: снимок, слои, биом, классы, кроны.
@@ -993,13 +1092,29 @@ fn analyse(agent: Option<&net::Agent>, frame: &Frame, files: &Files, step: &dyn 
     // Мокрые земли — в родном размере слоя, как в photo.py.
     let (lw, lh) = copernicus_size(frame);
     let waw = if in_england(frame) { None } else { copernicus(agent, &files.waw, frame, "waw", lw, lh).ok() };
+    // Copernicus — только Европа: за её пределами весь «нет данных» (255).
+    let dlt = dlt.filter(|d| d.iter().filter(|&&c| c < 254).count() * 2 > d.len());
+    let waw = waw.filter(|d| d.iter().filter(|&&c| c < 254).count() * 2 > d.len());
+    // Вне Европы — покров Esri: лес и снег по нему. В Европе свои слои точнее, а
+    // ледник под мореной (Мер-де-Глас) покров считает голой землёй.
+    let lc = if dlt.is_none() && nfi.is_none() { landcover(agent, &files.lc, frame, w, h) } else { None };
     step("analysis");
-    let biome = biome(&img, waw.as_deref());
-    let forest: Option<Vec<bool>> = dlt.as_ref().map(|d| d.iter().map(|&c| matches!(c, 1 | 2)).collect());
-    let cls = classify(&img, biome, forest.as_deref());
-    let crowns = crowns(&img, &cls, frame, dlt.as_deref(), nfi.as_ref());
-    let summary = format!("{biome:?}, снимок z{z}, {w}×{h}, крон {}", crowns.len());
-    Ok((Cover::from_classes(w, h, cls, crowns).with_photo(img), summary))
+    let snow_ok = lc.as_ref().is_none_or(|l| l.iter().filter(|&&c| c == LC_SNOW).count() * 10 > l.len());
+    let biome = biome(&img, waw.as_deref(), snow_ok);
+    let forest: Option<Vec<bool>> = match (&dlt, &lc) {
+        (Some(d), _) => Some(d.iter().map(|&c| matches!(c, 1 | 2)).collect()),
+        (None, Some(l)) => Some(cover_forest(&img, l)),
+        _ => None,
+    };
+    let mut cls = classify(&img, biome, forest.as_deref());
+    if let Some(l) = &lc {
+        fill_canopy(&mut cls, l);
+    }
+    let crowns = crowns(&img, &cls, frame, dlt.as_deref(), nfi.as_ref(), lc.as_deref());
+    let summary = format!("{biome:?}, снимок z{z}, {w}×{h}, крон {}{}", crowns.len(), if lc.is_some() { ", покров Esri" } else { "" });
+    let wild = lc.as_ref().map(|l| wild_water(&img, &cls, l));
+    let cover = Cover::from_classes(w, h, cls, crowns).with_photo(img);
+    Ok((if let Some(m) = wild { cover.with_wild_water(m) } else { cover }, summary))
 }
 
 /// Выгрузка OSM по рамке — с запасом вокруг: API отдаёт только линии с точкой
@@ -1023,7 +1138,8 @@ pub fn urls(lat: f64, lon: f64, cells: [u32; 2]) -> Vec<String> {
     // адреса слоёв не совпадут.
     let frame = Frame::of_osm(&with_bounds("<osm>", &want)).unwrap_or(want);
     let mut out = vec![osm_url(&want)];
-    for z in zooms(&frame) {
+    // Мельче 18 нужны редко (где крупнее — заглушка); их сборка докачает сама.
+    for z in zooms(&frame).into_iter().filter(|&z| z >= 18) {
         out.extend(tiles_of(&frame, z).into_iter().map(|(tx, ty)| tile_url(z, tx, ty)));
     }
     if in_england(&frame) {
@@ -1031,6 +1147,7 @@ pub fn urls(lat: f64, lon: f64, cells: [u32; 2]) -> Vec<String> {
     } else {
         out.push(copernicus_url(&frame, "dlt"));
         out.push(copernicus_url(&frame, "waw"));
+        out.push(landcover_url(&frame));
     }
     out
 }
@@ -1054,7 +1171,7 @@ pub fn build(lat: f64, lon: f64, cells: [u32; 2], cache: &Path, step: &dyn Fn(&s
         .filter_map(|id| cached(Some(&agent), &folder.join(format!("relation_{id}.osm")), &format!("https://api.openstreetmap.org/api/0.6/relation/{id}/full")).ok())
         .filter_map(|b| String::from_utf8(b).ok())
         .collect();
-    let files = Files { tiles: cache.join("sat_tiles"), dlt: folder.join("dlt.tif"), waw: folder.join("waw.tif"), nfi: folder.join("nfi.geojson") };
+    let files = Files { tiles: cache.join("sat_tiles"), dlt: folder.join("dlt.tif"), waw: folder.join("waw.tif"), nfi: folder.join("nfi.geojson"), lc: folder.join("landcover.tif") };
     let (cover, summary) = analyse(Some(&agent), &frame, &files, step)?;
     let _ = cover.save_files(&folder);
     Ok(Place { xml, extra, cover, folder, summary })
@@ -1073,7 +1190,7 @@ pub fn compare(osms: &[PathBuf]) -> i32 {
             continue;
         };
         let with = |ext: &str| PathBuf::from(format!("{}.{ext}", stem.display()));
-        let files = Files { tiles: dir.join("sat_tiles"), dlt: with("dlt.tif"), waw: with("waw.tif"), nfi: dir.join("nfi").join(format!("{name}.geojson")) };
+        let files = Files { tiles: dir.join("sat_tiles"), dlt: with("dlt.tif"), waw: with("waw.tif"), nfi: dir.join("nfi").join(format!("{name}.geojson")), lc: with("landcover.tif") };
         let t = std::time::Instant::now();
         let (cover, summary) = match analyse(None, &frame, &files, &|_| {}) {
             Ok(x) => x,
@@ -1120,12 +1237,14 @@ mod tests {
             } else {
                 assert!(list.contains(&copernicus_url(&frame, "dlt")) && list.contains(&copernicus_url(&frame, "waw")), "слои не совпали");
             }
-            for z in zooms(&frame) {
+            for z in zooms(&frame).into_iter().filter(|&z| z >= 18) {
                 assert!(tiles_of(&frame, z).iter().all(|&(x, y)| list.contains(&tile_url(z, x, y))), "плитки z{z}");
             }
         }
-        // Большой участок — только z18.
-        assert_eq!(zooms(&Frame::around(46.0, 7.0, [256, 256])), vec![18]);
+        // Большой участок — с z18 и мельче; малый — с z20, вниз до z12.
+        let big = zooms(&Frame::around(46.0, 7.0, [256, 256]));
+        assert_eq!((big[0], *big.last().unwrap()), (18, ZOOM_LOW));
+        assert_eq!(zooms(&Frame::around(46.0, 7.0, [40, 30]))[0], 20);
     }
 
     #[test]
@@ -1185,7 +1304,49 @@ mod tests {
         let cls = classify(&img, Biome::Green, None);
         assert_eq!(cls[50 * w as usize + 60], TREES);
         assert_eq!(cls[10 * w as usize + 10], GRASS);
-        let c = crowns(&img, &cls, &frame, None, None);
+        let c = crowns(&img, &cls, &frame, None, None, None);
         assert_eq!(c.len(), 1, "{c:?}");
+    }
+
+    /// Где на крупных масштабах заглушка Esri «нет снимка» (ровно серая 204),
+    /// снимок берётся с первого масштаба, где он есть, — тут z17.
+    #[test]
+    fn placeholder_tiles_send_the_photo_to_a_smaller_zoom() {
+        let dir = std::env::temp_dir().join(format!("kartograf-zoom-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let frame = Frame::around(-2.12725, -51.44072, [40, 30]);
+        for z in zooms(&frame) {
+            let colour = if z >= 18 { [204, 204, 204] } else { [40, 70, 35] };
+            for (tx, ty) in tiles_of(&frame, z) {
+                RgbImage::from_pixel(256, 256, image::Rgb(colour)).save(dir.join(format!("{z}_{tx}_{ty}.jpg"))).unwrap();
+            }
+        }
+        let z = zoom(None, &dir, &frame);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(z, Ok(17));
+    }
+
+    /// Серо-белое на снимке — снег, только если покров не против: заглушка и
+    /// облака в джунглях снегом не становятся.
+    #[test]
+    fn bright_grey_is_snow_only_when_cover_allows() {
+        let img = RgbImage::from_pixel(60, 40, image::Rgb([212, 214, 216]));
+        assert_eq!(biome(&img, None, true), Biome::Ice);
+        assert_ne!(biome(&img, None, false), Biome::Ice);
+    }
+
+    /// Лес по покрову, а снимок кроны почти не видит — лес сплошь; видит — как
+    /// на снимке. Вода остаётся водой.
+    #[test]
+    fn cover_forest_fills_canopy_the_photo_cannot_see() {
+        let lc = vec![LC_TREES; 100];
+        let mut blind: Vec<u8> = (0..100).map(|k| if k < 5 { TREES } else if k == 99 { WATER } else { GRASS }).collect();
+        fill_canopy(&mut blind, &lc);
+        assert_eq!(blind.iter().filter(|&&c| c == TREES).count(), 99);
+        assert_eq!(blind[99], WATER);
+        let mut sharp: Vec<u8> = (0..100).map(|k| if k % 2 == 0 { TREES } else { GRASS }).collect();
+        let before = sharp.clone();
+        fill_canopy(&mut sharp, &lc);
+        assert_eq!(sharp, before);
     }
 }

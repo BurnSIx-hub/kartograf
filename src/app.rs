@@ -1780,6 +1780,9 @@ impl App {
         let mut go = None;
         let mut pick = false;
         let busy = self.place.busy();
+        // Ассеты — как у генераторов: тот же выбор, тот же флажок в настройках.
+        let own_assets = self.library.assets.iter().any(|a| !a.is_builtin());
+        let mut library = self.settings.gen_library && own_assets;
         egui::Window::new("Местность по координатам").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("Координаты или ссылка на карту:");
             ui.horizontal(|ui| {
@@ -1796,6 +1799,16 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Деревья:");
                 ui.add(egui::Slider::new(&mut form.trees, 0.0..=1.0).custom_formatter(|v, _| if v <= 0.0 { "по снимку".to_owned() } else { format!("+{:.0} %", v * 100.0) }));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Ассеты:");
+                ui.selectable_value(&mut library, false, "Встроенные");
+                ui.add_enabled_ui(own_assets, |ui| {
+                    ui.selectable_value(&mut library, true, "Из библиотеки").on_hover_text("Паки и папка из «Правка»; чего там нет — встроенные");
+                });
+                if !own_assets {
+                    ui.weak("(паков и папки нет)");
+                }
             });
             if let Some((lat, lon)) = found {
                 ui.label(format!("{lat:.5}, {lon:.5}"));
@@ -1827,6 +1840,10 @@ impl App {
         });
         if pick {
             self.map_pick = Some(crate::mappick::MapPick::new(crate::place::parse_place(&form.text), form.cells));
+        }
+        if own_assets && library != self.settings.gen_library {
+            self.settings.gen_library = library;
+            self.save_settings();
         }
         if let Some((lat, lon, cells, trees)) = go {
             self.place.error = None;
