@@ -152,6 +152,8 @@ impl App {
             "edit_label" => self.tool_edit_label(a),
             "add_path" => self.tool_add_path(a),
             "set_wall_style" => self.tool_wall_style(a),
+            "edit_roof" => self.tool_edit_roof(a),
+            "add_roof" => self.tool_add_roof(a),
             "reload_assets" => {
                 if let Some(dir) = self.settings.textures_dir.clone() {
                     self.library.set_folder(&dir);
@@ -180,7 +182,12 @@ impl App {
                 if self.export.is_some() {
                     return Out::Done(Err("идёт выгрузка — подождите".into()));
                 }
-                self.start_picture(area, px);
+                let roofs = match a["roofs"].as_str().unwrap_or("solid") {
+                    "ghost" => 0.35,
+                    "hidden" => 0.0,
+                    _ => 1.0,
+                };
+                self.start_picture(area, px, roofs);
                 return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image });
             }
             "generate" => self.tool_generate(a),
@@ -273,6 +280,20 @@ impl App {
             let list: Vec<Value> = m.labels.iter().enumerate().filter(|(_, l)| inside(area, l.pos)).take(limit).map(|(i, l)| json!({"index": i, "text": l.text, "x": l.pos[0], "y": l.pos[1], "size": l.size})).collect();
             out.insert("labels".into(), json!(list));
         }
+        if want("roofs") {
+            let list: Vec<Value> = m
+                .roofs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| inside(area, [(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0]))
+                .take(limit)
+                .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "name": library::label(&r.paint)}))
+                .collect();
+            out.insert("roofs".into(), json!(list));
+            if !m.outline_roofs.is_empty() {
+                out.insert("outline_roofs".into(), json!(format!("{} roofs over OpenStreetMap buildings are not listed", m.outline_roofs.len())));
+            }
+        }
         if want("paths") {
             let list: Vec<Value> = m
                 .paths
@@ -316,8 +337,9 @@ impl App {
         let (x, y) = (need(a, "x")?, need(a, "y")?);
         let size = self.asset_size(&asset);
         let light = glow_of(a)?.flatten();
+        let layer = layer_of(a)?.flatten();
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow: None, light, canopy: None, layer: None, tint: None, open: None });
+        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow: None, light, canopy: None, layer, tint: None, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Ok(json!({"index": i, "size_cells": size, "light": glow_name(self.map.props[i].light())}))
@@ -334,10 +356,14 @@ impl App {
         };
         let size = asset.as_deref().map(|k| self.asset_size(k));
         let light = glow_of(a)?;
+        let layer = layer_of(a)?;
         self.checkpoint();
         let p = &mut self.map.props[i];
         if let Some(g) = light {
             p.light = g;
+        }
+        if let Some(l) = layer {
+            p.layer = l;
         }
         if let Some(x) = f(a, "x") {
             p.pos[0] = x;
@@ -370,7 +396,8 @@ impl App {
             "doors" => self.map.portals.len(),
             "labels" => self.map.labels.len(),
             "paths" => self.map.paths.len(),
-            _ => return Err("what: objects, walls, doors, labels или paths".into()),
+            "roofs" => self.map.roofs.len(),
+            _ => return Err("what: objects, walls, doors, labels, paths или roofs".into()),
         };
         if let Some(&bad) = idx.iter().find(|&&i| i >= len) {
             return Err(format!("{what}: номера {bad} нет, их {len}"));
@@ -382,6 +409,7 @@ impl App {
                 "walls" => drop(self.map.walls.remove(i)),
                 "doors" => drop(self.map.portals.remove(i)),
                 "labels" => drop(self.map.labels.remove(i)),
+                "roofs" => drop(self.map.roofs.remove(i)),
                 _ => drop(self.map.paths.remove(i)),
             }
         }
@@ -488,6 +516,52 @@ impl App {
             l.gm = g;
         }
         Ok(json!({"index": i, "text": l.text, "x": l.pos[0], "y": l.pos[1], "size": l.size, "rotation": l.rot, "gm_only": l.gm}))
+    }
+
+    fn tool_add_roof(&mut self, a: &Value) -> Res {
+        let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1] — по стенам дома")?;
+        if r[2] - r[0] < 1.0 || r[3] - r[1] < 1.0 {
+            return Err("крыша меньше клетки".into());
+        }
+        let paint = self.asset_key(a["paint"].as_str().unwrap_or("builtin:roof_metal"))?;
+        let shape = roof_shape(a["shape"].as_str().unwrap_or("gable"))?;
+        self.checkpoint();
+        let mut roof = map::Roof::new([r[0], r[1]], [r[2], r[3]], shape, paint);
+        if let Some(t) = a["turn"].as_u64() {
+            roof.turn = (t % 4) as u8;
+        }
+        if let Some(o) = f(a, "overhang") {
+            roof.overhang = o.clamp(0.0, 2.0);
+        }
+        self.map.roofs.push(roof);
+        Ok(json!({"index": self.map.roofs.len() - 1}))
+    }
+
+    fn tool_edit_roof(&mut self, a: &Value) -> Res {
+        let i = a["index"].as_u64().ok_or("нужен index")? as usize;
+        if i >= self.map.roofs.len() {
+            return Err(format!("крыши {i} нет: их {}", self.map.roofs.len()));
+        }
+        let paint = match a["paint"].as_str() {
+            Some(k) => Some(self.asset_key(k)?),
+            None => None,
+        };
+        let shape = match a["shape"].as_str() {
+            None => None,
+            Some(s) => Some(roof_shape(s)?),
+        };
+        self.checkpoint();
+        let r = &mut self.map.roofs[i];
+        if let Some(p) = paint {
+            r.paint = p;
+        }
+        if let Some(s) = shape {
+            r.shape = s;
+        }
+        if let Some(t) = a["turn"].as_u64() {
+            r.turn = (t % 4) as u8;
+        }
+        Ok(json!({"index": i, "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "turn": r.turn}))
     }
 
     fn tool_add_path(&mut self, a: &Value) -> Res {
@@ -636,6 +710,40 @@ fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
         _ => return Err("light: auto, off, campfire, fireplace, brazier, candle, lamp или arcane".into()),
     };
     Ok(Some(g))
+}
+
+fn roof_shape(s: &str) -> Result<map::RoofShape, String> {
+    Ok(match s {
+        "gable" => map::RoofShape::Gable,
+        "hip" => map::RoofShape::Hip,
+        "shed" => map::RoofShape::Shed,
+        "flat" => map::RoofShape::Flat,
+        "tent" => map::RoofShape::Tent,
+        _ => return Err("shape: gable, hip, shed, flat или tent".into()),
+    })
+}
+
+/// Слой из ответа ИИ: нет поля — не трогать; `auto` — по имени; иначе свой.
+fn layer_of(a: &Value) -> Result<Option<Option<i16>>, String> {
+    let v = &a["layer"];
+    if v.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = v.as_i64() {
+        return Ok(Some(Some(n.clamp(0, 1000) as i16)));
+    }
+    let l = match v.as_str().unwrap_or_default() {
+        "auto" => None,
+        "floor" => Some(100),
+        "low" => Some(200),
+        "normal" => Some(map::LAYER_DEFAULT),
+        "high" => Some(400),
+        "above_walls" => Some(map::ABOVE_WALLS),
+        "on_roof" => Some(map::ON_ROOF),
+        "above_roofs" => Some(map::ABOVE_ROOFS),
+        _ => return Err("layer: auto, floor, low, normal, high, above_walls, on_roof или above_roofs".into()),
+    };
+    Ok(Some(l))
 }
 
 /// Как светит объект — словом для ИИ; не светит — `null`.

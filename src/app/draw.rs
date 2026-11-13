@@ -131,7 +131,7 @@ impl App {
 
         // Объекты — под стенами, как мебель у стены; что выше слоем — позже.
         let shadows = self.map.shadows.clone();
-        self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS);
+        self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS, 1.0);
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
         // ложатся и на объекты у стены.
@@ -328,13 +328,17 @@ impl App {
         }
 
         // Слой «над стенами» — между стенами и крышами.
-        self.draw_props(painter, canvas, view, exporting, map::ABOVE_WALLS..map::ABOVE_ROOFS);
+        self.draw_props(painter, canvas, view, exporting, map::ABOVE_WALLS..map::ON_ROOF, 1.0);
 
         // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
         // они уходят в Foundry отдельными тайлами.
-        // Картинка для ИИ и превью — с крышами, как их видно в редакторе.
-        let picture = self.export.as_ref().is_some_and(|e| e.picture);
-        let roof_alpha = if exporting && !picture { 0.0 } else { self.roof_alpha() };
+        // Картинка для ИИ и превью — с крышами, какие ей заказали; выгрузка — без них
+        // (крыши уходят в Foundry тайлами).
+        let roof_alpha = match &self.export {
+            Some(e) if e.picture => e.roof_alpha,
+            Some(_) => 0.0,
+            None => self.roof_alpha(),
+        };
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
         if self.roof_view != RoofView::Hidden || exporting {
             let roofs = self.map.roofs.clone();
@@ -371,7 +375,11 @@ impl App {
             painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90)), egui::StrokeKind::Inside);
         }
 
-        self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX);
+        // Крышное — поверх крыш и тает вместе с ними: скрытые крыши — нет и его;
+        // в выгрузке его нет в картинке, оно запечено в тайлы крыш.
+        let on_roof = if self.roof_view == RoofView::Hidden && !exporting { 0.0 } else { roof_alpha };
+        self.draw_props(painter, canvas, view, exporting, map::ON_ROOF..map::ABOVE_ROOFS, on_roof);
+        self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX, 1.0);
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {

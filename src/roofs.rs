@@ -32,14 +32,14 @@ pub fn parapet_sides(lo: [f32; 2], hi: [f32; 2], w: f32) -> Vec<([[f32; 2]; 4], 
 
 /// Картинка крыши: `ppc` точек на клетку. Возвращает картинку и её левый
 /// верхний угол в клетках.
-/// Предмет на крыше: картинка 1×1 клетка, середина и поворот (по часовой).
-pub type Fixture<'a> = (&'a image::RgbaImage, [f32; 2], f32);
+/// Предмет на крыше: картинка, середина, поворот (по часовой) и размер в клетках.
+pub type Fixture<'a> = (&'a image::RgbaImage, [f32; 2], f32, [f32; 2]);
 
 /// Точка предмета `f` в картинке: доли 0..1 или `None`, если мимо.
 fn fixture_uv(f: &Fixture, p: [f32; 2]) -> Option<(f32, f32)> {
     let (s, c) = f.2.to_radians().sin_cos();
     let (dx, dy) = (p[0] - f.1[0], p[1] - f.1[1]);
-    let (u, v) = (c * dx + s * dy + 0.5, -s * dx + c * dy + 0.5);
+    let (u, v) = ((c * dx + s * dy) / f.3[0].max(1e-3) + 0.5, (-s * dx + c * dy) / f.3[1].max(1e-3) + 0.5);
     ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then_some((u, v))
 }
 
@@ -86,8 +86,9 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
     // Сливы выступают за край: картинка шире на их вынос.
     let (mut blo, mut bhi) = (lo, hi);
     for f in fixtures {
-        blo = [blo[0].min(f.1[0] - 0.71), blo[1].min(f.1[1] - 0.71)];
-        bhi = [bhi[0].max(f.1[0] + 0.71), bhi[1].max(f.1[1] + 0.71)];
+        let r = 0.5 * f.3[0].hypot(f.3[1]) + 0.01;
+        blo = [blo[0].min(f.1[0] - r), blo[1].min(f.1[1] - r)];
+        bhi = [bhi[0].max(f.1[0] + r), bhi[1].max(f.1[1] + r)];
     }
     // Начало — на целой точке картинки сцены.
     let origin = [(blo[0] * ppc).floor() / ppc, (blo[1] * ppc).floor() / ppc];
@@ -1510,7 +1511,15 @@ mod tests {
         assert_eq!(fx.iter().filter(|f| f.0.contains("Scupper")).count(), 2);
         assert!(fx.iter().any(|f| f.0.contains("Drain")));
         let imgs: Vec<image::RgbaImage> = fx.iter().map(|f| load(f.0.trim_start_matches("set:"))).collect();
-        let items: Vec<Fixture> = fx.iter().zip(&imgs).map(|(f, i)| (i, f.1, f.2)).collect();
+        let items: Vec<Fixture> = fx.iter().zip(&imgs).map(|(f, i)| (i, f.1, f.2, [1.0, 1.0])).collect();
+        // Предмет 2×2 (дымоход) закрашивает свои две клетки, а не одну.
+        let red = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+        let big: [Fixture; 1] = [(&red, [3.0, 2.0], 0.0, [2.0, 2.0])];
+        let (with, o2) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], None, &big, false);
+        let px = |p: [f32; 2]| with.get_pixel(((p[0] - o2[0]) * 64.0) as u32, ((p[1] - o2[1]) * 64.0) as u32).0;
+        assert_eq!(px([3.9, 2.9]), [255, 0, 0, 255]);
+        assert_eq!(px([2.1, 1.1]), [255, 0, 0, 255]);
+        assert_ne!(px([4.2, 2.0]), [255, 0, 0, 255]);
         let (full, origin) = render(&roof, &tex, tile, 64.0, [0.0, -1.0], Some(&pt), &items, false);
         assert!(origin[1] < 0.0 && full.height() > img.height());
         if let Ok(out) = std::env::var("KARTOGRAF_PARAPET_PNG") {

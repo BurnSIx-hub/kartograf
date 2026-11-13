@@ -296,7 +296,11 @@ impl App {
     }
 
     /// Объекты слоёв из `layers`: сначала все их тени, потом сами.
-    pub(super) fn draw_props(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, exporting: bool, layers: std::ops::Range<i16>) {
+    /// `fade` — общая прозрачность (крышное тает вместе с крышей); с ней и без тени.
+    pub(super) fn draw_props(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, exporting: bool, layers: std::ops::Range<i16>, fade: f32) {
+        if fade <= 0.0 {
+            return;
+        }
         let cam = self.cam;
         let mut order: Vec<usize> = (0..self.map.props.len()).filter(|&i| layers.contains(&self.map.props[i].layer())).collect();
         if order.is_empty() {
@@ -307,7 +311,7 @@ impl App {
         // нужен `&mut self` (картинки грузятся), а карту оно не читает.
         let props = std::mem::take(&mut self.map.props);
         let shadows = self.map.shadows.clone();
-        if shadows.on {
+        if shadows.on && fade >= 1.0 {
             // Тень кроны — своя, сдвинутая на высоту дерева ([`roofs::tree_shade`]).
             for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow() && !p.is_canopy()) {
                 let c = prop.corners();
@@ -343,7 +347,7 @@ impl App {
                 self.draw_prop(painter, canvas, &stump, Color32::WHITE);
             } else {
                 let tint = prop.tint.map_or(Color32::WHITE, |[r, g, b]| Color32::from_rgb(r, g, b));
-                self.draw_prop(painter, canvas, prop, tint);
+                self.draw_prop(painter, canvas, prop, if fade < 1.0 { tint.gamma_multiply(fade) } else { tint });
             }
             if self.sel == Some(Sel::Prop(i)) {
                 let q: Vec<Pos2> = c.iter().map(|&p| cam.to_screen(canvas, p)).collect();

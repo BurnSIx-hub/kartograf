@@ -42,13 +42,14 @@ impl App {
             stumps,
             picture: false,
             origin: [0.0, 0.0],
+            roof_alpha: 0.0,
         });
     }
 
     /// Снять область карты одной картинкой, как её рисует редактор, но без окон,
     /// сетки и выделения: предметы и двери в картинке, этаж текущий. Плитками, как
     /// выгрузка, — размер не упирается в окно. Готовое — в `self.picture`.
-    pub fn start_picture(&mut self, area: [f32; 4], px: u32) {
+    pub fn start_picture(&mut self, area: [f32; 4], px: u32, roof_alpha: f32) {
         let px = px.clamp(2, 400);
         let ppp = self.canvas_ppp;
         let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
@@ -82,6 +83,7 @@ impl App {
             stumps: Vec::new(),
             picture: true,
             origin: [area[0], area[1]],
+            roof_alpha,
         });
     }
 
@@ -259,16 +261,24 @@ impl App {
                     covers.insert(r.paint.clone(), (img, tile));
                 }
                 let fixtures = r.fixtures();
-                for pk in r.parapet().into_iter().chain(fixtures.iter().map(|f| f.0)) {
-                    if !covers.contains_key(pk) {
-                        let bytes = self.textures.bytes(pk)?;
-                        let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(pk)))?.to_rgba8();
-                        covers.insert(pk.to_owned(), (img, [roofs::PARAPET_TILE, roofs::PARAPET]));
+                // Дымоходы, вытяжки, люки этой крыши (слой «На крыше») — в её картинку:
+                // тает крыша, когда игрок вошёл в дом, — тают и они.
+                let mine: Vec<(String, [f32; 2], f32, [f32; 2])> = map
+                    .props
+                    .iter()
+                    .filter(|p| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && r.contains(p.pos))
+                    .map(|p| (p.asset.clone(), p.pos, p.rot, [p.size[0] * p.scale, p.size[1] * p.scale]))
+                    .collect();
+                for pk in r.parapet().into_iter().chain(fixtures.iter().map(|f| f.0)).map(str::to_owned).chain(mine.iter().map(|m| m.0.clone())) {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(pk.clone()) {
+                        let bytes = self.textures.bytes(&pk)?;
+                        slot.insert((library::decode_tinted(&pk, &bytes)?, [roofs::PARAPET_TILE, roofs::PARAPET]));
                     }
                 }
                 let (tex, tile) = &covers[&r.paint];
                 let parapet = r.parapet().map(|pk| &covers[pk].0);
-                let items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2)).collect();
+                let mut items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2, [1.0, 1.0])).collect();
+                items.extend(mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)));
                 // Крыша — в родном разрешении покрытия (256 на клетку), не в мелком
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
@@ -370,7 +380,9 @@ impl App {
             // открывается. Картинка — одна на ассет.
             // Остальные предметы — тоже тайлами, в родном разрешении картинки,
             // по слою: кто выше, тот позже.
-            let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile()).collect();
+            // Крышное над прямоугольной крышей уже в её картинке.
+            let baked = |p: &Prop| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && map.roofs.iter().any(|r| r.contains(p.pos));
+            let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !baked(p)).collect();
             items.sort_by_key(|p| p.layer());
             for prop in items {
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
@@ -393,7 +405,7 @@ impl App {
                 tile.fade = false;
                 tile.leaves = false;
                 tile.item = true;
-                tile.above = prop.layer() >= map::ABOVE_ROOFS;
+                tile.above = prop.layer() >= map::ON_ROOF;
                 tile.tint = prop.tint;
                 if !(map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
                     tiles.push(tile);
@@ -433,7 +445,8 @@ impl App {
             for k in 0..n {
                 let map = if k == self.level { &self.map } else { &self.levels[k] };
                 let mut flat = e.done[k].clone();
-                let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile()).collect();
+                // Крыш в Universal VTT нет — нет и крышного.
+                let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
                 items.sort_by_key(|p| p.layer());
                 let p = e.px as f32;
                 for prop in items {
