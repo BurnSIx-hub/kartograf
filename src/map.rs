@@ -547,7 +547,13 @@ pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
     if file.starts_with("Speaker_Stack") {
         return Some(("speaker", "on".into()));
     }
-    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A", "Airship_Gnome_Brass_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+}
+
+/// Летучее судно: в Foundry «Wild Canvas» качает его в воздухе, под ним ползёт тень.
+pub fn hover_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    ["airship", "zeppelin", "blimp", "dirigible", "balloon", "дирижабл", "аэростат"].iter().any(|w| k.contains(w))
 }
 
 /// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.

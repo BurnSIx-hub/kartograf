@@ -620,6 +620,8 @@ pub struct RoofTile {
     /// над крышами (слой «над крышами»).
     pub item: bool,
     pub above: bool,
+    /// Парит («Wild Canvas»): дирижабль плывёт, покачивается, под ним тень.
+    pub hover: bool,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
     /// Контур крыши OSM в точках сцены, двор — `true` ([`crate::roofs::outline`]).
@@ -716,11 +718,18 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 // Над крышами — выше крыши этажа, иначе на полу.
                 tile["elevation"] = json!(k as i64 * 10 + if r.above { 25 } else { 0 });
                 tile["occlusion"]["modes"] = json!([]);
+                if r.hover {
+                    tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});
+                }
             } else if let Some((key, value)) = &r.living {
-                // Живой предмет на полу, под токенами: колонка играет сразу.
-                tile["elevation"] = json!(k as i64 * 10);
+                // Живой предмет под токенами: колонка играет сразу. Дирижабль над
+                // крышами так и остаётся над ними — винты крутятся там.
+                tile["elevation"] = json!(k as i64 * 10 + if r.above { 25 } else { 0 });
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = json!({LIVE_MODULE: {*key: value}});
+                if r.hover {
+                    tile["flags"][LIVE_MODULE]["hover"] = json!(1);
+                }
             } else if r.web.is_some() || r.chest.is_some() {
                 tile["elevation"] = json!(k as i64 * 10);
                 tile["occlusion"]["modes"] = json!([]);
@@ -1109,6 +1118,26 @@ mod tests {
         assert_eq!((o[0]["hole"].as_bool(), o[1]["hole"].as_bool()), (Some(false), Some(true)));
         assert_eq!(o[1]["points"][1].as_f64(), Some(0.25));
         assert!(scene["tiles"][1].get("flags").is_none(), "у своей крыши Картографа контура нет — берётся прямоугольник");
+    }
+
+    #[test]
+    fn airship_floats_above_roofs_with_spinning_rotors() {
+        let a = Map::new(6, 4);
+        let la = layout(&a, &a.room_edges());
+        let key = "objects/steampunk/Airship_Gnome_Brass_A_5x10.webp";
+        assert!(crate::map::hover_by_name(key) && !crate::map::hover_by_name("objects/Barrel_A1_1x1.webp"));
+        let mut ship = canopy_tile("k/ship.webp".into(), [3.0, 2.0], [2.0, 4.0], 90.0, 100);
+        (ship.item, ship.above, ship.hover, ship.living) = (true, true, true, crate::map::living_by_name(key));
+        let mut balloon = canopy_tile("k/b.webp".into(), [1.0, 1.0], [1.0, 1.0], 0.0, 100);
+        (balloon.item, balloon.above, balloon.hover) = (true, true, true);
+        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon] }];
+        let scene = foundry_levels(&a, "Город", &levels, 100, &Default::default());
+        let t = &scene["tiles"][0];
+        assert_eq!(t["elevation"], 25, "над крышами, а не на полу, как колонка");
+        assert_eq!(t["flags"][LIVE_MODULE]["machine"], "Airship_Gnome_Brass_A");
+        assert_eq!(t["flags"][LIVE_MODULE]["hover"], 1);
+        let b = &scene["tiles"][1];
+        assert_eq!((b["elevation"].as_i64(), b["flags"][LIVE_MODULE]["hover"].as_i64()), (Some(25), Some(1)));
     }
 
     #[test]
