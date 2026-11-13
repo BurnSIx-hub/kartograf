@@ -550,6 +550,14 @@ pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
     ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A", "Airship_Gnome_Brass_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
 }
 
+/// Лестница, трап, люк: стоят в одном месте на соседних этажах — в Foundry между
+/// этими уровнями переход. Тень спуска, перила и упавшая стремянка — не переход.
+pub fn passage_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    ["stairs", "staircase", "ladder", "hatch", "trapdoor", "лестниц", "люк", "трап"].iter().any(|w| k.contains(w))
+        && !["shade", "overlay", "railing", "fallen", "aframe", "bed_ladder", "broken"].iter().any(|w| k.contains(w))
+}
+
 /// Летучее судно: в Foundry «Wild Canvas» качает его в воздухе, под ним ползёт тень.
 pub fn hover_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
@@ -1241,6 +1249,18 @@ fn segment_line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 }
 
 
+fn still(v: &f32) -> bool {
+    *v == 0.0
+}
+
+fn drift_down() -> f32 {
+    90.0
+}
+
+fn is_down(v: &f32) -> bool {
+    (*v - 90.0).abs() < 1e-3
+}
+
 fn default_materials() -> Vec<Material> {
     builtin_materials()
 }
@@ -1272,6 +1292,13 @@ pub struct Map {
     /// «Wild Canvas», внутри неё играет он, снаружи — `ambience`. Пусто — без неё.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub indoor: String,
+    /// Течение воды в «Wild Canvas», клеток в секунду: корабль на ходу стоит, а
+    /// вода уходит мимо борта, за кормой след. 0 — вода стоит.
+    #[serde(default, skip_serializing_if = "still")]
+    pub current: f32,
+    /// Куда течёт вода, градусы по часовой от «вправо»: 90 — вниз, корабль идёт вверх.
+    #[serde(default = "drift_down", skip_serializing_if = "is_down")]
+    pub drift: f32,
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1417,6 +1444,8 @@ impl Map {
             weather: String::new(),
             ambience: String::new(),
             indoor: String::new(),
+            current: 0.0,
+            drift: drift_down(),
             width,
             height,
             materials: builtin_materials(),

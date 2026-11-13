@@ -154,6 +154,9 @@ impl App {
             "set_wall_style" => self.tool_wall_style(a),
             "edit_roof" => self.tool_edit_roof(a),
             "add_roof" => self.tool_add_roof(a),
+            "set_scene" => self.tool_set_scene(a),
+            "add_level" => self.tool_add_level(a),
+            "switch_level" => self.tool_switch_level(a),
             "reload_assets" => {
                 if let Some(dir) = self.settings.textures_dir.clone() {
                     self.library.set_folder(&dir);
@@ -241,7 +244,9 @@ impl App {
             "file": self.path,
             "unsaved": self.dirty,
             "level": self.level, "levels": self.levels.len(),
+            "level_names": (0..self.levels.len()).map(|k| self.level_name(k)).collect::<Vec<_>>(),
             "seed": m.seed,
+            "scene": {"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift},
             "objects": m.props.len(), "walls": m.walls.len(), "doors": m.portals.len(),
             "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(),
             "materials": m.materials.iter().enumerate().map(|(i, x)| json!({"index": i, "name": x.name, "texture": match &x.paint { Paint::Texture(t) => Some(t.clone()), Paint::Color(_) => None }})).collect::<Vec<_>>(),
@@ -449,7 +454,8 @@ impl App {
             return Err("нужно хотя бы две точки".into());
         }
         self.checkpoint();
-        self.map.walls.push(Wall { points, closed: a["closed"].as_bool().unwrap_or(false), bends: Vec::new(), low: false, style: None });
+        let low = a["low"].as_bool().unwrap_or(false);
+        self.map.walls.push(Wall { points, closed: a["closed"].as_bool().unwrap_or(false), bends: Vec::new(), low, style: None });
         self.edges_dirty = true;
         Ok(json!({"index": self.map.walls.len() - 1}))
     }
@@ -516,6 +522,67 @@ impl App {
             l.gm = g;
         }
         Ok(json!({"index": i, "text": l.text, "x": l.pos[0], "y": l.pos[1], "size": l.size, "rotation": l.rot, "gm_only": l.gm}))
+    }
+
+    fn levels_reply(&self) -> Value {
+        json!({"level": self.level, "levels": (0..self.levels.len()).map(|k| self.level_name(k)).collect::<Vec<_>>()})
+    }
+
+    /// Новый этаж выше или ниже текущего; редактор переходит на него.
+    fn tool_add_level(&mut self, a: &Value) -> Res {
+        self.add_level(!a["below"].as_bool().unwrap_or(false));
+        if let Some(n) = a["name"].as_str() {
+            self.map.name = n.to_owned();
+        }
+        Ok(self.levels_reply())
+    }
+
+    fn tool_switch_level(&mut self, a: &Value) -> Res {
+        if let Some(k) = a["level"].as_u64() {
+            let k = k as usize;
+            if k >= self.levels.len() {
+                return Err(format!("этажей {}: номер от 0 до {}", self.levels.len(), self.levels.len() - 1));
+            }
+            self.switch_level(k);
+        }
+        if let Some(n) = a["name"].as_str() {
+            self.checkpoint();
+            self.map.name = n.to_owned();
+        }
+        Ok(self.levels_reply())
+    }
+
+    /// Живое сцены для «Wild Canvas»: звук места, что летит от крон, погода, течение.
+    fn tool_set_scene(&mut self, a: &Value) -> Res {
+        use crate::plan::{PARTICLES, PLACES, WEATHERS};
+        let pick = |key: &str, list: &[(&str, &str)]| -> Result<Option<String>, String> {
+            match a[key].as_str() {
+                None => Ok(None),
+                Some(v) if list.iter().any(|(k, _)| *k == v) => Ok(Some(v.to_owned())),
+                Some(v) => Err(format!("{key} «{v}»: одно из {}", list.iter().map(|(k, _)| format!("«{k}»")).collect::<Vec<_>>().join(", "))),
+            }
+        };
+        let (ambience, particles, weather) = (pick("ambience", &PLACES)?, pick("particles", &PARTICLES)?, pick("weather", &WEATHERS)?);
+        let current = f(a, "current").map(|v| v.clamp(0.0, 3.0));
+        let drift = f(a, "drift").map(|v| v.rem_euclid(360.0));
+        self.checkpoint();
+        let m = &mut self.map;
+        if let Some(v) = ambience {
+            m.ambience = v;
+        }
+        if let Some(v) = particles {
+            m.particles = v;
+        }
+        if let Some(v) = weather {
+            m.weather = v;
+        }
+        if let Some(v) = current {
+            m.current = v;
+        }
+        if let Some(v) = drift {
+            m.drift = v;
+        }
+        Ok(json!({"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift}))
     }
 
     fn tool_add_roof(&mut self, a: &Value) -> Res {

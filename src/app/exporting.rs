@@ -433,7 +433,11 @@ impl App {
         let levels: Vec<export::SceneLevel> = (0..n)
             .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
-        let scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
+        let mut scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
+        // Сцена открывается на том этаже, что открыт в редакторе: у корабля — палуба, а не трюм.
+        if n > 1 {
+            scene["initialLevel"] = serde_json::json!(export::level_id(self.level));
+        }
         let scene_path = e.dir.join(format!("{}.json", e.name));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
         // Universal VTT — для других VTT; модулю он не нужен, сцена создаётся сразу.

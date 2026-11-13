@@ -193,6 +193,16 @@ impl App {
             self.checkpoint();
             self.map.weather = weather;
         }
+        ui.separator();
+        // Корабль на ходу: вода уходит мимо борта (области воды в «Wild Canvas»).
+        ui.label("Течение воды");
+        let (mut current, mut drift) = (self.map.current, self.map.drift);
+        let r1 = ui.add(egui::Slider::new(&mut current, 0.0..=3.0).step_by(0.1).suffix(" кл/с"));
+        let r2 = ui.add_enabled(current > 0.0, egui::Slider::new(&mut drift, 0.0..=355.0).step_by(5.0).suffix("°").text("куда"));
+        if r1.drag_started() || r2.drag_started() || ((r1.changed() || r2.changed()) && !r1.dragged() && !r2.dragged()) {
+            self.checkpoint();
+        }
+        (self.map.current, self.map.drift) = (current, drift);
     }
 
     pub(super) fn swatch(&mut self, ui: &mut egui::Ui, paint: &Paint, size: f32) -> egui::Response {

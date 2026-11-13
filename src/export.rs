@@ -26,6 +26,9 @@ pub struct Layout {
     pub lights: Vec<Light>,
     /// Живые области: эффект и контуры в клетках; `true` — дыра (остров).
     pub zones: Vec<Zone>,
+    /// Лестницы и люки: рамки [x0, y0, x1, y1] в клетках. Совпали на соседних
+    /// этажах — в Foundry между уровнями переход.
+    pub passages: Vec<[f32; 4]>,
 }
 
 pub struct Zone {
@@ -129,7 +132,16 @@ pub fn surfaces(map: &Map) -> Option<Value> {
 /// Покрытия одного эффекта сливаются в одну маску до обводки: Foundry вычитает
 /// дыры области из всех её фигур, и дыра мха под светлым пятном (тоже болото)
 /// вырезала бы само пятно.
-fn zones(map: &Map) -> Vec<Zone> {
+fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
+    // Стены твёрдые: под ними живого нет. Без этого пена и рябь воды ложились
+    // поверх борта корабля и стен у воды — стены впечатаны в картинку под эффектом.
+    // Стена комнаты стоит снаружи края комнаты на всю толщину, свободная — серединой.
+    let room_w = map.wall_looks.iter().map(|l| l.width).fold(map.wall_style.width, f32::max);
+    let mut solid: Vec<(Segment, f32)> = room_edges.iter().map(|s| (*s, room_w + 0.1)).collect();
+    for w in map.walls.iter().filter(|w| !w.is_decor()) {
+        let half = w.style.as_ref().map_or(map.wall_style.width, |s| s.width) / 2.0 + 0.1;
+        solid.extend(w.segments().map(|s| (s, half)));
+    }
     let mut masks: Vec<(&'static str, mask::Mask)> = Vec::new();
     for (m, mat) in map.materials.iter().enumerate() {
         let Some(effect) = mat.live().effect() else { continue };
@@ -157,6 +169,16 @@ fn zones(map: &Map) -> Vec<Zone> {
                         if map::segment_distance([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], seg[0], seg[1]) <= hw {
                             mask.data[j * mask.w + i] = 0;
                         }
+                    }
+                }
+            }
+        }
+        for ((a, b), hw) in &solid {
+            let (lo, hi) = ([a[0].min(b[0]) - hw, a[1].min(b[1]) - hw], [a[0].max(b[0]) + hw, a[1].max(b[1]) + hw]);
+            for j in ((lo[1] * res).floor().max(0.0) as usize)..((hi[1] * res).ceil().max(0.0) as usize).min(mask.h) {
+                for i in ((lo[0] * res).floor().max(0.0) as usize)..((hi[0] * res).ceil().max(0.0) as usize).min(mask.w) {
+                    if map::segment_distance([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], *a, *b) <= *hw {
+                        mask.data[j * mask.w + i] = 0;
                     }
                 }
             }
@@ -275,7 +297,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
-    let mut zones = zones(map);
+    let mut zones = zones(map, room_edges);
     // Костёр под открытым небом — маленькая область: пламя и дым рисует модуль.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("campfire")) {
         let r = 0.45 * p.size[0] * p.scale;
@@ -349,7 +371,18 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
                 .collect()
         })
         .unwrap_or_default();
-    Layout { walls, low, cliffs, portals, lights, zones, tents }
+    let passages = map
+        .props
+        .iter()
+        .filter(|p| map::passage_by_name(&p.asset))
+        .map(|p| {
+            let (s, c) = p.rot.to_radians().sin_cos();
+            let (hw, hh) = (p.size[0] * p.scale / 2.0, p.size[1] * p.scale / 2.0);
+            let (ex, ey) = (hw * c.abs() + hh * s.abs(), hw * s.abs() + hh * c.abs());
+            [p.pos[0] - ex, p.pos[1] - ey, p.pos[0] + ex, p.pos[1] + ey]
+        })
+        .collect();
+    Layout { walls, low, cliffs, portals, lights, zones, tents, passages }
 }
 
 /// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
@@ -801,6 +834,12 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "elevation": {"bottom": null, "top": null}, "behaviors": behaviors,
                 "flags": if z.effect == "place" { json!({LIVE_MODULE: {"place": z.place}}) } else { json!({LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}) }
             });
+            let mut region = region;
+            // Корабль на ходу: вода уходит мимо борта.
+            if z.effect == "water" && map.current > 0.0 {
+                region["flags"][LIVE_MODULE]["current"] = json!((map.current as f64 * 10.0).round() / 10.0);
+                region["flags"][LIVE_MODULE]["drift"] = json!(map.drift.rem_euclid(360.0).round() as i64);
+            }
             regions.push(tag(region));
         }
         let mut doc = json!({"_id": level_id(k), "name": lv.name, "background": {"src": lv.image_src, "color": "#999999"}});
@@ -809,6 +848,27 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             doc["sort"] = json!(k as i64 * 100);
         }
         docs.push(doc);
+    }
+    // Переходы между этажами: лестница или люк в одном месте на соседних уровнях —
+    // область на обоих, с поведением ядра «Сменить уровень» (токен вошёл — вопрос, куда).
+    for k in 0..levels.len().saturating_sub(1) {
+        for a in &levels[k].layout.passages {
+            for b in &levels[k + 1].layout.passages {
+                if a[0] >= b[2] || b[0] >= a[2] || a[1] >= b[3] || b[1] >= a[3] {
+                    continue;
+                }
+                let r = [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
+                let p = px as f32;
+                let pts: Vec<i64> = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]].iter().flat_map(|v| [(v[0] * p).round() as i64, (v[1] * p).round() as i64]).collect();
+                regions.push(json!({
+                    "_id": doc_id('r', regions.len()), "name": format!("{} ↔ {}", levels[k].name, levels[k + 1].name), "color": "#c9a24a",
+                    "shapes": [{"type": "polygon", "points": pts, "hole": false}],
+                    "elevation": {"bottom": null, "top": null},
+                    "levels": [level_id(k), level_id(k + 1)],
+                    "behaviors": [{"_id": doc_id('c', regions.len()), "type": "changeLevel", "system": {"movementActions": []}}]
+                }));
+            }
+        }
     }
     json!({
         "name": name,
@@ -1072,6 +1132,68 @@ mod tests {
         assert_eq!(r["behaviors"][0]["system"]["difficulties"]["walk"], 2);
         assert_eq!(r["shapes"].as_array().unwrap().len(), 2);
         assert_eq!(r["shapes"][0]["type"], "polygon");
+    }
+
+    #[test]
+    fn hatch_over_ladder_links_two_levels() {
+        // Люк на палубе над трапом в трюме — переход между уровнями; трап в стороне — нет.
+        let hold = Map::new(10, 10);
+        let mut deck = hold.new_level();
+        let mut hold = hold;
+        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 5.0, 5.0));
+        hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 8.0, 2.0));
+        deck.props.push(prop("Trapdoor_Wood_Ashen_A2_Open_1x1.webp", 5.2, 4.6));
+        deck.props.push(prop("Barrel_Wood_A1_1x1.webp", 8.0, 2.0));
+        assert!(crate::map::passage_by_name("Stairs_Shade") == false && crate::map::passage_by_name("x/Floor_Hatch_A_1x1.webp"));
+        let (lh, ld) = (layout(&hold, &[]), layout(&deck, &[]));
+        let levels = [
+            SceneLevel { name: "Трюм".into(), image_src: "h.jpg".into(), layout: &lh, roofs: Vec::new() },
+            SceneLevel { name: "Палуба".into(), image_src: "d.jpg".into(), layout: &ld, roofs: Vec::new() },
+        ];
+        let scene = foundry_levels(&deck, "Корабль", &levels, 100, &Default::default());
+        let links: Vec<&Value> = scene["regions"].as_array().unwrap().iter().filter(|r| r["behaviors"][0]["type"] == "changeLevel").collect();
+        assert_eq!(links.len(), 1, "один переход: люк над трапом");
+        assert_eq!(links[0]["levels"], json!([level_id(0), level_id(1)]));
+        assert_eq!(links[0]["name"], "Трюм ↔ Палуба");
+        assert_eq!(links[0]["behaviors"][0]["system"]["movementActions"], json!([]));
+    }
+
+    #[test]
+    fn no_living_water_under_walls() {
+        // Борт корабля стоит над водой: пена не должна ложиться на стену.
+        let mut m = Map::new(12, 12);
+        let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        m.paint(crate::map::Layer::Floor, water, &crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (11, 11)));
+        m.wall_style.width = 0.4;
+        m.walls.push(crate::map::Wall { points: vec![[2.0, 6.0], [10.0, 6.0]], closed: false, bends: Vec::new(), low: true, style: None });
+        m.prune();
+        let lay = layout(&m, &m.room_edges());
+        let z = lay.zones.iter().find(|z| z.effect == "water").unwrap();
+        let wet = |p: [f32; 2]| z.loops.iter().filter(|(l, _)| inside(p, l)).count() % 2 == 1;
+        assert!(!wet([6.0, 6.0]) && !wet([6.0, 6.18]), "под стеной сухо");
+        assert!(wet([6.0, 3.0]) && wet([6.0, 6.6]), "рядом со стеной — вода");
+    }
+
+    #[test]
+    fn ship_underway_makes_water_run_past() {
+        let mut m = Map::new(12, 12);
+        let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        m.paint(crate::map::Layer::Floor, water, &crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (11, 11)));
+        m.paint(crate::map::Layer::Floor, 3, &crate::mask::cells(m.rooms.w, m.rooms.h, (5, 3), (7, 9)));
+        m.prune();
+        let lay = layout(&m, &[]);
+        let level = |lay| [SceneLevel { name: "Море".into(), image_src: "s.jpg".into(), layout: lay, roofs: Vec::new() }];
+        let still = foundry_levels(&m, "Море", &level(&lay), 100, &Default::default());
+        assert!(still["regions"][0]["flags"][LIVE_MODULE].get("current").is_none(), "стоячая вода без течения");
+        (m.current, m.drift) = (1.25, 450.0);
+        let back: Map = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!((back.current, back.drift), (1.25, 450.0));
+        let sea = foundry_levels(&m, "Море", &level(&lay), 100, &Default::default());
+        let f = &sea["regions"][0]["flags"][LIVE_MODULE];
+        assert_eq!((f["effect"].as_str(), f["current"].as_f64(), f["drift"].as_i64()), (Some("water"), Some(1.3), Some(90)));
+        let old: Map = serde_json::from_str(&serde_json::to_string(&Map::new(2, 2)).unwrap().replace(",\"drift\":90.0", "")).unwrap();
+        assert_eq!((old.current, old.drift), (0.0, 90.0), "старые карты: вода стоит, направление вниз");
     }
 
     #[test]

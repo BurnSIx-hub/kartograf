@@ -46,6 +46,20 @@ fn tools() -> Value {
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
             "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer
         }), &["index"]),
+        tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
+            "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, tavern, house"),
+            "particles": {"type": "string", "enum": ["", "leaves", "fireflies"]},
+            "weather": {"type": "string", "enum": ["", "snow"]},
+            "current": num("Water current, cells per second, 0..3; 0 — still water. About 1 for a ship under sail"),
+            "drift": num("Where the water runs, degrees clockwise from right: 90 — down the map, so the ship sails up")
+        }), &[]),
+        tool("add_level", "Add a floor above or below the current one and switch to it: a ship's lower deck, a cellar, an upper storey. Same size and palette; draw it like any map. In Foundry every floor is a level; a stairs, ladder or hatch object standing in the same place on two neighbouring floors becomes a passage between them. The scene opens on the floor that is current at export.", json!({
+            "below": {"type": "boolean", "description": "Put the new floor under the current one (hold, cellar); default above"},
+            "name": text("Floor name, shown in Foundry")
+        }), &[]),
+        tool("switch_level", "Switch to another floor (0 — the lowest, see map_info level_names) and/or rename the current one.", json!({
+            "level": int("Floor number"), "name": text("New name for the floor")
+        }), &[]),
         tool("add_roof", "Put a roof over a house: the rectangle of its walls in cells. Players see the roof from outside; it fades when they walk in.", json!({
             "area": area, "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"], "description": "Default gable"},
@@ -66,7 +80,8 @@ fn tools() -> Value {
         }), &["material", "area"]),
         tool("erase", "Erase floor and rooms over a rectangle or oval of cells.", json!({"area": area, "shape": {"type": "string", "enum": ["rect", "oval"]}}), &["area"]),
         tool("add_wall", "Add a free-standing wall through points (cells). Room walls come from painting with target 'room' instead.", json!({
-            "points": {"type": "array", "items": point, "minItems": 2}, "closed": {"type": "boolean", "description": "Connect the last point to the first"}
+            "points": {"type": "array", "items": point, "minItems": 2}, "closed": {"type": "boolean", "description": "Connect the last point to the first"},
+            "low": {"type": "boolean", "description": "Low wall — railing, ship's bulwark, parapet: in Foundry it stops movement, but sight and light pass over it"}
         }), &["points"]),
         tool("add_door", "Put a door, window or opening into the wall nearest to a point.", json!({
             "x": num("Point near the wall, cells"), "y": num("Point near the wall, cells"),
@@ -215,7 +230,7 @@ mod tests {
     fn tools_found_missing_on_a_real_map_are_there() {
         let list = tools();
         let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof"] {
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level"] {
             assert!(names.contains(&n), "{n}");
         }
         let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();
