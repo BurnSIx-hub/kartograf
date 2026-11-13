@@ -360,6 +360,11 @@ struct Export {
     canopies: bool,
     /// Модуль: обновить последнюю сцену, а не заводить новую.
     update: bool,
+    /// Только картинка области (MCP `view`, `render_picture`): предметы и двери в ней,
+    /// файлов сцены нет, этаж — текущий. Итог — в [`App::picture`].
+    picture: bool,
+    /// Левый верхний угол снимаемой области, клетки.
+    origin: [f32; 2],
 }
 
 /// Окно выгрузки: сколько пикселей на клетку; в модуле ещё имя сцены и новая/последняя.
@@ -531,6 +536,8 @@ pub struct App {
     pub generator: Option<Options>,
     new_map: Option<NewMap>,
     export: Option<Export>,
+    /// Готовая картинка карты с предметами ([`App::start_picture`]) — её забирает MCP.
+    picture: Option<image::RgbImage>,
     export_dialog: Option<ExportDialog>,
     /// Под каким именем эта карта последний раз ушла на сцену (модуль).
     scene_name: Option<String>,
@@ -709,6 +716,7 @@ impl App {
             generator: None,
             new_map: None,
             export: None,
+            picture: None,
             export_dialog: None,
             scene_name: None,
             export_args: args.export.map(|d| (d, args.px.unwrap_or(EXPORT_PX))),

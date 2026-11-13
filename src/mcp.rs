@@ -13,7 +13,9 @@ const GUIDE: &str = "Kartograf is a battle-map editor for tabletop RPGs (D&D, Fo
 
 Coordinates are grid cells: x to the right, y down, (0, 0) is the top-left corner of the map; one cell is 5 ft (1.524 m). Object positions are centres; sizes are in cells.
 
-Typical loop: `map_info` → `find_assets` to get asset keys → edit (`add_object`, `paint`, `add_wall`, `add_door`, …) → `view` to look at the result → `save_map` / `export_foundry`. To start from something, use `generate` (procedural maps), `build_plan` (a JSON plan, see plans/README.md in the repository) or `terrain_from_place` (real terrain from OpenStreetMap and satellite imagery).";
+Typical loop: `map_info` → `find_assets` to get asset keys → edit (`add_object`, `paint`, `add_wall`, `add_door`, …) → `view` to look at the result → `save_map` / `export_foundry`. To start from something, use `generate` (procedural maps), `build_plan` (a JSON plan, see plans/README.md in the repository) or `terrain_from_place` (real terrain from OpenStreetMap and satellite imagery).
+
+Lights in Foundry come from objects: lamps, fires and braziers glow by their name; give any object `light` (e.g. `arcane` for a magic crystal) in `add_object` / `edit_object`. Call `set_wall_style` before painting rooms to choose their walls. New picture files put into the user's asset folder appear after `reload_assets`. `render_picture` writes the whole map with objects to an image file for a preview.";
 
 fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
@@ -22,6 +24,7 @@ fn tools() -> Value {
     let point = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2});
     let area = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in cells; x1 and y1 are the far edges (a room [4, 3, 14, 11] gets walls on x=4, x=14, y=3, y=11)"});
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}});
+    let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow)"});
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers). Optionally only inside an area.", json!({
@@ -35,11 +38,11 @@ fn tools() -> Value {
         }), &["query"]),
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
-            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1")
+            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light
         }), &["asset", "x", "y"]),
-        tool("edit_object", "Move, rotate, scale or swap the picture of an object by index (see describe).", json!({
+        tool("edit_object", "Move, rotate, scale, light or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
-            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key")
+            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light
         }), &["index"]),
         tool("remove", "Remove items by indices: objects, walls, doors, labels or paths. Indices of later items shift down.", json!({
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths"]},
@@ -59,8 +62,25 @@ fn tools() -> Value {
             "kind": {"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"}
         }), &["x", "y"]),
         tool("add_label", "Write a label on the map (room name, street).", json!({"text": text("Text"), "x": num("Centre x"), "y": num("Centre y"), "size": num("Letter height in cells, default 1")}), &["text", "x", "y"]),
+        tool("edit_label", "Change a label by index (see describe): text, place, size, rotation, or hide it from players.", json!({
+            "index": int("Label index"), "text": text("New text"), "x": num("Centre x"), "y": num("Centre y"),
+            "size": num("Letter height in cells"), "rotation": num("Degrees clockwise"), "gm_only": {"type": "boolean", "description": "Only the GM sees it: not in the exported picture"}
+        }), &["index"]),
+        tool("add_path", "Lay a road, path, river or stream: a band of floor along a smooth line through the points, over the ground and under objects.", json!({
+            "points": {"type": "array", "items": point, "minItems": 2}, "material": text("Floor asset key from find_assets (kind floor), or a material index from map_info"),
+            "width": num("Cells, default 2"), "soft": num("0..1, how much the edge fades, default 0.35"), "rough": num("0..1, how ragged the edge is, default 0.25"),
+            "along": {"type": "boolean", "description": "Texture follows the line (cobbled road, carpet) instead of lying on the grid"}
+        }), &["points", "material"]),
+        tool("set_wall_style", "Choose how walls look. Without area: for walls made from now on (paint rooms after this); walls already standing keep their look. With area: restyle the walls standing in it.", json!({
+            "asset": text("Wall asset key from find_assets (kind wall)"), "color": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3, "description": "Plain colour [r, g, b] instead of a picture"},
+            "width": num("Thickness in cells, default 0.25 (0.35 for pictures)"), "area": area
+        }), &[]),
+        tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets.", json!({}), &[]),
         tool("undo", "Undo the last changes.", json!({"steps": int("Default 1")}), &[]),
-        tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it.", json!({"area": area, "max_px": int("Longest side of the picture, default 1024")}), &[]),
+        tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it (objects, doors, roofs; no grid or editor windows).", json!({"area": area, "max_px": int("Longest side of the picture, 128..2048, default 1024")}), &[]),
+        tool("render_picture", "Write a picture of the map with all objects to a file (PNG, JPEG or WebP by the extension) — for a preview or to share. Nothing is returned but the file.", json!({
+            "path": text("File path"), "px": int("Pixels per cell, 10..300, default 70"), "area": area
+        }), &["path"]),
         tool("generate", "Replace the map with a procedural one.", json!({
             "kind": {"type": "string", "enum": ["dungeon", "cave", "forest", "town", "walls", "house", "tavern", "jarl", "church", "arena", "cyberpunk"]},
             "width": int("Map width in cells (keeps the current size if omitted)"), "height": int("Map height in cells"),
@@ -179,6 +199,18 @@ mod tests {
 
     /// Каждый инструмент описан как следует: имя, описание, схема-объект, а
     /// обязательные поля есть среди свойств.
+    /// Инструменты, которых не хватило на первой живой карте (Иерихон), на месте.
+    #[test]
+    fn tools_found_missing_on_a_real_map_are_there() {
+        let list = tools();
+        let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label"] {
+            assert!(names.contains(&n), "{n}");
+        }
+        let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();
+        assert!(add["inputSchema"]["properties"]["light"]["enum"].as_array().unwrap().iter().any(|v| v == "arcane"));
+    }
+
     #[test]
     fn tools_are_well_formed() {
         let list = tools();

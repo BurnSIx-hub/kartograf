@@ -2,13 +2,15 @@
 //! каждый инструмент MCP. Правка — как рукой: точка отмены, видна сразу.
 
 use super::*;
-use crate::map::Label;
+use crate::map::{Glow, Label, Path as Road};
 use serde_json::{Value, json};
 use std::sync::mpsc::Sender;
 
-/// Ответ, которого ждут несколько кадров: снимок, место по координатам, выгрузка.
+/// Ответ, которого ждут несколько кадров: картинка, место по координатам, выгрузка.
 pub enum Waiting {
-    Shot { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, settle: u32, asked: bool },
+    /// Картинка области снимается плитками ([`App::start_picture`]): вернуть её ИИ
+    /// (`max_px` — сторона) и/или записать в файл.
+    Picture { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, path: Option<PathBuf>, image: bool },
     Place { reply: Sender<Result<Value, String>> },
     Export { reply: Sender<Result<Value, String>> },
 }
@@ -68,7 +70,7 @@ impl App {
             }
             Out::Wait(w) => {
                 self.control_wait = Some(match w {
-                    Waiting::Shot { area, max_px, .. } => Waiting::Shot { reply: req.reply, area, max_px, settle: 0, asked: false },
+                    Waiting::Picture { area, max_px, path, image, .. } => Waiting::Picture { reply: req.reply, area, max_px, path, image },
                     Waiting::Place { .. } => Waiting::Place { reply: req.reply },
                     Waiting::Export { .. } => Waiting::Export { reply: req.reply },
                 });
@@ -88,22 +90,15 @@ impl App {
     fn control_wait_step(&mut self, ctx: &egui::Context) {
         ctx.request_repaint();
         match self.control_wait.take() {
-            Some(Waiting::Shot { reply, area, max_px, mut settle, asked }) => {
-                if !asked {
-                    // Камера на область, пара кадров на подгрузку картинок, потом снимок.
-                    let (w, h) = ((area[2] - area[0]).max(1.0), (area[3] - area[1]).max(1.0));
-                    self.cam.scale = (self.canvas.width() / w).min(self.canvas.height() / h).clamp(1.0, 400.0);
-                    let size = vec2(w, h) * self.cam.scale;
-                    self.cam.pan = (self.canvas.size() - size) / 2.0 - vec2(area[0], area[1]) * self.cam.scale;
-                    self.fitted = true;
-                    settle += 1;
-                    let ready = settle >= 3 && self.textures.idle() && !self.library.loading();
-                    if ready {
-                        ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
-                    }
-                    self.control_wait = Some(Waiting::Shot { reply, area, max_px, settle, asked: ready });
+            Some(Waiting::Picture { reply, area, max_px, path, image }) => {
+                if self.export.is_some() {
+                    self.control_wait = Some(Waiting::Picture { reply, area, max_px, path, image });
                 } else {
-                    self.control_wait = Some(Waiting::Shot { reply, area, max_px, settle, asked });
+                    let r = match self.picture.take() {
+                        Some(img) => picture_reply(img, area, max_px, path.as_deref(), image),
+                        None => Err("картинка не снялась".into()),
+                    };
+                    let _ = reply.send(r);
                 }
             }
             Some(Waiting::Place { reply }) => {
@@ -124,42 +119,6 @@ impl App {
             }
             None => {}
         }
-    }
-
-    /// Пришёл снимок окна: если его ждёт ИИ — вырезать область и отдать PNG.
-    pub(super) fn control_shot(&mut self, ctx: &egui::Context, shot: &egui::ColorImage) -> bool {
-        let Some(Waiting::Shot { asked: true, .. }) = &self.control_wait else { return false };
-        let Some(Waiting::Shot { reply, area, max_px, .. }) = self.control_wait.take() else { return false };
-        let ppp = ctx.pixels_per_point();
-        let a = self.cam.to_screen(self.canvas, [area[0], area[1]]);
-        let b = self.cam.to_screen(self.canvas, [area[2], area[3]]);
-        let r = Rect::from_min_max(a, b).intersect(self.canvas);
-        let [sw, sh] = shot.size;
-        let (x0, y0) = (((r.min.x * ppp).max(0.0) as usize).min(sw), ((r.min.y * ppp).max(0.0) as usize).min(sh));
-        let (x1, y1) = (((r.max.x * ppp) as usize).min(sw), ((r.max.y * ppp) as usize).min(sh));
-        let (w, h) = (x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
-        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
-            let c = shot.pixels[((y0 + y as usize).min(sh - 1)) * sw + (x0 + x as usize).min(sw - 1)];
-            image::Rgb([c.r(), c.g(), c.b()])
-        });
-        let k = (max_px as f32 / w.max(h) as f32).min(1.0);
-        let img = if k < 1.0 { image::imageops::resize(&img, ((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle) } else { img };
-        let mut png = Vec::new();
-        let r = image::DynamicImage::ImageRgb8(img.clone())
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .map_err(|e| e.to_string())
-            .map(|_| {
-                use base64::Engine;
-                let cells = [area[2] - area[0], area[3] - area[1]];
-                json!({
-                    "image_png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
-                    "area": area,
-                    "pixels": [img.width(), img.height()],
-                    "px_per_cell": img.width() as f32 / cells[0].max(1e-3),
-                })
-            });
-        let _ = reply.send(r);
-        true
     }
 
     /// Ключ ассета: точный ключ, а нет — первый по имени.
@@ -190,6 +149,16 @@ impl App {
             "add_wall" => self.tool_add_wall(a),
             "add_door" => self.tool_add_door(a),
             "add_label" => self.tool_add_label(a),
+            "edit_label" => self.tool_edit_label(a),
+            "add_path" => self.tool_add_path(a),
+            "set_wall_style" => self.tool_wall_style(a),
+            "reload_assets" => {
+                if let Some(dir) = self.settings.textures_dir.clone() {
+                    self.library.set_folder(&dir);
+                }
+                let count = |k: Kind| self.library.assets.iter().filter(|x| x.kind == k).count();
+                Ok(json!({"folder": self.settings.textures_dir, "objects": count(Kind::Object), "floors": count(Kind::Floor), "walls": count(Kind::Wall), "doors": count(Kind::Door), "library_loading": self.library.loading()}))
+            }
             "undo" => {
                 let n = a["steps"].as_u64().unwrap_or(1).clamp(1, 50);
                 for _ in 0..n {
@@ -197,10 +166,22 @@ impl App {
                 }
                 Ok(json!({"undone": n}))
             }
-            "view" => {
+            "view" | "render_picture" => {
                 let area = area_of(a).unwrap_or([0.0, 0.0, self.map.width as f32, self.map.height as f32]);
-                let max_px = a["max_px"].as_u64().unwrap_or(1024).clamp(128, 2048) as u32;
-                return Out::Wait(Waiting::Shot { reply: dummy(), area, max_px, settle: 0, asked: false });
+                let longest = (area[2] - area[0]).max(area[3] - area[1]).max(1.0);
+                let (max_px, px, path, image) = if tool == "view" {
+                    let max_px = a["max_px"].as_u64().unwrap_or(1024).clamp(128, 2048) as u32;
+                    (max_px, (max_px as f32 / longest).floor().max(2.0) as u32, None, true)
+                } else {
+                    let Some(path) = a["path"].as_str().filter(|p| !p.is_empty()) else { return Out::Done(Err("нужен path — куда записать картинку".into())) };
+                    let px = a["px"].as_u64().unwrap_or(70).clamp(10, 300) as u32;
+                    (u32::MAX, px, Some(PathBuf::from(path)), false)
+                };
+                if self.export.is_some() {
+                    return Out::Done(Err("идёт выгрузка — подождите".into()));
+                }
+                self.start_picture(area, px);
+                return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image });
             }
             "generate" => self.tool_generate(a),
             "build_plan" => self.tool_plan(a),
@@ -275,7 +256,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| inside(area, p.pos))
                 .take(limit)
-                .map(|(i, p)| json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer()}))
+                .map(|(i, p)| json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light())}))
                 .collect();
             out.insert("objects".into(), json!(list));
         }
@@ -334,11 +315,12 @@ impl App {
         let asset = self.asset_key(a["asset"].as_str().unwrap_or_default())?;
         let (x, y) = (need(a, "x")?, need(a, "y")?);
         let size = self.asset_size(&asset);
+        let light = glow_of(a)?.flatten();
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
+        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow: None, light, canopy: None, layer: None, tint: None, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "size_cells": size}))
+        Ok(json!({"index": i, "size_cells": size, "light": glow_name(self.map.props[i].light())}))
     }
 
     fn tool_edit_object(&mut self, a: &Value) -> Res {
@@ -351,8 +333,12 @@ impl App {
             None => None,
         };
         let size = asset.as_deref().map(|k| self.asset_size(k));
+        let light = glow_of(a)?;
         self.checkpoint();
         let p = &mut self.map.props[i];
+        if let Some(g) = light {
+            p.light = g;
+        }
         if let Some(x) = f(a, "x") {
             p.pos[0] = x;
         }
@@ -370,7 +356,7 @@ impl App {
             p.size = sz;
         }
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "x": p.pos[0], "y": p.pos[1], "rotation": p.rot, "scale": p.scale, "asset": p.asset}))
+        Ok(json!({"index": i, "x": p.pos[0], "y": p.pos[1], "rotation": p.rot, "scale": p.scale, "asset": p.asset, "light": glow_name(p.light())}))
     }
 
     fn tool_remove(&mut self, a: &Value) -> Res {
@@ -421,20 +407,7 @@ impl App {
             self.edges_dirty = true;
             return Ok(json!({"erased_cells": weights.len() / (mask::RES * mask::RES)}));
         }
-        let m = match &a["material"] {
-            Value::Number(n) => {
-                let i = n.as_u64().unwrap_or(u64::MAX) as usize;
-                if i >= self.map.materials.len() {
-                    return Err(format!("материала {i} нет"));
-                }
-                i
-            }
-            v => {
-                let key = self.asset_key(v.as_str().unwrap_or_default())?;
-                let mat = Material { name: library::label(&key), paint: Paint::Texture(key), vary: false, live: map::Live::Auto };
-                self.map.material_index(mat).ok_or("в карте уже 255 материалов")?
-            }
-        };
+        let m = self.material_of(&a["material"])?;
         self.checkpoint();
         let room = a["target"].as_str() == Some("room");
         self.map.paint(if room { Layer::Rooms } else { Layer::Floor }, m, &weights);
@@ -485,6 +458,134 @@ impl App {
         Ok(json!({"index": self.map.labels.len() - 1}))
     }
 
+    fn tool_edit_label(&mut self, a: &Value) -> Res {
+        let i = a["index"].as_u64().ok_or("нужен index")? as usize;
+        if i >= self.map.labels.len() {
+            return Err(format!("подписи {i} нет: их {}", self.map.labels.len()));
+        }
+        let text = a["text"].as_str().map(|t| t.trim().to_owned());
+        if text.as_deref() == Some("") {
+            return Err("пустая надпись — удалите её через remove".into());
+        }
+        self.checkpoint();
+        let l = &mut self.map.labels[i];
+        if let Some(t) = text {
+            l.text = t;
+        }
+        if let Some(x) = f(a, "x") {
+            l.pos[0] = x;
+        }
+        if let Some(y) = f(a, "y") {
+            l.pos[1] = y;
+        }
+        if let Some(s) = f(a, "size") {
+            l.size = s.clamp(0.2, 20.0);
+        }
+        if let Some(r) = f(a, "rotation") {
+            l.rot = r;
+        }
+        if let Some(g) = a["gm_only"].as_bool() {
+            l.gm = g;
+        }
+        Ok(json!({"index": i, "text": l.text, "x": l.pos[0], "y": l.pos[1], "size": l.size, "rotation": l.rot, "gm_only": l.gm}))
+    }
+
+    fn tool_add_path(&mut self, a: &Value) -> Res {
+        let points: Vec<[f32; 2]> = a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default();
+        if points.len() < 2 {
+            return Err("нужно хотя бы две точки".into());
+        }
+        let m = self.material_of(&a["material"])?;
+        let mut road = Road::template(m);
+        road.points = points;
+        if let Some(w) = f(a, "width") {
+            road.width = w.clamp(0.2, 40.0);
+        }
+        if let Some(s) = f(a, "soft") {
+            road.soft = s.clamp(0.0, 1.0);
+        }
+        if let Some(r) = f(a, "rough") {
+            road.rough = r.clamp(0.0, 1.0);
+        }
+        if let Some(b) = a["along"].as_bool() {
+            road.along = b;
+        }
+        self.checkpoint();
+        self.map.paths.push(road);
+        Ok(json!({"index": self.map.paths.len() - 1, "material": m}))
+    }
+
+    /// Вид стен: новых (комнаты, которые закрасят дальше, и свободные стены) или,
+    /// с `area`, уже стоящих в области. Стоящие при смене вида новых не меняются.
+    fn tool_wall_style(&mut self, a: &Value) -> Res {
+        let mut st = self.map.wall_style.clone();
+        if let Some(k) = a["asset"].as_str() {
+            st.paint = Paint::Texture(self.asset_key(k)?);
+            if f(a, "width").is_none() && st.width < 0.3 {
+                st.width = 0.35;
+            }
+        }
+        if let Some(c) = a["color"].as_array() {
+            let c: Vec<u8> = c.iter().filter_map(|v| v.as_u64().map(|v| v.min(255) as u8)).collect();
+            if c.len() != 3 {
+                return Err("color: [r, g, b]".into());
+            }
+            st.paint = Paint::Color([c[0], c[1], c[2]]);
+        }
+        if let Some(w) = f(a, "width") {
+            st.width = w.clamp(0.05, 2.0);
+        }
+        self.checkpoint();
+        self.sel = None;
+        let edges = self.room_edges().to_vec();
+        let mid = |s: &Segment| [(s.0[0] + s.1[0]) / 2.0, (s.0[1] + s.1[1]) / 2.0];
+        let r = if let Some(area) = area_of(a) {
+            let pick: Vec<Segment> = edges.iter().filter(|s| inside(Some(area), mid(s))).copied().collect();
+            self.map.set_edge_look(&pick, &st);
+            let mut n = 0;
+            for w in self.map.walls.iter_mut().filter(|w| w.points.iter().all(|&p| inside(Some(area), p))) {
+                w.style = Some(st.clone());
+                n += 1;
+            }
+            json!({"room_edges": pick.len(), "walls": n})
+        } else {
+            // Стоящие остаются какими были: стенам комнат без своего вида он
+            // записывается, свободным — тоже.
+            let old = self.map.wall_style.clone();
+            let bare: Vec<Segment> = edges.iter().filter(|s| !self.map.edge_looks.contains_key(&map::edge_key(s))).copied().collect();
+            self.map.set_edge_look(&bare, &old);
+            for w in self.map.walls.iter_mut().filter(|w| w.style.is_none()) {
+                w.style = Some(old.clone());
+            }
+            self.map.wall_style = st.clone();
+            json!({"for": "new walls"})
+        };
+        self.edges_dirty = true;
+        let paint = match &st.paint {
+            Paint::Texture(k) => json!(k),
+            Paint::Color(c) => json!(c),
+        };
+        Ok(json!({"style": {"paint": paint, "width": st.width}, "changed": r}))
+    }
+
+    /// Материал из ответа ИИ: номер в палитре карты или ключ пола из библиотеки.
+    fn material_of(&mut self, v: &Value) -> Result<usize, String> {
+        match v {
+            Value::Number(n) => {
+                let i = n.as_u64().unwrap_or(u64::MAX) as usize;
+                if i >= self.map.materials.len() {
+                    return Err(format!("материала {i} нет"));
+                }
+                Ok(i)
+            }
+            v => {
+                let key = self.asset_key(v.as_str().unwrap_or_default())?;
+                let mat = Material { name: library::label(&key), paint: Paint::Texture(key), vary: false, live: map::Live::Auto };
+                self.map.material_index(mat).ok_or("в карте уже 255 материалов".into())
+            }
+        }
+    }
+
     fn tool_generate(&mut self, a: &Value) -> Res {
         let kind: generate::Kind = serde_json::from_value(a["kind"].clone()).map_err(|_| format!("kind: {}", generate::Kind::ALL.iter().map(|k| serde_json::to_string(k).unwrap_or_default()).collect::<Vec<_>>().join(", ")))?;
         if let (Some(w), Some(h)) = (a["width"].as_u64(), a["height"].as_u64()) {
@@ -518,6 +619,65 @@ impl App {
         self.place.start = Some((lat, lon, cells));
         Out::Wait(Waiting::Place { reply: dummy() })
     }
+}
+
+/// Свет из ответа ИИ: нет поля — не трогать; `auto` — по имени; иначе свой.
+fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
+    let Some(s) = a["light"].as_str() else { return Ok(None) };
+    let g = match s {
+        "auto" => None,
+        "off" => Some(Glow::Off),
+        "campfire" => Some(Glow::Campfire),
+        "fireplace" => Some(Glow::Fireplace),
+        "brazier" => Some(Glow::Brazier),
+        "candle" => Some(Glow::Candle),
+        "lamp" => Some(Glow::Lamp),
+        "arcane" => Some(Glow::Arcane),
+        _ => return Err("light: auto, off, campfire, fireplace, brazier, candle, lamp или arcane".into()),
+    };
+    Ok(Some(g))
+}
+
+/// Как светит объект — словом для ИИ; не светит — `null`.
+fn glow_name(g: Option<Glow>) -> Option<String> {
+    g.filter(|g| *g != Glow::Off).map(|g| format!("{g:?}").to_lowercase())
+}
+
+/// Готовая картинка: в файл (по расширению — PNG, JPEG или WebP) и/или ИИ в ответ.
+fn picture_reply(img: image::RgbImage, area: [f32; 4], max_px: u32, path: Option<&std::path::Path>, with_image: bool) -> Res {
+    let mut out = json!({"area": area, "pixels": [img.width(), img.height()], "px_per_cell": img.width() as f32 / (area[2] - area[0]).max(1e-3)});
+    if let Some(p) = path {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let bytes = match ext.as_str() {
+            "webp" => crate::export::webp_bytes(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 90.0),
+            "jpg" | "jpeg" => {
+                let mut v = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut v, 90).encode_image(&img).map_err(|e| e.to_string())?;
+                v
+            }
+            _ => {
+                let mut v = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+                v
+            }
+        };
+        std::fs::write(p, bytes).map_err(|e| format!("{}: {e}", p.display()))?;
+        out["saved"] = json!(p);
+    }
+    if with_image {
+        let k = (max_px as f32 / img.width().max(img.height()) as f32).min(1.0);
+        let img = if k < 1.0 { image::imageops::resize(&img, ((img.width() as f32 * k) as u32).max(1), ((img.height() as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle) } else { img };
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        use base64::Engine;
+        out["image_png_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&png));
+        out["pixels"] = json!([img.width(), img.height()]);
+        out["px_per_cell"] = json!(img.width() as f32 / (area[2] - area[0]).max(1e-3));
+    }
+    Ok(out)
 }
 
 /// Заглушка: настоящий адресат ответа подставляется в `control_step`.

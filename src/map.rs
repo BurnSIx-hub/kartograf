@@ -445,10 +445,12 @@ pub enum Glow {
     Brazier,
     Candle,
     Lamp,
+    /// Магический свет: рунный кристалл, реактор, светящиеся руны — холодный, голубой.
+    Arcane,
 }
 
 impl Glow {
-    pub const CHOICES: [Glow; 6] = [Glow::Off, Glow::Campfire, Glow::Fireplace, Glow::Brazier, Glow::Candle, Glow::Lamp];
+    pub const CHOICES: [Glow; 7] = [Glow::Off, Glow::Campfire, Glow::Fireplace, Glow::Brazier, Glow::Candle, Glow::Lamp, Glow::Arcane];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -458,6 +460,7 @@ impl Glow {
             Glow::Brazier => "жаровня",
             Glow::Candle => "свеча",
             Glow::Lamp => "фонарь",
+            Glow::Arcane => "магия",
         }
     }
 
@@ -470,6 +473,7 @@ impl Glow {
             Glow::Brazier => Some((2.0, 4.0, "#ffa040", "torch")),
             Glow::Candle => Some((1.0, 2.0, "#ffd9a0", "torch")),
             Glow::Lamp => Some((3.0, 6.0, "#ffc870", "torch")),
+            Glow::Arcane => Some((2.0, 5.0, "#78b8ff", "energy")),
         }
     }
 }
@@ -488,7 +492,7 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
     let pair = |a: &str, b: &str| words.iter().any(|x| x == a) && words.iter().any(|x| x == b);
     if has(&["campfire", "bonfire", "firepit", "костёр", "костер"]) || pair("fire", "pit") || pair("camp", "fire") {
         Some(Glow::Campfire)
-    } else if has(&["fireplace", "hearth", "камин", "очаг"]) || pair("fire", "place") {
+    } else if has(&["fireplace", "hearth", "камин", "очаг"]) || pair("fire", "place") || pair("forge", "lit") {
         Some(Glow::Fireplace)
     } else if has(&["brazier", "torch", "torches", "sconce", "жаровня", "факел"]) {
         Some(Glow::Brazier)
@@ -1140,6 +1144,13 @@ impl Path {
 
 /// Кривая Катмулла — Рома через точки; у концов — повтор крайней точки.
 pub fn smooth_line(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    // Прямая из двух точек — тоже шагами: дорога тает к концам, и без точек
+    // посередине она таяла целиком (дорогу в два щелчка не было видно).
+    if let [a, b] = pts {
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let steps = ((len / 0.15).ceil() as usize).clamp(1, 400);
+        return (0..=steps).map(|k| std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k as f32 / steps as f32)).collect();
+    }
     if pts.len() < 3 {
         return pts.to_vec();
     }
@@ -1950,6 +1961,15 @@ mod tests {
         assert_eq!(cut, vec![([0.0, 2.0], [2.0, 2.0]), ([3.0, 2.0], [4.5, 2.0]), ([5.5, 2.0], [6.0, 2.0]), ([6.0, 2.0], [6.0, 5.0])]);
     }
 
+    /// Дорога из двух точек: линия с точками посередине, иначе она тает целиком.
+    #[test]
+    fn two_point_road_has_a_middle() {
+        let line = smooth_line(&[[28.0, 27.6], [28.0, 31.4]]);
+        assert!(line.len() > 10, "{}", line.len());
+        assert_eq!(line[0], [28.0, 27.6]);
+        assert!((line[line.len() - 1][1] - 31.4).abs() < 1e-4);
+    }
+
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
         let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
@@ -1959,6 +1979,11 @@ mod tests {
         assert_eq!(prop("C:\\assets\\objects\\Chandelier_Iron_2x2.webp").light(), Some(Glow::Candle));
         assert_eq!(prop("pack:x|textures/objects/Lamp_Post_A.webp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:x|textures/objects/Barrel_A.webp").light(), None);
+        // Горн FA горит, холодный — нет; магический свет — голубой.
+        assert_eq!(prop("pack:fa|textures/objects/Forge_Lit_Stone_Earthy_Large_Square_A1_3x3.webp").light(), Some(Glow::Fireplace));
+        assert_eq!(prop("pack:fa|textures/objects/Forge_Stone_Earthy_Large_Square_A1_3x3.webp").light(), None);
+        assert_eq!(Glow::Arcane.params().map(|p| p.2), Some("#78b8ff"));
+        assert!(Glow::CHOICES.contains(&Glow::Arcane));
         // Рукой: выключить похожее по имени и зажечь непохожее.
         assert_eq!(Prop { light: Some(Glow::Off), ..prop("builtin:campfire") }.light(), None);
         assert_eq!(Prop { light: Some(Glow::Brazier), ..prop("pack:x|textures/objects/Barrel_A.webp") }.light(), Some(Glow::Brazier));

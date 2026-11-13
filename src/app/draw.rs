@@ -332,7 +332,9 @@ impl App {
 
         // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
         // они уходят в Foundry отдельными тайлами.
-        let roof_alpha = if exporting { 0.0 } else { self.roof_alpha() };
+        // Картинка для ИИ и превью — с крышами, как их видно в редакторе.
+        let picture = self.export.as_ref().is_some_and(|e| e.picture);
+        let roof_alpha = if exporting && !picture { 0.0 } else { self.roof_alpha() };
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
         if self.roof_view != RoofView::Hidden || exporting {
             let roofs = self.map.roofs.clone();
@@ -577,9 +579,11 @@ impl App {
             painter.add(Shape::convex_polygon(to_screen(rect_around(half), cam), color, edge));
         };
         let exporting = self.export.is_some();
+        // В выгрузке двери — тайлы Foundry, в картинке их нет; в картинке для ИИ — есть.
+        let leaves_out = exporting && !self.export.as_ref().is_some_and(|e| e.picture);
         match p.kind {
             PortalKind::Opening => {}
-            PortalKind::Door | PortalKind::DoubleDoor if exporting => {}
+            PortalKind::Door | PortalKind::DoubleDoor if leaves_out => {}
             PortalKind::Door => {
                 // Петля (правый край картинки) — у начала проёма: там её повесит и Foundry.
                 let key = p.asset.clone();

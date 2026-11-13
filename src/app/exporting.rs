@@ -40,6 +40,48 @@ impl App {
             canopies: self.settings.export_canopies,
             update: false,
             stumps,
+            picture: false,
+            origin: [0.0, 0.0],
+        });
+    }
+
+    /// Снять область карты одной картинкой, как её рисует редактор, но без окон,
+    /// сетки и выделения: предметы и двери в картинке, этаж текущий. Плитками, как
+    /// выгрузка, — размер не упирается в окно. Готовое — в `self.picture`.
+    pub fn start_picture(&mut self, area: [f32; 4], px: u32) {
+        let px = px.clamp(2, 400);
+        let ppp = self.canvas_ppp;
+        let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
+        let (w, h) = ((((area[2] - area[0]) * px as f32).ceil() as u32).max(1), (((area[3] - area[1]) * px as f32).ceil() as u32).max(1));
+        let mut tiles = Vec::new();
+        for ty in 0..h.div_ceil(tile[1]) {
+            for tx in 0..w.div_ceil(tile[0]) {
+                tiles.push([tx, ty]);
+            }
+        }
+        self.picture = None;
+        let sel = self.sel.take();
+        self.export = Some(Export {
+            dir: PathBuf::new(),
+            name: String::new(),
+            px,
+            tile,
+            tiles,
+            next: 0,
+            image: image::RgbImage::new(w, h),
+            done: Vec::new(),
+            doing: self.level,
+            start_level: self.level,
+            cam: self.cam,
+            sel,
+            settle: 0,
+            asked: false,
+            quit: false,
+            canopies: false,
+            update: false,
+            stumps: Vec::new(),
+            picture: true,
+            origin: [area[0], area[1]],
         });
     }
 
@@ -72,7 +114,7 @@ impl App {
         // Начало плитки ложится на целый пиксель экрана: плитки стыкуются без шва.
         let origin = [(canvas.min.x * ppp).ceil(), (canvas.min.y * ppp).ceil()];
         let scale = e.px as f32 / ppp;
-        let world = [(tx * e.tile[0]) as f32 / e.px as f32, (ty * e.tile[1]) as f32 / e.px as f32];
+        let world = [e.origin[0] + (tx * e.tile[0]) as f32 / e.px as f32, e.origin[1] + (ty * e.tile[1]) as f32 / e.px as f32];
         self.cam.scale = scale;
         self.cam.pan = vec2(origin[0] / ppp - canvas.min.x - world[0] * scale, origin[1] / ppp - canvas.min.y - world[1] * scale);
         e.settle += 1;
@@ -106,6 +148,14 @@ impl App {
         e.asked = false;
         e.settle = 0;
         if e.next < e.tiles.len() {
+            return;
+        }
+        // Только картинка: вернуть камеру и выбор, файлов не писать.
+        if e.picture {
+            let Some(e) = self.export.take() else { return };
+            self.cam = e.cam;
+            self.sel = e.sel;
+            self.picture = Some(e.image);
             return;
         }
         // Этаж снят — следующий, пока не кончатся.
@@ -284,7 +334,17 @@ impl App {
                     }
                     let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
-                    let file = e.dir.join(format!("{}_дерево_{}.webp", e.name, canopies.len() + 1));
+                    // Имя файла — по тому, что это: навес лавки, куст, бельё или крона.
+                    let what = if map::awning_by_name(&prop.asset) {
+                        "навес"
+                    } else if map::bush_by_name(&prop.asset) {
+                        "куст"
+                    } else if map::line_by_name(&prop.asset) {
+                        "бельё"
+                    } else {
+                        "дерево"
+                    };
+                    let file = e.dir.join(format!("{}_{what}_{}.webp", e.name, canopies.len() + 1));
                     files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 88.0)));
                     canopies.insert(look.clone(), export::foundry_src(&file));
                 }
@@ -420,12 +480,6 @@ impl App {
                 })
                 .collect()
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(image) = images.first()
-            && self.control_shot(ctx, image)
-        {
-            return;
-        }
         if self.export.as_ref().is_some_and(|e| e.asked) {
             if let Some(image) = images.first() {
                 self.export_tile(ctx, image);
