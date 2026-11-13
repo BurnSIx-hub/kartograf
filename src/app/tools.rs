@@ -157,6 +157,7 @@ impl App {
             "set_scene" => self.tool_set_scene(a),
             "add_level" => self.tool_add_level(a),
             "switch_level" => self.tool_switch_level(a),
+            "grow_map" => self.tool_grow_map(a),
             "reload_assets" => {
                 if let Some(dir) = self.settings.textures_dir.clone() {
                     self.library.set_folder(&dir);
@@ -535,6 +536,31 @@ impl App {
             self.map.name = n.to_owned();
         }
         Ok(self.levels_reply())
+    }
+
+    /// Поля к карте по краям, на всех этажах; нарисованное сдвигается. Отменить
+    /// нельзя: история хранит этаж, а размер у этажей общий.
+    fn tool_grow_map(&mut self, a: &Value) -> Res {
+        let side = |k: &str| a[k].as_u64().unwrap_or(0).min(400) as u32;
+        let (l, t, r, b) = (side("left"), side("top"), side("right"), side("bottom"));
+        if l + t + r + b == 0 {
+            return Err("нужно хоть одно поле: left, top, right или bottom (клетки)".into());
+        }
+        let (w, h) = (self.map.width + l + r, self.map.height + t + b);
+        if w > 600 || h > 600 {
+            return Err(format!("карта {w}×{h} — больше 600 клеток по стороне"));
+        }
+        self.map.grow(l, t, r, b);
+        for (k, m) in self.levels.iter_mut().enumerate() {
+            if k != self.level || m.width + l + r == w {
+                m.grow(l, t, r, b);
+            }
+        }
+        self.undo.clear();
+        self.redo.clear();
+        self.touch();
+        self.refresh_below();
+        Ok(json!({"width": w, "height": h, "levels": self.levels.len().max(1)}))
     }
 
     fn tool_switch_level(&mut self, a: &Value) -> Res {

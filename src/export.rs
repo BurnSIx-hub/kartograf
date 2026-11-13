@@ -36,6 +36,9 @@ pub struct Zone {
     pub loops: Vec<(Vec<[f32; 2]>, bool)>,
     /// У области «внутри» (`effect` = "place") — ключ её звука.
     pub place: String,
+    /// Доля мелководья у воды, 0..1: по ней блики на дне. Гавань глубокая —
+    /// дна не видно; у пруда с мелкими берегами блики как были.
+    pub shallow: f32,
 }
 
 /// Модуль Foundry, который оживляет области.
@@ -143,9 +146,18 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
         solid.extend(w.segments().map(|s| (s, half)));
     }
     let mut masks: Vec<(&'static str, mask::Mask)> = Vec::new();
+    // Сколько воды глубокой и сколько всего — по закрашенному.
+    let (mut deep, mut wet) = (0u64, 0u64);
     for (m, mat) in map.materials.iter().enumerate() {
         let Some(effect) = mat.live().effect() else { continue };
         let mask = map.material_mask(m);
+        if effect == "water" {
+            let area: u64 = mask.data.iter().map(|&v| v as u64).sum();
+            wet += area;
+            if mat.deep() {
+                deep += area;
+            }
+        }
         match masks.iter_mut().find(|(e, _)| *e == effect) {
             Some((_, all)) => {
                 for (a, v) in all.data.iter_mut().zip(&mask.data) {
@@ -155,6 +167,7 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
             None => masks.push((effect, mask)),
         }
     }
+    let shallow = if wet == 0 { 1.0 } else { 1.0 - deep as f32 / wet as f32 };
     let mut out: Vec<Zone> = Vec::new();
     for (effect, mut mask) in masks {
         // Под настилом (дорожка вдоль линии — мостки, мост) живого нет: по тропе
@@ -208,7 +221,7 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
                 (l.clone(), depth % 2 == 1)
             })
             .collect::<Vec<_>>();
-        out.push(Zone { effect, loops: tagged, place: String::new() });
+        out.push(Zone { effect, loops: tagged, place: String::new(), shallow });
     }
     out
 }
@@ -305,7 +318,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let a = i as f32 / 12.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new() });
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0 });
     }
     // Встроенный фонтан: эффект «Wild Canvas» по его трём чашам — струя, перелив, круги, журчание.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("fountain")) {
@@ -314,7 +327,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let a = i as f32 / 24.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new() });
+        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0 });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
@@ -322,7 +335,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
         let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
         let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new() });
+        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0 });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
     // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
@@ -340,7 +353,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
             let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
             let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new() });
+            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0 });
         }
     }
     // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
@@ -348,7 +361,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
         let tagged: Vec<_> = loops.iter().map(|l| (l.clone(), loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1)).collect();
         if !tagged.is_empty() {
-            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone() });
+            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0 });
         }
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
@@ -840,6 +853,10 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 "flags": if z.effect == "place" { json!({LIVE_MODULE: {"place": z.place}}) } else { json!({LIVE_MODULE: {"effect": z.effect, "fish": z.effect == "water"}}) }
             });
             let mut region = region;
+            // Глубокая вода — гавань, море: блики на дне гаснут по доле глубины.
+            if z.effect == "water" && z.shallow < 0.95 {
+                region["flags"][LIVE_MODULE]["caustic"] = json!(((z.shallow.max(0.15) as f64) * 100.0).round() / 100.0);
+            }
             // Корабль на ходу: вода уходит мимо борта.
             if z.effect == "water" && map.current > 0.0 {
                 region["flags"][LIVE_MODULE]["current"] = json!((map.current as f64 * 10.0).round() / 10.0);
@@ -1245,6 +1262,31 @@ mod tests {
         assert_eq!((f["effect"].as_str(), f["current"].as_f64(), f["drift"].as_i64()), (Some("water"), Some(1.3), Some(90)));
         let old: Map = serde_json::from_str(&serde_json::to_string(&Map::new(2, 2)).unwrap().replace(",\"drift\":90.0", "")).unwrap();
         assert_eq!((old.current, old.drift), (0.0, 90.0), "старые карты: вода стоит, направление вниз");
+    }
+
+    #[test]
+    fn harbour_water_hides_the_bottom() {
+        // Гавань — глубина: блики на дне почти гаснут; пруд — мелководье: как были;
+        // пополам — вполсилы. Область воды одна: шва с пеной между ними нет.
+        let caustic = |deep_cols: i32| {
+            let mut m = Map::new(10, 10);
+            let shallow = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+            let deep = m.materials.iter().position(|x| x.name == "Глубина").unwrap();
+            assert!(m.materials[deep].deep() && !m.materials[shallow].deep());
+            m.paint(crate::map::Layer::Floor, shallow, &crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (9, 9)));
+            if deep_cols > 0 {
+                m.paint(crate::map::Layer::Floor, deep, &crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (deep_cols - 1, 9)));
+            }
+            m.prune();
+            let lay = layout(&m, &[]);
+            let scene = foundry_levels(&m, "Вода", &[SceneLevel { name: "Вода".into(), image_src: "w.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+            let water: Vec<&Value> = scene["regions"].as_array().unwrap().iter().filter(|r| r["flags"][LIVE_MODULE]["effect"] == "water").collect();
+            assert_eq!(water.len(), 1);
+            water[0]["flags"][LIVE_MODULE]["caustic"].as_f64()
+        };
+        assert_eq!(caustic(0), None);
+        assert_eq!(caustic(10), Some(0.15));
+        assert!((caustic(5).unwrap() - 0.5).abs() < 0.05);
     }
 
     #[test]

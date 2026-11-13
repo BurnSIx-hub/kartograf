@@ -109,6 +109,15 @@ impl Material {
 }
 
 impl Material {
+    /// Глубокая вода — море, глубина: дна не видно, бликов на нём нет.
+    pub fn deep(&self) -> bool {
+        let key = match &self.paint {
+            Paint::Texture(k) => crate::library::label(k).to_lowercase() + " " + &self.name.to_lowercase(),
+            Paint::Color(_) => self.name.to_lowercase(),
+        };
+        ["deep", "глубин", "ocean", "океан", "sea_", "море"].iter().any(|w| key.contains(w))
+    }
+
     /// По чему звучат шаги в «Wild Canvas»: буква поверхности или `None` — молчать.
     /// Вода и болото — от живого материала; остальное по имени картинки и материала.
     /// Порядок проверок важен: «песчаник» — камень, а не песок; «иней на траве» — снег.
@@ -1720,6 +1729,61 @@ impl Map {
     }
 
     /// Новый пустой этаж того же размера, с той же палитрой и видом стен.
+    /// Карта шире: поля по краям в клетках; всё нарисованное сдвигается на
+    /// `left`, `top`. Этажи — так же: размер у них общий. Так к готовой карте
+    /// пристраивают окрестности: корабль — к причалу, дом — к улице.
+    pub fn grow(&mut self, left: u32, top: u32, right: u32, bottom: u32) {
+        let (w, h) = (self.width + left + right, self.height + top + bottom);
+        let d = [left as f32, top as f32];
+        let mv = move |p: &mut [f32; 2]| {
+            p[0] += d[0];
+            p[1] += d[1];
+        };
+        self.rooms = self.rooms.padded(w, h, left, top);
+        for c in self.terrain.iter_mut().chain(self.room_floor.iter_mut()) {
+            c.mask = c.mask.padded(w, h, left, top);
+        }
+        if let Some(s) = &mut self.shade {
+            *s = s.padded(w, h, left, top);
+        }
+        if let Some(r) = &mut self.relief {
+            *r = r.padded(w, h, left, top);
+        }
+        for wall in &mut self.walls {
+            wall.points.iter_mut().for_each(mv);
+        }
+        for p in &mut self.portals {
+            mv(&mut p.a);
+            mv(&mut p.b);
+        }
+        for p in &mut self.props {
+            mv(&mut p.pos);
+        }
+        for p in &mut self.paths {
+            p.points.iter_mut().for_each(mv);
+        }
+        for l in &mut self.labels {
+            mv(&mut l.pos);
+        }
+        for r in &mut self.roofs {
+            mv(&mut r.a);
+            mv(&mut r.b);
+        }
+        for r in &mut self.outline_roofs {
+            for piece in &mut r.pieces {
+                piece.rings.iter_mut().flatten().for_each(mv);
+            }
+        }
+        // Ключ отрезка — середина с шагом 1/64 клетки.
+        let (kx, ky) = (64 * left as i32, 64 * top as i32);
+        self.edge_looks = std::mem::take(&mut self.edge_looks).into_iter().map(|((x, y), v)| ((x + kx, y + ky), v)).collect();
+        self.width = w;
+        self.height = h;
+        for l in &mut self.levels {
+            l.grow(left, top, right, bottom);
+        }
+    }
+
     pub fn new_level(&self) -> Map {
         let mut m = Map::new(self.width, self.height);
         m.materials = self.materials.clone();
@@ -1847,6 +1911,33 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grown_map_keeps_everything_in_place_relative_to_each_other() {
+        // Палуба 4×3 с комнатой, стеной, дверью, предметом и крышей; поле слева 2, сверху 1.
+        let mut m = Map::new(4, 3);
+        m.rooms = m.rooms.padded(4, 3, 0, 0);
+        m.rooms.data[(crate::mask::RES * 1 + 1) * m.rooms.w + crate::mask::RES + 1] = 255;
+        m.walls.push(Wall { points: vec![[0.0, 0.0], [4.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
+        m.portals.push(Portal { a: [1.0, 3.0], b: [2.0, 3.0], kind: PortalKind::Door, asset: None, frame: None });
+        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
+        m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
+        m.edge_looks.insert((64, 0), 1);
+        let mut deck = m.new_level();
+        deck.props.push(m.props[0].clone());
+        m.levels.push(deck);
+        m.grow(2, 1, 3, 0);
+        assert_eq!((m.width, m.height), (9, 4));
+        assert_eq!((m.rooms.w, m.rooms.h), (9 * crate::mask::RES, 4 * crate::mask::RES));
+        let r = crate::mask::RES;
+        assert_eq!(m.rooms.data[(r * 2 + 1) * m.rooms.w + r * 3 + 1], 255, "комната на клетку ниже и на две правее");
+        assert_eq!(m.walls[0].points, vec![[2.0, 1.0], [6.0, 1.0]]);
+        assert_eq!((m.portals[0].a, m.portals[0].b), ([3.0, 4.0], [4.0, 4.0]));
+        assert_eq!(m.props[0].pos, [5.5, 2.5]);
+        assert_eq!((m.roofs[0].a, m.roofs[0].b), ([3.0, 2.0], [5.0, 3.0]));
+        assert_eq!(m.edge_looks.get(&(64 + 128, 64)), Some(&1));
+        assert_eq!((m.levels[0].width, m.levels[0].height, m.levels[0].props[0].pos), (9, 4, [5.5, 2.5]));
+    }
 
     #[test]
     fn roof_planes_cover_outline_and_face_out() {

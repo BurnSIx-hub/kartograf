@@ -60,6 +60,9 @@ fn tools() -> Value {
         tool("switch_level", "Switch to another floor (0 — the lowest, see map_info level_names) and/or rename the current one.", json!({
             "level": int("Floor number"), "name": text("New name for the floor")
         }), &[]),
+        tool("grow_map", "Add margins to the map, in cells, on every floor: everything drawn moves by left/top. Build the surroundings around a finished map — a harbour around a ship, a street around a house. Undo history is cleared.", json!({
+            "left": int("Cells to add on the left"), "top": int("Cells to add on top"), "right": int("Cells to add on the right"), "bottom": int("Cells to add at the bottom")
+        }), &[]),
         tool("add_roof", "Put a roof over a house: the rectangle of its walls in cells. Players see the roof from outside; it fades when they walk in.", json!({
             "area": area, "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"], "description": "Default gable"},
@@ -232,7 +235,7 @@ mod tests {
     fn tools_found_missing_on_a_real_map_are_there() {
         let list = tools();
         let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level"] {
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map"] {
             assert!(names.contains(&n), "{n}");
         }
         let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();

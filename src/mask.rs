@@ -37,6 +37,19 @@ impl Mask {
         self.data.iter().all(|&v| v == 0)
     }
 
+    /// Та же маска на холсте `cells_w × cells_h` клеток, сдвинутая на `dx`, `dy`
+    /// клеток; новые поля пустые. Холст не меньше прежнего со сдвигом.
+    pub fn padded(&self, cells_w: u32, cells_h: u32, dx: u32, dy: u32) -> Self {
+        let mut out = Self::for_cells(cells_w, cells_h);
+        let (ox, oy) = (dx as usize * RES, dy as usize * RES);
+        for j in 0..self.h.min(out.h.saturating_sub(oy)) {
+            let n = self.w.min(out.w.saturating_sub(ox));
+            let at = (j + oy) * out.w + ox;
+            out.data[at..at + n].copy_from_slice(&self.data[j * self.w..j * self.w + n]);
+        }
+        out
+    }
+
     /// Площадь выше порога, в клетках.
     pub fn area(&self) -> f32 {
         self.data.iter().filter(|&&v| v as f32 > LEVEL).count() as f32 / (RES * RES) as f32

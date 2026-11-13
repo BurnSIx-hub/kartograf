@@ -53,6 +53,19 @@ pub struct Relief {
 }
 
 impl Relief {
+    /// Тот же рельеф на поле шире (как [`Mask::padded`]): новые поля — на нуле.
+    pub fn padded(&self, cells_w: u32, cells_h: u32, dx: u32, dy: u32) -> Self {
+        let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
+        let (ox, oy) = (dx as usize * RES, dy as usize * RES);
+        let mut data = vec![0.0; w * h];
+        for j in 0..self.h.min(h.saturating_sub(oy)) {
+            let n = self.w.min(w.saturating_sub(ox));
+            let at = (j + oy) * w + ox;
+            data[at..at + n].copy_from_slice(&self.data[j * self.w..j * self.w + n]);
+        }
+        Self { w, h, data, ..self.clone() }
+    }
+
     pub fn for_cells(cells_w: u32, cells_h: u32) -> Self {
         let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
         Self { w, h, data: vec![0.0; w * h], face: String::new(), ridge: String::new(), under: String::new(), natural: false }

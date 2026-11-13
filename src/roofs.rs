@@ -159,7 +159,19 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
     let mut img = image::RgbaImage::new(w.max(1), h.max(1));
     let (planes, lines) = roof.geometry();
     let flat = roof.shape == RoofShape::Flat;
-    // Где к краю подходит трап — в перилах проход.
+    // Швы между рядами черепицы и сланца у FA прозрачные: в окне сквозь них виден
+    // пол под крышей, а цвет прозрачных точек — белый. В картинке крыши под швом —
+    // тёмная подложка в цвет самого покрытия, иначе по крыше шли белые полосы.
+    let under = {
+        let (mut s, mut n) = ([0.0f32; 3], 0.0f32);
+        for q in tex.pixels().step_by(7).filter(|q| q[3] > 200) {
+            for k in 0..3 {
+                s[k] += q[k] as f32;
+            }
+            n += 1.0;
+        }
+        if n > 0.0 { s.map(|v| v / n * 0.35) } else { [30.0; 3] }
+    };
     let gaps = if parapet.is_some() { rail_gaps(lo, hi, climbs) } else { Vec::new() };
     let sample_of = |tex: &image::RgbaImage, u: f32, v: f32| -> [f32; 3] {
         let (tw, th) = (tex.width() as f32, tex.height() as f32);
@@ -168,7 +180,8 @@ pub fn render(roof: &Roof, tex: &image::RgbaImage, tile: [f32; 2], ppc: f32, lig
         let (tx, ty) = (x - fx, y - fy);
         let at = |xx: f32, yy: f32| {
             let q = tex.get_pixel(xx.rem_euclid(tw) as u32 % tex.width(), yy.rem_euclid(th) as u32 % tex.height()).0;
-            [q[0] as f32, q[1] as f32, q[2] as f32]
+            let a = q[3] as f32 / 255.0;
+            [q[0] as f32 * a + under[0] * (1.0 - a), q[1] as f32 * a + under[1] * (1.0 - a), q[2] as f32 * a + under[2] * (1.0 - a)]
         };
         let (a, b, c, d) = (at(fx, fy), at(fx + 1.0, fy), at(fx, fy + 1.0), at(fx + 1.0, fy + 1.0));
         std::array::from_fn(|k| (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty)
@@ -1559,6 +1572,22 @@ mod tests {
         // Дом за краем карты — картинка только до края.
         let (cut, o) = render_outline(&yard_house(RoofForm::Flat), &tex, 10.0, [0.6, 0.8], ([0.0, 0.0], [4.0, 4.0]), &Near::default());
         assert!(o[0] >= 0.0 && cut.width() <= 41 && cut.height() <= 41, "{o:?} {}×{}", cut.width(), cut.height());
+    }
+
+    #[test]
+    fn transparent_tile_seams_go_dark_not_white() {
+        // Покрытие: ряд «черепицы» и прозрачный белый шов, как у FA.
+        let mut tex = image::RgbaImage::from_pixel(8, 8, image::Rgba([150, 60, 50, 255]));
+        for x in 0..8 {
+            tex.put_pixel(x, 0, image::Rgba([255, 255, 255, 0]));
+        }
+        let mut roof = Roof::new([0.0, 0.0], [4.0, 4.0], RoofShape::Flat, "x".into());
+        roof.overhang = 0.0;
+        let (img, _) = render(&roof, &tex, [1.0, 1.0], 8.0, [0.0, -1.0], None, &[], &[], false);
+        let seam = img.get_pixel(12, 8).0;
+        let tile = img.get_pixel(12, 12).0;
+        assert!(seam[0] < 70 && seam[1] < 70, "шов тёмный, а не белый: {seam:?}");
+        assert!(tile[0] > 120, "черепица своего цвета: {tile:?}");
     }
 
     #[test]
