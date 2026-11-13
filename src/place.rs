@@ -713,20 +713,20 @@ fn crowns(img: &RgbImage, cls: &[u8], frame: &Frame, dlt: Option<&[u8]>, nfi: Op
 const REF_MPP: f64 = 0.3;
 /// Крупный масштаб — только боевым участкам (сторона до 200 м).
 const BATTLE_M: f64 = 200.0;
-const TILE_URL: &str = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile";
+pub(crate) const TILE_URL: &str = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile";
 
-fn mpp_at(lat: f64, z: u32) -> f64 {
+pub(crate) fn mpp_at(lat: f64, z: u32) -> f64 {
     156_543.033_92 * lat.to_radians().cos() / 2f64.powi(z as i32)
 }
 
-fn tile_px(lat: f64, lon: f64, z: u32) -> (f64, f64) {
+pub(crate) fn tile_px(lat: f64, lon: f64, z: u32) -> (f64, f64) {
     let n = 2f64.powi(z as i32) * 256.0;
     let s = lat.to_radians().sin();
     ((lon + 180.0) / 360.0 * n, (0.5 - ((1.0 + s) / (1.0 - s)).ln() / (4.0 * std::f64::consts::PI)) * n)
 }
 
 /// Плитка-заглушка Esri «Map data not yet available»: почти вся ровно серая 204.
-fn blank(img: &RgbImage) -> bool {
+pub(crate) fn blank(img: &RgbImage) -> bool {
     let small = image::imageops::resize(img, 64, 64, image::imageops::FilterType::Triangle);
     let grey = small.pixels().filter(|p| p.0.iter().all(|&c| (c as i32 - 204).abs() <= 4)).count();
     grey as f32 / (64.0 * 64.0) > 0.6
@@ -748,7 +748,7 @@ pub struct Place {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-mod net {
+pub(crate) mod net {
     use std::time::Duration;
 
     pub type Agent = ureq::Agent;

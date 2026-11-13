@@ -8,6 +8,7 @@ mod blend;
 mod export;
 mod generate;
 mod library;
+mod mappick;
 mod map;
 mod mask;
 mod palette;

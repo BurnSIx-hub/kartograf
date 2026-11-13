@@ -637,6 +637,38 @@ function netPrefetch(urls) {
   for (let k = 0; k < NET_PARALLEL; k++) worker();
 }
 
+// Плитки карты выбора места и поиск: по одному адресу, фоном, по восемь разом.
+// Последнее спрошенное — первым: карту тащат, и нужны те плитки, что видны сейчас.
+const GET_PARALLEL = 8;
+const getQueue = [];
+const gotList = [];
+let getActive = 0;
+
+function netGet(url) {
+  getQueue.push(url);
+  getPump();
+}
+
+function getPump() {
+  while (getActive < GET_PARALLEL && getQueue.length) {
+    const url = getQueue.pop();
+    getActive++;
+    fetch(url)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`${r.status}`);
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        // Плитки снимка пригодятся и сборке места.
+        if (url.includes("/World_Imagery/")) netKeep(url, bytes);
+        gotList.push([url, bytes]);
+      })
+      .catch((err) => gotList.push([url, String(err?.message ?? err)]))
+      .finally(() => {
+        getActive--;
+        getPump();
+      });
+  }
+}
+
 function netFetch(url) {
   const hit = netCache.get(url);
   if (hit) return hit;
@@ -871,6 +903,8 @@ Hooks.once("init", () => {
   window.kartografFetch = netFetch;
   window.kartografNetPrefetch = netPrefetch;
   window.kartografNetState = () => [netJob.done, netJob.total];
+  window.kartografGet = netGet;
+  window.kartografGot = () => gotList.splice(0);
   window.kartografHold = hold;
   window.kartografAlive = alive;
   window.kartografRelease = release;

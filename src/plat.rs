@@ -196,6 +196,28 @@ pub fn net_prefetch(urls: &[String]) {
     let _ = web::call("kartografNetPrefetch", &[list.into()]);
 }
 
+/// Скачать фоном одно (`kartografGet`); что пришло — [`net_got`].
+#[cfg(target_arch = "wasm32")]
+pub fn net_get_async(url: &str) {
+    let _ = web::call("kartografGet", &[wasm_bindgen::JsValue::from_str(url)]);
+}
+
+/// Что пришло с прошлого раза по [`net_get_async`]: адрес и байты или ошибка.
+#[cfg(target_arch = "wasm32")]
+pub fn net_got() -> Vec<(String, Result<Vec<u8>, String>)> {
+    use wasm_bindgen::JsCast;
+    let Ok(v) = web::call("kartografGot", &[]) else { return Vec::new() };
+    js_sys::Array::from(&v)
+        .iter()
+        .filter_map(|pair| {
+            let pair = js_sys::Array::from(&pair);
+            let url = pair.get(0).as_string()?;
+            let body = pair.get(1);
+            Some((url, if body.is_instance_of::<js_sys::Uint8Array>() { Ok(js_sys::Uint8Array::new(&body).to_vec()) } else { Err(body.as_string().unwrap_or_default()) }))
+        })
+        .collect()
+}
+
 /// Сколько из начатого [`net_prefetch`] уже пришло (или не пришло) — и всего.
 #[cfg(target_arch = "wasm32")]
 pub fn net_state() -> (u32, u32) {

@@ -456,6 +456,8 @@ pub struct App {
     /// Выгрузка OpenStreetMap из командной строки — тоже.
     pending_osm: Option<PathBuf>,
     place_form: Option<PlaceForm>,
+    /// Окно «Место на карте» у формы места.
+    map_pick: Option<crate::mappick::MapPick>,
     place: PlaceJob,
     pub drawer_area: Rect,
     family_pick: std::collections::HashMap<String, String>,
@@ -682,6 +684,7 @@ impl App {
             pending_plan: None,
             pending_osm: None,
             place_form: None,
+            map_pick: None,
             place: PlaceJob::default(),
             drawer_area: Rect::NOTHING,
             door_asset: Some(library::DEFAULT_DOOR.into()),
@@ -1759,13 +1762,30 @@ impl App {
     }
 
     fn place_window(&mut self, ctx: &egui::Context) {
-        let Some(form) = &mut self.place_form else { return };
+        // Окно карты: «Готово» вписывает середину рамки и её размер в форму.
+        if let Some(pick) = &mut self.map_pick
+            && let Some(done) = pick.show(ctx)
+        {
+            if let (Some(p), Some(form)) = (done, &mut self.place_form) {
+                form.text = format!("{:.5}, {:.5}", p.lat, p.lon);
+                form.cells = p.cells;
+            }
+            self.map_pick = None;
+        }
+        let Some(form) = &mut self.place_form else {
+            self.map_pick = None;
+            return;
+        };
         let mut open = true;
         let mut go = None;
+        let mut pick = false;
         let busy = self.place.busy();
         egui::Window::new("Местность по координатам").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("Координаты или ссылка на карту:");
-            ui.add(egui::TextEdit::singleline(&mut form.text).desired_width(360.0).hint_text("59.46956, 25.65897"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut form.text).desired_width(360.0).hint_text("59.46956, 25.65897"));
+                pick = ui.button("На карте…").on_hover_text("Найти место и обвести рамкой на снимке").clicked();
+            });
             let found = crate::place::parse_place(&form.text);
             ui.horizontal(|ui| {
                 ui.label("Размер, клеток:");
@@ -1805,6 +1825,9 @@ impl App {
                 ui.colored_label(egui::Color32::from_rgb(220, 90, 70), e);
             }
         });
+        if pick {
+            self.map_pick = Some(crate::mappick::MapPick::new(crate::place::parse_place(&form.text), form.cells));
+        }
         if let Some((lat, lon, cells, trees)) = go {
             self.place.error = None;
             self.place.trees = trees;
@@ -1812,6 +1835,7 @@ impl App {
         }
         if !open {
             self.place_form = None;
+            self.map_pick = None;
         }
     }
 
