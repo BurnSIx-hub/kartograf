@@ -558,6 +558,12 @@ pub fn passage_by_name(key: &str) -> bool {
         && !["shade", "overlay", "railing", "fallen", "aframe", "bed_ladder", "broken"].iter().any(|w| k.contains(w))
 }
 
+/// Гамак: в Foundry «Wild Canvas» качает его, как качка судна, — крюки стоят, полотно ходит.
+pub fn swing_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    k.contains("hammock") || k.contains("гамак")
+}
+
 /// Летучее судно: в Foundry «Wild Canvas» качает его в воздухе, под ним ползёт тень.
 pub fn hover_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();

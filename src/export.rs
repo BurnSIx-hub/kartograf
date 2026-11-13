@@ -655,6 +655,8 @@ pub struct RoofTile {
     pub above: bool,
     /// Парит («Wild Canvas»): дирижабль плывёт, покачивается, под ним тень.
     pub hover: bool,
+    /// Гамак («Wild Canvas» качает): концы-крюки в долях картинки от середины.
+    pub swing: Option<[f32; 4]>,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
     /// Контур крыши OSM в точках сцены, двор — `true` ([`crate::roofs::outline`]).
@@ -753,6 +755,9 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 tile["occlusion"]["modes"] = json!([]);
                 if r.hover {
                     tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});
+                }
+                if let Some(e) = r.swing {
+                    tile["flags"][LIVE_MODULE]["swing"] = json!(e.map(|v| (v as f64 * 1000.0).round() / 1000.0));
                 }
             } else if let Some((key, value)) = &r.living {
                 // Живой предмет под токенами: колонка играет сразу. Дирижабль над
@@ -1252,7 +1257,10 @@ mod tests {
         (ship.item, ship.above, ship.hover, ship.living) = (true, true, true, crate::map::living_by_name(key));
         let mut balloon = canopy_tile("k/b.webp".into(), [1.0, 1.0], [1.0, 1.0], 0.0, 100);
         (balloon.item, balloon.above, balloon.hover) = (true, true, true);
-        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon] }];
+        let mut hammock = canopy_tile("k/h.webp".into(), [4.0, 1.0], [2.0, 2.0], 45.0, 100);
+        (hammock.item, hammock.swing) = (true, Some([-0.4371, -0.42, 0.43, 0.41]));
+        assert!(crate::map::swing_by_name("objects/Hammock_Wood_Dark_Blue_A_2x2.webp") && !crate::map::swing_by_name("x/Rope_A.webp"));
+        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon, hammock] }];
         let scene = foundry_levels(&a, "Город", &levels, 100, &Default::default());
         let t = &scene["tiles"][0];
         assert_eq!(t["elevation"], 25, "над крышами, а не на полу, как колонка");
@@ -1260,6 +1268,10 @@ mod tests {
         assert_eq!(t["flags"][LIVE_MODULE]["hover"], 1);
         let b = &scene["tiles"][1];
         assert_eq!((b["elevation"].as_i64(), b["flags"][LIVE_MODULE]["hover"].as_i64()), (Some(25), Some(1)));
+        // Гамак качается: концы-крюки в пометке, на полу под токенами.
+        let h = &scene["tiles"][2];
+        assert_eq!(h["flags"][LIVE_MODULE]["swing"], json!([-0.437, -0.42, 0.43, 0.41]));
+        assert_eq!(h["elevation"], 0);
     }
 
     #[test]

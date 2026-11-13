@@ -407,6 +407,7 @@ impl App {
                 tile.item = true;
                 tile.above = prop.layer() >= map::ON_ROOF;
                 tile.hover = map::hover_by_name(&prop.asset);
+                tile.swing = if map::swing_by_name(&prop.asset) { library::strand_ends(&self.textures.sources, &prop.asset) } else { None };
                 tile.tint = prop.tint;
                 if !(map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
                     tiles.push(tile);
