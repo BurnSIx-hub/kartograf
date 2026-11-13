@@ -456,6 +456,11 @@ pub struct App {
     /// Выгрузка OpenStreetMap из командной строки — тоже.
     pending_osm: Option<PathBuf>,
     place_form: Option<PlaceForm>,
+    /// Управление из MCP ([`crate::control`]): приём команд и ответ, что ждёт кадров.
+    #[cfg(not(target_arch = "wasm32"))]
+    control: Option<crate::control::Control>,
+    #[cfg(not(target_arch = "wasm32"))]
+    control_wait: Option<tools::Waiting>,
     /// Окно «Место на карте» у формы места.
     map_pick: Option<crate::mappick::MapPick>,
     place: PlaceJob,
@@ -684,6 +689,10 @@ impl App {
             pending_plan: None,
             pending_osm: None,
             place_form: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            control: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            control_wait: None,
             map_pick: None,
             place: PlaceJob::default(),
             drawer_area: Rect::NOTHING,
@@ -718,6 +727,11 @@ impl App {
         app.pending_osm = args.osm;
         app.place.start = args.place.as_deref().and_then(crate::place::parse_place).map(|(lat, lon)| (lat, lon, args.cells.unwrap_or([40, 30])));
         app.place.trees = args.trees.unwrap_or(0.0).clamp(0.0, 1.0);
+        // Окно для человека (не самопроверка, не снимок, не выгрузка) принимает команды MCP.
+        #[cfg(not(target_arch = "wasm32"))]
+        if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() {
+            app.control = crate::control::start(cc.egui_ctx.clone(), &app.data_dir);
+        }
         app
     }
 
@@ -2060,6 +2074,8 @@ impl App {
             self.import_osm_file(&osm);
         }
         self.place_step(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.control_step(&ctx);
         if self.library.loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -6202,6 +6218,12 @@ impl App {
                 })
                 .collect()
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(image) = images.first()
+            && self.control_shot(ctx, image)
+        {
+            return;
+        }
         if self.export.as_ref().is_some_and(|e| e.asked) {
             if let Some(image) = images.first() {
                 self.export_tile(ctx, image);
@@ -6230,6 +6252,11 @@ impl App {
     }
 }
 
+/// Команды ИИ (MCP) — отдельным файлом: `app.rs` и так велик.
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "app_tools.rs"]
+mod tools;
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // В модуле выбранное в окне браузера приходит не сразу, а кадром позже.
@@ -6248,6 +6275,10 @@ impl eframe::App for App {
         // Сюда доходят, только закрыв окно по-хорошему: карта сохранена или от правок
         // отказались. Копия на случай сбоя больше не нужна.
         self.recovery.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(c) = &self.control {
+            c.close();
+        }
         if self.update.restart {
             crate::update::relaunch();
         }

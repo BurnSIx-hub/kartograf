@@ -5,12 +5,16 @@
 
 mod app;
 mod blend;
+#[cfg(not(target_arch = "wasm32"))]
+mod control;
 mod export;
 mod generate;
 mod library;
 mod mappick;
 mod map;
 mod mask;
+#[cfg(not(target_arch = "wasm32"))]
+mod mcp;
 mod palette;
 mod pck;
 mod place;
@@ -98,6 +102,13 @@ fn packinfo(files: &[PathBuf]) -> i32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
+    // `--mcp`: без окна — сервер MCP для ИИ; правит карту в открытом окне редактора.
+    let all: Vec<String> = std::env::args().collect();
+    if all.iter().any(|a| a == "--mcp") {
+        let dir = all.iter().position(|a| a == "--data-dir").and_then(|i| all.get(i + 1)).map(PathBuf::from);
+        let explicit = dir.is_some();
+        std::process::exit(mcp::serve(dir.unwrap_or_else(app::default_data_dir), explicit));
+    }
     let args = parse_args();
     // Самопроверке нужен один и тот же размер окна, иначе точки щелчков поплывут.
     let size = args.size.or(args.selftest.as_ref().map(|_| [1280.0, 800.0])).unwrap_or([1400.0, 900.0]);
