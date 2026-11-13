@@ -1,7 +1,9 @@
 """Выложить выпуск: python tools/release.py "что нового".
 
 Версия берётся из Cargo.toml — поднять её до запуска. Собирает release и кладёт
-kartograf.exe и latest.json в публичный репозиторий выпусков.
+в публичный репозиторий выпусков kartograf.exe и latest.json (обновление
+программы), а рядом module.zip и module.json (обновление модуля Foundry, его
+собирает tools/module_pack.py; нужен WASM_BINDGEN или wasm-bindgen в PATH).
 """
 import hashlib, json, os, re, subprocess, sys, tempfile
 
@@ -19,4 +21,8 @@ latest = {
 }
 path = os.path.join(tempfile.mkdtemp(), 'latest.json')
 json.dump(latest, open(path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-subprocess.run(['gh', 'release', 'create', tag, exe, path, '--repo', REPO, '--title', version, '--notes', notes or version], check=True)
+here = os.path.dirname(os.path.abspath(__file__))
+out = os.path.dirname(path)
+subprocess.run([sys.executable, os.path.join(here, 'module_pack.py'), 'zip', out], check=True)
+assets = [exe, path, os.path.join(out, 'module.zip'), os.path.join(out, 'module.json')]
+subprocess.run(['gh', 'release', 'create', tag, *assets, '--repo', REPO, '--title', version, '--notes', notes or version], check=True)

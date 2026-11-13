@@ -26,6 +26,15 @@ https://github.com/BurnSIx-hub/kartograf-releases/releases/latest/download/karto
 Подписи у программы нет: SmartScreen может предупредить — «Подробнее» →
 «Выполнить в любом случае». Новые версии программа находит и ставит сама.
 
+Модуль Foundry VTT (v14): «Дополнения» → «Установить модуль» → в поле
+«URL манифеста» вставить
+
+    https://github.com/BurnSIx-hub/kartograf-releases/releases/latest/download/module.json
+
+Нужен модуль «🔥 Wild Canvas» (`burn-living-map`), Foundry поставит его сам.
+Модуль выходит в том же выпуске, что и программа, с той же версией; обновления
+Foundry находит по кнопке «Проверить обновления».
+
 ## ИИ правит карту (MCP)
 
 `kartograf.exe --mcp` — сервер [MCP](https://modelcontextprotocol.io): ИИ-клиент

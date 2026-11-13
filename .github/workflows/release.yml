@@ -19,7 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: wasm-bindgen для модуля Foundry
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
       - name: Собрать release и выложить
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}

@@ -9,5 +9,8 @@ cargo build --release --target wasm32-unknown-unknown
 if [ -n "${1:-}" ]; then
   rm -rf "$1/burn-kartograf"
   cp -r foundry "$1/burn-kartograf"
+  cp LICENSE "$1/burn-kartograf/"
+  # Версия из Cargo.toml: Foundry сверяет её с выпуском и предлагает обновиться.
+  python tools/module_pack.py stamp "$1/burn-kartograf/module.json"
 fi
 ls -la foundry/pkg

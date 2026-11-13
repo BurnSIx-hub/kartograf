@@ -5,6 +5,10 @@
   "compatibility": { "minimum": "14", "verified": "14" },
   "description": "Редактор карт Картограф внутри Foundry: тот же код, что у программы, собранный в WebAssembly. Только у Мастера.",
   "authors": [{ "name": "Vyazn & Claude" }],
+  "url": "https://github.com/BurnSIx-hub/kartograf",
+  "manifest": "https://github.com/BurnSIx-hub/kartograf-releases/releases/latest/download/module.json",
+  "download": "https://github.com/BurnSIx-hub/kartograf-releases/releases/download/v0.0.1/module.zip",
+  "license": "LICENSE",
   "esmodules": ["scripts/main.js"],
   "socket": true,
   "relationships": {
