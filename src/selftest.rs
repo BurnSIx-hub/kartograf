@@ -285,8 +285,10 @@ impl SelfTest {
                 let brick = image::RgbaImage::from_fn(64, 32, |x, y| if y % 16 == 0 || (x + (y / 16) * 16) % 32 == 0 { image::Rgba([60, 50, 44, 255]) } else { image::Rgba([150, 70, 50, 255]) });
                 let wrote = tile.save(&floor).is_ok() && brick.save(&wall).is_ok();
                 app.set_textures_dir(dir.clone());
-                // Две картинки папки, встроенные текстуры, объекты, стены и двери.
-                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len() + crate::library::BUILTIN_ROOFS.len();
+                // Две картинки папки, встроенные текстуры, объекты, стены и двери и
+                // встроенный набор «Киберпанк» (`set:`), что лежит рядом с ними.
+                let sets = app.library.assets.iter().filter(|a| a.key.starts_with(crate::library::SET)).count();
+                let builtin = crate::library::BUILTIN_TEXTURES.len() + crate::library::BUILTIN_OBJECTS.len() + crate::library::BUILTIN_WALLS.len() + crate::library::BUILTIN_PORTALS.len() + crate::library::BUILTIN_ROOFS.len() + sets;
                 self.check("папка текстур прочиталась", wrote && app.library.assets.len() == 2 + builtin, &format!("ассетов {}", app.library.assets.len()));
                 app.use_floor_texture(&floor.to_string_lossy());
                 // Вид всех стен: с выбранной стеной текстура легла бы только на неё.
@@ -367,11 +369,12 @@ impl SelfTest {
                 app.add_pack(pack);
             }
             27 => {
-                let objects = app.library.filter(Kind::Object, "").len();
-                let doors = app.library.filter(Kind::Door, "").len();
-                let builtin = crate::library::BUILTIN_OBJECTS.len();
-                self.check("пак прочитан: 2 объекта и дверь", objects == 2 + builtin && doors == 1 + crate::library::BUILTIN_PORTALS.len(), &format!("объектов {objects}, дверей {doors}, паки {:?}", app.library.packs));
-                let found = app.library.filter(Kind::Object, "barrel").len();
+                // Из пака — не встроенное и не из набора «Киберпанк».
+                let from_pack = |k: Kind| app.library.assets.iter().filter(|a| a.kind == k && !a.is_builtin() && !a.key.starts_with(crate::library::SET)).count();
+                let (objects, doors) = (from_pack(Kind::Object), from_pack(Kind::Door));
+                self.check("пак прочитан: 2 объекта и дверь", objects == 2 && doors == 1, &format!("объектов {objects}, дверей {doors}, паки {:?}", app.library.packs));
+                // Бочка есть и в «Киберпанке» (токсичная) — ищется тестовая.
+                let found = app.library.filter(Kind::Object, "barrel test").len();
                 self.check("поиск по имени нашёл бочку", found == 1, &format!("найдено {found}"));
                 // Дверь из пака — в верхнюю стену комнаты 12..18 × 10..15.
                 let door = app.library.assets[app.library.filter(Kind::Door, "")[0]].key.clone();
@@ -398,7 +401,7 @@ impl SelfTest {
                 let ok = w.as_ref().is_some_and(|w| w.kind == PortalKind::Window && w.a == [16.0, 17.0] && w.b == [18.0, 17.0]);
                 self.check("окно в две клетки встало в нижнюю стену", ok, &format!("{w:?}"));
                 // Объекты: бочка по щелчку, привязка к полуклетке.
-                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel")[0]].key.clone();
+                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel test")[0]].key.clone();
                 app.object_asset = Some(barrel);
                 self.key(Key::P, Modifiers::NONE);
                 let p = at(app, [14.2, 12.3]);
@@ -408,7 +411,8 @@ impl SelfTest {
             30 => {
                 let p = app.map.props.first().cloned();
                 self.check("бочка встала по сетке, 1×1 по размеру картинки", p.as_ref().is_some_and(|p| p.pos == [14.0, 12.5] && p.size == [1.0, 1.0]), &format!("{p:?}"));
-                let table = app.library.assets[app.library.filter(Kind::Object, "table")[0]].key.clone();
+                // Первым на «table» был столик «Киберпанка» 1×1 — нужен тестовый 2×1.
+                let table = app.library.assets[app.library.filter(Kind::Object, "table test")[0]].key.clone();
                 app.object_asset = Some(table);
                 let p = at(app, [15.6, 13.4]);
                 self.click(p);
@@ -579,7 +583,7 @@ impl SelfTest {
                 let h = app.map.walls[0].bend(0);
                 self.check("нарисованная стена выгнулась вниз на 2 клетки", h == -2.0, &format!("прогиб {h}"));
                 // Ручки: бочка вдвое больше за угол, потом поворот за верхнюю ручку.
-                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel")[0]].key.clone();
+                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel test")[0]].key.clone();
                 app.object_asset = Some(barrel);
                 app.object_rot = 0.0;
                 app.object_scale = 1.0;
@@ -719,8 +723,10 @@ impl SelfTest {
                 app.relief_mode = crate::app::ReliefMode::Raise;
                 app.relief_height = 2.0;
                 app.brush.hardness = 1.0;
-                app.paint((20, 1), (24, 4));
-                let top = app.map.relief.as_ref().map_or(0.0, |r| r.at([22.5, 2.5]));
+                // Внутри карты 20×12: на клетках 20–24 и 30–34 рамка и мазок с
+                // 10 ноября ложились за край, и проверка ни разу не проходила.
+                app.paint((15, 1), (18, 4));
+                let top = app.map.relief.as_ref().map_or(0.0, |r| r.at([17.0, 3.0]));
                 let cliffs = app.map.relief.as_ref().map_or(0, |r| crate::relief::edges(r).iter().filter(|e| e.kind == crate::relief::EdgeKind::Cliff).count());
                 self.check("«Рельеф» рамкой поднял плато на 2 яруса с обрывом", (top - 2.0).abs() < 0.05 && cliffs > 0, &format!("высота {top}, обрывов {cliffs}"));
                 app.relief_mode = crate::app::ReliefMode::Lower;
@@ -728,11 +734,11 @@ impl SelfTest {
                 app.brush.flow = 1.0;
                 app.brush.radius = 1.5;
                 app.brush.hardness = 0.3;
-                app.begin_stroke([30.0, 6.0]);
-                app.stroke_to([34.0, 6.0]);
-                app.stroke_to([34.0, 6.0]);
+                app.begin_stroke([13.0, 9.0]);
+                app.stroke_to([17.0, 9.0]);
+                app.stroke_to([17.0, 9.0]);
                 app.end_stroke();
-                let low = app.map.relief.as_ref().map_or(0.0, |r| r.at([32.0, 6.0]));
+                let low = app.map.relief.as_ref().map_or(0.0, |r| r.at([15.0, 9.0]));
                 self.check("мазок «Опустить» — ложбина не глубже 2 клеток", (-2.05..-1.0).contains(&low), &format!("{low}"));
                 app.set_tool(Tool::Text);
                 app.label_style.text = "Колодец".into();

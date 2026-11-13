@@ -90,13 +90,16 @@ cargo build --release
 
 | Файл | Что |
 |---|---|
-| `src/app.rs` | окно редактора: меню, инструменты, библиотека, холст |
+| `src/app.rs` | окно редактора: состояние, запуск, тема, помощники |
+| `src/app/` | окно по темам: `frame` (кадр, окна, клавиши), `panels` (меню, панель настроек), `shelf` (библиотека), `input` (мышь на холсте), `draw`, `draw_ground`, `draw_scene` (отрисовка), `history`, `brush`, `edit` (правки), `build` (генераторы, OSM), `files`, `exporting`, `tools` (команды MCP) |
 | `src/map.rs` | карта: материалы, маски пола, стены, двери, предметы, крыши |
 | `src/procgen.rs`, `src/plan.rs`, `src/generate.rs` | план карты и строитель |
 | `src/dungeon.rs`, `src/quarter.rs`, `src/walls.rs` | генераторы |
-| `src/osm.rs`, `src/place.rs`, `src/mappick.rs` | местность из OpenStreetMap и снимка, выбор места |
+| `src/osm.rs` | местность из OpenStreetMap: сам импорт |
+| `src/osm/` | по темам: `parse` (разбор выгрузки), `cover` (подсказка со снимка), `water`, `growth`, `roof_photo`, `buildings`, `ways`, `parts`, `tests` |
+| `src/place.rs`, `src/mappick.rs` | местность по координатам: снимок, слои, разбор; выбор места на карте |
 | `src/roofs.rs`, `src/relief.rs` | крыши и рельеф |
 | `src/export.rs` | выгрузка в Foundry и Universal VTT |
-| `src/mcp.rs`, `src/control.rs`, `src/app_tools.rs` | сервер MCP и команды окну |
+| `src/mcp.rs`, `src/control.rs` | сервер MCP и канал к окну |
 | `src/library.rs`, `src/pck.rs` | библиотека ассетов, паки Dungeondraft |
 | `foundry/` | обёртка модуля Foundry |
