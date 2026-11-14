@@ -564,7 +564,18 @@ pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
     if file.starts_with("Speaker_Stack") {
         return Some(("speaker", "on".into()));
     }
-    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A", "Airship_Gnome_Brass_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+    // Ветроуказатель: «Wild Canvas» гнёт конус от шеста (шест слева на картинке).
+    if file.starts_with("Windsock") {
+        return Some(("sock", "1".into()));
+    }
+    ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A", "Airship_Gnome_Brass_A", "Signal_Beacon_Arcane_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+}
+
+/// Дымоход, из которого идёт дым («Wild Canvas» пускает клубы над крышей): не
+/// вытяжка-колпак, не заглушённый и не картинка самого дыма.
+pub fn smokes_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    k.contains("chimney") && !["smoke", "hood", "plug"].iter().any(|w| k.contains(w))
 }
 
 /// Лестница, трап, люк: стоят в одном месте на соседних этажах — в Foundry между
@@ -1924,6 +1935,18 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn airfield_things_come_alive_by_name() {
+        // Дым — из трубы, не из колпака-вытяжки, не из заглушки и не из картинки дыма.
+        assert!(smokes_by_name("objects/Chimney_Stone_Earthy_A_1x1.webp") && smokes_by_name("x/Chimney_Metal_Brass_Square_A1_1x1.webp"));
+        assert!(!smokes_by_name("x/Chimney_Metal_Brass_Hood_Large_A1_2x1.webp") && !smokes_by_name("x/Chimney_Smoke_A_2x2.webp"));
+        assert!(!smokes_by_name("x/Chimney_Metal_Brass_Plug_Small_A1_1x1.webp"));
+        // Ветроуказатель качается, маяк искрит; дирижабль — по-прежнему машина.
+        assert_eq!(living_by_name("objects/steampunk/Windsock_Striped_A_3x1.webp"), Some(("sock", "1".to_owned())));
+        assert_eq!(living_by_name("objects/steampunk/Signal_Beacon_Arcane_A_2x2.webp"), Some(("machine", "Signal_Beacon_Arcane_A".to_owned())));
+        assert_eq!(living_by_name("objects/steampunk/Airship_Gnome_Brass_A_5x10.webp").map(|l| l.0), Some("machine"));
+    }
 
     #[test]
     fn grown_map_keeps_everything_in_place_relative_to_each_other() {

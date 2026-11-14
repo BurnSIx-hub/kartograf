@@ -662,6 +662,9 @@ pub struct RoofTile {
     /// Сливы на крыше (вшиты в картинку): середина в точках сцены и поворот —
     /// «Wild Canvas» пускает по ним воду в дождь.
     pub scuppers: Vec<[f32; 3]>,
+    /// Дымоходы на крыше (вшиты в картинку): середина и сторона в точках сцены —
+    /// «Wild Canvas» пускает над ними дым, который гаснет вместе с крышей.
+    pub chimneys: Vec<[f32; 3]>,
     /// Предмет карты своим тайлом: на полу под токенами, закреплён; `above` —
     /// над крышами (слой «над крышами»).
     pub item: bool,
@@ -807,6 +810,10 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 // Сливы крыши: середина и поворот; размер — клетка сцены.
                 let s: Vec<Value> = r.scuppers.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();
                 tile["flags"] = json!({LIVE_MODULE: {"scuppers": s, "scupperSize": px}});
+            }
+            if !r.chimneys.is_empty() {
+                let c: Vec<Value> = r.chimneys.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();
+                tile["flags"][LIVE_MODULE]["chimneys"] = json!(c);
             }
             if !r.outline.is_empty() && w > 0 && h > 0 {
                 // Доли тайла от левого верхнего угла, 4 знака: у тайла в 8000 точек — меньше точки.
@@ -1381,7 +1388,7 @@ mod tests {
         b2.walls.push(crate::map::Wall { points: vec![[0.0, 0.0], [6.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         let (la, lb) = (layout(&a, &a.room_edges()), layout(&b2, &b2.room_edges()));
         let levels = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]], ..Default::default() }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![RoofTile { src: "k/r.png".into(), rect: [50, 50, 300, 200], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: vec![[100.0, 50.0, 0.0]], chimneys: vec![[120.0, 80.0, 40.0]], ..Default::default() }] },
             SceneLevel { name: "Верх".into(), image_src: "k/b.jpg".into(), layout: &lb, roofs: vec![canopy_tile("k/t.png".into(), [3.0, 2.0], [3.0, 3.0], 90.0, 100)] },
         ];
         let scene = foundry_levels(&a, "Дом", &levels, 100, &Default::default());
@@ -1406,6 +1413,8 @@ mod tests {
         // Крону качает ветер «Wild Canvas», крышу — нет; у крыши лишь сливы для дождя.
         assert!(t["flags"][LIVE_MODULE].get("wind").is_none());
         assert_eq!(t["flags"][LIVE_MODULE]["scuppers"][0], json!([100, 50, 0]));
+        // Дымоходы — рядом со сливами, метка не затирает их.
+        assert_eq!(t["flags"][LIVE_MODULE]["chimneys"][0], json!([120, 80, 40]));
         let crown = &scene["tiles"][1];
         assert_eq!(crown["flags"][LIVE_MODULE]["wind"], 1);
         assert!(crown["flags"][LIVE_MODULE].get("particles").is_none());

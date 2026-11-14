@@ -285,6 +285,7 @@ impl App {
                 let parapet = r.parapet().map(|pk| &covers[pk].0);
                 let mut items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2, [1.0, 1.0])).collect();
                 items.extend(mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)));
+                let smoke = smoke_spots(&mine, e.px as f32);
                 // Крыша — в родном разрешении покрытия (256 на клетку), не в мелком
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
@@ -294,7 +295,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), ..Default::default() });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, ..Default::default() });
             }
             // Крыши по контуру (из OSM) — тоже по одной, в масштабе сцены: их сотни.
             let casters = roofs::Casters::new(&map.outline_roofs, &map.props);
@@ -327,6 +328,7 @@ impl App {
                 }
                 let items: Vec<roofs::Fixture> = mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)).collect();
                 roofs::paste_fixtures(&mut img, origin, ppc, &items);
+                let smoke = smoke_spots(&mine, ppc);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
@@ -344,6 +346,7 @@ impl App {
                     chest: None,
                     living: None,
                     scuppers: Vec::new(),
+                    chimneys: smoke,
                     outline: roofs::outline(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * ppc, v[1] * ppc]).collect(), hole)).collect(),
                     ..Default::default()
                 });
@@ -548,4 +551,10 @@ impl App {
         }
         ctx.request_repaint();
     }
+}
+
+/// Дымоходы среди крышного (ключ, середина в клетках, поворот, размер): середина
+/// и большая сторона в точках сцены — «Wild Canvas» пускает над ними дым.
+fn smoke_spots(mine: &[(String, [f32; 2], f32, [f32; 2])], px: f32) -> Vec<[f32; 3]> {
+    mine.iter().filter(|m| map::smokes_by_name(&m.0)).map(|m| [m.1[0] * px, m.1[1] * px, m.3[0].max(m.3[1]) * px]).collect()
 }
