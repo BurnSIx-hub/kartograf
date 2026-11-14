@@ -218,7 +218,11 @@ impl App {
             let bytes = webp.unwrap_or_else(|| jpg.clone());
             files.push((img_path.clone(), bytes));
             let map = if k == self.level { &self.map } else { &self.levels[k] };
-            let mut lay = export::layout(map, &map.room_edges());
+            // Вырез воды под мостом — по нарисованному: рамка картинки, по разу на картинку.
+            let sources = &self.textures.sources;
+            let boxes = std::cell::RefCell::new(std::collections::HashMap::new());
+            let seen = |key: &str| *boxes.borrow_mut().entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key));
+            let mut lay = export::layout_seen(map, &map.room_edges(), &seen);
             // Стены палаток — по нарисованному пологу, а не по полям картинки.
             let mut tents = Vec::new();
             for p in map.props.iter().filter(|p| map::awning_by_name(&p.asset)) {

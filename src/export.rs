@@ -233,6 +233,17 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
     out
 }
 
+/// Вырез под мостом в клетках: по видимой рамке картинки (доли холста от середины),
+/// а без неё — чуть внутрь холста. Куски моста нарисованы до самых краёв холста,
+/// и вырезы соседних кусков смыкаются.
+fn bridge_cut(p: &map::Prop, visible: Option<[f32; 4]>) -> Vec<[f32; 2]> {
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let [l, t, r, b] = visible.unwrap_or([-0.45, -0.42, 0.45, 0.42]);
+    let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
+    let corner = |x: f32, y: f32| [p.pos[0] + x * w * c - y * h * s, p.pos[1] + x * w * s + y * h * c];
+    vec![corner(l, t), corner(r, t), corner(r, b), corner(l, b), corner(l, t)]
+}
+
 /// Мост по имени файла: встроенный и библиотечные (`Log_Bridge_…`).
 fn is_bridge(key: &str) -> bool {
     let file = key.rsplit(['/', '\\', '|']).next().unwrap_or(key).to_lowercase();
@@ -276,6 +287,13 @@ pub struct Light {
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
 /// ломаные и упрощённые — Foundry медленнеет от тысяч мелких отрезков.
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
+    layout_seen(map, room_edges, &|_| None)
+}
+
+/// То же, но вырез под мостом — по нарисованному: `seen` даёт видимую рамку
+/// картинки (`library::visible_box`, доли холста от середины). Без неё — 90 % ширины
+/// и 84 % длины холста, а у моста из кусков на стыках тогда проходила бы вода.
+pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 4]>) -> Layout {
     let mut segs: Vec<Segment> = room_edges.to_vec();
     // Трубы по полу — рисунок, не стена.
     let mut low_segs: Vec<Segment> = Vec::new();
@@ -338,11 +356,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
-        let (hw, hh) = (p.size[0] * p.scale * 0.45, p.size[1] * p.scale * 0.42);
-        let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
-        let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
-        let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
+        zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
     // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
@@ -1327,6 +1341,31 @@ mod tests {
         assert_eq!((murky["foam"].as_f64(), murky["caustic"].as_f64(), murky["fish"].as_bool()), (Some(0.0), Some(0.0), Some(false)));
         let clear = flags("Мелководье");
         assert_eq!((clear.get("foam"), clear["fish"].as_bool()), (None, Some(true)));
+    }
+
+    #[test]
+    fn bridge_pieces_cut_water_end_to_end() {
+        use crate::map::Prop;
+        let mut m = Map::new(12, 14);
+        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        m.props.push(piece(4.0, 0.0));
+        m.props.push(piece(8.0, 180.0));
+        // Кусок нарисован во всю длину холста, по ширине — настил со сваями.
+        let seen = |_: &str| Some([-0.45, -0.5, 0.45, 0.5]);
+        let lay = layout_seen(&m, &[], &seen);
+        let cuts: Vec<_> = lay.zones.iter().filter(|z| z.effect == "cut").collect();
+        assert_eq!(cuts.len(), 2);
+        let ys = |z: &Zone| {
+            let v: Vec<f32> = z.loops[0].0.iter().map(|q| q[1]).collect();
+            (v.iter().cloned().fold(f32::MAX, f32::min), v.iter().cloned().fold(f32::MIN, f32::max))
+        };
+        let (a, b) = (ys(cuts[0]), ys(cuts[1]));
+        assert!((a.0 - 2.0).abs() < 1e-4 && (b.1 - 10.0).abs() < 1e-4, "{a:?} {b:?}");
+        assert!((a.1 - b.0).abs() < 1e-4, "стык без щели: {a:?} {b:?}");
+        // Без картинки — как раньше, чуть внутрь холста.
+        let old = layout(&m, &[]);
+        let c0 = old.zones.iter().find(|z| z.effect == "cut").unwrap();
+        assert!(ys(c0).0 > 2.0);
     }
 
     #[test]
