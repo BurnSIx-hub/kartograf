@@ -106,6 +106,35 @@ fn fixture_uv(f: &Fixture, p: [f32; 2]) -> Option<(f32, f32)> {
     ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then_some((u, v))
 }
 
+/// Предметы на крыше поверх готовой картинки крыши (`origin` — её левый верхний
+/// угол в клетках, `ppc` — точек на клетку): у крыши по контуру скаты уже
+/// нарисованы, дымоходы и вытяжки кладутся сверху «поверх» по прозрачности.
+pub fn paste_fixtures(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, fixtures: &[Fixture]) {
+    for f in fixtures {
+        let r = 0.5 * f.3[0].hypot(f.3[1]);
+        let x0 = (((f.1[0] - r - origin[0]) * ppc).floor().max(0.0)) as u32;
+        let y0 = (((f.1[1] - r - origin[1]) * ppc).floor().max(0.0)) as u32;
+        let x1 = (((f.1[0] + r - origin[0]) * ppc).ceil().max(0.0) as u32).min(img.width());
+        let y1 = (((f.1[1] + r - origin[1]) * ppc).ceil().max(0.0) as u32).min(img.height());
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = [origin[0] + (x as f32 + 0.5) / ppc, origin[1] + (y as f32 + 0.5) / ppc];
+                let Some((u, v)) = fixture_uv(f, p) else { continue };
+                let q = f.0.get_pixel(((u * f.0.width() as f32) as u32).min(f.0.width() - 1), ((v * f.0.height() as f32) as u32).min(f.0.height() - 1)).0;
+                let qa = q[3] as f32 / 255.0;
+                if qa <= 0.0 {
+                    continue;
+                }
+                let d = img.get_pixel(x, y).0;
+                let da = d[3] as f32 / 255.0;
+                let na = qa + da * (1.0 - qa);
+                let c: [u8; 3] = std::array::from_fn(|k| ((q[k] as f32 * qa + d[k] as f32 * da * (1.0 - qa)) / na).round().clamp(0.0, 255.0) as u8);
+                img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], (na * 255.0).round() as u8]));
+            }
+        }
+    }
+}
+
 /// Снег на крыше: цвет; сквозь ровный покров чуть видны ряды покрытия.
 const SNOW: [f32; 3] = [236.0, 241.0, 248.0];
 const SNOW_DEPTH: f32 = 0.86;
@@ -1271,6 +1300,25 @@ pub fn shadow_offset(sh: &map::Shadows) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixtures_are_pasted_over_an_outline_roof() {
+        // Свод ангара 6×4 по контуру: дымоход 2×2 ложится поверх ската в своей
+        // клетке, на остальное не влезает; точка вне дома — под крышей нет.
+        let piece = crate::map::RoofPiece { rings: vec![vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]]], form: crate::map::RoofForm::Round, paint: String::new(), height: 0.0, eaves: 0.0, down: None, across: false };
+        let roof = crate::map::OutlineRoof { pieces: vec![piece] };
+        assert!(roof.contains([3.0, 2.0]) && !roof.contains([7.0, 2.0]));
+        let mut img = image::RgbaImage::from_pixel(6 * 32, 4 * 32, image::Rgba([90, 90, 90, 255]));
+        let red = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+        let half = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 128]));
+        paste_fixtures(&mut img, [0.0, 0.0], 32.0, &[(&red, [2.0, 2.0], 0.0, [2.0, 2.0]), (&half, [5.0, 1.0], 0.0, [1.0, 1.0])]);
+        assert_eq!(img.get_pixel(64, 64).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(40, 40).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(120, 64).0, [90, 90, 90, 255]);
+        // Полупрозрачный — смесь с кровлей, кровля под ним не пропадает.
+        let q = img.get_pixel(160, 32).0;
+        assert!(q[2] > 150 && q[0] > 30 && q[3] == 255, "{q:?}");
+    }
 
     #[test]
     fn outline_loses_nodes_on_straight_walls_but_keeps_corners() {

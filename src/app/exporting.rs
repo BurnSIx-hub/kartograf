@@ -307,10 +307,26 @@ impl App {
                 }
                 let ppc = e.px as f32;
                 let near = casters.near(idx, r.bounds());
-                let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
+                let (mut img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
                 if img.width() <= 1 {
                     continue;
                 }
+                // Крышное над крышей по контуру (свод ангара, купол, шатёр) — тоже в её
+                // картинку: отдельным тайлом оно висело бы над комнатой, когда крыша тает.
+                let mine: Vec<(String, [f32; 2], f32, [f32; 2])> = map
+                    .props
+                    .iter()
+                    .filter(|p| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && r.contains(p.pos))
+                    .map(|p| (p.asset.clone(), p.pos, p.rot, [p.size[0] * p.scale, p.size[1] * p.scale]))
+                    .collect();
+                for m in &mine {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(m.0.clone()) {
+                        let bytes = self.textures.bytes(&m.0)?;
+                        slot.insert((library::decode_tinted(&m.0, &bytes)?, [roofs::PARAPET_TILE, roofs::PARAPET]));
+                    }
+                }
+                let items: Vec<roofs::Fixture> = mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)).collect();
+                roofs::paste_fixtures(&mut img, origin, ppc, &items);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
@@ -385,8 +401,8 @@ impl App {
             // открывается. Картинка — одна на ассет.
             // Остальные предметы — тоже тайлами, в родном разрешении картинки,
             // по слою: кто выше, тот позже.
-            // Крышное над прямоугольной крышей уже в её картинке.
-            let baked = |p: &Prop| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && map.roofs.iter().any(|r| r.contains(p.pos));
+            // Крышное над крышей уже в её картинке — и над прямоугольной, и по контуру.
+            let baked = |p: &Prop| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && (map.roofs.iter().any(|r| r.contains(p.pos)) || map.outline_roofs.iter().any(|r| r.contains(p.pos)));
             let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !baked(p)).collect();
             items.sort_by_key(|p| p.layer());
             for prop in items {

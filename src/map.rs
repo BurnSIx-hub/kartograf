@@ -854,6 +854,11 @@ impl RoofPiece {
 }
 
 impl OutlineRoof {
+    /// Точка под крышей: внутри первого куска — он весь дом.
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        self.pieces.first().is_some_and(|k| k.contains(p))
+    }
+
     /// Левый верхний и правый нижний углы, в клетках.
     pub fn bounds(&self) -> ([f32; 2], [f32; 2]) {
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
