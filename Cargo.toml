@@ -18,6 +18,7 @@ serde_json = "1.0.154"
 # Только программа (exe): сжатие WebP через libwebp, сеть для обновлений, системные окна файлов.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 webp = "0.3"
+raw-window-handle = "0.6"
 ureq = "3"
 rfd = "0.17.2"
 

@@ -79,6 +79,38 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Окно свёрнуто: `ui` не идёт, команды ИИ — отсюда. Правки карты делаются и так;
+    /// снимку, выгрузке и поиску места нужны кадры — окно разворачивается, не отнимая
+    /// фокус, и потом сворачивается обратно ([`Self::hide_after_ai`]). Раньше вызов
+    /// при свёрнутом окне ждал, пока окно не развернут руками.
+    pub(super) fn control_while_minimized(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().minimized) != Some(true) {
+            return;
+        }
+        self.control_step(ctx);
+        if (self.control_wait.is_some() || self.export.is_some()) && self.shown_for_ai.is_none() {
+            self.shown_for_ai = Some(ctx.input(|i| i.time));
+            self.show_window(ctx, false);
+        }
+    }
+
+    /// Окно развернули для снимка — свернуть, когда полторы секунды нечего ждать:
+    /// снимки подряд не мигают окном. Человек сам открыл окно — не трогать.
+    pub(super) fn hide_after_ai(&mut self, ctx: &egui::Context) {
+        let Some(since) = self.shown_for_ai else { return };
+        let now = ctx.input(|i| i.time);
+        if self.control_wait.is_some() || self.export.is_some() {
+            self.shown_for_ai = Some(now);
+        } else if ctx.input(|i| i.viewport().focused) == Some(true) {
+            self.shown_for_ai = None;
+        } else if now - since >= 1.5 {
+            self.shown_for_ai = None;
+            self.show_window(ctx, true);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
     /// Ошибка, что правка положила в окно ошибки, — в ответ ИИ, а не на экран.
     fn take_error(&mut self) -> Result<(), String> {
         match self.error.take() {
@@ -274,7 +306,13 @@ impl App {
             "scene": {"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift},
             "objects": m.props.len(), "walls": m.walls.len(), "doors": m.portals.len(),
             "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(),
-            "materials": m.materials.iter().enumerate().map(|(i, x)| json!({"index": i, "name": x.name, "texture": match &x.paint { Paint::Texture(t) => Some(t.clone()), Paint::Color(_) => None }})).collect::<Vec<_>>(),
+            "materials": m.materials.iter().enumerate().map(|(i, x)| {
+                let mut j = json!({"index": i, "name": x.name, "texture": match &x.paint { Paint::Texture(t) => Some(t.clone()), Paint::Color(_) => None }});
+                if x.rot != 0.0 {
+                    j["angle"] = json!(x.rot);
+                }
+                j
+            }).collect::<Vec<_>>(),
             "cell": "5 ft (1.524 m); x right, y down, origin top-left",
         })
     }
@@ -582,7 +620,7 @@ impl App {
             self.edges_dirty = true;
             return Ok(json!({"erased_cells": cells, "feather": feather}));
         }
-        let m = self.material_turned(&a["material"], f(a, "angle").unwrap_or(0.0))?;
+        let m = self.material_turned(&a["material"], f(a, "angle"))?;
         self.checkpoint();
         self.map.paint(if room { Layer::Rooms } else { Layer::Floor }, m, &weights);
         self.edges_dirty = true;
@@ -1152,9 +1190,11 @@ impl App {
     }
 
     /// Материал с узором, повёрнутым на `angle` градусов по часовой: свой номер в
-    /// палитре на каждый угол.
-    fn material_turned(&mut self, v: &Value, angle: f32) -> Result<usize, String> {
+    /// палитре на каждый угол. Без `angle` номер из палитры остаётся со своим
+    /// поворотом, а новый ключ ложится ровно.
+    fn material_turned(&mut self, v: &Value, angle: Option<f32>) -> Result<usize, String> {
         let m = self.material_of(v)?;
+        let Some(angle) = angle else { return Ok(m) };
         let angle = angle.rem_euclid(360.0);
         if (self.map.materials[m].rot - angle).abs() < 1e-3 {
             return Ok(m);
@@ -1164,17 +1204,25 @@ impl App {
         self.map.material_index(mat).ok_or("в карте уже 255 материалов".into())
     }
 
-    /// Материал из ответа ИИ: номер в палитре карты или ключ пола из библиотеки.
+    /// Материал из ответа ИИ: номер в палитре карты (числом или строкой «40») или
+    /// ключ пола из библиотеки.
     fn material_of(&mut self, v: &Value) -> Result<usize, String> {
-        match v {
-            Value::Number(n) => {
-                let i = n.as_u64().unwrap_or(u64::MAX) as usize;
+        // Строка из одних цифр — номер, а не имя: иначе «40» искалось бы в именах
+        // ассетов и брало первый попавшийся с «40» в имени.
+        let index = match v {
+            Value::Number(n) => Some(n.as_u64().unwrap_or(u64::MAX)),
+            Value::String(s) if !s.trim().is_empty() && s.trim().bytes().all(|b| b.is_ascii_digit()) => Some(s.trim().parse().unwrap_or(u64::MAX)),
+            _ => None,
+        };
+        match index {
+            Some(i) => {
+                let i = i as usize;
                 if i >= self.map.materials.len() {
                     return Err(format!("материала {i} нет"));
                 }
                 Ok(i)
             }
-            v => {
+            None => {
                 let key = self.asset_key(v.as_str().unwrap_or_default())?;
                 let mat = Material { name: library::label(&key), paint: Paint::Texture(key), vary: false, live: map::Live::Auto, rot: 0.0 };
                 self.map.material_index(mat).ok_or("в карте уже 255 материалов".into())

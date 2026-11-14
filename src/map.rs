@@ -494,7 +494,8 @@ impl Glow {
             Glow::Brazier => Some((2.0, 4.0, "#ffa040", "torch")),
             Glow::Candle => Some((1.0, 2.0, "#ffd9a0", "torch")),
             Glow::Lamp => Some((3.0, 6.0, "#ffc870", "torch")),
-            Glow::Arcane => Some((2.0, 5.0, "#78b8ff", "energy")),
+            // Магический светильник тише камина: бра и шары по стенам не заливают зал.
+            Glow::Arcane => Some((1.5, 4.0, "#78b8ff", "energy")),
         }
     }
 }

@@ -338,7 +338,7 @@ struct Export {
     dir: PathBuf,
     name: String,
     px: u32,
-    /// Размер плитки в пикселях экрана.
+    /// Размер плитки в пикселях экрана: по холсту на первом шаге, когда окно развёрнуто.
     tile: [u32; 2],
     tiles: Vec<[u32; 2]>,
     next: usize,
@@ -367,6 +367,8 @@ struct Export {
     origin: [f32; 2],
     /// Крыши в картинке: 1 — целые, как их видят игроки; 0 — без крыш.
     roof_alpha: f32,
+    /// Кадров до раскладки плиток: развёрнутому окну дать принять размер.
+    wait: u32,
 }
 
 /// Окно выгрузки: сколько пикселей на клетку; в модуле ещё имя сцены и новая/последняя.
@@ -515,6 +517,13 @@ pub struct App {
     filter_key: (Kind, String, usize, usize),
     /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
     window_bands: std::collections::HashMap<String, [f32; 2]>,
+    /// Код окна в Windows: развернуть свёрнутое на время снимка.
+    #[cfg(not(target_arch = "wasm32"))]
+    window_code: isize,
+    /// Окно свернули, а ИИ просил снимок: развёрнуто тогда-то (секунды `egui`),
+    /// свернуть обратно, когда работа кончится.
+    #[cfg(not(target_arch = "wasm32"))]
+    shown_for_ai: Option<f64>,
     /// Видимые рамки лестниц и трапов по ассету: размыкают перила у крыши.
     visible_boxes: std::collections::HashMap<String, Option<[f32; 4]>>,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
@@ -692,6 +701,10 @@ impl App {
             filtered: Vec::new(),
             filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
             window_bands: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            window_code: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            shown_for_ai: None,
             visible_boxes: std::collections::HashMap::new(),
             window_glass: std::collections::HashMap::new(),
             used_only: false,
@@ -775,6 +788,20 @@ mod exporting;
 mod tools;
 
 impl eframe::App for App {
+    /// Свёрнутое окно eframe не рисует и `ui` не зовёт — только это: команды ИИ
+    /// идут и отсюда, а снимок и выгрузка разворачивают окно на время.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.window_code == 0 {
+                self.window_code = crate::plat::window_code(_frame);
+            }
+            self.control_while_minimized(ctx);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // В модуле выбранное в окне браузера приходит не сразу, а кадром позже.
         #[cfg(target_arch = "wasm32")]

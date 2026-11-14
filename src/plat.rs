@@ -10,6 +10,34 @@ pub use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_arch = "wasm32")]
 pub use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Окно программы по его коду в Windows (`HWND`), 0 — неизвестно.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn window_code(frame: &eframe::Frame) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => 0,
+    }
+}
+
+/// Развернуть свёрнутое окно или свернуть обратно, не отнимая фокус у того, что
+/// открыто поверх (игра, другая программа). Не Windows — `false`: пусть окно
+/// разворачивает eframe.
+pub fn show_quietly(code: isize, minimized: bool) -> bool {
+    #[cfg(windows)]
+    if code != 0 {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        }
+        // SW_SHOWMINNOACTIVE и SW_SHOWNOACTIVATE.
+        unsafe { ShowWindow(code, if minimized { 7 } else { 4 }) };
+        return true;
+    }
+    let _ = (code, minimized);
+    false
+}
+
 /// Номер процесса — метка автосейва этого запуска. В браузере процессов нет: время в мкс.
 pub fn pid() -> u32 {
     #[cfg(not(target_arch = "wasm32"))]

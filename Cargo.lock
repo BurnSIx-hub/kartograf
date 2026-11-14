@@ -1053,6 +1053,7 @@ dependencies = [
  "flate2",
  "image",
  "js-sys",
+ "raw-window-handle",
  "rfd",
  "roxmltree",
  "serde",

@@ -41,6 +41,8 @@ impl App {
             self.shortcuts(&ctx);
         }
         self.export_step(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.hide_after_ai(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));

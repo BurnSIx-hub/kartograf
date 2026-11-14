@@ -23,7 +23,7 @@ Facing: most FA furniture is drawn with its back at the TOP of the picture and f
 
 Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows each picture at rotation 0 with its sides labelled TOP, RIGHT, BOTTOM, LEFT and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
 
-Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes. Roofs: `add_roof` takes `points` for towers, rotundas and slanted wings (`shape: tent` gives a faceted spire). Pictures: `view` and `render_picture` take `lighting: dusk` or `night` to bake the objects' lights with wall shadows and light through windows into the picture; the Foundry export is unaffected (Foundry lights the scene itself).";
+Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes. Roofs: `add_roof` takes `points` for towers, rotundas and slanted wings (`shape: tent` gives a faceted spire). Pictures: `view` and `render_picture` take `lighting: dusk` or `night` to bake the objects' lights with wall shadows and light through windows into the picture; bright light is daylight and stacked lights do not burn the floor white. The Foundry export is unaffected (Foundry lights the scene itself). With the editor window minimized, edits go on in the background; a picture shows the window for a few seconds without taking focus and minimizes it again.";
 
 fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
@@ -42,7 +42,7 @@ fn tools() -> Value {
     let front = json!({"type": "string", "enum": ["bottom", "top", "left", "right"], "description": "Which side of the picture is the object's face, as labelled in preview_assets; default bottom (most FA furniture: back drawn at the top). Used by look_at and against_wall"});
     let look_at = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "Point [x, y] in cells the front should face (a chair to its table, a telescope to the lake); sets rotation unless rotation is given"});
     let against_wall = json!({"type": "boolean", "description": "Put the object's back against the nearest wall within 2 cells (room or free-standing, straight or diagonal): it turns to face away from the wall along its normal and moves so its visible back touches the wall face. The reply has the final x, y, rotation and the wall"});
-    let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors"});
+    let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors. Bright light shows the floor as by day and never brighter, however many lights overlap (as in Foundry)"});
     let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
@@ -93,7 +93,7 @@ fn tools() -> Value {
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent", "dome", "vault"], "description": "Default gable for area, tent for points (a faceted spire with a ridge from every corner); dome and vault only with points"},
             "turn": int("Quarter turns of the ridge, 0..3"), "overhang": num("Cells over the walls, default 0.25"),
             "rail": text("Railing along the edge of a flat roof (a ship's quarterdeck, a balcony): a wall asset key from find_assets (kind wall). It opens where a ladder or stairs object reaches the edge")
-        }), &["area"]),
+        }), &[]),
         tool("edit_roof", "Change a roof by index (see describe with roofs): covering picture, shape, ridge direction; a polygon roof also takes new points.", json!({
             "index": int("Roof index"), "paint": text("Roof covering asset key from find_assets (kind roof), e.g. builtin:roof_copper"),
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent", "dome", "vault"]}, "turn": int("Quarter turns of the ridge, 0..3"),
@@ -110,7 +110,7 @@ fn tools() -> Value {
             "points": points,
             "target": {"type": "string", "enum": ["terrain", "room"], "description": "Default terrain"},
             "feather": num("Terrain only, 0..1, default 0: soft edge — the share of the way from the edge to the middle over which the paint fades. About 0.35 for lawns, mud and shores"),
-            "angle": num("Turn the floor pattern, degrees clockwise (45 for parquet along a diagonal wall); default 0")
+            "angle": num("Turn the floor pattern, degrees clockwise (45 for parquet along a diagonal wall). Without it a library key lies straight and a material index keeps its own angle (map_info shows it)")
         }), &["material"]),
         tool("erase", "Erase floor and rooms over a rectangle, oval or polygon, exact to a quarter cell.", json!({
             "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"]}, "points": points,
@@ -299,6 +299,9 @@ mod tests {
         }
         assert!(props("view").get("lighting").is_some() && props("render_picture").get("lighting").is_some());
         assert!(props("add_roof").get("points").is_some() && props("edit_roof").get("points").is_some() && props("paint").get("angle").is_some());
+        // Крыша по контуру приходит без area — строгий клиент не должен её отклонять.
+        let roof = list.as_array().unwrap().iter().find(|t| t["name"] == "add_roof").unwrap();
+        assert!(roof["inputSchema"]["required"].as_array().is_none_or(|r| r.is_empty()), "add_roof: area не обязательна");
         let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();
         assert!(add["inputSchema"]["properties"]["light"]["enum"].as_array().unwrap().iter().any(|v| v == "arcane"));
     }

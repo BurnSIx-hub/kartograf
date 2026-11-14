@@ -7,15 +7,7 @@ impl App {
     pub fn start_export(&mut self, dir: PathBuf, name: String, px: u32, quit: bool) {
         // Большая карта — мельче: иначе Foundry картинку не покажет.
         let px = export::fit_px(self.map.width, self.map.height, px);
-        let ppp = self.canvas_ppp;
-        let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
         let (w, h) = (self.map.width * px, self.map.height * px);
-        let mut tiles = Vec::new();
-        for ty in 0..h.div_ceil(tile[1]) {
-            for tx in 0..w.div_ceil(tile[0]) {
-                tiles.push([tx, ty]);
-            }
-        }
         self.notice = None;
         let start_level = self.level;
         let sel = self.sel.take();
@@ -25,8 +17,8 @@ impl App {
             dir,
             name,
             px,
-            tile,
-            tiles,
+            tile: [0, 0],
+            tiles: Vec::new(),
             next: 0,
             image: image::RgbImage::new(w, h),
             done: Vec::new(),
@@ -43,6 +35,7 @@ impl App {
             picture: false,
             origin: [0.0, 0.0],
             roof_alpha: 0.0,
+            wait: 0,
         });
     }
 
@@ -51,23 +44,15 @@ impl App {
     /// выгрузка, — размер не упирается в окно. Готовое — в `self.picture`.
     pub fn start_picture(&mut self, area: [f32; 4], px: u32, roof_alpha: f32) {
         let px = px.clamp(2, 400);
-        let ppp = self.canvas_ppp;
-        let tile = [((self.canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((self.canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
         let (w, h) = ((((area[2] - area[0]) * px as f32).ceil() as u32).max(1), (((area[3] - area[1]) * px as f32).ceil() as u32).max(1));
-        let mut tiles = Vec::new();
-        for ty in 0..h.div_ceil(tile[1]) {
-            for tx in 0..w.div_ceil(tile[0]) {
-                tiles.push([tx, ty]);
-            }
-        }
         self.picture = None;
         let sel = self.sel.take();
         self.export = Some(Export {
             dir: PathBuf::new(),
             name: String::new(),
             px,
-            tile,
-            tiles,
+            tile: [0, 0],
+            tiles: Vec::new(),
             next: 0,
             image: image::RgbImage::new(w, h),
             done: Vec::new(),
@@ -84,7 +69,16 @@ impl App {
             picture: true,
             origin: [area[0], area[1]],
             roof_alpha,
+            wait: 0,
         });
+    }
+
+    /// Развернуть свёрнутое окно (или свернуть обратно), не отнимая фокус.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn show_window(&self, ctx: &egui::Context, minimized: bool) {
+        if !crate::plat::show_quietly(self.window_code, minimized) {
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(minimized));
+        }
     }
 
     /// Шаг выгрузки до отрисовки кадра: поставить камеру на плитку и, когда
@@ -111,6 +105,17 @@ impl App {
         ctx.request_repaint();
         if e.asked {
             return;
+        }
+        if e.tiles.is_empty() {
+            // Окно только что развернули для снимка: дать ему принять размер.
+            e.wait += 1;
+            if e.wait < 3 {
+                return;
+            }
+            // Плитки — по холсту развёрнутого окна.
+            e.tile = [((canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
+            let (w, h) = (e.image.width(), e.image.height());
+            e.tiles = (0..h.div_ceil(e.tile[1])).flat_map(|ty| (0..w.div_ceil(e.tile[0])).map(move |tx| [tx, ty])).collect();
         }
         let [tx, ty] = e.tiles[e.next];
         // Начало плитки ложится на целый пиксель экрана: плитки стыкуются без шва.
