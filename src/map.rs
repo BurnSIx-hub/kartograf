@@ -125,6 +125,16 @@ impl Material {
         ["deep", "глубин", "ocean", "океан", "sea_", "море"].iter().any(|w| key.contains(w))
     }
 
+    /// Мутная вода — непрозрачная у FA (`Water_Opaque…`), болотная: дна не видно,
+    /// пены у берега и рыб нет — в Foundry она стоит тёмным зеркалом.
+    pub fn murky(&self) -> bool {
+        let key = match &self.paint {
+            Paint::Texture(k) => crate::library::label(k).to_lowercase() + " " + &self.name.to_lowercase(),
+            Paint::Color(_) => self.name.to_lowercase(),
+        };
+        ["opaque", "murky", "мутн"].iter().any(|w| key.contains(w))
+    }
+
     /// По чему звучат шаги в «Wild Canvas»: буква поверхности или `None` — молчать.
     /// Вода и болото — от живого материала; остальное по имени картинки и материала.
     /// Порядок проверок важен: «песчаник» — камень, а не песок; «иней на траве» — снег.

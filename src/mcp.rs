@@ -23,7 +23,7 @@ Facing: most FA furniture is drawn with its back at the TOP of the picture and f
 
 Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows each picture at rotation 0 with its sides labelled TOP, RIGHT, BOTTOM, LEFT and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
 
-Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes. Roofs: `add_roof` takes `points` for towers, rotundas and slanted wings (`shape: tent` gives a faceted spire). Pictures: `view` and `render_picture` take `lighting: dusk` or `night` to bake the objects' lights with wall shadows and light through windows into the picture; bright light is daylight and stacked lights do not burn the floor white. The Foundry export is unaffected (Foundry lights the scene itself). With the editor window minimized, edits go on in the background; a picture shows the window for a few seconds without taking focus and minimizes it again.";
+Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying; a tree picture of your own becomes a crown above tokens in Foundry with `canopy: true` (Forgotten Adventures tree tops are crowns by themselves). `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes. Roofs: `add_roof` takes `points` for towers, rotundas and slanted wings (`shape: tent` gives a faceted spire). Pictures: `view` and `render_picture` take `lighting: dusk` or `night` to bake the objects' lights with wall shadows and light through windows into the picture; bright light is daylight and stacked lights do not burn the floor white. The Foundry export is unaffected (Foundry lights the scene itself). With the editor window minimized, edits go on in the background; a picture shows the window for a few seconds without taking focus and minimizes it again.";
 
 fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
@@ -35,6 +35,7 @@ fn tools() -> Value {
     let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow)"});
     let layer = json!({"type": "string", "enum": ["auto", "floor", "low", "normal", "high", "above_walls", "on_roof", "above_roofs"], "description": "What covers what: floor (rugs), low, normal, high (trees, wardrobes), above_walls, on_roof (chimneys, vents, hatches: part of the roof, gone with it when players enter), above_roofs (airships, birds flying over everything); auto — by its name"});
     let roofs = json!({"type": "string", "enum": ["solid", "ghost", "hidden"], "description": "Roofs: solid as players see them (default), ghost — see-through to check inside, hidden"});
+    let canopy = json!({"type": ["boolean", "string"], "description": "A tree crown in Foundry: its own tile above tokens that fades when a token walks under it and sways in the wind (Wild Canvas). Auto (default) — Forgotten Adventures tree tops and the built-in tree; give true for your own tree pictures, false to keep a crown on the ground"});
     let shadow = json!({"type": ["boolean", "string"], "description": "Cast a shadow: true, false (blankets, rugs, flowers on the ground) or \"auto\" — by its name (flat things have none). Default auto"});
     let tint = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Multiply the picture by [r, g, b]: shade or darken it (autumn or frosty trees, a dim corner); null or [] removes it"});
     let recolor = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Paint the picture in [r, g, b], keeping its pattern and shading: Colorable rugs, banners, cloth, bricks; null or [] restores the original colours"});
@@ -62,12 +63,12 @@ fn tools() -> Value {
         }), &["assets"]),
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
-            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor,
+            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "tint": tint, "recolor": recolor,
             "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
-            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor,
+            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "tint": tint, "recolor": recolor,
             "front": front, "look_at": look_at, "against_wall": against_wall
         }), &["index"]),
         tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
@@ -286,7 +287,7 @@ mod tests {
             assert!(names.contains(&n), "{n}");
         }
         let props = |tool: &str| list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"].clone();
-        for k in ["shadow", "tint", "recolor"] {
+        for k in ["shadow", "canopy", "tint", "recolor"] {
             assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");
         }
         for k in ["asset", "frame", "a", "b", "width"] {

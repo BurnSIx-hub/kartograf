@@ -39,6 +39,9 @@ pub struct Zone {
     /// Доля мелководья у воды, 0..1: по ней блики на дне. Гавань глубокая —
     /// дна не видно; у пруда с мелкими берегами блики как были.
     pub shallow: f32,
+    /// Доля мутной воды, 0..1 ([`crate::map::Material::murky`]): больше половины —
+    /// у области нет пены у берега, бликов на дне и рыб.
+    pub murky: f32,
 }
 
 /// Модуль Foundry, который оживляет области.
@@ -147,7 +150,7 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
     }
     let mut masks: Vec<(&'static str, mask::Mask)> = Vec::new();
     // Сколько воды глубокой и сколько всего — по закрашенному.
-    let (mut deep, mut wet) = (0u64, 0u64);
+    let (mut deep, mut wet, mut murk) = (0u64, 0u64, 0u64);
     for (m, mat) in map.materials.iter().enumerate() {
         let Some(effect) = mat.live().effect() else { continue };
         let mask = map.material_mask(m);
@@ -156,6 +159,9 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
             wet += area;
             if mat.deep() {
                 deep += area;
+            }
+            if mat.murky() {
+                murk += area;
             }
         }
         match masks.iter_mut().find(|(e, _)| *e == effect) {
@@ -168,6 +174,7 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
         }
     }
     let shallow = if wet == 0 { 1.0 } else { 1.0 - deep as f32 / wet as f32 };
+    let murky = if wet == 0 { 0.0 } else { murk as f32 / wet as f32 };
     let mut out: Vec<Zone> = Vec::new();
     for (effect, mut mask) in masks {
         // Под настилом (дорожка вдоль линии — мостки, мост) живого нет: по тропе
@@ -221,7 +228,7 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
                 (l.clone(), depth % 2 == 1)
             })
             .collect::<Vec<_>>();
-        out.push(Zone { effect, loops: tagged, place: String::new(), shallow });
+        out.push(Zone { effect, loops: tagged, place: String::new(), shallow, murky });
     }
     out
 }
@@ -318,7 +325,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let a = i as f32 / 12.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0 });
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Встроенный фонтан: эффект «Wild Canvas» по его трём чашам — струя, перелив, круги, журчание.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("fountain")) {
@@ -327,7 +334,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let a = i as f32 / 24.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0 });
+        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
@@ -335,7 +342,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
         let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
         let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0 });
+        zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
     // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
@@ -353,7 +360,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
             let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
             let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
             let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0 });
+            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
         }
     }
     // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
@@ -361,7 +368,7 @@ pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
         let tagged: Vec<_> = loops.iter().map(|l| (l.clone(), loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1)).collect();
         if !tagged.is_empty() {
-            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0 });
+            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0, murky: 0.0 });
         }
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
@@ -864,6 +871,12 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             if z.effect == "water" && z.shallow < 0.95 {
                 region["flags"][LIVE_MODULE]["caustic"] = json!(((z.shallow.max(0.15) as f64) * 100.0).round() / 100.0);
             }
+            // Мутная вода (болото, тёмный пруд): ни пены у берега, ни бликов на дне, ни рыб.
+            if z.effect == "water" && z.murky >= 0.5 {
+                region["flags"][LIVE_MODULE]["foam"] = json!(0);
+                region["flags"][LIVE_MODULE]["caustic"] = json!(0);
+                region["flags"][LIVE_MODULE]["fish"] = json!(false);
+            }
             // Корабль на ходу: вода уходит мимо борта.
             if z.effect == "water" && map.current > 0.0 {
                 region["flags"][LIVE_MODULE]["current"] = json!((map.current as f64 * 10.0).round() / 10.0);
@@ -1294,6 +1307,26 @@ mod tests {
         assert_eq!(caustic(0), None);
         assert_eq!(caustic(10), Some(0.15));
         assert!((caustic(5).unwrap() - 0.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn murky_water_has_no_surf_bottom_or_fish() {
+        // Мутная вода (у FA — Water_Opaque…): у берега нет белой пены, дна и рыб не видно.
+        // Чистая вода рядом — как была.
+        let flags = |name: &str| {
+            let mut m = Map::new(10, 10);
+            let w = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+            m.materials[w].name = name.into();
+            m.paint(crate::map::Layer::Floor, w, &crate::mask::cells(m.rooms.w, m.rooms.h, (2, 2), (7, 7)));
+            m.prune();
+            let lay = layout(&m, &[]);
+            let scene = foundry_levels(&m, "Топь", &[SceneLevel { name: "Топь".into(), image_src: "w.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+            scene["regions"].as_array().unwrap().iter().find(|r| r["flags"][LIVE_MODULE]["effect"] == "water").unwrap()["flags"][LIVE_MODULE].clone()
+        };
+        let murky = flags("Мутная вода");
+        assert_eq!((murky["foam"].as_f64(), murky["caustic"].as_f64(), murky["fish"].as_bool()), (Some(0.0), Some(0.0), Some(false)));
+        let clear = flags("Мелководье");
+        assert_eq!((clear.get("foam"), clear["fish"].as_bool()), (None, Some(true)));
     }
 
     #[test]

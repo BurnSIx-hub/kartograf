@@ -79,8 +79,8 @@ ROOF_OK = ("Chimney", "Steam", "Vent", "Hatch", "Skylight", "Water_Tank", "Pipe_
 FLYING = ("Airship_Gnome", "Airship_Cargo", "Bird", "Balloon")
 VERTICAL = ("Clock_Metal_Brass_Face", "Clock_Metal_Brass_Hand", "Wall_Trophy")
 CONNECT = ("Boiler", "Tank", "Reactor", "Chimney", "Valve", "Manhole", "Gauge", "Gas_Holder", "Mooring_Mast", "Gas_Cylinders")
-INDOOR = ("Chair_Wood", "Table_Round", "Table_Rectangle", "Bookshelf", "Desk", "Stove", "Oven", "Cupboard", "Chandelier",
-          "Wall_Lamp", "Bar_Wood", "Stool", "Keg", "Shelf_", "Fireplace", "Bed", "Globe", "Telescope", "Map_", "Hammer_Rack",
+INDOOR = ("Table_Round", "Table_Rectangle", "Bookshelf", "Desk", "Stove", "Oven", "Cupboard", "Chandelier",
+          "Wall_Lamp", "Bar_Wood", "Stool", "Keg", "Shelf_", "Fireplace", "Arranged_Bed", "Globe", "Telescope", "Map_", "Hammer_Rack",
           "Forge", "Anvil", "Scaffolding", "Engine_Steam", "Sail_Table", "Envelope_Frame")
 OUTDOOR = ("Lamp_Street", "Mooring_Post", "Windsock", "Gyrocopter", "Landing_Pad", "Signal_Beacon", "Cart_Wood",
            "Лавка", "Ящик с цветами", "Sign_Post", "MineCart", "Track_", "Crane_Steam", "Mooring_Mast", "Gas_Holder", "Winch_Metal",
@@ -120,13 +120,16 @@ for o, e in ends:
         continue
     issues.append(f"[труба] #{o['index']}: конец ({e[0]:.1f}, {e[1]:.1f}) ни к чему не подключён")
 # 4. Наложения одного слоя
-SKIP = ("Steam", "Track_", "Rug", "Pipe_Brass", "Manhole", "Floor_", "Landing_Pad", "Puddle", "Map_", "Lantern", "Toolbox",
+SKIP = ("Steam", "Track_", "Rug", "Pipe_Brass", "Manhole", "Floor_", "Landing_Pad", "Puddle", "Map_", "Lantern", "Toolbox", "Cattail", "Lilypad", "Reeds_", "Skull_Decor",
         "Gauge", "Propeller_Metal", "Box_Luggage_Lid_Leather_Brown_Metal_Brass_A11", "Valve")
 cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800]
 for i, a in enumerate(cand):
     ba = box(a, 0.8)
     for b in cand[i + 1:]:
         if a["layer"] != b["layer"]:
+            continue
+        # Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
+        if any(has(x, "Table", "Desk", "Counter", "Bar_") for x in (a, b)) and min(a["w"] * a["h"], b["w"] * b["h"]) <= 2:
             continue
         bb = box(b, 0.8)
         ix = max(0, min(ba[2], bb[2]) - max(ba[0], bb[0])) * max(0, min(ba[3], bb[3]) - max(ba[1], bb[1]))
@@ -166,6 +169,8 @@ for o in objs:
         issues.append(f"[дом] #{o['index']} {name(o)} на улице ({o['x']:.1f}, {o['y']:.1f})")
 # 8. За краем карты
 for o in objs:
+    if has(o, "Tree"):
+        continue  # крона за краем карты — нормально
     b = box(o, 0.8)
     if b[0] < -0.2 or b[1] < -0.2 or b[2] > W + 0.2 or b[3] > H + 0.2:
         issues.append(f"[край] #{o['index']} {name(o)} вылезает за карту")

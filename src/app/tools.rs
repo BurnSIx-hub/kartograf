@@ -432,11 +432,12 @@ impl App {
         let light = glow_of(a)?.flatten();
         let layer = layer_of(a)?.flatten();
         let shadow = shadow_of(a)?.flatten();
+        let canopy = canopy_of(a)?.flatten();
         let tint = color_of(a, "tint")?.flatten();
         let scale = f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0);
         let (pos, rot, wall) = self.facing(a, &asset, size, scale, [x, y], 0.0)?;
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy: None, layer, tint, open: None });
+        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         let p = &self.map.props[i];
@@ -456,6 +457,7 @@ impl App {
         let light = glow_of(a)?;
         let layer = layer_of(a)?;
         let shadow = shadow_of(a)?;
+        let canopy = canopy_of(a)?;
         let tint = color_of(a, "tint")?;
         let recolor = color_of(a, "recolor")?;
         let now = &self.map.props[i];
@@ -472,6 +474,9 @@ impl App {
         }
         if let Some(s) = shadow {
             p.shadow = s;
+        }
+        if let Some(c) = canopy {
+            p.canopy = c;
         }
         if let Some(t) = tint {
             p.tint = t;
@@ -1378,6 +1383,16 @@ fn shadow_of(a: &Value) -> Result<Option<Option<bool>>, String> {
         Some(Value::Bool(b)) => Ok(Some(Some(*b))),
         Some(v) if v.as_str() == Some("auto") => Ok(Some(None)),
         _ => Err("shadow: true, false или \"auto\"".into()),
+    }
+}
+
+/// Крона из ответа ИИ: нет поля — не трогать; `"auto"` — по имени (деревья FA, встроенное).
+fn canopy_of(a: &Value) -> Result<Option<Option<bool>>, String> {
+    match a.get("canopy") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(Some(*b))),
+        Some(v) if v.as_str() == Some("auto") => Ok(Some(None)),
+        _ => Err("canopy: true, false или \"auto\"".into()),
     }
 }
 
