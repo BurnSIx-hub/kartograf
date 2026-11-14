@@ -15,6 +15,8 @@ mod map;
 mod mask;
 #[cfg(not(target_arch = "wasm32"))]
 mod mcp;
+#[cfg(not(target_arch = "wasm32"))]
+mod sheet;
 mod palette;
 mod pck;
 mod place;

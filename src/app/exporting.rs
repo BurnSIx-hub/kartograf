@@ -234,10 +234,9 @@ impl App {
             if leaves.contains_key(&key) {
                 continue;
             }
-            let bytes = self.textures.bytes(&key)?;
             // Foundry вращает створку вокруг левого конца картинки, а петля у FA
             // и у встроенных нарисована справа: створка уходит отражённой.
-            let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&key)))?.fliph();
+            let img = image::DynamicImage::ImageRgba8(self.textures.rgba(&key)?).fliph();
             let width = img.width();
             let file = e.dir.join(format!("{}_створка_{}.webp", e.name, leaves.len() + 1));
             files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
@@ -333,8 +332,7 @@ impl App {
                 // Подкрашенная крона — свой файл: та же картинка в другом цвете.
                 let look = prop.tint.map_or_else(|| prop.asset.clone(), |t| format!("{}#{t:?}", prop.asset));
                 if !canopies.contains_key(&look) {
-                    let bytes = self.textures.bytes(&prop.asset)?;
-                    let mut img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&prop.asset)))?;
+                    let mut img = image::DynamicImage::ImageRgba8(self.textures.rgba(&prop.asset)?);
                     if let Some(t) = prop.tint {
                         let mut rgba = img.to_rgba8();
                         for p in rgba.pixels_mut() {
@@ -391,8 +389,7 @@ impl App {
                     if let Some(src) = canopies.get(key) {
                         return Ok(src.clone());
                     }
-                    let bytes = self.textures.bytes(key)?;
-                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(key)))?;
+                    let img = image::DynamicImage::ImageRgba8(self.textures.rgba(key)?);
                     let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
@@ -461,7 +458,7 @@ impl App {
                 items.sort_by_key(|p| p.layer());
                 let p = e.px as f32;
                 for prop in items {
-                    let pic = pics.entry(prop.asset.clone()).or_insert_with(|| self.textures.bytes(&prop.asset).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8()));
+                    let pic = pics.entry(prop.asset.clone()).or_insert_with(|| self.textures.rgba(&prop.asset).ok());
                     if let Some(pic) = pic {
                         export::stamp(&mut flat, pic, [prop.pos[0] * p, prop.pos[1] * p], [prop.size[0] * prop.scale * p, prop.size[1] * prop.scale * p], prop.rot, prop.tint);
                     }

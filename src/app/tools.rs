@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 pub enum Waiting {
     /// Картинка области снимается плитками ([`App::start_picture`]): вернуть её ИИ
     /// (`max_px` — сторона) и/или записать в файл.
-    Picture { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, path: Option<PathBuf>, image: bool },
+    Picture { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, path: Option<PathBuf>, image: bool, grid: bool },
     Place { reply: Sender<Result<Value, String>> },
     Export { reply: Sender<Result<Value, String>> },
 }
@@ -70,7 +70,7 @@ impl App {
             }
             Out::Wait(w) => {
                 self.control_wait = Some(match w {
-                    Waiting::Picture { area, max_px, path, image, .. } => Waiting::Picture { reply: req.reply, area, max_px, path, image },
+                    Waiting::Picture { area, max_px, path, image, grid, .. } => Waiting::Picture { reply: req.reply, area, max_px, path, image, grid },
                     Waiting::Place { .. } => Waiting::Place { reply: req.reply },
                     Waiting::Export { .. } => Waiting::Export { reply: req.reply },
                 });
@@ -90,12 +90,12 @@ impl App {
     fn control_wait_step(&mut self, ctx: &egui::Context) {
         ctx.request_repaint();
         match self.control_wait.take() {
-            Some(Waiting::Picture { reply, area, max_px, path, image }) => {
+            Some(Waiting::Picture { reply, area, max_px, path, image, grid }) => {
                 if self.export.is_some() {
-                    self.control_wait = Some(Waiting::Picture { reply, area, max_px, path, image });
+                    self.control_wait = Some(Waiting::Picture { reply, area, max_px, path, image, grid });
                 } else {
                     let r = match self.picture.take() {
-                        Some(img) => picture_reply(img, area, max_px, path.as_deref(), image),
+                        Some(img) => picture_reply(img, area, max_px, path.as_deref(), image, grid),
                         None => Err("картинка не снялась".into()),
                     };
                     let _ = reply.send(r);
@@ -121,8 +121,13 @@ impl App {
         }
     }
 
-    /// Ключ ассета: точный ключ, а нет — первый по имени.
+    /// Ключ ассета: точный ключ, а нет — первый по имени. Ключ в цвете (`tint:…:ключ`)
+    /// годится, если годится сама картинка.
     fn asset_key(&self, name: &str) -> Result<String, String> {
+        if let (Some(_), inner) = library::untint(name) {
+            self.asset_key(inner)?;
+            return Ok(name.to_owned());
+        }
         if self.library.assets.iter().any(|a| a.key == name) || name.starts_with(library::BUILTIN) || name.starts_with("set:") {
             return Ok(name.to_owned());
         }
@@ -148,6 +153,9 @@ impl App {
             "erase" => self.tool_paint(a, true),
             "add_wall" => self.tool_add_wall(a),
             "add_door" => self.tool_add_door(a),
+            "edit_door" => self.tool_edit_door(a),
+            "preview_assets" => self.tool_preview_assets(a),
+            "batch" => self.tool_batch(a),
             "add_label" => self.tool_add_label(a),
             "edit_label" => self.tool_edit_label(a),
             "add_path" => self.tool_add_path(a),
@@ -192,7 +200,8 @@ impl App {
                     _ => 1.0,
                 };
                 self.start_picture(area, px, roofs);
-                return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image });
+                let grid = a["grid"].as_bool().unwrap_or(false);
+                return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image, grid });
             }
             "generate" => self.tool_generate(a),
             "build_plan" => self.tool_plan(a),
@@ -269,7 +278,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| inside(area, p.pos))
                 .take(limit)
-                .map(|(i, p)| json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light())}))
+                .map(|(i, p)| json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
                 .collect();
             out.insert("objects".into(), json!(list));
         }
@@ -279,7 +288,7 @@ impl App {
             out.insert("room_walls".into(), json!("walls along painted rooms are automatic and not listed; change them by painting/erasing rooms"));
         }
         if want("doors") {
-            let list: Vec<Value> = m.portals.iter().enumerate().filter(|(_, d)| inside(area, d.center())).take(limit).map(|(i, d)| json!({"index": i, "a": d.a, "b": d.b, "kind": d.kind.label()})).collect();
+            let list: Vec<Value> = m.portals.iter().enumerate().filter(|(_, d)| inside(area, d.center())).take(limit).map(|(i, d)| door_json(i, d)).collect();
             out.insert("doors".into(), json!(list));
         }
         if want("labels") {
@@ -314,19 +323,31 @@ impl App {
         Value::Object(out)
     }
 
+    /// Поиск по словам с ранжированием ([`library::Asset::score`]): то же имя — первым,
+    /// слово целиком выше куска чужого слова (`table` ≠ `tablet`), ломаное и особые
+    /// ветки паков — ниже, если их не назвали; `exclude` — убрать совсем.
     fn tool_find(&mut self, a: &Value) -> Res {
-        let words: Vec<String> = a["query"].as_str().unwrap_or_default().to_lowercase().replace('_', " ").split_whitespace().map(str::to_owned).collect();
+        let words = library::name_tokens(a["query"].as_str().unwrap_or_default());
+        let exclude = library::name_tokens(a["exclude"].as_str().unwrap_or_default());
         let kind = a["kind"].as_str();
         let limit = a["limit"].as_u64().unwrap_or(30).clamp(1, 200) as usize;
-        let hits: Vec<(String, String, String, Kind)> = self
+        let mut ranked: Vec<(f32, usize)> = self
             .library
             .assets
             .iter()
-            // Встроенные названы по-русски («Плиты»), а ключ — по-английски
-            // (`builtin:flagstones`): ищется и по нему.
-            .filter(|x| kind.is_none_or(|k| kind_name(x.kind) == k) && (x.matches(&words) || words.iter().all(|w| x.key.to_lowercase().replace('_', " ").contains(w.as_str()))))
+            .enumerate()
+            .filter(|(_, x)| kind.is_none_or(|k| kind_name(x.kind) == k) && (exclude.is_empty() || !x.mentions(&exclude)))
+            .filter_map(|(i, x)| Some((x.score(&words)?, i)))
+            .collect();
+        ranked.sort_by(|p, q| q.0.total_cmp(&p.0).then(p.1.cmp(&q.1)));
+        let total = ranked.len();
+        let hits: Vec<(String, String, String, Kind)> = ranked
+            .into_iter()
             .take(limit)
-            .map(|x| (x.key.clone(), x.name.clone(), x.folder.clone(), x.kind))
+            .map(|(_, i)| {
+                let x = &self.library.assets[i];
+                (x.key.clone(), x.name.clone(), x.folder.clone(), x.kind)
+            })
             .collect();
         let list: Vec<Value> = hits
             .into_iter()
@@ -335,20 +356,26 @@ impl App {
                 json!({"key": key, "name": name, "folder": folder, "kind": kind_name(kind), "size_cells": size})
             })
             .collect();
-        Ok(json!({"assets": list, "library_loading": self.library.loading()}))
+        Ok(json!({"assets": list, "found": total, "library_loading": self.library.loading()}))
     }
 
     fn tool_add_object(&mut self, a: &Value) -> Res {
-        let asset = self.asset_key(a["asset"].as_str().unwrap_or_default())?;
+        let mut asset = self.asset_key(a["asset"].as_str().unwrap_or_default())?;
+        if let Some(Some(c)) = color_of(a, "recolor")? {
+            asset = library::tint_key(c, &asset);
+        }
         let (x, y) = (need(a, "x")?, need(a, "y")?);
         let size = self.asset_size(&asset);
         let light = glow_of(a)?.flatten();
         let layer = layer_of(a)?.flatten();
+        let shadow = shadow_of(a)?.flatten();
+        let tint = color_of(a, "tint")?.flatten();
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow: None, light, canopy: None, layer, tint: None, open: None });
+        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow, light, canopy: None, layer, tint, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "size_cells": size, "light": glow_name(self.map.props[i].light())}))
+        let p = &self.map.props[i];
+        Ok(json!({"index": i, "size_cells": size, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
     }
 
     fn tool_edit_object(&mut self, a: &Value) -> Res {
@@ -363,10 +390,19 @@ impl App {
         let size = asset.as_deref().map(|k| self.asset_size(k));
         let light = glow_of(a)?;
         let layer = layer_of(a)?;
+        let shadow = shadow_of(a)?;
+        let tint = color_of(a, "tint")?;
+        let recolor = color_of(a, "recolor")?;
         self.checkpoint();
         let p = &mut self.map.props[i];
         if let Some(g) = light {
             p.light = g;
+        }
+        if let Some(s) = shadow {
+            p.shadow = s;
+        }
+        if let Some(t) = tint {
+            p.tint = t;
         }
         if let Some(l) = layer {
             p.layer = l;
@@ -387,8 +423,13 @@ impl App {
             p.asset = k;
             p.size = sz;
         }
+        match recolor {
+            Some(Some(c)) => p.asset = library::tint_key(c, &p.asset),
+            Some(None) => p.asset = library::untint(&p.asset).1.to_owned(),
+            None => {}
+        }
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "x": p.pos[0], "y": p.pos[1], "rotation": p.rot, "scale": p.scale, "asset": p.asset, "light": glow_name(p.light())}))
+        Ok(json!({"index": i, "x": p.pos[0], "y": p.pos[1], "rotation": p.rot, "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
     }
 
     fn tool_remove(&mut self, a: &Value) -> Res {
@@ -424,33 +465,52 @@ impl App {
         Ok(json!({"removed": idx.len()}))
     }
 
+    /// Пол по прямоугольнику, овалу или многоугольнику. Края — с шагом маски, четверть
+    /// клетки: комната [4, 3, 14, 11] стенами встаёт ровно на 4, 14, 3 и 11, а пол
+    /// до 9,5 — под стену `add_wall` на 9,5. `feather` (земля и стирание) — мягкий
+    /// край: доля пути от края к середине, на которой сила спадает.
     fn tool_paint(&mut self, a: &Value, erase: bool) -> Res {
-        let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1]")?;
         let (mw, mh) = (self.map.rooms.w, self.map.rooms.h);
-        // Клетки области [x0, x1) × [y0, y1): правый и нижний край не входят, и
-        // комната [4, 3, 14, 11] стенами встаёт ровно на 4, 14, 3 и 11.
-        let c0 = (r[0].floor() as i32, r[1].floor() as i32);
-        let c1 = ((r[2].ceil() as i32 - 1).max(c0.0), (r[3].ceil() as i32 - 1).max(c0.1));
-        let weights = if a["shape"].as_str() == Some("oval") { mask::oval(mw, mh, c0, c1) } else { mask::cells(mw, mh, c0, c1) };
+        let shape = a["shape"].as_str().unwrap_or("rect");
+        let mut weights = match shape {
+            "poly" => {
+                let pts = points_of(a);
+                if pts.len() < 3 {
+                    return Err("shape poly: нужны points — хотя бы три точки [x, y]".into());
+                }
+                mask::poly(mw, mh, &pts)
+            }
+            "rect" | "oval" => {
+                let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1]")?;
+                if shape == "oval" { mask::oval_f(mw, mh, r) } else { mask::rect_f(mw, mh, r) }
+            }
+            other => return Err(format!("shape «{other}»: rect, oval или poly")),
+        };
         if weights.is_empty() {
-            return Err("область вне карты".into());
+            return Err("область пустая или вне карты".into());
         }
+        let room = !erase && a["target"].as_str() == Some("room");
+        let feather = f(a, "feather").unwrap_or(0.0).clamp(0.0, 1.0);
+        if feather > 0.0 && room {
+            return Err("feather — для земли (target terrain) и стирания: у комнаты край — её стены".into());
+        }
+        mask::soften(mw, mh, &mut weights, feather);
+        let cells = (weights.iter().map(|w| w.1).sum::<f32>() / (mask::RES * mask::RES) as f32 * 100.0).round() / 100.0;
         if erase {
             self.checkpoint();
             self.map.erase(&weights);
             self.edges_dirty = true;
-            return Ok(json!({"erased_cells": weights.len() / (mask::RES * mask::RES)}));
+            return Ok(json!({"erased_cells": cells, "feather": feather}));
         }
         let m = self.material_of(&a["material"])?;
         self.checkpoint();
-        let room = a["target"].as_str() == Some("room");
         self.map.paint(if room { Layer::Rooms } else { Layer::Floor }, m, &weights);
         self.edges_dirty = true;
-        Ok(json!({"material": m, "cells": weights.len() / (mask::RES * mask::RES), "target": if room { "room" } else { "terrain" }}))
+        Ok(json!({"material": m, "cells": cells, "target": if room { "room" } else { "terrain" }, "feather": feather}))
     }
 
     fn tool_add_wall(&mut self, a: &Value) -> Res {
-        let points: Vec<[f32; 2]> = a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default();
+        let points = points_of(a);
         if points.len() < 2 {
             return Err("нужно хотя бы две точки".into());
         }
@@ -461,22 +521,221 @@ impl App {
         Ok(json!({"index": self.map.walls.len() - 1}))
     }
 
-    fn tool_add_door(&mut self, a: &Value) -> Res {
-        let p = [need(a, "x")?, need(a, "y")?];
-        let kind = match a["kind"].as_str().unwrap_or("door") {
-            "double" => PortalKind::DoubleDoor,
-            "window" => PortalKind::Window,
-            "opening" => PortalKind::Opening,
-            "secret" => PortalKind::Secret,
-            _ => PortalKind::Door,
+    /// Картинки проёма по ответу ИИ: `asset` — створка, окно или подоконник, `frame` —
+    /// косяк; `""` — без картинки. Не названо — как в окне редактора, но по виду
+    /// проёма: окну — подоконник, двери — створка.
+    fn door_pictures(&self, a: &Value, kind: PortalKind) -> Result<(Option<String>, Option<String>), String> {
+        let pick = |k: &str| -> Result<Option<String>, String> {
+            match a[k].as_str() {
+                Some("") => Ok(None),
+                Some(n) => Ok(Some(self.asset_key(n)?)),
+                None => Err(String::new()),
+            }
         };
-        let was = self.door_kind;
-        self.door_kind = kind;
-        let i = self.place_portal(p);
-        self.door_kind = was;
-        let i = i.ok_or("рядом с точкой нет стены")?;
-        let d = &self.map.portals[i];
-        Ok(json!({"index": i, "a": d.a, "b": d.b, "kind": d.kind.label()}))
+        let window_like = |k: &str| k.contains("window") || k.to_lowercase().contains("sill");
+        let asset = match pick("asset") {
+            Ok(v) => v,
+            Err(e) if !e.is_empty() => return Err(e),
+            Err(_) => match kind {
+                PortalKind::Opening | PortalKind::Secret => None,
+                PortalKind::Window => Some(self.door_asset.clone().filter(|k| window_like(k)).unwrap_or_else(|| format!("{}window_stone", library::BUILTIN))),
+                _ => Some(self.door_asset.clone().filter(|k| !window_like(k)).unwrap_or_else(|| library::DEFAULT_DOOR.into())),
+            },
+        };
+        let frame = match pick("frame") {
+            Ok(v) => v,
+            Err(e) if !e.is_empty() => return Err(e),
+            Err(_) => if kind.hidden() { None } else { self.door_frame.clone() },
+        };
+        Ok((asset, frame))
+    }
+
+    /// Проём по отрезку `a`–`b`: оба конца ложатся на ближайшую стену (её линию в
+    /// пределах отрезка стены), без привязки к сетке.
+    fn door_on_wall(&mut self, a: [f32; 2], b: [f32; 2]) -> Result<([f32; 2], [f32; 2]), String> {
+        let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let (s0, s1) = self
+            .all_wall_segments()
+            .into_iter()
+            .map(|s| (s, map::segment_distance(mid, s.0, s.1)))
+            .filter(|(_, d)| *d <= DOOR_REACH)
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .ok_or("у середины отрезка нет стены")?
+            .0;
+        let (dx, dy) = (s1[0] - s0[0], s1[1] - s0[1]);
+        let len2 = (dx * dx + dy * dy).max(1e-9);
+        let on = |p: [f32; 2]| {
+            let t = (((p[0] - s0[0]) * dx + (p[1] - s0[1]) * dy) / len2).clamp(0.0, 1.0);
+            [s0[0] + dx * t, s0[1] + dy * t]
+        };
+        let (mut p, mut q) = (on(a), on(b));
+        if ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() < 0.2 {
+            return Err("проём короче 0,2 клетки — концы сошлись на стене".into());
+        }
+        if (q[0], q[1]) < (p[0], p[1]) {
+            std::mem::swap(&mut p, &mut q);
+        }
+        Ok((p, q))
+    }
+
+    fn tool_add_door(&mut self, a: &Value) -> Res {
+        let kind = portal_kind(a["kind"].as_str().unwrap_or("door"))?;
+        let (asset, frame) = self.door_pictures(a, kind)?;
+        let i = if let (Some(pa), Some(pb)) = (point_at(a, "a"), point_at(a, "b")) {
+            let (pa, pb) = self.door_on_wall(pa, pb)?;
+            let w = ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2)).sqrt();
+            let frame = frame.map(|k| library::frame_for_width(&k, w));
+            let portal = Portal { a: pa, b: pb, kind, asset, frame };
+            let clash = self.map.portals.iter().position(|q| map::segment_distance(q.center(), portal.a, portal.b) < 0.01);
+            self.checkpoint();
+            let i = match clash {
+                Some(i) => {
+                    self.map.portals[i] = portal;
+                    i
+                }
+                None => {
+                    self.map.portals.push(portal);
+                    self.map.portals.len() - 1
+                }
+            };
+            self.sel = Some(Sel::Portal(i));
+            i
+        } else {
+            let p = [need(a, "x").map_err(|_| "нужны x, y — точка у стены — или отрезок a, b".to_owned())?, need(a, "y")?];
+            let width = f(a, "width").unwrap_or(if kind == PortalKind::DoubleDoor { 2.0 } else { self.door_width }).clamp(0.5, 8.0);
+            // Окно редактора помнит свой выбор: подменить на время и вернуть.
+            let was = (self.door_kind, self.door_width, self.door_asset.clone(), self.door_frame.clone());
+            (self.door_kind, self.door_width, self.door_asset, self.door_frame) = (kind, width, asset, frame);
+            let i = self.place_portal(p);
+            (self.door_kind, self.door_width, self.door_asset, self.door_frame) = was;
+            i.ok_or("рядом с точкой нет стены")?
+        };
+        Ok(door_json(i, &self.map.portals[i]))
+    }
+
+    /// Проём по номеру: вид, картинки створки и косяка, место по отрезку.
+    fn tool_edit_door(&mut self, a: &Value) -> Res {
+        let i = a["index"].as_u64().ok_or("нужен index")? as usize;
+        if i >= self.map.portals.len() {
+            return Err(format!("проёма {i} нет: их {}", self.map.portals.len()));
+        }
+        let kind = match a["kind"].as_str() {
+            Some(k) => portal_kind(k)?,
+            None => self.map.portals[i].kind,
+        };
+        let pick = |k: &str| -> Result<Option<Option<String>>, String> {
+            match a[k].as_str() {
+                None => Ok(None),
+                Some("") => Ok(Some(None)),
+                Some(n) => Ok(Some(Some(self.asset_key(n)?))),
+            }
+        };
+        let (asset, frame) = (pick("asset")?, pick("frame")?);
+        let ends = match (point_at(a, "a"), point_at(a, "b")) {
+            (Some(pa), Some(pb)) => Some(self.door_on_wall(pa, pb)?),
+            (None, None) => None,
+            _ => return Err("отрезок — оба конца: a и b".into()),
+        };
+        self.checkpoint();
+        let d = &mut self.map.portals[i];
+        d.kind = kind;
+        if let Some((pa, pb)) = ends {
+            (d.a, d.b) = (pa, pb);
+        }
+        if let Some(v) = asset {
+            d.asset = v;
+        }
+        if let Some(v) = frame {
+            d.frame = v;
+        }
+        if matches!(kind, PortalKind::Opening) {
+            d.asset = None;
+        }
+        let w = ((d.b[0] - d.a[0]).powi(2) + (d.b[1] - d.a[1]).powi(2)).sqrt();
+        d.frame = d.frame.take().map(|k| library::frame_for_width(&k, w));
+        self.sel = Some(Sel::Portal(i));
+        self.edges_dirty = true;
+        Ok(door_json(i, &self.map.portals[i]))
+    }
+
+    /// Лист ассетов: куда смотрит картинка при повороте 0, размер в клетках и где
+    /// в ней непрозрачное. Картинка ИИ — в ответ, подробности — JSON.
+    fn tool_preview_assets(&mut self, a: &Value) -> Res {
+        let keys: Vec<String> = a["assets"].as_array().map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        if keys.is_empty() || keys.len() > 16 {
+            return Err("assets: от 1 до 16 ключей из find_assets".into());
+        }
+        let tile = a["tile_px"].as_u64().unwrap_or(192).clamp(64, 512) as u32;
+        let mut items = Vec::new();
+        let mut info = Vec::new();
+        for (n, name) in keys.iter().enumerate() {
+            let key = self.asset_key(name)?;
+            let size = self.asset_size(&key);
+            let img = library::load_rgba(&self.textures.sources, &key).ok_or(format!("{name}: картинка не читается (пак не подключён?)"))?;
+            let bbox = crate::sheet::alpha_bbox(&img);
+            let r2 = |v: f32| (v * 1000.0).round() / 1000.0;
+            info.push(json!({
+                "tile": n + 1, "key": key, "name": library::label(&key), "size_cells": size, "pixels": [img.width(), img.height()],
+                "alpha_bbox": bbox.map(|b| b.map(r2)),
+                // То же в клетках от середины объекта при повороте 0 и масштабе 1.
+                "visible_cells": bbox.map(|b| [r2((b[0] - 0.5) * size[0]), r2((b[1] - 0.5) * size[1]), r2((b[2] - 0.5) * size[0]), r2((b[3] - 0.5) * size[1])]),
+            }));
+            items.push((img, size));
+        }
+        let sheet = crate::sheet::contact_sheet(&items, tile);
+        let mut png = Vec::new();
+        sheet.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        use base64::Engine;
+        Ok(json!({
+            "assets": info,
+            "legend": "tile number top-left; orange triangle marks the top of the picture at rotation 0 (rotation turns clockwise); faint lines are the cells the asset covers",
+            "image_png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
+        }))
+    }
+
+    /// Пачка правок за один вызов: одна точка отмены на каждый тронутый этаж. Ошибка —
+    /// вся пачка откатывается и ничего не меняется.
+    fn tool_batch(&mut self, a: &Value) -> Res {
+        const NOT_IN_BATCH: [&str; 15] = ["batch", "view", "render_picture", "export_foundry", "terrain_from_place", "generate", "build_plan", "new_map", "open_map", "save_map", "grow_map", "add_level", "undo", "reload_assets", "preview_assets"];
+        let ops = a["ops"].as_array().ok_or("нужен ops: [{\"tool\": …, \"arguments\": {…}}]")?;
+        if ops.is_empty() || ops.len() > 1000 {
+            return Err("ops: от 1 до 1000 правок".into());
+        }
+        let mut list = Vec::new();
+        for (k, op) in ops.iter().enumerate() {
+            let tool = op["tool"].as_str().ok_or(format!("ops[{k}]: нет tool"))?;
+            if NOT_IN_BATCH.contains(&tool) {
+                return Err(format!("ops[{k}]: {tool} в batch нельзя — вызовите отдельно"));
+            }
+            list.push((tool.to_owned(), op.get("arguments").or_else(|| op.get("args")).cloned().unwrap_or(json!({}))));
+        }
+        let start = self.level;
+        self.batch = Some(Vec::new());
+        let mut results = Vec::new();
+        let mut failed = None;
+        for (k, (tool, args)) in list.iter().enumerate() {
+            match self.run_tool(tool, args) {
+                Out::Done(Ok(v)) => results.push(v),
+                Out::Done(Err(e)) => {
+                    failed = Some(format!("ops[{k}] {tool}: {e}"));
+                    break;
+                }
+                Out::Wait(_) => {
+                    failed = Some(format!("ops[{k}] {tool}: ждёт кадров — в batch нельзя"));
+                    break;
+                }
+            }
+        }
+        let touched = self.batch.take().unwrap_or_default();
+        if let Some(e) = failed {
+            for _ in 0..touched.len() {
+                self.undo();
+            }
+            self.redo.clear();
+            self.switch_level(start);
+            return Err(format!("{e} — пачка откатана, карта как была"));
+        }
+        Ok(json!({"done": results.len(), "results": results, "undo_steps": touched.len()}))
     }
 
     fn tool_add_label(&mut self, a: &Value) -> Res {
@@ -671,7 +930,7 @@ impl App {
     }
 
     fn tool_add_path(&mut self, a: &Value) -> Res {
-        let points: Vec<[f32; 2]> = a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default();
+        let points = points_of(a);
         if points.len() < 2 {
             return Err("нужно хотя бы две точки".into());
         }
@@ -801,6 +1060,68 @@ impl App {
     }
 }
 
+/// Точки `[[x, y], …]` из поля `points`.
+fn points_of(a: &Value) -> Vec<[f32; 2]> {
+    a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default()
+}
+
+/// Точка `[x, y]` из поля.
+fn point_at(a: &Value, k: &str) -> Option<[f32; 2]> {
+    let v = a.get(k)?.as_array()?;
+    Some([v.first()?.as_f64()? as f32, v.get(1)?.as_f64()? as f32])
+}
+
+fn portal_kind(s: &str) -> Result<PortalKind, String> {
+    Ok(match s {
+        "door" => PortalKind::Door,
+        "double" => PortalKind::DoubleDoor,
+        "window" => PortalKind::Window,
+        "opening" => PortalKind::Opening,
+        "secret" => PortalKind::Secret,
+        _ => return Err("kind: door, double, window, opening или secret".into()),
+    })
+}
+
+fn portal_kind_name(k: PortalKind) -> &'static str {
+    match k {
+        PortalKind::Door => "door",
+        PortalKind::DoubleDoor => "double",
+        PortalKind::Window => "window",
+        PortalKind::Opening => "opening",
+        PortalKind::Secret => "secret",
+    }
+}
+
+fn door_json(i: usize, d: &Portal) -> Value {
+    let w = ((d.b[0] - d.a[0]).powi(2) + (d.b[1] - d.a[1]).powi(2)).sqrt();
+    json!({"index": i, "a": d.a, "b": d.b, "width": (w * 100.0).round() / 100.0, "kind": portal_kind_name(d.kind), "asset": d.asset, "frame": d.frame})
+}
+
+/// Тень из ответа ИИ: нет поля — не трогать; `"auto"` — по имени (плоское без тени).
+fn shadow_of(a: &Value) -> Result<Option<Option<bool>>, String> {
+    match a.get("shadow") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(Some(*b))),
+        Some(v) if v.as_str() == Some("auto") => Ok(Some(None)),
+        _ => Err("shadow: true, false или \"auto\"".into()),
+    }
+}
+
+/// Цвет из ответа ИИ (`tint` — умножением, `recolor` — перекраска с узором): нет
+/// поля — не трогать; `[r, g, b]` — этот; `null` или `[]` — убрать.
+fn color_of(a: &Value, k: &str) -> Result<Option<Option<[u8; 3]>>, String> {
+    match a.get(k) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Array(l)) if l.is_empty() => Ok(Some(None)),
+        Some(Value::Array(l)) if l.len() == 3 => {
+            let c: Vec<u8> = l.iter().filter_map(|v| v.as_u64().map(|v| v.min(255) as u8)).collect();
+            if c.len() == 3 { Ok(Some(Some([c[0], c[1], c[2]]))) } else { Err(format!("{k}: [r, g, b], числа 0..255")) }
+        }
+        _ => Err(format!("{k}: [r, g, b], числа 0..255; null — убрать")),
+    }
+}
+
 /// Свет из ответа ИИ: нет поля — не трогать; `auto` — по имени; иначе свой.
 fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
     let Some(s) = a["light"].as_str() else { return Ok(None) };
@@ -858,8 +1179,16 @@ fn glow_name(g: Option<Glow>) -> Option<String> {
 }
 
 /// Готовая картинка: в файл (по расширению — PNG, JPEG или WebP) и/или ИИ в ответ.
-fn picture_reply(img: image::RgbImage, area: [f32; 4], max_px: u32, path: Option<&std::path::Path>, with_image: bool) -> Res {
+fn picture_reply(img: image::RgbImage, area: [f32; 4], max_px: u32, path: Option<&std::path::Path>, with_image: bool, grid: bool) -> Res {
     let mut out = json!({"area": area, "pixels": [img.width(), img.height()], "px_per_cell": img.width() as f32 / (area[2] - area[0]).max(1e-3)});
+    // В файл сетка идёт сразу; ИИ — после уменьшения, чтобы цифры читались.
+    let img = if grid && !with_image {
+        let (g, m) = crate::sheet::ruler(&img, area);
+        out["grid_margin_px"] = json!(m);
+        g
+    } else {
+        img
+    };
     if let Some(p) = path {
         let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -884,12 +1213,21 @@ fn picture_reply(img: image::RgbImage, area: [f32; 4], max_px: u32, path: Option
     if with_image {
         let k = (max_px as f32 / img.width().max(img.height()) as f32).min(1.0);
         let img = if k < 1.0 { image::imageops::resize(&img, ((img.width() as f32 * k) as u32).max(1), ((img.height() as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle) } else { img };
+        let ppc = img.width() as f32 / (area[2] - area[0]).max(1e-3);
+        let img = if grid {
+            let (g, m) = crate::sheet::ruler(&img, area);
+            // Точка (px, py) картинки — клетка (area.x0 + (px - left) / ppc, area.y0 + (py - top) / ppc).
+            out["grid_margin_px"] = json!(m);
+            g
+        } else {
+            img
+        };
         let mut png = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
         use base64::Engine;
         out["image_png_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&png));
         out["pixels"] = json!([img.width(), img.height()]);
-        out["px_per_cell"] = json!(img.width() as f32 / (area[2] - area[0]).max(1e-3));
+        out["px_per_cell"] = json!(ppc);
     }
     Ok(out)
 }

@@ -5,6 +5,15 @@ use super::*;
 impl App {
     /// Запомнить карту перед правкой.
     pub fn checkpoint(&mut self) {
+        // В пачке правок (`batch`) этаж запоминается один раз — до первой правки.
+        if let Some(seen) = &mut self.batch {
+            if seen.contains(&self.level) {
+                self.redo.clear();
+                self.touch();
+                return;
+            }
+            seen.push(self.level);
+        }
         self.undo.push((self.level, self.map.clone()));
         if self.undo.len() > HISTORY {
             self.undo.remove(0);

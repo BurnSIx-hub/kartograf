@@ -288,8 +288,7 @@ impl App {
         let mut out = image::RgbaImage::new(w, h);
         for &i in idx {
             let p = self.map.props[i].clone();
-            let bytes = self.textures.bytes(&p.asset)?;
-            let img = image::load_from_memory(&bytes).map_err(|e| format!("{}: {e}", library::label(&p.asset)))?.to_rgba8();
+            let img = self.textures.rgba(&p.asset)?;
             bake_prop(&mut out, &img, &p, lo, PPC);
         }
         let dir = self.data_dir.join("baked");

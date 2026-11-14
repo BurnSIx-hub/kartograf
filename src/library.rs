@@ -419,6 +419,9 @@ pub struct Asset {
     pub kind: Kind,
     /// Для поиска: имя и папка в нижнем регистре.
     search: String,
+    /// Слова имени и папки (`HeightMap` → height, map) — для ранжирования поиска.
+    name_words: Vec<String>,
+    folder_words: Vec<String>,
     /// Варианты одного предмета лежат на полке одной миниатюрой.
     pub family: String,
 }
@@ -429,7 +432,54 @@ impl Asset {
         let name = file.rsplit_once('.').map_or(file, |(n, _)| n).to_owned();
         let search = format!("{} {}", name, folder).to_lowercase().replace('_', " ");
         let family = family_of(&key, &name, folder);
-        Self { key, name, folder: folder.to_owned(), kind, search, family }
+        let (name_words, folder_words) = (name_tokens(&name), name_tokens(folder));
+        Self { key, name, folder: folder.to_owned(), kind, search, family, name_words, folder_words }
+    }
+
+    /// Насколько ассет подходит под запрос; `None` — не нашлось какое-то слово.
+    /// Выше всего — то же имя (без хвоста размера `_1x1`), потом слова имени целиком
+    /// и подряд с начала, ниже — начало слова (`table` в `tablet`), слово папки и,
+    /// последним, кусок внутри слова. Ломаное, павшее, пустынное, киберпанк и прочие
+    /// особые ветки паков опускаются вниз, если их не просили.
+    pub fn score(&self, words: &[String]) -> Option<f32> {
+        if words.is_empty() {
+            return Some(0.0);
+        }
+        let key = self.key.to_lowercase();
+        let mut s = 0.0;
+        for w in words {
+            s += if self.name_words.iter().any(|n| n == w) {
+                20.0
+            } else if self.folder_words.iter().any(|n| n == w || n.starts_with(w.as_str())) {
+                6.0
+            } else if self.name_words.iter().any(|n| n.starts_with(w.as_str())) {
+                4.0
+            } else if self.search.contains(w.as_str()) || key.contains(w.as_str()) {
+                1.0
+            } else {
+                return None;
+            };
+        }
+        let plain: Vec<&String> = self.name_words.iter().filter(|n| !is_size_word(n)).collect();
+        let asked: Vec<&String> = words.iter().filter(|w| !is_size_word(w)).collect();
+        if self.name_words.as_slice() == words || (!asked.is_empty() && plain == asked) {
+            s += 1000.0;
+        }
+        // Слова запроса с начала имени, по порядку; последнее может быть началом слова.
+        let lead = words.iter().zip(&self.name_words).enumerate().take_while(|(i, (w, n))| n == w || (*i + 1 == words.len() && n.starts_with(w.as_str()))).count();
+        s += if lead == words.len() { 40.0 * lead as f32 } else { 10.0 * lead as f32 };
+        let found = words.iter().filter(|w| self.name_words.contains(w)).count();
+        s -= 1.5 * plain.len().saturating_sub(found) as f32;
+        let mut junk: Vec<&str> = self.name_words.iter().chain(&self.folder_words).map(String::as_str).filter(|n| SIDE_BRANCHES.contains(n) && !words.iter().any(|w| n.starts_with(w.as_str()))).collect();
+        junk.sort_unstable();
+        junk.dedup();
+        s -= (10.0 * junk.len() as f32).min(20.0);
+        Some(s)
+    }
+
+    /// Есть ли в имени или папке слово (или его начало) из списка исключений.
+    pub fn mentions(&self, words: &[String]) -> bool {
+        words.iter().any(|w| self.name_words.iter().chain(&self.folder_words).any(|n| n.starts_with(w.as_str())) || self.search.contains(w.as_str()))
     }
 
     pub fn matches(&self, words: &[String]) -> bool {
@@ -444,6 +494,51 @@ impl Asset {
     pub fn words(&self) -> Vec<&str> {
         self.search.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect()
     }
+}
+
+/// Особые ветки паков FA: в поиске опускаются, если их не назвали.
+const SIDE_BRANCHES: [&str; 22] = [
+    "broken", "damaged", "fallen", "ruin", "ruins", "ruined", "burnt", "burned", "debris", "destroyed", "desert", "arctic", "snowy", "frosty", "cyberpunk", "киберпанк", "ceremorph", "drow", "nursery", "spilled", "torn", "bloody",
+];
+
+/// Хвост размера FA: `1x1`, `2x3`.
+fn is_size_word(w: &str) -> bool {
+    w.split_once('x').is_some_and(|(a, b)| !a.is_empty() && !b.is_empty() && a.chars().chain(b.chars()).all(|c| c.is_ascii_digit()))
+}
+
+/// Слова имени: по `_`, `-`, пробелу, `/` и стыку строчной с заглавной
+/// (`HeightMap` → height, map), в нижнем регистре.
+pub fn name_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase();
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Служебные карты текстур — высоты, нормали, шероховатость: для движков, не для
+/// карты. В библиотеку не берутся.
+pub fn is_technical_map(path: &str) -> bool {
+    const TECH: [&str; 11] = ["height", "normal", "normals", "nrm", "roughness", "specular", "metallic", "metalness", "displacement", "bump", "occlusion"];
+    let file = path.rsplit(['/', '\\', '|']).next().unwrap_or(path);
+    let stem = file.rsplit_once('.').map_or(file, |(n, _)| n);
+    name_tokens(stem).last().is_some_and(|w| TECH.contains(&w.as_str()))
 }
 
 /// Ширина и высота картинки в точках без полного раскрытия — по заголовку.
@@ -467,6 +562,12 @@ pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
         }
     }
     (r > l && b > t).then(|| [l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5])
+}
+
+/// Картинка ассета целиком, RGBA, в цвете ключа (`tint:`).
+pub fn load_rgba(sources: &Sources, key: &str) -> Option<image::RgbaImage> {
+    let bytes = read_source(key, sources).ok()?;
+    decode_tinted(key, &bytes).ok()
 }
 
 /// Концы нити (паутина): крайние непрозрачные точки вдоль главной оси рисунка,
@@ -570,6 +671,9 @@ pub fn pack_assets(file: &std::path::Path) -> Result<Vec<Asset>, String> {
         .iter()
         .filter_map(|e| {
             let kind = kind_of(&e.path, true)?;
+            if is_technical_map(&e.path) {
+                return None;
+            }
             let inner = e.path.strip_prefix("textures/").unwrap_or(&e.path);
             let inner = inner.split_once('/').map_or(inner, |(_, rest)| rest);
             Some(Asset::new(pack_key(&pack.file, &e.path), &format!("{}/{inner}", pack.name), kind))
@@ -757,6 +861,12 @@ impl Textures {
     /// Байты картинки как есть — для выгрузки, где файл нужен целиком.
     pub fn bytes(&self, key: &str) -> Result<Vec<u8>, String> {
         read_source(key, &self.sources)
+    }
+
+    /// Картинка целиком, в цвете ключа (`tint:`): перекрашенный ковёр уходит в
+    /// выгрузку перекрашенным, как в окне.
+    pub fn rgba(&self, key: &str) -> Result<image::RgbaImage, String> {
+        decode_tinted(key, &self.bytes(key)?)
     }
 
     pub fn new(ctx: &egui::Context) -> Self {
@@ -1110,6 +1220,9 @@ impl Library {
             .into_iter()
             .filter_map(|p| {
                 let inner = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().into_owned();
+                if is_technical_map(&inner) {
+                    return None;
+                }
                 let kind = kind_of(&inner, false)?;
                 Some(Asset::new(p.to_string_lossy().into_owned(), &inner, kind))
             })
@@ -1157,6 +1270,9 @@ impl Library {
                     let before = self.from_packs.len();
                     for e in &pack.entries {
                         let Some(kind) = kind_of(&e.path, true) else { continue };
+                        if is_technical_map(&e.path) {
+                            continue;
+                        }
                         let key = pack_key(&pack.file, &e.path);
                         sources.insert(key.clone(), (pack.file.clone(), e.offset, e.size));
                         let inner = e.path.strip_prefix("textures/").unwrap_or(&e.path);
@@ -1214,6 +1330,51 @@ impl Library {
             }
         }
         groups
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn search_ranks_whole_words_and_the_exact_name_first() {
+        let a = |inner: &str| Asset::new(format!("pack:x|{inner}"), inner, Kind::Object);
+        let lib = [
+            a("FA/Writing/Wax_Tablet_Pen_Wood_A1_1x1.webp"),
+            a("FA/Furniture/Broken/Table_Small_Wood_Ashen_Fallen_A1_2x1.webp"),
+            a("FA/Furniture/Table_Small_Wood_Ashen_A1_2x1.webp"),
+            a("FA/Furniture/Damaged/Chair_Damaged_Wood_Ashen_A_1x1.webp"),
+            a("FA/Furniture/Chair_Wood_Ashen_Upholstered_A1_1x1.webp"),
+            a("FA/Furniture/Chair_Wood_Ashen_A_1x1.webp"),
+            a("FA/Desert/Palm_Tree_Frond_Green_B1_1x2.webp"),
+            a("FA/Trees/Tree_Green_B1_4x4.webp"),
+        ];
+        let rank = |q: &str| {
+            let words = name_tokens(q);
+            let mut hits: Vec<(f32, &str)> = lib.iter().filter_map(|x| Some((x.score(&words)?, x.name.as_str()))).collect();
+            hits.sort_by(|p, q| q.0.total_cmp(&p.0));
+            hits.into_iter().map(|(_, n)| n).collect::<Vec<_>>()
+        };
+        let t = rank("table wood");
+        assert_eq!(t[0], "Table_Small_Wood_Ashen_A1_2x1", "{t:?}");
+        assert_eq!(t.last().copied(), Some("Wax_Tablet_Pen_Wood_A1_1x1"), "table внутри tablet — последним: {t:?}");
+        assert_eq!(rank("Chair_Wood_Ashen_A_1x1")[0], "Chair_Wood_Ashen_A_1x1");
+        assert_eq!(rank("Chair_Wood_Ashen_A")[0], "Chair_Wood_Ashen_A_1x1", "без хвоста размера");
+        assert_eq!(rank("Tree_Green_B1")[0], "Tree_Green_B1_4x4");
+        assert_eq!(rank("chair")[2], "Chair_Damaged_Wood_Ashen_A_1x1", "сломанное — после целых");
+        assert_eq!(rank("damaged chair")[0], "Chair_Damaged_Wood_Ashen_A_1x1", "названное — не штрафуется");
+        assert!(lib[1].mentions(&name_tokens("fallen")) && !lib[2].mentions(&name_tokens("fallen")));
+    }
+
+    #[test]
+    fn engine_maps_are_not_library_pictures() {
+        assert!(is_technical_map("textures/terrain/Dirt_E_01_height.webp"));
+        assert!(is_technical_map("Stone_Normal.png") && is_technical_map("pack:x|t/Wood_roughness.jpg"));
+        assert!(!is_technical_map("textures/patterns/Square_Tiles_HeightMap_Overlay_A.png"));
+        assert!(!is_technical_map("Dirt_A_01.jpg"));
+        assert_eq!(name_tokens("Square_Tiles_HeightMap_Overlay A"), ["square", "tiles", "height", "map", "overlay", "a"]);
+        assert_eq!(name_tokens("Stool_Wood_Ashen_A1_1x1"), ["stool", "wood", "ashen", "a1", "1x1"]);
     }
 }
 

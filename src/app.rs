@@ -468,6 +468,9 @@ pub struct App {
     control: Option<crate::control::Control>,
     #[cfg(not(target_arch = "wasm32"))]
     control_wait: Option<tools::Waiting>,
+    /// Идёт `batch` из MCP: этажи, у которых точка отмены уже есть, — вся пачка
+    /// отменяется одним шагом на этаж.
+    batch: Option<Vec<usize>>,
     /// Окно «Место на карте» у формы места.
     map_pick: Option<crate::mappick::MapPick>,
     place: PlaceJob,
@@ -705,6 +708,7 @@ impl App {
             control: None,
             #[cfg(not(target_arch = "wasm32"))]
             control_wait: None,
+            batch: None,
             map_pick: None,
             place: PlaceJob::default(),
             drawer_area: Rect::NOTHING,

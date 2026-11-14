@@ -15,7 +15,11 @@ Coordinates are grid cells: x to the right, y down, (0, 0) is the top-left corne
 
 Typical loop: `map_info` → `find_assets` to get asset keys → edit (`add_object`, `paint`, `add_wall`, `add_door`, …) → `view` to look at the result → `save_map` / `export_foundry`. To start from something, use `generate` (procedural maps), `build_plan` (a JSON plan, see plans/README.md in the repository) or `terrain_from_place` (real terrain from OpenStreetMap and satellite imagery).
 
-Lights in Foundry come from objects: lamps, fires and braziers glow by their name; give any object `light` (e.g. `arcane` for a magic crystal) in `add_object` / `edit_object`. Chimneys, vents and hatches go on a roof with layer `on_roof`: they are part of that roof and vanish with it when players enter the house; `above_roofs` is only for things flying over the town. Call `set_wall_style` before painting rooms to choose their walls. New picture files put into the user's asset folder appear after `reload_assets`. `render_picture` writes the whole map with objects to an image file for a preview.";
+Lights in Foundry come from objects: lamps, fires and braziers glow by their name; give any object `light` (e.g. `arcane` for a magic crystal) in `add_object` / `edit_object`. Chimneys, vents and hatches go on a roof with layer `on_roof`: they are part of that roof and vanish with it when players enter the house; `above_roofs` is only for things flying over the town. Call `set_wall_style` before painting rooms to choose their walls. New picture files put into the user's asset folder appear after `reload_assets`. `render_picture` writes the whole map with objects to an image file for a preview.
+
+Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows where the top of each picture is at rotation 0 and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
+
+Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes.";
 
 fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
@@ -27,24 +31,34 @@ fn tools() -> Value {
     let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow)"});
     let layer = json!({"type": "string", "enum": ["auto", "floor", "low", "normal", "high", "above_walls", "on_roof", "above_roofs"], "description": "What covers what: floor (rugs), low, normal, high (trees, wardrobes), above_walls, on_roof (chimneys, vents, hatches: part of the roof, gone with it when players enter), above_roofs (airships, birds flying over everything); auto — by its name"});
     let roofs = json!({"type": "string", "enum": ["solid", "ghost", "hidden"], "description": "Roofs: solid as players see them (default), ghost — see-through to check inside, hidden"});
+    let shadow = json!({"type": ["boolean", "string"], "description": "Cast a shadow: true, false (blankets, rugs, flowers on the ground) or \"auto\" — by its name (flat things have none). Default auto"});
+    let tint = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Multiply the picture by [r, g, b]: shade or darken it (autumn or frosty trees, a dim corner); null or [] removes it"});
+    let recolor = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Paint the picture in [r, g, b], keeping its pattern and shading: Colorable rugs, banners, cloth, bricks; null or [] restores the original colours"});
+    let points = json!({"type": "array", "items": point, "minItems": 3, "description": "Polygon corners in cells, for shape poly"});
+    let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
             "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]}, "description": "Sections to list; default all"},
             "area": area, "limit": int("Max items per section, default 200")
         }), &[]),
-        tool("find_assets", "Search the asset library (built-in pictures plus the user's Dungeondraft packs and folder) by words. Returns keys to use in add_object / paint.", json!({
-            "query": text("Words to match in the name or folder, e.g. 'barrel', 'oak tree', 'stone floor'"),
-            "kind": {"type": "string", "enum": ["floor", "wall", "door", "object", "roof"]},
+        tool("find_assets", "Search the asset library (built-in pictures plus the user's Dungeondraft packs and folder) by words, best matches first: the exact file name, then whole words of the name in order; 'table' does not rank 'tablet'; broken, damaged, fallen, desert, arctic, cyberpunk and similar branches sink unless named. Height, normal and roughness maps are not in the library. Returns keys to use in add_object / paint / add_door.", json!({
+            "query": text("Words to match in the name or folder, e.g. 'barrel', 'oak tree', 'stone floor', or an exact file name 'Chair_Wood_Ashen_A_1x1'"),
+            "kind": {"type": "string", "enum": ["floor", "wall", "door", "object", "roof"], "description": "door: door leaves, jambs (Door_Frame), windows and window sills"},
+            "exclude": text("Words to drop, space-separated, e.g. 'broken fallen bloody'"),
             "limit": int("Default 30")
         }), &["query"]),
+        tool("preview_assets", "Look at assets before placing them: a contact sheet on a dark background, one tile per asset with its number, the cells it covers, and an orange triangle over the top of the picture at rotation 0 (rotation turns clockwise). JSON gives size in cells, alpha_bbox (opaque part, fractions of the picture: u right, v down) and visible_cells (the same in cells from the object's centre).", json!({
+            "assets": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16, "description": "Asset keys from find_assets"},
+            "tile_px": int("Tile size, 64..512, default 192")
+        }), &["assets"]),
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
-            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer
+            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor
         }), &["asset", "x", "y"]),
-        tool("edit_object", "Move, rotate, scale, light or swap the picture of an object by index (see describe).", json!({
+        tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
-            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer
+            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor
         }), &["index"]),
         tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
             "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, tavern, house"),
@@ -78,20 +92,33 @@ fn tools() -> Value {
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]},
             "indices": {"type": "array", "items": {"type": "integer"}}
         }), &["what", "indices"]),
-        tool("paint", "Paint floor over a rectangle or oval of cells. target 'terrain' paints ground; 'room' paints a room floor and walls appear along its edge automatically (dungeons, houses).", json!({
+        tool("paint", "Paint floor over a rectangle, oval or polygon. Edges are exact to a quarter cell, so fractional areas line up with add_wall (a room [4, 3, 9.5, 7.5] gets walls on x=9.5 and y=7.5). target 'terrain' paints ground; 'room' paints a room floor and walls appear along its edge automatically (dungeons, houses).", json!({
             "material": text("Floor asset key from find_assets (kind floor), or a material index from map_info"),
-            "area": area, "shape": {"type": "string", "enum": ["rect", "oval"], "description": "Default rect"},
-            "target": {"type": "string", "enum": ["terrain", "room"], "description": "Default terrain"}
-        }), &["material", "area"]),
-        tool("erase", "Erase floor and rooms over a rectangle or oval of cells.", json!({"area": area, "shape": {"type": "string", "enum": ["rect", "oval"]}}), &["area"]),
+            "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"], "description": "Default rect; poly takes points instead of area"},
+            "points": points,
+            "target": {"type": "string", "enum": ["terrain", "room"], "description": "Default terrain"},
+            "feather": num("Terrain only, 0..1, default 0: soft edge — the share of the way from the edge to the middle over which the paint fades. About 0.35 for lawns, mud and shores")
+        }), &["material"]),
+        tool("erase", "Erase floor and rooms over a rectangle, oval or polygon, exact to a quarter cell.", json!({
+            "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"]}, "points": points,
+            "feather": num("0..1, default 0: erase with a soft edge")
+        }), &[]),
         tool("add_wall", "Add a free-standing wall through points (cells). Room walls come from painting with target 'room' instead.", json!({
             "points": {"type": "array", "items": point, "minItems": 2}, "closed": {"type": "boolean", "description": "Connect the last point to the first"},
             "low": {"type": "boolean", "description": "Low wall — railing, ship's bulwark, parapet: in Foundry it stops movement, but sight and light pass over it"}
         }), &["points"]),
-        tool("add_door", "Put a door, window or opening into the wall nearest to a point.", json!({
+        tool("add_door", "Put a door, window or opening into a wall: near a point (snapped to the grid along the wall) or exactly on a segment a–b (both ends are projected onto the nearest wall). A door in the same place replaces the old one.", json!({
             "x": num("Point near the wall, cells"), "y": num("Point near the wall, cells"),
-            "kind": {"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"}
-        }), &["x", "y"]),
+            "a": point.clone(), "b": point.clone(),
+            "kind": door_kind.clone(),
+            "width": num("Cells along the wall, with x/y; default 1, double 2"),
+            "asset": text("Door leaf, window or window sill picture from find_assets (kind door); '' for none. Default: a wooden door, or a stone sill for a window"),
+            "frame": text("Jamb picture from find_assets (kind door, e.g. Door_Frame_… or builtin:frame_stone_1); '' for none. Built-in jambs fit the width by themselves")
+        }), &[]),
+        tool("edit_door", "Change a door, window or opening by index (see describe with doors): kind, pictures, or move it to a segment a–b on a wall.", json!({
+            "index": int("Door index"), "kind": door_kind, "a": point.clone(), "b": point.clone(),
+            "asset": text("Door leaf / window / sill picture key; '' removes it"), "frame": text("Jamb picture key; '' removes it")
+        }), &["index"]),
         tool("add_label", "Write a label on the map (room name, street).", json!({"text": text("Text"), "x": num("Centre x"), "y": num("Centre y"), "size": num("Letter height in cells, default 1")}), &["text", "x", "y"]),
         tool("edit_label", "Change a label by index (see describe): text, place, size, rotation, or hide it from players.", json!({
             "index": int("Label index"), "text": text("New text"), "x": num("Centre x"), "y": num("Centre y"),
@@ -107,10 +134,17 @@ fn tools() -> Value {
             "width": num("Thickness in cells, default 0.25 (0.35 for pictures)"), "area": area
         }), &[]),
         tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets.", json!({}), &[]),
-        tool("undo", "Undo the last changes.", json!({"steps": int("Default 1")}), &[]),
-        tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it (objects, doors, roofs; no grid or editor windows).", json!({"area": area, "max_px": int("Longest side of the picture, 128..2048, default 1024"), "roofs": roofs}), &[]),
+        tool("undo", "Undo the last changes. A batch is one step (one per floor it touched).", json!({"steps": int("Default 1")}), &[]),
+        tool("batch", "Run many edits in one call; they are undone as one step (one per floor touched). If any edit fails, the whole batch is rolled back and the map stays as it was. Not allowed inside: view, render_picture, preview_assets, export_foundry, save_map, open_map, new_map, generate, build_plan, terrain_from_place, grow_map, add_level, undo, reload_assets, batch.", json!({
+            "ops": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "properties": {"tool": text("Tool name, e.g. add_object"), "arguments": {"type": "object", "description": "Its arguments"}}, "required": ["tool"]}}
+        }), &["ops"]),
+        tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it (objects, doors, roofs; no editor windows).", json!({
+            "area": area, "max_px": int("Longest side of the picture, 128..2048, default 1024"), "roofs": roofs,
+            "grid": {"type": "boolean", "description": "Draw cell lines (every fifth darker) and coordinates along the top and left margins; grid_margin_px in the reply is [left, top]: picture point (px, py) is cell (area.x0 + (px - left) / px_per_cell, area.y0 + (py - top) / px_per_cell)"}
+        }), &[]),
         tool("render_picture", "Write a picture of the map with all objects to a file (PNG, JPEG or WebP by the extension) — for a preview or to share. Nothing is returned but the file.", json!({
-            "path": text("File path"), "px": int("Pixels per cell, 10..300, default 70"), "area": area, "roofs": roofs
+            "path": text("File path"), "px": int("Pixels per cell, 10..300, default 70"), "area": area, "roofs": roofs,
+            "grid": {"type": "boolean", "description": "Cell lines and coordinates on the margins, as in view"}
         }), &["path"]),
         tool("generate", "Replace the map with a procedural one.", json!({
             "kind": {"type": "string", "enum": ["dungeon", "cave", "forest", "town", "walls", "house", "tavern", "jarl", "church", "arena", "cyberpunk"]},
@@ -235,9 +269,18 @@ mod tests {
     fn tools_found_missing_on_a_real_map_are_there() {
         let list = tools();
         let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map"] {
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map", "edit_door", "preview_assets", "batch"] {
             assert!(names.contains(&n), "{n}");
         }
+        let props = |tool: &str| list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"].clone();
+        for k in ["shadow", "tint", "recolor"] {
+            assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");
+        }
+        for k in ["asset", "frame", "a", "b", "width"] {
+            assert!(props("add_door").get(k).is_some(), "add_door {k}");
+        }
+        assert!(props("paint").get("feather").is_some() && props("paint")["shape"]["enum"].as_array().unwrap().iter().any(|v| v == "poly"));
+        assert!(props("find_assets").get("exclude").is_some() && props("view").get("grid").is_some());
         let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();
         assert!(add["inputSchema"]["properties"]["light"]["enum"].as_array().unwrap().iter().any(|v| v == "arcane"));
     }

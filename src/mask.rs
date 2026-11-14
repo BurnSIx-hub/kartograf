@@ -271,16 +271,74 @@ pub fn cells(w: usize, h: usize, a: (i32, i32), b: (i32, i32)) -> Vec<(usize, f3
 /// Овал, вписанный в прямоугольник клеток между двумя углами (включительно),
 /// с краем, размытым на шаг маски, — как у круглой кисти.
 pub fn oval(w: usize, h: usize, a: (i32, i32), b: (i32, i32)) -> Vec<(usize, f32)> {
-    let cw = (w / RES) as i32;
-    let ch = (h / RES) as i32;
-    let (x0, x1) = (a.0.min(b.0), a.0.max(b.0) + 1);
-    let (y0, y1) = (a.1.min(b.1), a.1.max(b.1) + 1);
-    let c = [(x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0];
-    let (rx, ry) = ((x1 - x0) as f32 / 2.0, (y1 - y0) as f32 / 2.0);
-    let aa = 0.5 / RES as f32;
+    oval_f(w, h, [a.0.min(b.0) as f32, a.1.min(b.1) as f32, (a.0.max(b.0) + 1) as f32, (a.1.max(b.1) + 1) as f32])
+}
+
+/// Точки маски от `lo` до `hi` клеток по одной оси: середины подклеток внутри.
+fn span(lo: f32, hi: f32, n: usize) -> std::ops::Range<usize> {
+    let at = |v: f32| ((v * RES as f32 - 0.5).ceil().max(0.0) as usize).min(n);
+    at(lo)..at(hi)
+}
+
+/// Прямоугольник `[x0, y0, x1, y1]` в клетках, края — с точностью шага маски
+/// (четверть клетки): пол до 9,5 встаёт ровно под стену на 9,5. На целых — то же,
+/// что [`cells`].
+pub fn rect_f(w: usize, h: usize, r: [f32; 4]) -> Vec<(usize, f32)> {
     let mut out = Vec::new();
-    for j in (y0.max(0) as usize * RES)..(y1.min(ch).max(0) as usize * RES) {
-        for i in (x0.max(0) as usize * RES)..(x1.min(cw).max(0) as usize * RES) {
+    for j in span(r[1].min(r[3]), r[1].max(r[3]), h) {
+        for i in span(r[0].min(r[2]), r[0].max(r[2]), w) {
+            out.push((j * w + i, 1.0));
+        }
+    }
+    out
+}
+
+/// Многоугольник по точкам в клетках; край размыт на шаг маски, как у овала.
+pub fn poly(w: usize, h: usize, pts: &[[f32; 2]]) -> Vec<(usize, f32)> {
+    if pts.len() < 3 {
+        return Vec::new();
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in pts {
+        (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
+    }
+    let pad = 1.0 / RES as f32;
+    let mut out = Vec::new();
+    for j in span(y0 - pad, y1 + pad, h) {
+        for i in span(x0 - pad, x1 + pad, w) {
+            let p = sample_pos(i as isize, j as isize);
+            let mut inside = false;
+            let mut d = f32::MAX;
+            for k in 0..pts.len() {
+                let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+                if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+                    inside = !inside;
+                }
+                let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+                let t = (((p[0] - a[0]) * ex + (p[1] - a[1]) * ey) / (ex * ex + ey * ey).max(1e-9)).clamp(0.0, 1.0);
+                d = d.min(((p[0] - a[0] - ex * t).powi(2) + (p[1] - a[1] - ey * t).powi(2)).sqrt());
+            }
+            let v = (0.5 + if inside { d } else { -d } * RES as f32).clamp(0.0, 1.0);
+            if v > 0.0 {
+                out.push((j * w + i, v));
+            }
+        }
+    }
+    out
+}
+
+/// Овал, вписанный в прямоугольник `[x0, y0, x1, y1]` клеток (края — дробные),
+/// с краем, размытым на шаг маски.
+pub fn oval_f(w: usize, h: usize, r: [f32; 4]) -> Vec<(usize, f32)> {
+    let (x0, x1) = (r[0].min(r[2]), r[0].max(r[2]));
+    let (y0, y1) = (r[1].min(r[3]), r[1].max(r[3]));
+    let c = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
+    let (rx, ry) = (((x1 - x0) / 2.0).max(1e-3), ((y1 - y0) / 2.0).max(1e-3));
+    let aa = 0.5 / RES as f32;
+    let at = |v: f32, n: usize| ((v * RES as f32).max(0.0) as usize).min(n);
+    let mut out = Vec::new();
+    for j in at(y0.floor(), h)..at(y1.ceil(), h) {
+        for i in at(x0.floor(), w)..at(x1.ceil(), w) {
             let p = sample_pos(i as isize, j as isize);
             let (dx, dy) = ((p[0] - c[0]) / rx, (p[1] - c[1]) / ry);
             // Расстояние до края по нормали — приближённо, через градиент.
@@ -294,6 +352,46 @@ pub fn oval(w: usize, h: usize, a: (i32, i32), b: (i32, i32)) -> Vec<(usize, f32
         }
     }
     out
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn fractional_shapes_land_on_quarter_cells() {
+        let (w, h) = (20 * RES, 16 * RES);
+        let mut a = rect_f(w, h, [4.0, 3.0, 14.0, 11.0]);
+        let mut b = cells(w, h, (4, 3), (13, 10));
+        a.sort_by_key(|p| p.0);
+        b.sort_by_key(|p| p.0);
+        assert_eq!(a, b, "на целых — как клетки");
+        let r = rect_f(w, h, [9.5, 7.25, 12.0, 8.0]);
+        assert_eq!(r.len(), (2.5 * RES as f32) as usize * (0.75 * RES as f32) as usize);
+        let xs: Vec<usize> = r.iter().map(|p| p.0 % w).collect();
+        assert_eq!(*xs.iter().min().unwrap(), 38, "левый край — ровно 9,5");
+        // Квадрат многоугольником — тот же прямоугольник.
+        let mut p = poly(w, h, &[[4.0, 3.0], [14.0, 3.0], [14.0, 11.0], [4.0, 11.0]]);
+        p.sort_by_key(|q| q.0);
+        assert_eq!(p, a);
+        // Треугольник: половина квадрата 4×4, край размыт.
+        let t: f32 = poly(w, h, &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]]).iter().map(|q| q.1).sum::<f32>() / (RES * RES) as f32;
+        assert!((t - 8.0).abs() < 0.3, "{t}");
+        // Дробный овал — площадь πab.
+        let o: f32 = oval_f(w, h, [2.5, 2.5, 8.5, 6.5]).iter().map(|q| q.1).sum::<f32>() / (RES * RES) as f32;
+        assert!((o - std::f32::consts::PI * 3.0 * 2.0).abs() < 0.3, "{o}");
+    }
+
+    #[test]
+    fn feather_fades_the_edge_and_keeps_the_middle() {
+        let (w, h) = (20 * RES, 20 * RES);
+        let mut o = oval_f(w, h, [2.0, 2.0, 18.0, 18.0]);
+        soften(w, h, &mut o, 0.35);
+        let at = |x: f32, y: f32| o.iter().find(|q| q.0 == (y * RES as f32) as usize * w + (x * RES as f32) as usize).map_or(0.0, |q| q.1);
+        assert!(at(10.0, 10.0) > 0.99, "середина");
+        assert!(at(2.2, 10.0) < 0.2, "край мягкий: {}", at(2.2, 10.0));
+        assert!(at(4.0, 10.0) > at(2.5, 10.0), "к середине сильнее");
+    }
 }
 
 // ----- контур -----
