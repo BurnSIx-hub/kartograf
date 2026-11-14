@@ -218,6 +218,7 @@ impl App {
 
     pub(super) fn draw_path(&mut self, painter: &egui::Painter, canvas: Rect, path: &map::Path, seed: u32) {
         let Some(material) = self.map.materials.get(path.material) else { return };
+        let (rs, rc) = material.rot.to_radians().sin_cos();
         let (tex, tile, tint) = match &material.paint {
             Paint::Color(c) => (None, [1.0, 1.0], rgb(*c)),
             Paint::Texture(key) => {
@@ -263,7 +264,7 @@ impl App {
                 let uv = match tex {
                     None => egui::epaint::WHITE_UV,
                     Some(_) if path.along => pos2(d / tile[0], (hw - off) / tile[1]),
-                    Some(_) => pos2(p[0] / tile[0], p[1] / tile[1]),
+                    Some(_) => pos2((p[0] * rc + p[1] * rs) / tile[0], (p[1] * rc - p[0] * rs) / tile[1]),
                 };
                 let alpha = (a * end * 255.0).round() as u8;
                 let color = if tex.is_some() { Color32::from_white_alpha(alpha) } else { Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), alpha) };

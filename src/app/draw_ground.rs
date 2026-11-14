@@ -59,6 +59,8 @@ impl App {
             None => egui::Mesh::default(),
         };
         let cam = self.cam;
+        // Узор повёрнут на `rot` по часовой: точка карты берёт плитку повёрнутой назад.
+        let (rs, rc) = material.rot.to_radians().sin_cos();
         // Вершина в точке маски с дробными номерами (fx, fy) и силой `alpha`.
         let vertex = |fx: f32, fy: f32, alpha: u8| {
             let w = [((fx + 0.5) / res).clamp(0.0, map_w), ((fy + 0.5) / res).clamp(0.0, map_h)];
@@ -67,7 +69,7 @@ impl App {
                 None => Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], alpha),
             };
             // Цветной слой берёт белую точку атласа egui, текстурный — плитку.
-            let uv = if tex.is_some() { pos2(w[0] / tile[0], w[1] / tile[1]) } else { egui::epaint::WHITE_UV };
+            let uv = if tex.is_some() { pos2((w[0] * rc + w[1] * rs) / tile[0], (w[1] * rc - w[0] * rs) / tile[1]) } else { egui::epaint::WHITE_UV };
             egui::epaint::Vertex { pos: cam.to_screen(canvas, w), uv, color }
         };
         // Вблизи четырёхугольник у края дробится мельче, сила между точками маски —

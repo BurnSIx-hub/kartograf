@@ -106,7 +106,7 @@ fn key(name: &str) -> String {
 
 fn mat(m: &mut Map, name: &str) -> usize {
     let k = asset(name).key;
-    m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto }).unwrap_or(0)
+    m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto, rot: 0.0 }).unwrap_or(0)
 }
 
 /// Стена слота: картинка своя или встроенная, толщина — встроенной полосы.

@@ -514,7 +514,7 @@ pub struct App {
     filtered: Vec<usize>,
     filter_key: (Kind, String, usize, usize),
     /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
-    window_bands: std::collections::HashMap<String, f32>,
+    window_bands: std::collections::HashMap<String, [f32; 2]>,
     /// Видимые рамки лестниц и трапов по ассету: размыкают перила у крыши.
     visible_boxes: std::collections::HashMap<String, Option<[f32; 4]>>,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).

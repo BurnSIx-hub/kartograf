@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 pub enum Waiting {
     /// Картинка области снимается плитками ([`App::start_picture`]): вернуть её ИИ
     /// (`max_px` — сторона) и/или записать в файл.
-    Picture { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, path: Option<PathBuf>, image: bool, grid: bool },
+    Picture { reply: Sender<Result<Value, String>>, area: [f32; 4], max_px: u32, path: Option<PathBuf>, image: bool, grid: bool, light: Option<Box<(crate::lighting::Scene, crate::lighting::Time)>> },
     Place { reply: Sender<Result<Value, String>> },
     Export { reply: Sender<Result<Value, String>> },
 }
@@ -70,7 +70,7 @@ impl App {
             }
             Out::Wait(w) => {
                 self.control_wait = Some(match w {
-                    Waiting::Picture { area, max_px, path, image, grid, .. } => Waiting::Picture { reply: req.reply, area, max_px, path, image, grid },
+                    Waiting::Picture { area, max_px, path, image, grid, light, .. } => Waiting::Picture { reply: req.reply, area, max_px, path, image, grid, light },
                     Waiting::Place { .. } => Waiting::Place { reply: req.reply },
                     Waiting::Export { .. } => Waiting::Export { reply: req.reply },
                 });
@@ -90,12 +90,17 @@ impl App {
     fn control_wait_step(&mut self, ctx: &egui::Context) {
         ctx.request_repaint();
         match self.control_wait.take() {
-            Some(Waiting::Picture { reply, area, max_px, path, image, grid }) => {
+            Some(Waiting::Picture { reply, area, max_px, path, image, grid, light }) => {
                 if self.export.is_some() {
-                    self.control_wait = Some(Waiting::Picture { reply, area, max_px, path, image, grid });
+                    self.control_wait = Some(Waiting::Picture { reply, area, max_px, path, image, grid, light });
                 } else {
                     let r = match self.picture.take() {
-                        Some(img) => picture_reply(img, area, max_px, path.as_deref(), image, grid),
+                        Some(mut img) => {
+                            if let Some(l) = &light {
+                                crate::lighting::apply(&mut img, area, &l.0, l.1);
+                            }
+                            picture_reply(img, area, max_px, path.as_deref(), image, grid)
+                        }
                         None => Err("картинка не снялась".into()),
                     };
                     let _ = reply.send(r);
@@ -199,9 +204,19 @@ impl App {
                     "hidden" => 0.0,
                     _ => 1.0,
                 };
+                let time = match crate::lighting::Time::parse(a["lighting"].as_str().unwrap_or("day")) {
+                    Ok(t) => t,
+                    Err(e) => return Out::Done(Err(e)),
+                };
+                // Вечер и ночь: огни, стены и окна — те же, что уйдут в Foundry.
+                let light = (time != crate::lighting::Time::Day).then(|| {
+                    let lay = crate::export::layout(&self.map, &self.map.room_edges());
+                    let covers = if roofs >= 1.0 { self.roof_outlines() } else { Vec::new() };
+                    Box::new((crate::lighting::Scene::new(&lay, self.map.rooms.clone(), covers), time))
+                });
                 self.start_picture(area, px, roofs);
                 let grid = a["grid"].as_bool().unwrap_or(false);
-                return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image, grid });
+                return Out::Wait(Waiting::Picture { reply: dummy(), area, max_px, path, image, grid, light });
             }
             "generate" => self.tool_generate(a),
             "build_plan" => self.tool_plan(a),
@@ -304,10 +319,20 @@ impl App {
                 .take(limit)
                 .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "name": library::label(&r.paint), "rail": r.rail}))
                 .collect();
+            let n = m.roofs.len();
+            let mut list = list;
+            list.extend(
+                m.outline_roofs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.pieces.first().and_then(|p| p.rings.first()).is_some_and(|ring| ring.iter().any(|&q| inside(area, q))))
+                    .take(limit.saturating_sub(list.len()))
+                    .map(|(i, r)| {
+                        let p = &r.pieces[0];
+                        json!({"index": n + i, "points": p.rings[0].iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>(), "shape": form_name(p.form), "paint": p.paint, "name": library::label(&p.paint), "pieces": r.pieces.len()})
+                    }),
+            );
             out.insert("roofs".into(), json!(list));
-            if !m.outline_roofs.is_empty() {
-                out.insert("outline_roofs".into(), json!(format!("{} roofs over OpenStreetMap buildings are not listed", m.outline_roofs.len())));
-            }
         }
         if want("paths") {
             let list: Vec<Value> = m
@@ -370,12 +395,14 @@ impl App {
         let layer = layer_of(a)?.flatten();
         let shadow = shadow_of(a)?.flatten();
         let tint = color_of(a, "tint")?.flatten();
+        let scale = f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0);
+        let (pos, rot, wall) = self.facing(a, &asset, size, scale, [x, y], 0.0)?;
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos: [x, y], size, rot: f(a, "rotation").unwrap_or(0.0), scale: f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0), shadow, light, canopy: None, layer, tint, open: None });
+        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy: None, layer, tint, open: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         let p = &self.map.props[i];
-        Ok(json!({"index": i, "size_cells": size, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
+        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "size_cells": size, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
     }
 
     fn tool_edit_object(&mut self, a: &Value) -> Res {
@@ -393,8 +420,15 @@ impl App {
         let shadow = shadow_of(a)?;
         let tint = color_of(a, "tint")?;
         let recolor = color_of(a, "recolor")?;
+        let now = &self.map.props[i];
+        let pos = [f(a, "x").unwrap_or(now.pos[0]), f(a, "y").unwrap_or(now.pos[1])];
+        let scale = f(a, "scale").map_or(now.scale, |s| s.clamp(0.05, 20.0));
+        let (key, sz, rot0) = (asset.clone().unwrap_or_else(|| now.asset.clone()), size.unwrap_or(now.size), now.rot);
+        let (pos, rot, wall) = self.facing(a, &key, sz, scale, pos, rot0)?;
         self.checkpoint();
         let p = &mut self.map.props[i];
+        p.pos = pos;
+        p.rot = rot;
         if let Some(g) = light {
             p.light = g;
         }
@@ -407,18 +441,7 @@ impl App {
         if let Some(l) = layer {
             p.layer = l;
         }
-        if let Some(x) = f(a, "x") {
-            p.pos[0] = x;
-        }
-        if let Some(y) = f(a, "y") {
-            p.pos[1] = y;
-        }
-        if let Some(r) = f(a, "rotation") {
-            p.rot = r;
-        }
-        if let Some(s) = f(a, "scale") {
-            p.scale = s.clamp(0.05, 20.0);
-        }
+        p.scale = scale;
         if let (Some(k), Some(sz)) = (asset, size) {
             p.asset = k;
             p.size = sz;
@@ -429,7 +452,63 @@ impl App {
             None => {}
         }
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "x": p.pos[0], "y": p.pos[1], "rotation": p.rot, "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
+        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
+    }
+
+    /// Где встанет предмет и как повернётся: `look_at` — лицом (`front`) к точке,
+    /// `against_wall` — спиной к ближайшей стене, вплотную по видимой части
+    /// картинки. Явный `rotation` главнее обоих. Третье — стена, к которой прижат.
+    fn facing(&mut self, a: &Value, key: &str, size: [f32; 2], scale: f32, pos: [f32; 2], rot_now: f32) -> Result<([f32; 2], f32, Option<Value>), String> {
+        let front = a["front"].as_str().unwrap_or("bottom");
+        let base = front_base(front)?;
+        let look = point_at(a, "look_at");
+        let explicit = f(a, "rotation");
+        if a["against_wall"].as_bool() != Some(true) {
+            let rot = match (explicit, look) {
+                (Some(r), _) => r,
+                (None, Some(t)) => look_rotation(pos, t, base).unwrap_or(rot_now),
+                (None, None) => rot_now,
+            };
+            return Ok((pos, rot, None));
+        }
+        let (seg, half) = self.nearest_wall_face(pos, WALL_REACH).ok_or(format!("в {WALL_REACH} клетках от точки нет стены"))?;
+        let rooms = &self.map.rooms;
+        let inside = |q: [f32; 2]| rooms.get((q[0] * mask::RES as f32).floor() as isize, (q[1] * mask::RES as f32).floor() as isize) > 127;
+        let (p, n) = wall_side(seg, pos, half, look, inside);
+        let rot = explicit.unwrap_or_else(|| look_rotation(p, [p[0] + n[0], p[1] + n[1]], base).unwrap_or(rot_now));
+        let vb = library::visible_box(&self.textures.sources, key).unwrap_or([-0.5, -0.5, 0.5, 0.5]);
+        let back = back_extent(front, vb, size) * scale;
+        let d = half + back + 0.01;
+        Ok(([p[0] + n[0] * d, p[1] + n[1] * d], rot, Some(json!({"a": seg.0, "b": seg.1, "normal": [r3(n[0]), r3(n[1])]}))))
+    }
+
+    /// Контуры крыш этажа: прямоугольные — с выносом, по контуру — внешние кольца.
+    fn roof_outlines(&self) -> Vec<Vec<[f32; 2]>> {
+        let mut out: Vec<Vec<[f32; 2]>> = self
+            .map
+            .roofs
+            .iter()
+            .map(|r| {
+                let o = r.overhang;
+                let (x0, y0, x1, y1) = (r.a[0].min(r.b[0]) - o, r.a[1].min(r.b[1]) - o, r.a[0].max(r.b[0]) + o, r.a[1].max(r.b[1]) + o);
+                vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            })
+            .collect();
+        for r in &self.map.outline_roofs {
+            out.extend(r.pieces.iter().filter_map(|p| p.rings.first().cloned()));
+        }
+        out
+    }
+
+    /// Ближайшая к точке стена — свободная или комнаты — и половина её толщины.
+    fn nearest_wall_face(&mut self, p: [f32; 2], reach: f32) -> Option<(Segment, f32)> {
+        let edges = self.room_edges().to_vec();
+        let mut faces: Vec<(Segment, f32)> = edges.iter().map(|s| (*s, self.map.edge_look(map::edge_key(s)).width / 2.0)).collect();
+        for w in &self.map.walls {
+            let half = w.style.as_ref().unwrap_or(&self.map.wall_style).width / 2.0;
+            faces.extend(w.segments().map(|s| (s, half)));
+        }
+        faces.into_iter().map(|f| (map::segment_distance(p, f.0.0, f.0.1), f)).filter(|(d, _)| *d <= reach).min_by(|x, y| x.0.total_cmp(&y.0)).map(|(_, f)| f)
     }
 
     fn tool_remove(&mut self, a: &Value) -> Res {
@@ -443,7 +522,7 @@ impl App {
             "doors" => self.map.portals.len(),
             "labels" => self.map.labels.len(),
             "paths" => self.map.paths.len(),
-            "roofs" => self.map.roofs.len(),
+            "roofs" => self.map.roofs.len() + self.map.outline_roofs.len(),
             _ => return Err("what: objects, walls, doors, labels, paths или roofs".into()),
         };
         if let Some(&bad) = idx.iter().find(|&&i| i >= len) {
@@ -456,6 +535,7 @@ impl App {
                 "walls" => drop(self.map.walls.remove(i)),
                 "doors" => drop(self.map.portals.remove(i)),
                 "labels" => drop(self.map.labels.remove(i)),
+                "roofs" if i >= self.map.roofs.len() => drop(self.map.outline_roofs.remove(i - self.map.roofs.len())),
                 "roofs" => drop(self.map.roofs.remove(i)),
                 _ => drop(self.map.paths.remove(i)),
             }
@@ -502,11 +582,11 @@ impl App {
             self.edges_dirty = true;
             return Ok(json!({"erased_cells": cells, "feather": feather}));
         }
-        let m = self.material_of(&a["material"])?;
+        let m = self.material_turned(&a["material"], f(a, "angle").unwrap_or(0.0))?;
         self.checkpoint();
         self.map.paint(if room { Layer::Rooms } else { Layer::Floor }, m, &weights);
         self.edges_dirty = true;
-        Ok(json!({"material": m, "cells": cells, "target": if room { "room" } else { "terrain" }, "feather": feather}))
+        Ok(json!({"material": m, "cells": cells, "target": if room { "room" } else { "terrain" }, "feather": feather, "angle": self.map.materials[m].rot}))
     }
 
     fn tool_add_wall(&mut self, a: &Value) -> Res {
@@ -688,7 +768,7 @@ impl App {
         use base64::Engine;
         Ok(json!({
             "assets": info,
-            "legend": "tile number top-left; orange triangle marks the top of the picture at rotation 0 (rotation turns clockwise); faint lines are the cells the asset covers",
+            "legend": "each tile shows the asset at rotation 0, number top-left; TOP, RIGHT, BOTTOM, LEFT label the sides of the picture and are the values of `front` in add_object / edit_object (most FA furniture faces BOTTOM: its back is drawn at the top); faint lines are the cells it covers",
             "image_png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
         }))
     }
@@ -871,7 +951,10 @@ impl App {
     }
 
     fn tool_add_roof(&mut self, a: &Value) -> Res {
-        let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1] — по стенам дома")?;
+        if a.get("points").is_some_and(|v| !v.is_null()) {
+            return self.tool_add_outline_roof(a);
+        }
+        let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1] по стенам дома — или points: контур многоугольником")?;
         if r[2] - r[0] < 1.0 || r[3] - r[1] < 1.0 {
             return Err("крыша меньше клетки".into());
         }
@@ -894,10 +977,71 @@ impl App {
         Ok(json!({"index": self.map.roofs.len() - 1}))
     }
 
+    /// Крыша по контуру: башня, ротонда, эркер. Контур — по стенам, вынос — наружу
+    /// по нормалям рёбер. Шатёр — грани к вершине, вальма — скаты ко всем сторонам.
+    fn tool_add_outline_roof(&mut self, a: &Value) -> Res {
+        let pts = points_of(a);
+        if pts.len() < 3 {
+            return Err("points: хотя бы три точки [x, y] по стенам".into());
+        }
+        let paint = self.asset_key(a["paint"].as_str().unwrap_or("builtin:roof_metal"))?;
+        let form = roof_form(a["shape"].as_str().unwrap_or("tent"))?;
+        let ring = grow_ring(&pts, f(a, "overhang").unwrap_or(0.25).clamp(0.0, 2.0));
+        let mut piece = map::RoofPiece { rings: vec![ring], form, paint, height: 0.0, eaves: 0.0, down: None, across: false };
+        piece.fit_form();
+        for _ in 0..a["turn"].as_u64().unwrap_or(0) % 4 {
+            piece.turn();
+        }
+        self.checkpoint();
+        self.map.outline_roofs.push(map::OutlineRoof { pieces: vec![piece] });
+        let k = self.map.outline_roofs.len() - 1;
+        self.sel = Some(Sel::Outline(k, 0));
+        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(form), "points": self.map.outline_roofs[k].pieces[0].rings[0]}))
+    }
+
+    /// Крыша по контуру по номеру из describe (после прямоугольных).
+    fn tool_edit_outline_roof(&mut self, a: &Value, k: usize) -> Res {
+        let paint = match a["paint"].as_str() {
+            Some(p) => Some(self.asset_key(p)?),
+            None => None,
+        };
+        let form = match a["shape"].as_str() {
+            Some(s) => Some(roof_form(s)?),
+            None => None,
+        };
+        let pts = points_of(a);
+        if !pts.is_empty() && pts.len() < 3 {
+            return Err("points: хотя бы три точки".into());
+        }
+        self.checkpoint();
+        let p = &mut self.map.outline_roofs[k].pieces[0];
+        if let Some(v) = paint {
+            p.paint = v;
+        }
+        if let Some(v) = form {
+            p.form = v;
+            p.fit_form();
+        }
+        if pts.len() >= 3 {
+            p.rings = vec![grow_ring(&pts, f(a, "overhang").unwrap_or(0.25).clamp(0.0, 2.0))];
+            p.down = None;
+            p.fit_form();
+        }
+        for _ in 0..a["turn"].as_u64().unwrap_or(0) % 4 {
+            p.turn();
+        }
+        self.sel = Some(Sel::Outline(k, 0));
+        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(p.form), "paint": p.paint, "points": p.rings[0]}))
+    }
+
     fn tool_edit_roof(&mut self, a: &Value) -> Res {
         let i = a["index"].as_u64().ok_or("нужен index")? as usize;
-        if i >= self.map.roofs.len() {
-            return Err(format!("крыши {i} нет: их {}", self.map.roofs.len()));
+        let n = self.map.roofs.len();
+        if i >= n && i < n + self.map.outline_roofs.len() {
+            return self.tool_edit_outline_roof(a, i - n);
+        }
+        if i >= n {
+            return Err(format!("крыши {i} нет: их {}", n + self.map.outline_roofs.len()));
         }
         let paint = match a["paint"].as_str() {
             Some(k) => Some(self.asset_key(k)?),
@@ -1007,6 +1151,19 @@ impl App {
         Ok(json!({"style": {"paint": paint, "width": st.width}, "changed": r}))
     }
 
+    /// Материал с узором, повёрнутым на `angle` градусов по часовой: свой номер в
+    /// палитре на каждый угол.
+    fn material_turned(&mut self, v: &Value, angle: f32) -> Result<usize, String> {
+        let m = self.material_of(v)?;
+        let angle = angle.rem_euclid(360.0);
+        if (self.map.materials[m].rot - angle).abs() < 1e-3 {
+            return Ok(m);
+        }
+        let mut mat = self.map.materials[m].clone();
+        mat.rot = angle;
+        self.map.material_index(mat).ok_or("в карте уже 255 материалов".into())
+    }
+
     /// Материал из ответа ИИ: номер в палитре карты или ключ пола из библиотеки.
     fn material_of(&mut self, v: &Value) -> Result<usize, String> {
         match v {
@@ -1019,7 +1176,7 @@ impl App {
             }
             v => {
                 let key = self.asset_key(v.as_str().unwrap_or_default())?;
-                let mat = Material { name: library::label(&key), paint: Paint::Texture(key), vary: false, live: map::Live::Auto };
+                let mat = Material { name: library::label(&key), paint: Paint::Texture(key), vary: false, live: map::Live::Auto, rot: 0.0 };
                 self.map.material_index(mat).ok_or("в карте уже 255 материалов".into())
             }
         }
@@ -1058,6 +1215,75 @@ impl App {
         self.place.start = Some((lat, lon, cells));
         Out::Wait(Waiting::Place { reply: dummy() })
     }
+}
+
+/// Как далеко от точки ищется стена для `against_wall`, в клетках.
+const WALL_REACH: f32 = 2.0;
+
+fn r3(v: f32) -> f32 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// Угол стороны `front` картинки при повороте 0, по часовой от «вправо»: экран, y вниз.
+fn front_base(front: &str) -> Result<f32, String> {
+    Ok(match front {
+        "right" => 0.0,
+        "bottom" => 90.0,
+        "left" => 180.0,
+        "top" => 270.0,
+        _ => return Err("front: top, right, bottom или left — сторона картинки в preview_assets".into()),
+    })
+}
+
+/// Поворот, при котором сторона с углом `base` смотрит из `from` на `to`; точки
+/// совпали — `None`.
+fn look_rotation(from: [f32; 2], to: [f32; 2], base: f32) -> Option<f32> {
+    let (dx, dy) = ((to[0] - from[0]) as f64, (to[1] - from[1]) as f64);
+    if dx.hypot(dy) < 1e-6 {
+        return None;
+    }
+    let target = dy.atan2(dx).to_degrees();
+    Some((((target - base as f64) % 360.0 + 360.0) % 360.0) as f32)
+}
+
+/// Проекция точки на стену и нормаль к ней — в сторону точки. Точка в толще стены
+/// (`half` — половина толщины): к `look`, а нет его — внутрь комнаты (`inside`),
+/// иначе туда, куда точка чуть сдвинута.
+fn wall_side(seg: Segment, p: [f32; 2], half: f32, look: Option<[f32; 2]>, inside: impl Fn([f32; 2]) -> bool) -> ([f32; 2], [f32; 2]) {
+    let (a, b) = seg;
+    let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+    let len = (ex * ex + ey * ey).sqrt().max(1e-6);
+    let t = (((p[0] - a[0]) * ex + (p[1] - a[1]) * ey) / (len * len)).clamp(0.0, 1.0);
+    let q = [a[0] + ex * t, a[1] + ey * t];
+    let mut n = [-ey / len, ex / len];
+    let side = |v: [f32; 2]| (v[0] - q[0]) * n[0] + (v[1] - q[1]) * n[1];
+    let s = side(p);
+    let (ahead, behind) = (inside([q[0] + n[0] * (half + 0.3), q[1] + n[1] * (half + 0.3)]), inside([q[0] - n[0] * (half + 0.3), q[1] - n[1] * (half + 0.3)]));
+    let flip = if s.abs() > half + 0.05 {
+        s < 0.0
+    } else if let Some(l) = look.filter(|l| side(*l).abs() > 1e-3) {
+        side(l) < 0.0
+    } else if ahead != behind {
+        behind
+    } else {
+        s < 0.0
+    };
+    if flip {
+        n = [-n[0], -n[1]];
+    }
+    (q, n)
+}
+
+/// Сколько видимой картинки за её серединой со стороны спины (против `front`), в
+/// клетках при масштабе 1; `vb` — видимая рамка в долях от середины (−0,5…0,5).
+fn back_extent(front: &str, vb: [f32; 4], size: [f32; 2]) -> f32 {
+    match front {
+        "top" => vb[3] * size[1],
+        "right" => -vb[0] * size[0],
+        "left" => vb[2] * size[0],
+        _ => -vb[1] * size[1],
+    }
+    .max(0.0)
 }
 
 /// Точки `[[x, y], …]` из поля `points`.
@@ -1137,6 +1363,59 @@ fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
         _ => return Err("light: auto, off, campfire, fireplace, brazier, candle, lamp или arcane".into()),
     };
     Ok(Some(g))
+}
+
+/// Вид крыши по контуру из ответа ИИ.
+fn roof_form(s: &str) -> Result<map::RoofForm, String> {
+    Ok(match s {
+        "gable" => map::RoofForm::Gabled,
+        "hip" => map::RoofForm::Pitched,
+        "shed" => map::RoofForm::Shed,
+        "flat" => map::RoofForm::Flat,
+        "tent" => map::RoofForm::Spire,
+        "dome" => map::RoofForm::Dome,
+        "vault" => map::RoofForm::Round,
+        _ => return Err("shape: tent, hip, gable, shed, flat, dome или vault".into()),
+    })
+}
+
+fn form_name(f: map::RoofForm) -> &'static str {
+    match f {
+        map::RoofForm::Gabled => "gable",
+        map::RoofForm::Pitched => "hip",
+        map::RoofForm::Shed => "shed",
+        map::RoofForm::Flat => "flat",
+        map::RoofForm::Spire => "tent",
+        map::RoofForm::Dome => "dome",
+        map::RoofForm::Round => "vault",
+        map::RoofForm::Rows => "rows",
+    }
+}
+
+/// Контур, раздвинутый наружу на `d` клеток по нормалям рёбер (вершины — по
+/// биссектрисе, у острых углов вынос не больше тройного).
+fn grow_ring(pts: &[[f32; 2]], d: f32) -> Vec<[f32; 2]> {
+    let n = pts.len();
+    let area: f32 = (0..n).map(|k| pts[k][0] * pts[(k + 1) % n][1] - pts[(k + 1) % n][0] * pts[k][1]).sum();
+    // При площади больше нуля (по часовой на экране, y вниз) наружу — правая нормаль.
+    let out = |a: [f32; 2], b: [f32; 2]| {
+        let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+        let l = (ex * ex + ey * ey).sqrt().max(1e-6);
+        if area > 0.0 { [ey / l, -ex / l] } else { [-ey / l, ex / l] }
+    };
+    (0..n)
+        .map(|k| {
+            let (p, prev, next) = (pts[k], pts[(k + n - 1) % n], pts[(k + 1) % n]);
+            let (n1, n2) = (out(prev, p), out(p, next));
+            let dot = n1[0] * n2[0] + n1[1] * n2[1];
+            let mut m = [(n1[0] + n2[0]) / (1.0 + dot).max(1e-3), (n1[1] + n2[1]) / (1.0 + dot).max(1e-3)];
+            let ml = (m[0] * m[0] + m[1] * m[1]).sqrt();
+            if ml > 3.0 {
+                m = [m[0] * 3.0 / ml, m[1] * 3.0 / ml];
+            }
+            [p[0] + m[0] * d, p[1] + m[1] * d]
+        })
+        .collect()
 }
 
 fn roof_shape(s: &str) -> Result<map::RoofShape, String> {
@@ -1235,4 +1514,60 @@ fn picture_reply(img: image::RgbImage, area: [f32; 4], max_px: u32, path: Option
 /// Заглушка: настоящий адресат ответа подставляется в `control_step`.
 fn dummy() -> Sender<Result<Value, String>> {
     std::sync::mpsc::channel().0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn look_at_turns_the_front_side_to_the_point() {
+        let rot = |p: [f32; 2], t: [f32; 2], front: &str| look_rotation(p, t, front_base(front).unwrap()).unwrap();
+        assert!((rot([5.28, 14.85], [6.05, 15.45], "bottom") - 307.9).abs() < 0.1, "кресло слева от стола");
+        assert!((rot([6.82, 14.85], [6.05, 15.45], "bottom") - 52.1).abs() < 0.1, "кресло справа");
+        assert!((rot([17.28, 8.5], [16.55, 8.5], "bottom") - 90.0).abs() < 1e-3, "стул");
+        assert!(rot([3.02, 8.75], [5.35, 8.75], "right").abs() < 1e-3, "камин");
+        assert!((rot([19.25, 3.55], [22.0, 0.8], "top") - 45.0).abs() < 1e-3, "телескоп");
+        assert_eq!(look_rotation([1.0, 1.0], [1.0, 1.0], 90.0), None);
+        assert!(front_base("front").is_err());
+    }
+
+    #[test]
+    fn against_a_diagonal_wall_the_back_touches_its_face() {
+        // Стена под 45°, шкаф 2×1 с видимой глубиной 0,5 клетки (спинка — верх картинки).
+        let seg: Segment = ([0.0, 4.0], [4.0, 0.0]);
+        let (q, n) = wall_side(seg, [2.6, 2.6], 0.2, None, |_| false);
+        assert!((q[0] - 2.0).abs() < 1e-4 && (q[1] - 2.0).abs() < 1e-4, "{q:?}");
+        assert!(n[0] > 0.7 && n[1] > 0.7, "нормаль к точке: {n:?}");
+        let back = back_extent("bottom", [-0.5, -0.25, 0.5, 0.25], [2.0, 1.0]);
+        assert!((back - 0.25).abs() < 1e-6);
+        let rot = look_rotation(q, [q[0] + n[0], q[1] + n[1]], front_base("bottom").unwrap()).unwrap();
+        assert!((rot - 315.0).abs() < 1e-3, "фасад от стены: {rot}");
+        // Точка прямо на стене: сторона — к look_at, а без него — внутрь комнаты.
+        let (_, n2) = wall_side(seg, [2.0, 2.0], 0.2, Some([0.0, 0.0]), |_| false);
+        assert!(n2[0] < 0.0 && n2[1] < 0.0);
+        let (_, n3) = wall_side(seg, [2.0, 2.0], 0.2, None, |p| p[0] + p[1] < 4.0);
+        assert!(n3[0] < 0.0 && n3[1] < 0.0, "внутрь комнаты: {n3:?}");
+        // Точка в толще стены, чуть снаружи, — всё равно внутрь комнаты.
+        let (_, n4) = wall_side(seg, [2.05, 2.05], 0.2, None, |p| p[0] + p[1] < 4.0);
+        assert!(n4[0] < 0.0 && n4[1] < 0.0, "из толщи стены — в комнату: {n4:?}");
+        assert_eq!(back_extent("right", [-0.3, -0.5, 0.5, 0.5], [1.0, 1.0]), 0.3);
+    }
+
+    #[test]
+    fn roof_outline_grows_outwards_either_way_round() {
+        let sq = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
+        let g = grow_ring(&sq, 0.25);
+        assert!((g[0][0] + 0.25).abs() < 1e-5 && (g[0][1] + 0.25).abs() < 1e-5, "{g:?}");
+        assert!((g[2][0] - 2.25).abs() < 1e-5 && (g[2][1] - 2.25).abs() < 1e-5);
+        let back: Vec<[f32; 2]> = sq.iter().rev().copied().collect();
+        let h = grow_ring(&back, 0.25);
+        assert!((h[3][0] + 0.25).abs() < 1e-5 && (h[3][1] + 0.25).abs() < 1e-5, "в обратном обходе — тоже наружу: {h:?}");
+        // Восьмиугольник: вершины уходят от середины на d / cos(22,5°).
+        let oct: Vec<[f32; 2]> = (0..8).map(|k| { let t = std::f32::consts::FRAC_PI_4 * k as f32 + std::f32::consts::FRAC_PI_8; [5.0 + 3.0 * t.cos(), 5.0 + 3.0 * t.sin()] }).collect();
+        let o = grow_ring(&oct, 0.3);
+        let r = ((o[0][0] - 5.0).powi(2) + (o[0][1] - 5.0).powi(2)).sqrt();
+        assert!((r - (3.0 + 0.3 / (std::f32::consts::FRAC_PI_8).cos())).abs() < 1e-3, "{r}");
+        assert!(roof_form("tent").is_ok() && roof_form("pyramid").is_err());
+    }
 }

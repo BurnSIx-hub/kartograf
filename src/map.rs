@@ -37,6 +37,13 @@ pub struct Material {
     /// Оживает ли в Foundry (модуль «Wild Canvas»): вода, лава, болото.
     #[serde(default, skip_serializing_if = "Live::is_auto")]
     pub live: Live,
+    /// Поворот узора, градусы по часовой: паркет и плитка вдоль скошенной стены.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rot: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// Живой материал: в выгрузке всё, что им залито, становится областью сцены
@@ -182,7 +189,7 @@ impl Default for WallStyle {
 pub fn builtin_materials() -> Vec<Material> {
     crate::library::BUILTIN_TEXTURES
         .iter()
-        .map(|t| Material { name: t.1.into(), paint: Paint::Texture(format!("{}{}", crate::library::BUILTIN, t.0)), vary: t.2, live: Live::Auto })
+        .map(|t| Material { name: t.1.into(), paint: Paint::Texture(format!("{}{}", crate::library::BUILTIN, t.0)), vary: t.2, live: Live::Auto, rot: 0.0 })
         .collect()
 }
 
@@ -1636,7 +1643,7 @@ impl Map {
 
     /// Номер материала в палитре карты; новый дописывается в конец.
     pub fn material_index(&mut self, m: Material) -> Option<usize> {
-        if let Some(i) = self.materials.iter().position(|x| x.paint == m.paint) {
+        if let Some(i) = self.materials.iter().position(|x| x.paint == m.paint && x.rot == m.rot) {
             return Some(i);
         }
         if self.materials.len() >= 255 {
@@ -2196,10 +2203,10 @@ mod tests {
         let mut m = Map::new(6, 4);
         m.paint_rect(Layer::Floor, (1, 1), (2, 2), Some(2));
         m.paint_rect(Layer::Rooms, (3, 0), (4, 1), Some(0));
-        let i = m.material_index(Material { name: "Плитка".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false, live: Live::Auto }).unwrap();
+        let i = m.material_index(Material { name: "Плитка".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false, live: Live::Auto, rot: 0.0 }).unwrap();
         let n = builtin_materials().len();
         assert_eq!(i, n);
-        assert_eq!(m.material_index(Material { name: "другое имя".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false, live: Live::Auto }), Some(n));
+        assert_eq!(m.material_index(Material { name: "другое имя".into(), paint: Paint::Texture("C:/t/tile.png".into()), vary: false, live: Live::Auto, rot: 0.0 }), Some(n));
         m.walls.push(Wall { points: vec![[1.0, 1.0], [3.0, 1.0]], closed: false, bends: Vec::new(), low: false, style: None });
         assert_eq!(Map::from_json(&m.to_json()).unwrap(), m);
         let broken = m.to_json().replace("\"width\": 6", "\"width\": 7");

@@ -42,7 +42,7 @@ impl App {
 
         // Затемнение ярусов и их тени — поверх пола и дорог.
         if let Some(look) = &relief {
-            let black = Material { name: String::new(), paint: Paint::Color([10, 14, 26]), vary: false, live: map::Live::Auto };
+            let black = Material { name: String::new(), paint: Paint::Color([10, 14, 26]), vary: false, live: map::Live::Auto, rot: 0.0 };
             self.draw_mask(painter, canvas, &black, &look.dark, &[], None, view);
         }
 
@@ -70,13 +70,13 @@ impl App {
 
         // Нарисованная тень — поверх пола и дорог.
         if let Some(shade) = self.map.shade.take() {
-            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto };
+            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto, rot: 0.0 };
             self.draw_mask(painter, canvas, &black, &shade, &[], None, view);
             self.map.shade = Some(shade);
         }
         // Тени крон — там же: на полу, под предметами и стенами.
         if let Some(trees) = self.tree_shade() {
-            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto };
+            let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto, rot: 0.0 };
             self.draw_mask(painter, canvas, &black, &trees, &[], None, view);
         }
 
@@ -439,10 +439,14 @@ impl App {
     }
 
     /// Картинка, натянутая на четыре угла (в клетках).
+    /// Края картинки — на полтекселя внутрь: текстуры повторяются (полам это нужно),
+    /// и на краю спрайта сэмплер подмешивал противоположный край — тонкие полоски.
     pub(super) fn quad(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, corners: [[f32; 2]; 4], uv: [Pos2; 4], tint: Color32) -> bool {
         let Some((tex, _)) = self.textures.get(key, false) else { return false };
+        let [tw, th] = tex.size().map(|v| v.max(2) as f32);
         let mut mesh = egui::Mesh::with_texture(tex.id());
         for (p, uv) in corners.iter().zip(uv) {
+            let uv = pos2((0.5 + uv.x * (tw - 1.0)) / tw, (0.5 + uv.y * (th - 1.0)) / th);
             mesh.vertices.push(egui::epaint::Vertex { pos: self.cam.to_screen(canvas, *p), uv, color: tint });
         }
         mesh.add_triangle(0, 1, 2);
@@ -515,8 +519,30 @@ impl App {
 
     /// Доля холста поперёк, занятая рисунком (подоконник, косяк, полоса стены).
     pub(super) fn band(&mut self, key: &str) -> f32 {
+        let [t, b] = self.band_edges(key);
+        (b - t).max(0.05)
+    }
+
+    /// Верх и низ рисунка поперёк холста, доли 0..1.
+    fn band_edges(&mut self, key: &str) -> [f32; 2] {
         let sources = &self.textures.sources;
-        *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or(1.0, |[_, t, _, b]| (b - t).max(0.05)))
+        *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or([0.0, 1.0], |[_, t, _, b]| [t + 0.5, (b + 0.5).max(t + 0.55)]))
+    }
+
+    /// Только рисунок холста (без пустых полей и бледной тени FA вокруг) вдоль
+    /// отрезка, толщиной `visible` клеток поперёк. Растянутый целиком холст тянул
+    /// за собой тень: у косяков и подоконников — тёмные «хвостики» за стеной.
+    pub(super) fn draw_band(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, s: [f32; 2], e: [f32; 2], visible: f32) -> bool {
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len == 0.0 || self.textures.get(key, false).is_none() {
+            return false;
+        }
+        let [v0, v1] = self.band_edges(key);
+        let (nx, ny) = (-dy / len * visible / 2.0, dx / len * visible / 2.0);
+        let c = [[s[0] + nx, s[1] + ny], [e[0] + nx, e[1] + ny], [e[0] - nx, e[1] - ny], [s[0] - nx, s[1] - ny]];
+        let uv = [pos2(0.0, v0), pos2(1.0, v0), pos2(1.0, v1), pos2(0.0, v1)];
+        self.quad(painter, canvas, key, c, uv, Color32::WHITE)
     }
 
     /// Проём: косяк в свой размер посередине, затем створка, две створки или окно.
@@ -534,14 +560,16 @@ impl App {
             // В разрезе стены подоконник FA и рама поверх, по всей длине проёма.
             let key = p.asset.clone().unwrap_or_default();
             let thick = self.sill_thick(&key, wall_width);
-            if !self.draw_across(painter, canvas, &key, p.a, p.b, Some(thick)) {
+            let sill = thick * self.band(&key);
+            if !self.draw_band(painter, canvas, &key, p.a, p.b, sill) {
                 let (nx, ny) = (-uy * wall_width * 0.3, ux * wall_width * 0.3);
                 let q = [[p.a[0] + nx, p.a[1] + ny], [p.b[0] + nx, p.b[1] + ny], [p.b[0] - nx, p.b[1] - ny], [p.a[0] - nx, p.a[1] - ny]];
                 let q: Vec<Pos2> = q.iter().map(|&w| self.cam.to_screen(canvas, w)).collect();
                 painter.add(Shape::convex_polygon(q, Color32::from_rgb(150, 196, 220), Stroke::new(1.5, Color32::from_rgb(20, 16, 13))));
             } else {
                 if let Some(f) = p.frame.clone() {
-                    self.draw_across(painter, canvas, &f, p.a, p.b, Some(thick));
+                    let visible = thick * self.band(&f);
+                    self.draw_band(painter, canvas, &f, p.a, p.b, visible);
                 }
                 // Само окно — стекло с переплётом поверх подоконника.
                 let assets = &self.library.assets;
@@ -569,13 +597,11 @@ impl App {
             // поперёк (у FA — две пятых), и холст растягивается так, чтобы в стену
             // попала видимая часть: иначе стойки выходили тоньше стены и она торчала.
             // У стен FA камень тоже не во всю полосу — стойка по видимой стене.
-            let band = self.band(&f);
             let seen = match wall.paint.clone() {
                 Paint::Texture(w) => self.band(&w),
                 Paint::Color(_) => 1.0,
             };
-            let thick = Some(wall_width * seen / band);
-            self.draw_across(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy], thick);
+            self.draw_band(painter, canvas, &f, [mid[0] - hx, mid[1] - hy], [mid[0] + hx, mid[1] + hy], wall_width * seen);
         }
         let rect_around = |half: f32| {
             let (nx, ny) = (-uy * half, ux * half);

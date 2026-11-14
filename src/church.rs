@@ -311,7 +311,7 @@ pub(super) fn ledge(m: &mut Map, vertical: bool, c: f32, s: f32, e: f32, low: f3
 /// из них рвётся.
 pub(super) fn curb(m: &mut Map, corners: &[[f32; 2]]) {
     let k = key("wall_stone_blocks");
-    let stone = m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto }).unwrap_or(0);
+    let stone = m.material_index(Material { name: library::label(&k), paint: Paint::Texture(k), vary: false, live: Live::Auto, rot: 0.0 }).unwrap_or(0);
     // Частыми точками: дорога из пары точек тает целиком, а у углов точки
     // поближе — поворот выходит плавным, но коротким.
     let mut points: Vec<[f32; 2]> = Vec::new();

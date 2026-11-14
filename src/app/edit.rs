@@ -344,7 +344,7 @@ impl App {
 
     /// Картинка из библиотеки становится материалом пола и выбирается.
     pub fn use_floor_texture(&mut self, key: &str) {
-        let m = Material { name: library::label(key), paint: Paint::Texture(key.to_owned()), vary: false, live: map::Live::Auto };
+        let m = Material { name: library::label(key), paint: Paint::Texture(key.to_owned()), vary: false, live: map::Live::Auto, rot: 0.0 };
         if !self.map.materials.iter().any(|x| x.paint == m.paint) {
             self.checkpoint();
         }

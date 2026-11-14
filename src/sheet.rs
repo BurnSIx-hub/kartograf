@@ -1,7 +1,7 @@
-//! Картинки для ИИ ([`crate::mcp`]): лист ассетов (`preview_assets`) — куда смотрит
-//! картинка при повороте 0 и где в клетке её непрозрачная часть, — и линейка
-//! клеток поверх снимка карты (`view` с `grid`). Цифры — свой мелкий шрифт 3×5:
-//! шрифта для растровых картинок в программе нет, а надписи ИИ берёт из JSON.
+//! Картинки для ИИ ([`crate::mcp`]): лист ассетов (`preview_assets`) — стороны
+//! картинки при повороте 0 и где в клетке её непрозрачная часть, — и линейка
+//! клеток поверх снимка карты (`view` с `grid`). Буквы и цифры — свой мелкий
+//! шрифт 3×5: шрифта для растровых картинок в программе нет.
 
 use image::{Rgb, RgbImage, RgbaImage};
 
@@ -19,33 +19,66 @@ const DIGITS: [[u8; 5]; 10] = [
     [0b111, 0b101, 0b111, 0b001, 0b111],
 ];
 
-/// Ширина числа в точках при масштабе `k`: цифра 3, промежуток 1.
-pub fn number_width(n: u32, k: u32) -> u32 {
-    let len = n.to_string().len() as u32;
-    (len * 4 - 1) * k
+/// Заглавные буквы 3×5 — только те, что нужны подписям сторон.
+fn letter(c: char) -> Option<[u8; 5]> {
+    Some(match c {
+        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b011, 0b100, 0b101, 0b101, 0b011],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'O' => [0b010, 0b101, 0b101, 0b101, 0b010],
+        'P' => [0b110, 0b101, 0b110, 0b100, 0b100],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        d => DIGITS[d.to_digit(10)? as usize],
+    })
 }
 
-/// Число цифрами 3×5, увеличенными в `k` раз, левым верхним углом в `(x, y)`.
-pub fn draw_number(img: &mut RgbImage, x: i64, y: i64, n: u32, k: u32, color: [u8; 3]) {
-    for (pos, ch) in n.to_string().chars().enumerate() {
-        let glyph = DIGITS[ch.to_digit(10).unwrap_or(0) as usize];
-        let gx = x + pos as i64 * 4 * k as i64;
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..3 {
-                if bits >> (2 - col) & 1 == 0 {
-                    continue;
-                }
-                for dy in 0..k as i64 {
-                    for dx in 0..k as i64 {
-                        let (px, py) = (gx + col * k as i64 + dx, y + row as i64 * k as i64 + dy);
-                        if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
-                            img.put_pixel(px as u32, py as u32, Rgb(color));
-                        }
+/// Ширина числа в точках при масштабе `k`: цифра 3, промежуток 1.
+pub fn number_width(n: u32, k: u32) -> u32 {
+    text_width(&n.to_string(), k)
+}
+
+/// Ширина строки в точках при масштабе `k`.
+pub fn text_width(s: &str, k: u32) -> u32 {
+    (s.chars().count() as u32 * 4).saturating_sub(1) * k
+}
+
+fn draw_glyph(img: &mut RgbImage, x: i64, y: i64, glyph: [u8; 5], k: u32, color: [u8; 3]) {
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..3 {
+            if bits >> (2 - col) & 1 == 0 {
+                continue;
+            }
+            for dy in 0..k as i64 {
+                for dx in 0..k as i64 {
+                    let (px, py) = (x + col * k as i64 + dx, y + row as i64 * k as i64 + dy);
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        img.put_pixel(px as u32, py as u32, Rgb(color));
                     }
                 }
             }
         }
     }
+}
+
+/// Строка (цифры и буквы подписей) шрифтом 3×5, увеличенным в `k` раз, левым
+/// верхним углом в `(x, y)`; `down` — буквы столбиком сверху вниз.
+pub fn draw_text(img: &mut RgbImage, x: i64, y: i64, s: &str, k: u32, color: [u8; 3], down: bool) {
+    for (pos, ch) in s.chars().enumerate() {
+        let Some(glyph) = letter(ch) else { continue };
+        let (gx, gy) = if down { (x, y + pos as i64 * 6 * k as i64) } else { (x + pos as i64 * 4 * k as i64, y) };
+        draw_glyph(img, gx, gy, glyph, k, color);
+    }
+}
+
+/// Число цифрами 3×5, увеличенными в `k` раз, левым верхним углом в `(x, y)`.
+pub fn draw_number(img: &mut RgbImage, x: i64, y: i64, n: u32, k: u32, color: [u8; 3]) {
+    draw_text(img, x, y, &n.to_string(), k, color, false);
 }
 
 fn blend(img: &mut RgbImage, x: u32, y: u32, c: [u8; 3], a: f32) {
@@ -73,12 +106,13 @@ pub fn alpha_bbox(img: &RgbaImage) -> Option<[f32; 4]> {
 const BACK: [u8; 3] = [38, 40, 46];
 const PAPER: [u8; 3] = [56, 60, 68];
 const INK: [u8; 3] = [226, 228, 232];
-const ACCENT: [u8; 3] = [255, 176, 64];
+const MUTED: [u8; 3] = [150, 156, 168];
 
 /// Лист картинок: каждая — в своей плитке `tile` точек на тёмном фоне, по своему
-/// размеру в клетках (`size`, ширина × высота), с сеткой клеток под ней, номером
-/// плитки слева вверху и треугольником над серединой верхнего края — так ассет
-/// стоит при повороте 0, верх картинки — верх карты.
+/// размеру в клетках (`size`, ширина × высота), при повороте 0, с сеткой клеток
+/// под ней, номером плитки слева вверху и подписями сторон картинки — TOP, RIGHT,
+/// BOTTOM, LEFT: те же слова, что `front` у предмета. Стрелку сверху ИИ читал как
+/// «сюда смотрит фасад», а у мебели FA сверху спинка.
 pub fn contact_sheet(items: &[(RgbaImage, [f32; 2])], tile: u32) -> RgbImage {
     let n = items.len().max(1) as u32;
     let cols = (n as f32).sqrt().ceil() as u32;
@@ -92,12 +126,12 @@ pub fn contact_sheet(items: &[(RgbaImage, [f32; 2])], tile: u32) -> RgbImage {
                 sheet.put_pixel(x, y, Rgb(PAPER));
             }
         }
-        // Поле под картинку: отступ под номер и треугольник; масштаб — по клеткам.
-        let room = tile.saturating_sub(28).max(8) as f32;
+        // Поле под картинку: отступы под номер и подписи сторон; масштаб — по клеткам.
+        let room = tile.saturating_sub(44).max(8) as f32;
         let (sw, sh) = (size[0].max(0.01), size[1].max(0.01));
         let ppc = room / sw.max(sh);
         let (dw, dh) = ((sw * ppc).round().max(1.0) as u32, (sh * ppc).round().max(1.0) as u32);
-        let (ox, oy) = (cx + (tile - dw) / 2, cy + 14 + (tile - 14 - dh) / 2);
+        let (ox, oy) = (cx + (tile - dw) / 2, cy + (tile - dh) / 2);
         // Клетки, которые занимает ассет.
         for i in 0..=sw.ceil() as u32 {
             let x = ox + ((i as f32 * ppc).round() as u32).min(dw.saturating_sub(1));
@@ -115,16 +149,14 @@ pub fn contact_sheet(items: &[(RgbaImage, [f32; 2])], tile: u32) -> RgbImage {
         for (x, y, p) in fit.enumerate_pixels() {
             blend(&mut sheet, ox + x, oy + y, [p[0], p[1], p[2]], p[3] as f32 / 255.0);
         }
-        // Верх при повороте 0.
-        let mid = (ox + dw / 2) as i64;
-        for row in 0..6i64 {
-            for dx in -row..=row {
-                let (x, y) = (mid + dx, oy as i64 - 8 + row);
-                if x >= 0 && y >= 0 {
-                    blend(&mut sheet, x as u32, y as u32, ACCENT, 1.0);
-                }
-            }
-        }
+        // Стороны картинки при повороте 0: приглушённо, у середины каждого края.
+        let (mx, my) = ((ox + dw / 2) as i64, (oy + dh / 2) as i64);
+        let k1 = 1;
+        let tw = |s: &str| text_width(s, k1) as i64;
+        draw_text(&mut sheet, mx - tw("TOP") / 2, oy as i64 - 8, "TOP", k1, MUTED, false);
+        draw_text(&mut sheet, mx - tw("BOTTOM") / 2, (oy + dh) as i64 + 3, "BOTTOM", k1, MUTED, false);
+        draw_text(&mut sheet, ox as i64 - 7, my - 6 * 4 / 2, "LEFT", k1, MUTED, true);
+        draw_text(&mut sheet, (ox + dw) as i64 + 4, my - 6 * 5 / 2, "RIGHT", k1, MUTED, true);
         draw_number(&mut sheet, cx as i64 + 4, cy as i64 + 4, k as u32 + 1, 2, INK);
     }
     sheet
@@ -204,6 +236,19 @@ mod tests {
         // Линия клетки 3 — на 60-й точке снимка, между линиями — белое.
         assert!(out.get_pixel(l + 60, t + 50)[0] < 255);
         assert_eq!(out.get_pixel(l + 70, t + 50)[0], 255);
+    }
+
+    #[test]
+    fn side_labels_are_written() {
+        let mut img = RgbImage::new(30, 10);
+        draw_text(&mut img, 0, 0, "TOP", 1, [255, 255, 255], false);
+        // «T»: верхний ряд целиком, ниже — середина.
+        assert_eq!((img.get_pixel(0, 0)[0], img.get_pixel(2, 0)[0], img.get_pixel(0, 2)[0], img.get_pixel(1, 2)[0]), (255, 255, 0, 255));
+        assert_eq!(text_width("RIGHT", 1), 19);
+        let mut tall = RgbImage::new(4, 40);
+        draw_text(&mut tall, 0, 0, "LEFT", 1, [255, 255, 255], true);
+        assert_eq!(tall.get_pixel(0, 6 * 3 + 4)[0], 0, "у «T» внизу — только середина");
+        assert_eq!(tall.get_pixel(1, 6 * 3 + 4)[0], 255);
     }
 
     #[test]

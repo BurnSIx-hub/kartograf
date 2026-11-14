@@ -1294,7 +1294,7 @@ mod tests {
         use crate::map::{Live, Material, Paint, Prop};
         let mut m = Map::new(10, 8);
         let key = "pack:cp|textures/terrain/cyberpunk/floors/Floor_Alloy_Grid_A.webp";
-        let floor = m.material_index(Material { name: "Floor_Alloy_Grid_A".into(), paint: Paint::Texture(key.into()), vary: false, live: Live::Auto }).unwrap();
+        let floor = m.material_index(Material { name: "Floor_Alloy_Grid_A".into(), paint: Paint::Texture(key.into()), vary: false, live: Live::Auto, rot: 0.0 }).unwrap();
         assert_eq!(m.materials[floor].live(), Live::Neon);
         let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (8, 6));
         m.paint(crate::map::Layer::Rooms, floor, &all);

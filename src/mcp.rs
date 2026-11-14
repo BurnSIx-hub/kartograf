@@ -17,9 +17,13 @@ Typical loop: `map_info` → `find_assets` to get asset keys → edit (`add_obje
 
 Lights in Foundry come from objects: lamps, fires and braziers glow by their name; give any object `light` (e.g. `arcane` for a magic crystal) in `add_object` / `edit_object`. Chimneys, vents and hatches go on a roof with layer `on_roof`: they are part of that roof and vanish with it when players enter the house; `above_roofs` is only for things flying over the town. Call `set_wall_style` before painting rooms to choose their walls. New picture files put into the user's asset folder appear after `reload_assets`. `render_picture` writes the whole map with objects to an image file for a preview.
 
-Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows where the top of each picture is at rotation 0 and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
+Rooms and open floors: `paint` with `target: room` puts walls around the painted floor by itself (room_edges) — use it for enclosed rooms only. Open terraces, balconies, porches, piers and courtyards are `target: terrain` with `feather: 0`, edged with `add_wall` `low: true` where a railing belongs.
 
-Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes.";
+Facing: most FA furniture is drawn with its back at the TOP of the picture and faces BOTTOM; fireplaces open to the RIGHT. Give `front` (the facing side as `preview_assets` labels it) and `look_at` [x, y] instead of computing `rotation`; `against_wall: true` turns the back to the nearest wall (straight or diagonal) and moves the object so its visible back touches the wall face.
+
+Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows each picture at rotation 0 with its sides labelled TOP, RIGHT, BOTTOM, LEFT and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
+
+Precision: `paint` and `erase` take fractional areas in quarter cells (a floor up to 9.5 meets a wall added at 9.5), `shape: poly` with `points`, and `feather` for soft ground edges (lawns, mud, shores). `view` with `grid: true` draws cell lines and coordinates along the top and left edges. Doors: `add_door` takes the door leaf / window `asset` and the jamb `frame` from `find_assets` (kind door), a `width`, or an exact segment `a`–`b` on a wall; `edit_door` changes them later. Objects take `shadow` (false for blankets, rugs, flowers on the ground), `recolor` [r, g, b] to paint Colorable rugs, banners and cloth in a colour, and `tint` [r, g, b] to shade a picture by multiplying. `batch` runs many edits in one call and undoes them as one step; if one fails, nothing changes. Roofs: `add_roof` takes `points` for towers, rotundas and slanted wings (`shape: tent` gives a faceted spire). Pictures: `view` and `render_picture` take `lighting: dusk` or `night` to bake the objects' lights with wall shadows and light through windows into the picture; the Foundry export is unaffected (Foundry lights the scene itself).";
 
 fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
@@ -35,6 +39,10 @@ fn tools() -> Value {
     let tint = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Multiply the picture by [r, g, b]: shade or darken it (autumn or frosty trees, a dim corner); null or [] removes it"});
     let recolor = json!({"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 0, "maxItems": 3, "description": "Paint the picture in [r, g, b], keeping its pattern and shading: Colorable rugs, banners, cloth, bricks; null or [] restores the original colours"});
     let points = json!({"type": "array", "items": point, "minItems": 3, "description": "Polygon corners in cells, for shape poly"});
+    let front = json!({"type": "string", "enum": ["bottom", "top", "left", "right"], "description": "Which side of the picture is the object's face, as labelled in preview_assets; default bottom (most FA furniture: back drawn at the top). Used by look_at and against_wall"});
+    let look_at = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "Point [x, y] in cells the front should face (a chair to its table, a telescope to the lake); sets rotation unless rotation is given"});
+    let against_wall = json!({"type": "boolean", "description": "Put the object's back against the nearest wall within 2 cells (room or free-standing, straight or diagonal): it turns to face away from the wall along its normal and moves so its visible back touches the wall face. The reply has the final x, y, rotation and the wall"});
+    let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors"});
     let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
@@ -48,17 +56,19 @@ fn tools() -> Value {
             "exclude": text("Words to drop, space-separated, e.g. 'broken fallen bloody'"),
             "limit": int("Default 30")
         }), &["query"]),
-        tool("preview_assets", "Look at assets before placing them: a contact sheet on a dark background, one tile per asset with its number, the cells it covers, and an orange triangle over the top of the picture at rotation 0 (rotation turns clockwise). JSON gives size in cells, alpha_bbox (opaque part, fractions of the picture: u right, v down) and visible_cells (the same in cells from the object's centre).", json!({
+        tool("preview_assets", "Look at assets before placing them: a contact sheet on a dark background, one tile per asset at rotation 0 with its number, the cells it covers and its sides labelled TOP, RIGHT, BOTTOM, LEFT — the values of `front` in add_object / edit_object. JSON gives size in cells, alpha_bbox (opaque part, fractions of the picture: u right, v down) and visible_cells (the same in cells from the object's centre).", json!({
             "assets": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16, "description": "Asset keys from find_assets"},
             "tile_px": int("Tile size, 64..512, default 192")
         }), &["assets"]),
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
-            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor
+            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor,
+            "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
-            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor
+            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "tint": tint, "recolor": recolor,
+            "front": front, "look_at": look_at, "against_wall": against_wall
         }), &["index"]),
         tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
             "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, tavern, house"),
@@ -77,27 +87,30 @@ fn tools() -> Value {
         tool("grow_map", "Add margins to the map, in cells, on every floor: everything drawn moves by left/top. Build the surroundings around a finished map — a harbour around a ship, a street around a house. Undo history is cleared.", json!({
             "left": int("Cells to add on the left"), "top": int("Cells to add on top"), "right": int("Cells to add on the right"), "bottom": int("Cells to add at the bottom")
         }), &[]),
-        tool("add_roof", "Put a roof over a house: the rectangle of its walls in cells. Players see the roof from outside; it fades when they walk in.", json!({
-            "area": area, "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
-            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"], "description": "Default gable"},
+        tool("add_roof", "Put a roof over a house: the rectangle of its walls (area) or, for towers, rotundas and slanted wings, the polygon of its walls (points). Players see the roof from outside; it fades when they walk in. Polygon roofs get roof index after the rectangular ones in describe.", json!({
+            "area": area, "points": {"type": "array", "items": point.clone(), "minItems": 3, "description": "Polygon of the walls in cells, instead of area; the overhang grows it outwards"},
+            "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
+            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent", "dome", "vault"], "description": "Default gable for area, tent for points (a faceted spire with a ridge from every corner); dome and vault only with points"},
             "turn": int("Quarter turns of the ridge, 0..3"), "overhang": num("Cells over the walls, default 0.25"),
             "rail": text("Railing along the edge of a flat roof (a ship's quarterdeck, a balcony): a wall asset key from find_assets (kind wall). It opens where a ladder or stairs object reaches the edge")
         }), &["area"]),
-        tool("edit_roof", "Change a roof by index (see describe with roofs): covering picture, shape, ridge direction.", json!({
+        tool("edit_roof", "Change a roof by index (see describe with roofs): covering picture, shape, ridge direction; a polygon roof also takes new points.", json!({
             "index": int("Roof index"), "paint": text("Roof covering asset key from find_assets (kind roof), e.g. builtin:roof_copper"),
-            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent"]}, "turn": int("Quarter turns of the ridge, 0..3"),
+            "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent", "dome", "vault"]}, "turn": int("Quarter turns of the ridge, 0..3"),
+            "points": {"type": "array", "items": point.clone(), "minItems": 3, "description": "Polygon roofs: new outline of the walls"}, "overhang": num("Polygon roofs, with points: cells over the walls, default 0.25"),
             "rail": text("Railing along the edge of a flat roof: a wall asset key (kind wall); empty string removes it. It opens where a ladder or stairs object reaches the edge")
         }), &["index"]),
         tool("remove", "Remove items by indices: objects, walls, doors, labels, paths or roofs. Indices of later items shift down.", json!({
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]},
             "indices": {"type": "array", "items": {"type": "integer"}}
         }), &["what", "indices"]),
-        tool("paint", "Paint floor over a rectangle, oval or polygon. Edges are exact to a quarter cell, so fractional areas line up with add_wall (a room [4, 3, 9.5, 7.5] gets walls on x=9.5 and y=7.5). target 'terrain' paints ground; 'room' paints a room floor and walls appear along its edge automatically (dungeons, houses).", json!({
+        tool("paint", "Paint floor over a rectangle, oval or polygon. Edges are exact to a quarter cell, so fractional areas line up with add_wall (a room [4, 3, 9.5, 7.5] gets walls on x=9.5 and y=7.5). target 'terrain' paints ground; 'room' paints a room floor and puts walls all around it by itself (room_edges) — so open terraces, balconies, porches and wooden piers are terrain with feather 0, edged with add_wall low: true where needed.", json!({
             "material": text("Floor asset key from find_assets (kind floor), or a material index from map_info"),
             "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"], "description": "Default rect; poly takes points instead of area"},
             "points": points,
             "target": {"type": "string", "enum": ["terrain", "room"], "description": "Default terrain"},
-            "feather": num("Terrain only, 0..1, default 0: soft edge — the share of the way from the edge to the middle over which the paint fades. About 0.35 for lawns, mud and shores")
+            "feather": num("Terrain only, 0..1, default 0: soft edge — the share of the way from the edge to the middle over which the paint fades. About 0.35 for lawns, mud and shores"),
+            "angle": num("Turn the floor pattern, degrees clockwise (45 for parquet along a diagonal wall); default 0")
         }), &["material"]),
         tool("erase", "Erase floor and rooms over a rectangle, oval or polygon, exact to a quarter cell.", json!({
             "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"]}, "points": points,
@@ -139,11 +152,11 @@ fn tools() -> Value {
             "ops": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "properties": {"tool": text("Tool name, e.g. add_object"), "arguments": {"type": "object", "description": "Its arguments"}}, "required": ["tool"]}}
         }), &["ops"]),
         tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it (objects, doors, roofs; no editor windows).", json!({
-            "area": area, "max_px": int("Longest side of the picture, 128..2048, default 1024"), "roofs": roofs,
+            "area": area, "max_px": int("Longest side of the picture, 128..2048, default 1024"), "roofs": roofs, "lighting": lighting.clone(),
             "grid": {"type": "boolean", "description": "Draw cell lines (every fifth darker) and coordinates along the top and left margins; grid_margin_px in the reply is [left, top]: picture point (px, py) is cell (area.x0 + (px - left) / px_per_cell, area.y0 + (py - top) / px_per_cell)"}
         }), &[]),
         tool("render_picture", "Write a picture of the map with all objects to a file (PNG, JPEG or WebP by the extension) — for a preview or to share. Nothing is returned but the file.", json!({
-            "path": text("File path"), "px": int("Pixels per cell, 10..300, default 70"), "area": area, "roofs": roofs,
+            "path": text("File path"), "px": int("Pixels per cell, 10..300, default 70"), "area": area, "roofs": roofs, "lighting": lighting,
             "grid": {"type": "boolean", "description": "Cell lines and coordinates on the margins, as in view"}
         }), &["path"]),
         tool("generate", "Replace the map with a procedural one.", json!({
@@ -281,6 +294,11 @@ mod tests {
         }
         assert!(props("paint").get("feather").is_some() && props("paint")["shape"]["enum"].as_array().unwrap().iter().any(|v| v == "poly"));
         assert!(props("find_assets").get("exclude").is_some() && props("view").get("grid").is_some());
+        for k in ["front", "look_at", "against_wall"] {
+            assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");
+        }
+        assert!(props("view").get("lighting").is_some() && props("render_picture").get("lighting").is_some());
+        assert!(props("add_roof").get("points").is_some() && props("edit_roof").get("points").is_some() && props("paint").get("angle").is_some());
         let add = list.as_array().unwrap().iter().find(|t| t["name"] == "add_object").unwrap();
         assert!(add["inputSchema"]["properties"]["light"]["enum"].as_array().unwrap().iter().any(|v| v == "arcane"));
     }

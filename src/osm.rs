@@ -612,8 +612,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let mut walks: Vec<Vec<[f32; 2]>> = Vec::new();
     let mut street_names: BTreeMap<String, ([f32; 2], [f32; 2], f32)> = BTreeMap::new();
     let mut stones: Vec<[f32; 2]> = Vec::new();
-    let rails_mat = m.material_index(Material { name: "Рельсы".into(), paint: Paint::Color([84, 82, 80]), vary: false, live: Live::Off }).unwrap_or(0);
-    let deck_base = m.material_index(Material { name: "Настил".into(), paint: Paint::Color([70, 50, 34]), vary: false, live: Live::Off }).unwrap_or(0);
+    let rails_mat = m.material_index(Material { name: "Рельсы".into(), paint: Paint::Color([84, 82, 80]), vary: false, live: Live::Off, rot: 0.0 }).unwrap_or(0);
+    let deck_base = m.material_index(Material { name: "Настил".into(), paint: Paint::Color([70, 50, 34]), vary: false, live: Live::Off, rot: 0.0 }).unwrap_or(0);
     // Тропа по пляжу и гальке не видна: на снимке Лулворта следа нет, а на карте
     // береговая тропа ложилась вдоль пляжа тёмной полосой.
     let beaches: Vec<&Area> = areas.iter().filter(|a| matches!(get(a.tags, "natural"), "beach" | "shingle" | "sand")).collect();
