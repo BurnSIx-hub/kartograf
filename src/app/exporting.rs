@@ -298,7 +298,7 @@ impl App {
             // Крыши, что врезаются друг в друга, — одной отрисовкой на группу; картинка
             // и тайл у каждой свои: в них только то, что у неё видно поверх соседей.
             let mut joined: std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)> = std::collections::HashMap::new();
-            for group in roofs::join_groups(&map.roofs, &map.outline_roofs) {
+            for group in roofs::raster_groups(&map.roofs, &map.outline_roofs) {
                 let n = map.roofs.len();
                 let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
                 for &id in &group {
@@ -311,7 +311,7 @@ impl App {
                 }
                 let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
                 let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &group, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]));
+                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &group, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), map.weather == "snow");
                 for (id, (img, origin)) in group.iter().zip(out) {
                     joined.insert(*id, (img, origin, ppc));
                 }

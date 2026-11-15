@@ -196,9 +196,13 @@ impl App {
         let exact = self.export.is_some();
         let want = (self.cam.scale * self.canvas_ppp).max(1.0);
         let casters = roofs::Casters::new(&roofs, &self.map.props);
-        // Крыши, что врезаются друг в друга, рисуются группой — после остальных.
+        // Скатные прямоугольные крыши и группы врезки рисуются картинкой по граням —
+        // после остальных; сеткой остаются плоская и односкатная.
         let rects = self.map.roofs.clone();
-        let groups = roofs::join_groups(&rects, &roofs);
+        let groups = roofs::raster_groups(&rects, &roofs);
+        let snow = self.map.weather == "snow";
+        // Что нарисовано в этом кадре: при тесноте в памяти остальное выбрасывается.
+        let mut drawn: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let grouped: std::collections::HashSet<usize> = groups.iter().flatten().copied().collect();
         self.joined_rects = grouped.iter().copied().filter(|id| *id < rects.len()).collect();
         for (idx, r) in roofs.iter().enumerate() {
@@ -260,6 +264,7 @@ impl App {
             } else {
                 self.outline_last.get(&idx).copied()
             };
+            drawn.extend(shown);
             if let Some((handle, origin, size)) = shown.and_then(|k| self.outline_cache.get(&k)) {
                 let a = self.cam.to_screen(canvas, *origin);
                 let b = self.cam.to_screen(canvas, [origin[0] + size[0], origin[1] + size[1]]);
@@ -297,7 +302,7 @@ impl App {
                     paints.insert(piece.paint.clone());
                 }
             }
-            (light[0].to_bits(), light[1].to_bits(), ppc.to_bits()).hash(&mut hs);
+            (light[0].to_bits(), light[1].to_bits(), ppc.to_bits(), snow).hash(&mut hs);
             let key = hs.finish();
             let slot = |k: usize| key.wrapping_add(k as u64 + 1);
             let cost = w * h * ppc * ppc;
@@ -309,7 +314,7 @@ impl App {
                 if covers.len() == paints.len() {
                     fresh += 1;
                     fresh_px += cost;
-                    let out = roofs::render_joined(&rects, &roofs, group, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], map_size));
+                    let out = roofs::render_joined(&rects, &roofs, group, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], map_size), snow);
                     for (k, (img, origin)) in out.into_iter().enumerate() {
                         let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
                         let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
@@ -325,6 +330,7 @@ impl App {
                 } else {
                     self.outline_last.get(&(GROUP + id)).copied()
                 };
+                drawn.extend(shown);
                 if let Some((handle, origin, size)) = shown.and_then(|k| self.outline_cache.get(&k)) {
                     let a = self.cam.to_screen(canvas, *origin);
                     let b = self.cam.to_screen(canvas, [origin[0] + size[0], origin[1] + size[1]]);
@@ -338,6 +344,13 @@ impl App {
         if self.outline_cache.len() > (roofs.len() + rects.len()) * 3 + 16 {
             let keep: std::collections::HashSet<u64> = self.outline_last.values().copied().collect();
             self.outline_cache.retain(|k, _| keep.contains(k));
+        }
+        // Картинки крыш вблизи — по 256 точек на клетку: обойдя так весь город, можно
+        // набрать гигабайт. Больше 80 млн точек (320 МБ) — остаётся только видимое.
+        let total: usize = self.outline_cache.values().map(|(h, ..)| h.size()[0] * h.size()[1]).sum();
+        if total > 80_000_000 {
+            self.outline_cache.retain(|k, _| drawn.contains(k));
+            self.outline_last.retain(|_, k| drawn.contains(k));
         }
         self.map.outline_roofs = roofs;
         self.outline_pending = pending;
