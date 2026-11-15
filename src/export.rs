@@ -244,12 +244,6 @@ fn bridge_cut(p: &map::Prop, visible: Option<[f32; 4]>) -> Vec<[f32; 2]> {
     vec![corner(l, t), corner(r, t), corner(r, b), corner(l, b), corner(l, t)]
 }
 
-/// Мост по имени файла: встроенный и библиотечные (`Log_Bridge_…`).
-fn is_bridge(key: &str) -> bool {
-    let file = key.rsplit(['/', '\\', '|']).next().unwrap_or(key).to_lowercase();
-    file.split(|c: char| !c.is_alphanumeric()).any(|w| w == "bridge" || w == "мост")
-}
-
 /// Точка внутри замкнутой ломаной (чётность пересечений).
 fn inside(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let mut c = false;
@@ -355,7 +349,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
         zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
-    for p in map.props.iter().filter(|p| is_bridge(&p.asset)) {
+    for p in map.props.iter().filter(|p| map::bridge_by_name(&p.asset)) {
         zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0 });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на

@@ -523,7 +523,19 @@ pub fn glow_by_name(key: &str) -> Option<Glow> {
     let has = |ws: &[&str]| ws.iter().any(|w| words.iter().any(|x| x == w));
     let pair = |a: &str, b: &str| words.iter().any(|x| x == a) && words.iter().any(|x| x == b);
     if has(&["campfire", "bonfire", "firepit", "костёр", "костер"]) || pair("fire", "pit") || pair("camp", "fire") {
-        Some(Glow::Campfire)
+        // Зола, холодное кострище и вертел без огня не светят; тлеющие угли — слабо.
+        // В паках FA костры и очаги парами: `Campfire_A` — сложенные дрова, `Campfire_A_Lit` —
+        // огонь (так же `Firepit_Stone_…` и `…_Lit`): без `Lit` огня нет.
+        let fa_pair = key.starts_with("pack:") && ["campfire", "firepit"].contains(&words.first().map_or("", |w| w.as_str()));
+        if has(&["cold", "ash", "ashes", "unlit", "spit"]) {
+            None
+        } else if words.iter().any(|w| w.starts_with("ember")) {
+            Some(Glow::Brazier)
+        } else if has(&["lit"]) || !fa_pair {
+            Some(Glow::Campfire)
+        } else {
+            None
+        }
     } else if has(&["fireplace", "hearth", "камин", "очаг"]) || pair("fire", "place") || pair("forge", "lit") {
         Some(Glow::Fireplace)
     } else if has(&["brazier", "torch", "torches", "sconce", "жаровня", "факел"]) {
@@ -625,6 +637,12 @@ pub fn swing_by_name(key: &str) -> bool {
     k.contains("hammock") || k.contains("гамак")
 }
 
+/// Мост по имени файла: встроенный и библиотечные (`Log_Bridge_…`, `Bridge_Boardwalk_…`).
+pub fn bridge_by_name(key: &str) -> bool {
+    let file = key.rsplit(['/', '\\', '|']).next().unwrap_or(key).to_lowercase();
+    file.split(|c: char| !c.is_alphanumeric()).any(|w| w == "bridge" || w == "мост")
+}
+
 /// Летучее судно: в Foundry «Wild Canvas» качает его в воздухе, под ним ползёт тень.
 pub fn hover_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
@@ -702,7 +720,9 @@ impl Prop {
     pub fn own_tile(&self) -> bool {
         // Тень спуска лежит поверх ступеней: в фоне её накрыл бы тайл лестницы.
         let over_stairs = self.asset.ends_with("stairs_shade");
-        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs)
+        // Мост и помост — пол над водой: на них стоят хижины, а стены в Foundry
+        // впечатаны в фон — тайл моста их бы накрыл.
+        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs)
     }
 
     pub fn layer(&self) -> i16 {
@@ -2094,6 +2114,17 @@ mod tests {
     }
 
     #[test]
+    fn bridges_are_baked_under_walls_not_own_tiles() {
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        assert!(!prop("C:/a/objects/bridges/Bridge_Boardwalk_Platform_A_5x4.webp").own_tile());
+        assert!(!prop("pack:fa|textures/objects/Log_Bridge_Wood_Dark_A1_11x4.webp").own_tile());
+        // Мост тень бросает, как раньше.
+        assert!(prop("C:/a/objects/bridges/Bridge_Rope_Straight_A_2x4.webp").casts_shadow());
+        assert!(prop("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp").own_tile());
+        assert!(!bridge_by_name("pack:fa|textures/objects/Cambridge_Sign_A_1x1.webp"));
+    }
+
+    #[test]
     fn shadow_layers_add_up_and_reach_the_same_edge() {
         let sh = Shadows { on: true, dist: 1.0, blur: 0.2, opacity: 0.6, fade: 1.0, ..Shadows::default() };
         let layers = sh.layers();
@@ -2195,6 +2226,18 @@ mod tests {
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
+        // Костры FA парами: без `Lit` — дрова или зола, огня нет; угли тлеют слабо.
+        let fa = |n: &str| prop(&format!("pack:fa|textures/objects/{n}.webp")).light();
+        assert_eq!(fa("Campfire_A_1x1"), None);
+        assert_eq!(fa("Campfire_A_Lit_1x1"), Some(Glow::Campfire));
+        assert_eq!(fa("Campfire_A_Cold_1x1"), None);
+        assert_eq!(fa("Campfire_Ash_A1_1x1"), None);
+        assert_eq!(fa("Campfire_A_Embers1_1x1"), Some(Glow::Brazier));
+        assert_eq!(fa("Campfire_Spit_Pig_01_A1_1x2"), None);
+        assert_eq!(fa("Firepit_Stone_Earthy_A1_1x1"), None);
+        assert_eq!(fa("Firepit_Stone_Earthy_A1_Lit_1x1"), Some(Glow::Campfire));
+        // Свой костёр без пары горит, как раньше.
+        assert_eq!(prop("C:\\assets\\objects\\Campfire_Big_A_2x2.webp").light(), Some(Glow::Campfire));
         assert_eq!(prop("C:\\assets\\objects\\Chandelier_Iron_2x2.webp").light(), Some(Glow::Candle));
         assert_eq!(prop("pack:x|textures/objects/Lamp_Post_A.webp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:x|textures/objects/Barrel_A.webp").light(), None);

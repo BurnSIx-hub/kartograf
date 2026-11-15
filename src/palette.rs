@@ -296,7 +296,8 @@ const OBJECTS: &[Slot] = &[
     ("cage", &[&["cage", "metal"]], &["bird", "door", "top", "bed", "ceremorph", "small", "chain"]),
     ("pillar_stone", &[&["pillar", "stone"], &["pillar", "solid"], &["pillar", "marble"]], &["broken", "wood", "lamp", "railing", "torment", "drow", "dwarven", "palisade", "awning", "overlay", "metal", "brickwood", "stonewood", "blue", "green", "purple", "red", "white", "yellow"]),
     ("pillar_broken", &[&["pillar", "broken"]], &[]),
-    ("campfire", &[&["campfire"], &["bonfire"], &["костёр"], &["костер"]], &[]),
+    // Горящий: у FA без `Lit` — дрова или зола (см. `map::glow_by_name`).
+    ("campfire", &[&["campfire", "lit"], &["bonfire"], &["костёр"], &["костер"]], &["cold", "ash", "spit"]),
     // Волшебная «повелевающая элементалями» и упавшие — не для обстановки.
     ("brazier", &[&["brazier"], &["жаровня"]], &["commanding", "elementals", "fallen"]),
     ("weapon_rack", &[&["weapon", "rack"], &["sword", "rack"], &["стойка", "мечами"]], &["spear", "axe", "mace", "bow"]),

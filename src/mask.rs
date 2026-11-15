@@ -162,27 +162,54 @@ pub fn soften(w: usize, h: usize, weights: &mut [(usize, f32)], fade: f32) {
         (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
     }
     // Расстояние до края по двум проходам: прямой шаг 1, косой √2. Поле шире фигуры на
-    // точку: снаружи ноль.
+    // точку: снаружи ноль. С `beyond` фигура, что упирается в край карты, за ним
+    // продолжается: рамка карты — не край фигуры (берег, нарисованный за край, не
+    // тает у рамки и не оставляет под собой полоску воды).
     let (fw, fh) = (x1 - x0 + 3, y1 - y0 + 3);
-    let mut dist = vec![0f32; fw * fh];
-    for &(i, v) in weights.iter() {
-        if v >= 0.5 {
-            let (x, y) = inside(i);
-            dist[(y - y0 + 1) * fw + x - x0 + 1] = f32::MAX;
-        }
-    }
-    for pass in 0..2 {
-        for k in 0..fw * fh {
-            let k = if pass == 0 { k } else { fw * fh - 1 - k };
-            let (x, y) = (k % fw, k / fw);
-            if x == 0 || y == 0 || x == fw - 1 || y == fh - 1 || dist[k] == 0.0 {
-                continue;
+    let field = |beyond: bool| {
+        let mut dist = vec![0f32; fw * fh];
+        for &(i, v) in weights.iter() {
+            if v >= 0.5 {
+                let (x, y) = inside(i);
+                dist[(y - y0 + 1) * fw + x - x0 + 1] = f32::MAX;
             }
-            let around = if pass == 0 { [(k - 1, 1.0), (k - fw, 1.0), (k - fw - 1, SQRT_2), (k - fw + 1, SQRT_2)] } else { [(k + 1, 1.0), (k + fw, 1.0), (k + fw + 1, SQRT_2), (k + fw - 1, SQRT_2)] };
-            dist[k] = around.iter().map(|&(n, cost)| dist[n] + cost).fold(dist[k], f32::min);
         }
-    }
-    let deepest = dist.iter().copied().filter(|d| *d < f32::MAX).fold(0.0, f32::max);
+        if beyond {
+            for y in 0..fh {
+                if x0 == 0 {
+                    dist[y * fw] = dist[y * fw + 1];
+                }
+                if x1 + 1 == w {
+                    dist[y * fw + fw - 1] = dist[y * fw + fw - 2];
+                }
+            }
+            for x in 0..fw {
+                if y0 == 0 {
+                    dist[x] = dist[fw + x];
+                }
+                if y1 + 1 == h {
+                    dist[(fh - 1) * fw + x] = dist[(fh - 2) * fw + x];
+                }
+            }
+        }
+        for pass in 0..2 {
+            for k in 0..fw * fh {
+                let k = if pass == 0 { k } else { fw * fh - 1 - k };
+                let (x, y) = (k % fw, k / fw);
+                if x == 0 || y == 0 || x == fw - 1 || y == fh - 1 || dist[k] == 0.0 {
+                    continue;
+                }
+                let around = if pass == 0 { [(k - 1, 1.0), (k - fw, 1.0), (k - fw - 1, SQRT_2), (k - fw + 1, SQRT_2)] } else { [(k + 1, 1.0), (k + fw, 1.0), (k + fw + 1, SQRT_2), (k + fw - 1, SQRT_2)] };
+                dist[k] = around.iter().map(|&(n, cost)| dist[n] + cost).fold(dist[k], f32::min);
+            }
+        }
+        dist
+    };
+    // Ширина спада — по самой фигуре, как и раньше; рамка карты её не меняет.
+    let plain = field(false);
+    let deepest = plain.iter().copied().filter(|d| *d < f32::MAX).fold(0.0, f32::max);
+    let touches = x0 == 0 || y0 == 0 || x1 + 1 == w || y1 + 1 == h;
+    let dist = if touches { field(true) } else { plain };
     let reach = (deepest * fade).max(1.0);
     for (i, v) in weights.iter_mut() {
         let (x, y) = inside(*i);
@@ -391,6 +418,23 @@ mod shape_tests {
         assert!(at(10.0, 10.0) > 0.99, "середина");
         assert!(at(2.2, 10.0) < 0.2, "край мягкий: {}", at(2.2, 10.0));
         assert!(at(4.0, 10.0) > at(2.5, 10.0), "к середине сильнее");
+    }
+
+    #[test]
+    fn feather_does_not_fade_at_the_map_border() {
+        // Берег у левого края карты: у рамки он в полную силу, тает только к воде.
+        let (w, h) = (20 * RES, 20 * RES);
+        let mut r = rect_f(w, h, [-1.0, -1.0, 6.0, 21.0]);
+        soften(w, h, &mut r, 0.3);
+        let at = |x: f32, y: f32| r.iter().find(|q| q.0 == (y * RES as f32) as usize * w + (x * RES as f32) as usize).map_or(0.0, |q| q.1);
+        assert!(at(0.05, 10.0) > 0.99, "у рамки слева: {}", at(0.05, 10.0));
+        assert!(at(3.0, 0.05) > 0.99, "у рамки сверху: {}", at(3.0, 0.05));
+        assert!(at(5.9, 10.0) < 0.3, "к воде тает: {}", at(5.9, 10.0));
+        // Ширина спада у фигуры, что упирается в рамку, та же, что без рамки.
+        let mut free = rect_f(w, h, [7.0, 2.0, 14.0, 18.0]);
+        soften(w, h, &mut free, 0.3);
+        let at2 = |x: f32, y: f32| free.iter().find(|q| q.0 == (y * RES as f32) as usize * w + (x * RES as f32) as usize).map_or(0.0, |q| q.1);
+        assert!((at(5.0, 10.0) - at2(13.0, 10.0)).abs() < 0.08, "{} против {}", at(5.0, 10.0), at2(13.0, 10.0));
     }
 }
 

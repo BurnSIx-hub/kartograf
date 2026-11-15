@@ -75,6 +75,8 @@ for _r in roofs:
 
 has = lambda o, *ws: any(w.lower() in o["name"].lower() for w in ws)
 name = lambda o: o["name"]
+# Мост, мостки, помост — пол над водой (как в Картографе, `bridge_by_name`): на нём стоят и ходят.
+bridge = lambda o: any(w in ("bridge", "мост") for w in "".join(c if c.isalnum() else " " for c in o["name"].lower()).split())
 ROOF_OK = ("Chimney", "Steam", "Vent", "Hatch", "Skylight", "Water_Tank", "Pipe_Brass", "Signal_Beacon", "Antenna")
 FLYING = ("Airship_Gnome", "Airship_Cargo", "Bird", "Balloon")
 VERTICAL = ("Clock_Metal_Brass_Face", "Clock_Metal_Brass_Hand", "Wall_Trophy")
@@ -128,6 +130,9 @@ for i, a in enumerate(cand):
     for b in cand[i + 1:]:
         if a["layer"] != b["layer"]:
             continue
+        # Вещь на помосте — не наложение; два куска моста внахлёст — наложение.
+        if bridge(a) != bridge(b):
+            continue
         # Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
         if any(has(x, "Table", "Desk", "Counter", "Bar_") for x in (a, b)) and min(a["w"] * a["h"], b["w"] * b["h"]) <= 2:
             continue
@@ -144,7 +149,7 @@ for dd in doors:
     (x1, y1), (x2, y2) = dd["a"], dd["b"]
     L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2 or 1
     for o in objs:
-        if o["layer"] >= 800 or has(o, "Rug", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
+        if o["layer"] >= 800 or bridge(o) or has(o, "Rug", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
             continue
         tt = max(0, min(1, ((o["x"] - x1) * (x2 - x1) + (o["y"] - y1) * (y2 - y1)) / L2))
         dseg = math.dist((o["x"], o["y"]), (x1 + tt * (x2 - x1), y1 + tt * (y2 - y1)))
@@ -153,7 +158,7 @@ for dd in doors:
             issues.append(f"[дверь] у двери #{dd['index']} ({c[0]:.1f}, {c[1]:.1f}) стоит #{o['index']} {name(o)}")
 # 6. Предмет через стену дома: углы видимой части по разные стороны стены
 for o in objs:
-    if o["layer"] >= 800 or has(o, "Wall_Lamp", "Notice_Board", "Propeller_Wood", "Landing_Pad", "Fireplace", "Oven_Brick"):
+    if o["layer"] >= 800 or bridge(o) or has(o, "Wall_Lamp", "Notice_Board", "Propeller_Wood", "Landing_Pad", "Fireplace", "Oven_Brick"):
         continue
     rs = {room_of(c) for c in corners(o, 0.7)}
     if len(rs) > 1:
