@@ -610,12 +610,15 @@ impl App {
             // В Universal VTT тайлов нет: предметы, ушедшие в тайлы, впечатываются
             // в его картинку.
             let mut pics: std::collections::HashMap<String, Option<(image::RgbaImage, [f32; 2])>> = std::collections::HashMap::new();
+            let mut flats: Vec<image::RgbImage> = Vec::new();
             for k in 0..n {
                 let map = if k == self.level { &self.map } else { &self.levels[k] };
-                // Прозрачности в нём нет: пустота верхнего этажа — прежняя серая.
-                let mut flat = match &open[k] {
-                    Some(rgba) => export::over_color(rgba, [38, 38, 38]),
-                    None => e.done[k].clone(),
+                // Прозрачности в нём нет: в пустоте и дырах верхнего этажа — картинка этажа
+                // ниже, как его видно в Foundry (у самого нижнего — серая пустота).
+                let mut flat = match (&open[k], k.checked_sub(1).and_then(|b| flats.get(b))) {
+                    (Some(rgba), Some(under)) => export::over_image(rgba, under),
+                    (Some(rgba), None) => export::over_color(rgba, [38, 38, 38]),
+                    (None, _) => e.done[k].clone(),
                 };
                 // Крыш в Universal VTT нет — нет и крышного.
                 let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !p.with_walls() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
@@ -644,6 +647,7 @@ impl App {
                 }
                 let mut jpg = Vec::new();
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&flat).map_err(|x| x.to_string())?;
+                flats.push(flat);
                 let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpg), &layouts[k]);
                 files.push((e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string().into_bytes()));
             }

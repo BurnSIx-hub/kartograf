@@ -9,6 +9,7 @@ impl App {
         self.levels = std::iter::once(map.clone()).chain(rest).collect();
         self.level = 0;
         self.below.clear();
+        self.under.clear();
         self.map = map;
         self.path = path;
         self.dirty = false;

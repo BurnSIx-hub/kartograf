@@ -519,6 +519,11 @@ pub struct App {
     outline_last: std::collections::HashMap<usize, u64>,
     /// Не все крыши по контуру нарисованы под нынешний масштаб: снимок ждёт.
     outline_pending: bool,
+    /// Этажи ниже текущего, видные сквозь его пустоту и решётки: их кэши отрисовки
+    /// (картинки крыш по контуру, стены комнат, тени крон) — по номеру этажа.
+    under: std::collections::HashMap<usize, draw::UnderCache>,
+    /// Сейчас рисуется этаж ниже текущего: 1 — самый нижний (он заливает пустоту), 2 — выше него.
+    underlay: u8,
     /// Прямоугольные крыши, что врезаются в соседние ([`roofs::join_groups`]): их
     /// рисует не сетка видеокарты, а общая картинка группы.
     joined_rects: std::collections::HashSet<usize>,
@@ -741,6 +746,8 @@ impl App {
             outline_cache: std::collections::HashMap::new(),
             outline_last: std::collections::HashMap::new(),
             outline_pending: false,
+            under: std::collections::HashMap::new(),
+            underlay: 0,
             joined_rects: std::collections::HashSet::new(),
             cover_cache: std::collections::HashMap::new(),
             roof_from: None,

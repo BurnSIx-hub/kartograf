@@ -789,6 +789,21 @@ pub fn over_color(layer: &image::RgbaImage, color: [u8; 3]) -> image::RgbImage {
     out
 }
 
+/// Слой поверх картинки того же размера: пустота и дыры верхнего этажа показывают
+/// этаж ниже (в Universal VTT уровней нет — каждый этаж одной картинкой). Другой
+/// размер — серая пустота, как прежде.
+pub fn over_image(layer: &image::RgbaImage, under: &image::RgbImage) -> image::RgbImage {
+    if layer.dimensions() != under.dimensions() {
+        return over_color(layer, [38, 38, 38]);
+    }
+    let mut out = under.clone();
+    for (o, p) in out.pixels_mut().zip(layer.pixels()) {
+        let a = p[3] as f32 / 255.0;
+        *o = image::Rgb([0, 1, 2].map(|k| (p[k] as f32 * a + o[k] as f32 * (1.0 - a)).round() as u8));
+    }
+    out
+}
+
 /// Прозрачный слой во всю сцену — файлом: WebP, а не вышел — PNG. Расширение — вторым.
 pub fn layer_bytes(img: &image::RgbaImage, quality: f32) -> (Vec<u8>, &'static str) {
     if let Some(bytes) = try_webp(img, quality) {
@@ -1911,9 +1926,15 @@ mod tests {
         let mut same = noisy.clone();
         same.put_pixel(0, 0, image::Rgb([122, 92, 62]));
         assert!(floor_from_pair(&noisy, &same).is_none());
-        // Для Universal VTT пустота — прежняя серая.
+        // Для Universal VTT в пустоте — картинка этажа ниже; у самого нижнего — прежняя серая.
         let flat = over_color(&bg, [38, 38, 38]);
         assert_eq!((flat.get_pixel(0, 0).0, flat.get_pixel(2, 0).0), ([120, 90, 60], [38, 38, 38]));
+        let below = image::RgbImage::from_pixel(3, 1, image::Rgb([10, 200, 30]));
+        let seen = over_image(&bg, &below);
+        assert_eq!((seen.get_pixel(0, 0).0, seen.get_pixel(2, 0).0), ([120, 90, 60], [10, 200, 30]), "сквозь пустоту — этаж ниже");
+        let half = seen.get_pixel(1, 0).0;
+        assert!((half[1] as i32 - 145).abs() <= 3, "край пополам: {half:?}");
+        assert_eq!(over_image(&bg, &image::RgbImage::new(5, 1)).get_pixel(2, 0).0, [38, 38, 38], "чужой размер — серая пустота");
     }
 
     #[test]

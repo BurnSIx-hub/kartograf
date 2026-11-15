@@ -2,20 +2,110 @@
 
 use super::*;
 
+/// Кэши отрисовки этажа ниже текущего ([`App::draw_below`]): у текущего они в самом
+/// `App`, а этаж ниже рисуется каждый кадр — свои, чтобы этажи не вытесняли друг друга.
+#[derive(Default)]
+pub(super) struct UnderCache {
+    /// `App::rev`, при котором сверены стены комнат, и отпечаток маски комнат.
+    rev: u64,
+    rooms: u64,
+    edges: Vec<Segment>,
+    relief_look: Option<(u64, std::rc::Rc<crate::relief::Look>)>,
+    tree_shade: Option<(u64, Option<std::rc::Rc<Mask>>)>,
+    outline_cache: std::collections::HashMap<u64, (egui::TextureHandle, [f32; 2], [f32; 2])>,
+    outline_last: std::collections::HashMap<usize, u64>,
+}
+
 impl App {
+    /// Этажи ниже — под текущим, как в Foundry: сквозь пустоту верхнего этажа и дыры
+    /// его пола (решётка люка, световой люк) видно, что внизу. Крыша этажа ниже,
+    /// больше чем наполовину накрытая полом выше, не рисуется — сквозь люк видна
+    /// каюта, а не её крыша. В выгрузке для Foundry пустота снимается пустой: там
+    /// нижний этаж показывает сама сцена. Возвращает, нарисован ли хоть один.
+    fn draw_below(&mut self, painter: &egui::Painter, canvas: Rect) -> bool {
+        let k = self.level;
+        if k == 0 || self.underlay != 0 || self.export.as_ref().is_some_and(|e| !e.picture) {
+            return false;
+        }
+        // Какие крыши этажа j накрыты полом этажей выше него (до текущего включительно).
+        let hidden: Vec<(Vec<usize>, Vec<usize>)> = (0..k)
+            .map(|j| {
+                let above: Vec<&Map> = (j + 1..k).map(|a| &self.levels[a]).chain(std::iter::once(&self.map)).collect();
+                let m = &self.levels[j];
+                let rects = m.roofs.iter().enumerate().filter(|(_, r)| map::under_floor(&r.outline(), &above)).map(|(i, _)| i).collect();
+                let outlines = m.outline_roofs.iter().enumerate().filter(|(_, r)| r.pieces.first().and_then(|p| p.rings.first()).is_some_and(|ring| map::under_floor(ring, &above))).map(|(i, _)| i).collect();
+                (rects, outlines)
+            })
+            .collect();
+        let sel = self.sel.take();
+        let picked = std::mem::take(&mut self.picked);
+        let edges_dirty = self.edges_dirty;
+        for (j, (rects, outlines)) in hidden.into_iter().enumerate() {
+            std::mem::swap(&mut self.map, &mut self.levels[j]);
+            let mut c = self.under.remove(&j).unwrap_or_default();
+            // Стены комнат — заново, только если маска комнат этого этажа сменилась.
+            if c.rev != self.rev || c.edges.is_empty() {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (self.map.rooms.w, self.map.rooms.h, &self.map.rooms.data).hash(&mut h);
+                let rooms = h.finish();
+                if rooms != c.rooms || c.rev == 0 {
+                    c.edges = self.map.room_edges();
+                    c.rooms = rooms;
+                }
+                c.rev = self.rev;
+            }
+            std::mem::swap(&mut self.edges, &mut c.edges);
+            std::mem::swap(&mut self.relief_look, &mut c.relief_look);
+            std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
+            std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
+            std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            self.edges_dirty = false;
+            let keep = (self.map.roofs.clone(), self.map.outline_roofs.clone());
+            let mut i = 0;
+            self.map.roofs.retain(|_| (!rects.contains(&i), i += 1).0);
+            i = 0;
+            self.map.outline_roofs.retain(|_| (!outlines.contains(&i), i += 1).0);
+            self.underlay = if j == 0 { 1 } else { 2 };
+            self.draw(painter, canvas);
+            self.underlay = 0;
+            (self.map.roofs, self.map.outline_roofs) = keep;
+            std::mem::swap(&mut self.edges, &mut c.edges);
+            std::mem::swap(&mut self.relief_look, &mut c.relief_look);
+            std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
+            std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
+            std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            self.under.insert(j, c);
+            std::mem::swap(&mut self.map, &mut self.levels[j]);
+        }
+        self.edges_dirty = edges_dirty;
+        self.sel = sel;
+        self.picked = picked;
+        true
+    }
+
     pub(super) fn draw(&mut self, painter: &egui::Painter, canvas: Rect) {
         let cam = self.cam;
         let s = cam.scale;
         let (mw, mh) = (self.map.width as i32, self.map.height as i32);
         let map_rect = cam.map_rect(canvas, self.map.width, self.map.height);
+        // Ручки, рамки, сетка, подписи — только у текущего этажа, не у видного под ним.
+        let ui = self.underlay == 0;
+        if ui {
+            self.outline_pending = false;
+        }
         // Пустота: где на этаже ничего не нарисовано. В выгрузке верхнего этажа она
         // снимается чёрной и белой — по разнице снимков фон там выходит прозрачным.
+        // В окне и на картинке под пустотой — этажи ниже ([`App::draw_below`]).
         let void = match self.export.as_ref().and_then(|e| e.void()) {
             Some(true) => Color32::WHITE,
             Some(false) => Color32::BLACK,
             None => Color32::from_gray(38),
         };
-        painter.rect_filled(map_rect, 0.0, void);
+        let below = ui && self.draw_below(painter, canvas);
+        if !below && self.underlay != 2 {
+            painter.rect_filled(map_rect, 0.0, void);
+        }
 
         // Рисуется только видимая часть: на большой карте при сильном приближении
         // остальное всё равно за краем окна.
@@ -96,7 +186,7 @@ impl App {
             painter.rect_filled(canvas, 0.0, if pass == Some(1) { Color32::BLACK } else { Color32::WHITE });
         }
         // Протянутая заливка — рамкой, пока кнопку не отпустили.
-        if let (Some(a), Some(p)) = (self.drag_from, self.hover.filter(|_| !exporting)) {
+        if let (Some(a), Some(p)) = (self.drag_from, self.hover.filter(|_| !exporting && ui)) {
             let b = self.drag_corner(a, cam.cell(canvas, p), painter.ctx().input(|i| i.modifiers.shift));
             let r = Rect::from_min_max(
                 cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
@@ -122,7 +212,7 @@ impl App {
 
         // Сетка. На мелком масштабе она сливается в сплошной фон — тогда её нет.
         // В выгрузке сетки нет: её рисует сам VTT.
-        if s >= 10.0 && !exporting {
+        if s >= 10.0 && !exporting && ui {
             let grid = Stroke::new(1.0, Color32::from_black_alpha(60));
             for x in x0..=x1 {
                 painter.line_segment([cam.to_screen(canvas, [x as f32, y0 as f32]), cam.to_screen(canvas, [x as f32, y1 as f32])], grid);
@@ -131,12 +221,12 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, [x0 as f32, y as f32]), cam.to_screen(canvas, [x1 as f32, y as f32])], grid);
             }
         }
-        if !exporting {
+        if !exporting && ui {
             painter.rect_stroke(map_rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
         }
 
         // Стены этажа ниже — пунктиром, чтобы верхний лёг на них.
-        if !self.below.is_empty() && !exporting {
+        if !self.below.is_empty() && !exporting && ui {
             let ghost = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 220, 140, 120));
             for (a, b) in &self.below {
                 painter.add(Shape::dashed_line(&[cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], ghost, 6.0, 4.0));
@@ -251,11 +341,12 @@ impl App {
         // Изгиб: какую стену возьмёт протяжка и куда ляжет дуга стены комнаты.
         let blue = Color32::from_rgb(120, 180, 255);
         match self.bending {
-            Some(Bend::Room { a, b, h }) => {
+            Some(Bend::Room { a, b, h }) if ui => {
                 let q: Vec<Pos2> = map::arc_points(a, b, h).iter().map(|&p| cam.to_screen(canvas, p)).collect();
                 painter.add(Shape::line(q, Stroke::new(3.0, blue)));
             }
             Some(_) => {}
+            None if !ui => {}
             None => {
                 let keys = painter.ctx().input(|i| i.modifiers.command && i.modifiers.shift);
                 if keys && let Some(h) = self.hover.filter(|p| canvas.contains(*p)) {
@@ -282,7 +373,7 @@ impl App {
                     painter.add(Shape::closed_line(q, Stroke::new(1.5, green)));
                 }
             }
-            if let (Some(a), Some(h)) = (self.band_from, self.hover) {
+            if let (Some(a), Some(h)) = (self.band_from, self.hover.filter(|_| ui)) {
                 let r = Rect::from_two_pos(cam.to_screen(canvas, a), h);
                 painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(140, 220, 160, 25), Stroke::new(1.0, green), egui::StrokeKind::Middle);
             }
@@ -304,7 +395,7 @@ impl App {
         }
 
         // Призрак того, что поставит щелчок.
-        let hover = self.hover.filter(|p| canvas.contains(*p));
+        let hover = self.hover.filter(|p| canvas.contains(*p) && ui);
         match (self.tool, hover) {
             (Tool::Object, Some(h)) => {
                 if let Some(asset) = self.object_asset.clone() {
@@ -361,7 +452,6 @@ impl App {
             Some(_) => 0.0,
             None => self.roof_alpha(),
         };
-        self.outline_pending = false;
         self.joined_rects.clear();
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
         if (self.roof_view != RoofView::Hidden || exporting) && !walls_only {
@@ -392,7 +482,7 @@ impl App {
                 }
             }
         }
-        if let (Some(a), Some(p)) = (self.roof_from, self.hover.filter(|_| !exporting)) {
+        if let (Some(a), Some(p)) = (self.roof_from, self.hover.filter(|_| !exporting && ui)) {
             let b = cam.cell(canvas, p);
             let r = Rect::from_min_max(
                 cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
@@ -411,7 +501,8 @@ impl App {
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {
-            if (exporting && label.gm) || walls_only {
+            // Подписи этажа ниже не видны: названия его комнат легли бы на палубу сверху.
+            if (exporting && label.gm) || walls_only || !ui {
                 continue;
             }
             self.draw_label(painter, canvas, label);
@@ -437,7 +528,7 @@ impl App {
                 painter.circle_stroke(cam.to_screen(canvas, *q), 4.0, Stroke::new(1.5, Color32::from_rgb(120, 180, 255)));
             }
         }
-        if !self.path_draft.is_empty() {
+        if !self.path_draft.is_empty() && ui {
             let mut pts = self.path_draft.clone();
             if let (Some(h), false) = (hover, self.path_free) {
                 pts.push(self.snap_pos(cam.to_world(canvas, h), painter.ctx().input(|i| i.modifiers.alt)));
@@ -454,7 +545,7 @@ impl App {
 
         // Начатая стена и отрезок до курсора.
         let outer = (style.width * s).max(3.0);
-        if !self.draft.is_empty() {
+        if !self.draft.is_empty() && ui {
             let mut points: Vec<Pos2> = self.draft.iter().map(|&p| cam.to_screen(canvas, p)).collect();
             if let Some(h) = hover {
                 points.push(cam.to_screen(canvas, cam.node(canvas, h)));

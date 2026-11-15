@@ -559,6 +559,51 @@ pub fn is_bare_tree(key: &str) -> bool {
     lower.contains("bare_tree") || lower.contains("tree_bare") || lower.ends_with("builtin:tree_bare")
 }
 
+/// Сила пола этажа `m` в точке (0–255): местность и пол комнат (в пределах комнат).
+pub fn floor_at(m: &Map, p: [f32; 2]) -> u8 {
+    let (i, j) = ((p[0] * crate::mask::RES as f32).floor() as isize, (p[1] * crate::mask::RES as f32).floor() as isize);
+    let ground = m.terrain.iter().map(|c| c.mask.get(i, j)).max().unwrap_or(0);
+    let room = m.room_floor.iter().map(|c| c.mask.get(i, j)).max().unwrap_or(0).min(m.rooms.get(i, j));
+    ground.max(room)
+}
+
+/// Крыша этажа ниже (контур `ring`), больше чем наполовину накрытая полом этажей
+/// выше (`above`): сверху её не видно — пол накрывает, а сквозь дыры в нём (световой
+/// люк, решётка) видна комната под ней, а не крыша. Как в выгрузке (`export::Solid`).
+pub fn under_floor(ring: &[[f32; 2]], above: &[&Map]) -> bool {
+    if ring.len() < 3 || above.is_empty() {
+        return false;
+    }
+    let (lo, hi) = ring.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), q| ([l[0].min(q[0]), l[1].min(q[1])], [h[0].max(q[0]), h[1].max(q[1])]));
+    let inside = |x: f32, y: f32| {
+        let mut c = false;
+        for k in 0..ring.len() {
+            let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+            if (a[1] > y) != (b[1] > y) && x < a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+                c = !c;
+            }
+        }
+        c
+    };
+    const STEP: f32 = 0.25;
+    let (mut all, mut covered) = (0u32, 0u32);
+    let mut y = lo[1] + STEP / 2.0;
+    while y < hi[1] {
+        let mut x = lo[0] + STEP / 2.0;
+        while x < hi[0] {
+            if inside(x, y) {
+                all += 1;
+                if above.iter().any(|m| floor_at(m, [x, y]) >= 191) {
+                    covered += 1;
+                }
+            }
+            x += STEP;
+        }
+        y += STEP;
+    }
+    all > 0 && covered * 2 > all
+}
+
 /// У кроны есть ствол — в картинке под её тайлом остаётся пень: деревья по имени и
 /// из папки `trees`. Парус, полог и прочее, отмеченное кроной рукой, ствола не имеют.
 pub fn has_trunk(key: &str) -> bool {
@@ -2320,6 +2365,23 @@ mod tests {
         assert!(!prop("builtin:stump").is_canopy());
         assert!(is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Bare_Trees/Bare_Tree_A1_6x6.webp"));
         assert!(!is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp"));
+        // Крыша нижнего этажа, накрытая полом верхнего больше чем наполовину, сверху не видна.
+        let mut deck = Map::new(10, 10);
+        let ring = [[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]];
+        assert!(!under_floor(&ring, &[&deck]), "над крышей пусто");
+        let mut m = Mask::for_cells(10, 10);
+        for j in 0..m.h {
+            for i in 0..m.w {
+                if (i as f32 + 0.5) / crate::mask::RES as f32 >= 4.0 {
+                    m.data[j * m.w + i] = 255;
+                }
+            }
+        }
+        deck.terrain.push(Coat { material: 0, mask: m });
+        assert!(under_floor(&ring, &[&deck]), "две трети крыши под полом");
+        assert!(!under_floor(&[[0.0, 0.0], [5.0, 0.0], [5.0, 5.0], [0.0, 5.0]], &[&deck]), "под полом только пятая часть");
+        assert_eq!(floor_at(&deck, [6.0, 1.0]), 255);
+        assert_eq!(floor_at(&deck, [1.0, 1.0]), 0);
         // Пень под кроной — только у дерева; парус, отмеченный кроной, уходит в тайл целиком.
         assert!(has_trunk("builtin:tree") && has_trunk("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp"));
         assert!(has_trunk("C:\\Картограф\\ассеты\\objects\\trees\\Willow_Black_Ancient_A_9x9.webp"));

@@ -353,7 +353,7 @@ impl App {
             self.outline_last.retain(|_, k| drawn.contains(k));
         }
         self.map.outline_roofs = roofs;
-        self.outline_pending = pending;
+        self.outline_pending |= pending;
         if pending {
             painter.ctx().request_repaint();
         }
