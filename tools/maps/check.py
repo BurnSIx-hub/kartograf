@@ -87,7 +87,7 @@ has = lambda o, *ws: any(w.lower() in o["name"].lower() for w in ws)
 name = lambda o: o["name"]
 # Мост, мостки, помост — пол над водой (как в Картографе, `bridge_by_name`): на нём стоят и ходят.
 bridge = lambda o: any(w in ("bridge", "мост") for w in "".join(c if c.isalnum() else " " for c in o["name"].lower()).split())
-ROOF_OK = ("Chimney", "Steam", "Vent", "Hatch", "Skylight", "Water_Tank", "Pipe_Brass", "Signal_Beacon", "Antenna")
+ROOF_OK = ("Chimney", "Steam", "Vent", "Hatch", "Skylight", "Water_Tank", "Pipe_Brass", "Signal_Beacon", "Antenna", "Weathervane")
 FLYING = ("Airship_Gnome", "Airship_Cargo", "Bird", "Balloon")
 VERTICAL = ("Clock_Metal_Brass_Face", "Clock_Metal_Brass_Hand", "Wall_Trophy")
 CONNECT = ("Boiler", "Tank", "Reactor", "Chimney", "Valve", "Manhole", "Gauge", "Gas_Holder", "Mooring_Mast", "Gas_Cylinders")
@@ -139,6 +139,19 @@ PARTS = (("Cannon_Base", "Cannon_Metal"), ("Mast_Wood", "Rigging_Mast"))
 # Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску.
 ON_TOP = ("Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle")
 cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800 and not o.get("canopy")]
+
+
+def beam_run(a, b):
+    """Куски одного бруса внахлёст (комингс люка, балка): оба — брусья, один поворот, на одной оси."""
+    if not (has(a, "_Beam_") and has(b, "_Beam_")):
+        return False
+    ra, rb = a["rotation"] or 0, b["rotation"] or 0
+    if min((ra - rb) % 180, (rb - ra) % 180) > 1:
+        return False
+    t = math.radians(ra)            # при повороте 0 брус идёт вдоль y
+    return abs((b["x"] - a["x"]) * math.cos(t) + (b["y"] - a["y"]) * math.sin(t)) < 0.05
+
+
 for i, a in enumerate(cand):
     ba = box(a, 0.8)
     for b in cand[i + 1:]:
@@ -150,6 +163,8 @@ for i, a in enumerate(cand):
         if any(has(a, x) and has(b, y) or has(a, y) and has(b, x) for x, y in PARTS):
             continue
         if has(a, *ON_TOP) or has(b, *ON_TOP):
+            continue
+        if beam_run(a, b):
             continue
         # Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
         if any(has(x, "Table", "Desk", "Counter", "Bar_") for x in (a, b)) and min(a["w"] * a["h"], b["w"] * b["h"]) <= 2:
@@ -167,7 +182,7 @@ for dd in doors:
     (x1, y1), (x2, y2) = dd["a"], dd["b"]
     L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2 or 1
     for o in objs:
-        if o["layer"] >= 800 or o.get("canopy") or bridge(o) or has(o, "Rug", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
+        if o["layer"] >= 800 or o.get("canopy") or bridge(o) or has(o, "Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
             continue
         tt = max(0, min(1, ((o["x"] - x1) * (x2 - x1) + (o["y"] - y1) * (y2 - y1)) / L2))
         dseg = math.dist((o["x"], o["y"]), (x1 + tt * (x2 - x1), y1 + tt * (y2 - y1)))
@@ -176,7 +191,8 @@ for dd in doors:
             issues.append(f"[дверь] у двери #{dd['index']} ({c[0]:.1f}, {c[1]:.1f}) стоит #{o['index']} {name(o)}")
 # 6. Предмет через стену дома: углы видимой части по разные стороны стены
 for o in objs:
-    if o["layer"] >= 800 or bridge(o) or has(o, "Wall_Lamp", "Notice_Board", "Propeller_Wood", "Landing_Pad", "Fireplace", "Oven_Brick"):
+    # Крона над стеной — не предмет поперёк неё: она висит над крышей. Труба входит в дом сквозь стену.
+    if o["layer"] >= 800 or o.get("canopy") or bridge(o) or has(o, "Wall_Lamp", "Notice_Board", "Propeller_Wood", "Landing_Pad", "Fireplace", "Oven_Brick", "Pipe_Brass"):
         continue
     rs = {room_of(c) for c in corners(o, 0.7)}
     if len(rs) > 1:
@@ -225,7 +241,7 @@ for o in objs:
         issues.append(f"[дом] #{o['index']} {name(o)} на улице ({o['x']:.1f}, {o['y']:.1f})")
 # 8. За краем карты
 for o in objs:
-    if has(o, "Tree"):
+    if has(o, "Tree", "Дерево") or o.get("canopy"):
         continue  # крона за краем карты — нормально
     b = box(o, 0.8)
     if b[0] < -0.2 or b[1] < -0.2 or b[2] > W + 0.2 or b[3] > H + 0.2:
