@@ -177,17 +177,34 @@ impl App {
         Some(img)
     }
 
-    /// Крыши по контуру (из OSM): картинкой, нарисованной точками по
+    /// Крыши по контуру: картинкой, нарисованной точками по
     /// [`roofs::render_outline`], — их скаты сходят к любой стороне, мешем egui
-    /// так не нарисовать. Новых за кадр — несколько, остальные в следующих.
+    /// так не нарисовать. Разрешение картинки — под масштаб окна ([`outline_ppc`]):
+    /// раньше оно было не больше 24 точек на клетку, и рядом с прямоугольной
+    /// крышей (её рисует видеокарта в полную резкость) такая выходила мылом.
+    /// Новых за кадр — несколько, остальные в следующих; пока новая не готова,
+    /// видна прежняя.
     pub(super) fn draw_outline_roofs(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, alpha: f32, light: [f32; 2]) {
         use std::hash::{Hash, Hasher};
         const NEW_PER_FRAME: usize = 6;
+        /// Новых точек картинок за кадр: больше — окно замирает.
+        const PX_PER_FRAME: f32 = 3.0e6;
         let roofs = std::mem::take(&mut self.map.outline_roofs);
         let mut fresh = 0;
+        let mut fresh_px = 0.0;
         let mut pending = false;
+        let exact = self.export.is_some();
+        let want = (self.cam.scale * self.canvas_ppp).max(1.0);
         let casters = roofs::Casters::new(&roofs, &self.map.props);
+        // Крыши, что врезаются друг в друга, рисуются группой — после остальных.
+        let rects = self.map.roofs.clone();
+        let groups = roofs::join_groups(&rects, &roofs);
+        let grouped: std::collections::HashSet<usize> = groups.iter().flatten().copied().collect();
+        self.joined_rects = grouped.iter().copied().filter(|id| *id < rects.len()).collect();
         for (idx, r) in roofs.iter().enumerate() {
+            if grouped.contains(&(rects.len() + idx)) {
+                continue;
+            }
             let (lo, hi) = r.bounds();
             if hi[0] < view.min.x || hi[1] < view.min.y || lo[0] > view.max.x || lo[1] > view.max.y {
                 continue;
@@ -209,15 +226,17 @@ impl App {
                     p[0].to_bits().hash(&mut hs);
                     p[1].to_bits().hash(&mut hs);
                 }
-                (piece.form as u8, &piece.paint, piece.height.to_bits(), piece.eaves.to_bits(), piece.down.map(|d| (d[0].to_bits(), d[1].to_bits())), piece.across).hash(&mut hs);
+                (piece.form as u8, &piece.paint, piece.height.to_bits(), piece.eaves.to_bits(), piece.down.map(|d| (d[0].to_bits(), d[1].to_bits())), piece.across, piece.overhang.map(f32::to_bits)).hash(&mut hs);
             }
             (light[0].to_bits(), light[1].to_bits()).hash(&mut hs);
+            let (w, h) = ((hi[0].min(self.map.width as f32) - lo[0].max(0.0)).max(1.0), (hi[1].min(self.map.height as f32) - lo[1].max(0.0)).max(1.0));
+            let ppc = outline_ppc(want, w.max(h), exact);
+            ppc.to_bits().hash(&mut hs);
             let key = hs.finish();
-            if !self.outline_cache.contains_key(&key) {
-                if fresh >= NEW_PER_FRAME {
-                    pending = true;
-                    continue;
-                }
+            let cost = w * h * ppc * ppc;
+            if !self.outline_cache.contains_key(&key) && fresh > 0 && (fresh >= NEW_PER_FRAME || fresh_px + cost > PX_PER_FRAME) {
+                pending = true;
+            } else if !self.outline_cache.contains_key(&key) {
                 let mut covers: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>> = std::collections::HashMap::new();
                 for piece in &r.pieces {
                     if let Some(img) = self.cover_rgba(&piece.paint) {
@@ -228,25 +247,100 @@ impl App {
                     continue;
                 }
                 fresh += 1;
-                let span = (hi[0].min(self.map.width as f32) - lo[0].max(0.0)).max(hi[1].min(self.map.height as f32) - lo[1].max(0.0)).max(1.0);
-                let ppc = (2048.0 / span).clamp(4.0, 24.0);
+                fresh_px += cost;
                 let (img, origin) = roofs::render_outline(r, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]), &near);
                 let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
                 let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                 let handle = painter.ctx().load_texture(format!("outline-roof-{key}"), ci, egui::TextureOptions::LINEAR);
                 self.outline_cache.insert(key, (handle, origin, size));
             }
-            if let Some((handle, origin, size)) = self.outline_cache.get(&key) {
+            let shown = if self.outline_cache.contains_key(&key) {
+                self.outline_last.insert(idx, key);
+                Some(key)
+            } else {
+                self.outline_last.get(&idx).copied()
+            };
+            if let Some((handle, origin, size)) = shown.and_then(|k| self.outline_cache.get(&k)) {
                 let a = self.cam.to_screen(canvas, *origin);
                 let b = self.cam.to_screen(canvas, [origin[0] + size[0], origin[1] + size[1]]);
                 painter.image(handle.id(), Rect::from_min_max(a, b), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0).round() as u8));
             }
         }
-        // Старые картинки (крыша правилась, свет повернулся) — выбросить разом.
-        if self.outline_cache.len() > roofs.len() * 2 + 16 {
-            self.outline_cache.clear();
+        // Группы врезки: одна отрисовка на группу, картинка — у каждой крыши своя.
+        const GROUP: usize = 1 << 24;
+        let map_size = [self.map.width as f32, self.map.height as f32];
+        for group in &groups {
+            let frame = |id: usize| if id < rects.len() { (rects[id].outline()[0], rects[id].outline()[2]) } else { roofs[id - rects.len()].bounds() };
+            let (lo, hi) = group.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), &id| {
+                let (a, b) = frame(id);
+                ([l[0].min(a[0]), l[1].min(a[1])], [h[0].max(b[0]), h[1].max(b[1])])
+            });
+            if hi[0] < view.min.x || hi[1] < view.min.y || lo[0] > view.max.x || lo[1] > view.max.y {
+                continue;
+            }
+            let (w, h) = ((hi[0].min(map_size[0]) - lo[0].max(0.0)).max(1.0), (hi[1].min(map_size[1]) - lo[1].max(0.0)).max(1.0));
+            let ppc = outline_ppc(want, w.max(h), exact);
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            let mut paints = std::collections::BTreeSet::new();
+            for &id in group {
+                id.hash(&mut hs);
+                if id < rects.len() {
+                    let r = &rects[id];
+                    (r.a.map(f32::to_bits), r.b.map(f32::to_bits), r.shape as u8, &r.paint, r.turn, r.overhang.to_bits()).hash(&mut hs);
+                    paints.insert(r.paint.clone());
+                } else {
+                    let piece = &roofs[id - rects.len()].pieces[0];
+                    for p in piece.rings.iter().flatten() {
+                        (p[0].to_bits(), p[1].to_bits()).hash(&mut hs);
+                    }
+                    (piece.form as u8, &piece.paint, piece.overhang.map(f32::to_bits)).hash(&mut hs);
+                    paints.insert(piece.paint.clone());
+                }
+            }
+            (light[0].to_bits(), light[1].to_bits(), ppc.to_bits()).hash(&mut hs);
+            let key = hs.finish();
+            let slot = |k: usize| key.wrapping_add(k as u64 + 1);
+            let cost = w * h * ppc * ppc;
+            let ready = self.outline_cache.contains_key(&slot(0));
+            if !ready && fresh > 0 && (fresh >= NEW_PER_FRAME || fresh_px + cost > PX_PER_FRAME) {
+                pending = true;
+            } else if !ready {
+                let covers: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>> = paints.iter().filter_map(|k| Some((k.clone(), self.cover_rgba(k)?))).collect();
+                if covers.len() == paints.len() {
+                    fresh += 1;
+                    fresh_px += cost;
+                    let out = roofs::render_joined(&rects, &roofs, group, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], map_size));
+                    for (k, (img, origin)) in out.into_iter().enumerate() {
+                        let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
+                        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                        let handle = painter.ctx().load_texture(format!("joined-roof-{key}-{k}"), ci, egui::TextureOptions::LINEAR);
+                        self.outline_cache.insert(slot(k), (handle, origin, size));
+                    }
+                }
+            }
+            for (k, &id) in group.iter().enumerate() {
+                let shown = if self.outline_cache.contains_key(&slot(k)) {
+                    self.outline_last.insert(GROUP + id, slot(k));
+                    Some(slot(k))
+                } else {
+                    self.outline_last.get(&(GROUP + id)).copied()
+                };
+                if let Some((handle, origin, size)) = shown.and_then(|k| self.outline_cache.get(&k)) {
+                    let a = self.cam.to_screen(canvas, *origin);
+                    let b = self.cam.to_screen(canvas, [origin[0] + size[0], origin[1] + size[1]]);
+                    painter.image(handle.id(), Rect::from_min_max(a, b), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0).round() as u8));
+                }
+            }
+        }
+        // Старые картинки (крыша правилась, свет повернулся, масштаб сменился) —
+        // выбросить, кроме показанных.
+        self.outline_last.retain(|i, _| if *i >= GROUP { grouped.contains(&(*i - GROUP)) } else { *i < roofs.len() && !grouped.contains(&(rects.len() + *i)) });
+        if self.outline_cache.len() > (roofs.len() + rects.len()) * 3 + 16 {
+            let keep: std::collections::HashSet<u64> = self.outline_last.values().copied().collect();
+            self.outline_cache.retain(|k, _| keep.contains(k));
         }
         self.map.outline_roofs = roofs;
+        self.outline_pending = pending;
         if pending {
             painter.ctx().request_repaint();
         }
@@ -490,4 +584,18 @@ pub(super) fn climb_rects(props: &[map::Prop], sources: &library::Sources, seen:
             map::prop_rect(p, v)
         })
         .collect()
+}
+
+/// Точек на клетку у картинки крыши по контуру: `want` — точек экрана на клетку,
+/// `span` — длинная сторона крыши в клетках. В окне — ближайшая ступень не мельче
+/// экрана (ступенями, чтобы колесо мыши не перерисовывало крышу на каждый щелчок),
+/// не больше родных 256 и картинки в 4096 точек. Для снимка (`exact`) — точка в
+/// точку с картинкой снимка.
+pub(super) fn outline_ppc(want: f32, span: f32, exact: bool) -> f32 {
+    let span = span.max(1.0);
+    if exact {
+        return want.min(8192.0 / span).max(4.0);
+    }
+    const STEPS: [f32; 10] = [8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0];
+    STEPS.iter().copied().find(|s| *s >= want * 0.85).unwrap_or(library::PX_PER_CELL).min(4096.0 / span).max(4.0)
 }

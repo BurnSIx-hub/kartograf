@@ -795,7 +795,7 @@ impl SelfTest {
                 self.check("крыша видна в «Выборе» и прозрачна для стен", ghost && solid, &format!("ghost {ghost} solid {solid}"));
                 // Крыша OSM у правого края: Г-образный дом вальмой и шатёр-часть на нём.
                 let slate = format!("{}roof_slate_blue", crate::library::BUILTIN);
-                let piece = |ring: Vec<[f32; 2]>, form, height| map::RoofPiece { rings: vec![ring], form, paint: slate.clone(), height, eaves: 1.0, down: None, across: false };
+                let piece = |ring: Vec<[f32; 2]>, form, height| map::RoofPiece { rings: vec![ring], form, paint: slate.clone(), height, eaves: 1.0, down: None, across: false, overhang: None };
                 let house = vec![[17.0, 4.0], [20.0, 4.0], [20.0, 11.0], [18.5, 11.0], [18.5, 8.0], [17.0, 8.0]];
                 let tower = vec![[17.5, 5.0], [19.5, 5.0], [19.5, 7.0], [17.5, 7.0]];
                 app.map.outline_roofs.push(map::OutlineRoof { pieces: vec![piece(house, map::RoofForm::Pitched, 2.0), piece(tower, map::RoofForm::Spire, 4.0)] });

@@ -257,6 +257,7 @@ pub(super) fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Opt
         eaves: eaves_of(a.tags, base_form, own_h),
         down: (base_form == RoofForm::Shed).then(|| roof_down(tag("roof:direction"))).flatten(),
         across: tag("roof:orientation") == "across",
+        overhang: None,
     }];
     mine.sort_by(|x, y| part_height(x.2.tags).total_cmp(&part_height(y.2.tags)));
     // Цвет частей — группами по тегу `roof:colour` (грани вальмы без тега — одной
@@ -339,6 +340,7 @@ pub(super) fn outline_roof(a: &Area, parts: &[(f32, [f32; 2], &Area)], hint: Opt
             eaves: eaves_of(t, form, h),
             down: (form == RoofForm::Shed).then(|| roof_down(get(t, "roof:direction"))).flatten(),
             across: get(t, "roof:orientation") == "across",
+            overhang: None,
         });
     }
     // Основа дома с частями видна только в щелях между ними, а её `height` — верх

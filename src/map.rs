@@ -799,6 +799,12 @@ pub struct RoofPiece {
     /// Конёк двускатной, свода и рядов — поперёк длинной стороны (`roof:orientation=across`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub across: bool,
+    /// Свес за стены, в клетках: тогда кольца — контур стен, а край крыши шире на
+    /// свес ([`RoofPiece::edge_rings`]) — так у крыш, заданных руками. Пусто — кольца
+    /// и есть край крыши: дома из OSM и карты до 0.2.30, где свес запекался в точки
+    /// (и правка контура грозила удвоить его).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhang: Option<f32>,
 }
 
 /// Как сходит кусок крыши.
@@ -856,6 +862,14 @@ impl RoofPiece {
         crate::roofs::inside_rings(&self.rings, p)
     }
 
+    /// Край крыши: кольца со свесом — дом наружу, двор внутрь двора.
+    pub fn edge_rings(&self) -> Vec<Vec<[f32; 2]>> {
+        match self.overhang {
+            Some(o) if o > 0.0 => self.rings.iter().enumerate().map(|(i, r)| grow_ring(r, if i == 0 { o } else { -o })).collect(),
+            _ => self.rings.clone(),
+        }
+    }
+
     /// Односкатной без стороны ската — скат от самой длинной стороны внешнего
     /// кольца внутрь: иначе она рисуется вальмой.
     pub fn fit_form(&mut self) {
@@ -903,12 +917,41 @@ impl OutlineRoof {
     /// Левый верхний и правый нижний углы, в клетках.
     pub fn bounds(&self) -> ([f32; 2], [f32; 2]) {
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-        for p in self.pieces.iter().flat_map(|k| k.rings.iter().flatten()) {
-            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
-            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        for k in &self.pieces {
+            let o = k.overhang.unwrap_or(0.0).max(0.0);
+            for p in k.rings.iter().flatten() {
+                lo = [lo[0].min(p[0] - o), lo[1].min(p[1] - o)];
+                hi = [hi[0].max(p[0] + o), hi[1].max(p[1] + o)];
+            }
         }
         (lo, hi)
     }
+}
+
+/// Кольцо, раздвинутое наружу на `d` клеток по нормалям сторон (углы — по
+/// биссектрисе, острый — не дальше трёх `d`); с минусом — внутрь.
+pub fn grow_ring(pts: &[[f32; 2]], d: f32) -> Vec<[f32; 2]> {
+    let n = pts.len();
+    let area: f32 = (0..n).map(|k| pts[k][0] * pts[(k + 1) % n][1] - pts[(k + 1) % n][0] * pts[k][1]).sum();
+    // При площади больше нуля (по часовой на экране, y вниз) наружу — правая нормаль.
+    let out = |a: [f32; 2], b: [f32; 2]| {
+        let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+        let l = (ex * ex + ey * ey).sqrt().max(1e-6);
+        if area > 0.0 { [ey / l, -ex / l] } else { [-ey / l, ex / l] }
+    };
+    (0..n)
+        .map(|k| {
+            let (p, prev, next) = (pts[k], pts[(k + n - 1) % n], pts[(k + 1) % n]);
+            let (n1, n2) = (out(prev, p), out(p, next));
+            let dot = n1[0] * n2[0] + n1[1] * n2[1];
+            let mut m = [(n1[0] + n2[0]) / (1.0 + dot).max(1e-3), (n1[1] + n2[1]) / (1.0 + dot).max(1e-3)];
+            let ml = (m[0] * m[0] + m[1] * m[1]).sqrt();
+            if ml > 3.0 {
+                m = [m[0] * 3.0 / ml, m[1] * 3.0 / ml];
+            }
+            [p[0] + m[0] * d, p[1] + m[1] * d]
+        })
+        .collect()
 }
 
 /// Стальной отлив по краю плоской крыши «Киберпанка».
@@ -978,7 +1021,7 @@ impl Roof {
     }
 
     /// Прямоугольник со свесом.
-    fn outer(&self) -> ([f32; 2], [f32; 2]) {
+    pub(crate) fn outer(&self) -> ([f32; 2], [f32; 2]) {
         let o = self.overhang;
         ([self.a[0] - o, self.a[1] - o], [self.b[0] + o, self.b[1] + o])
     }
@@ -1058,7 +1101,7 @@ impl Roof {
     }
 
     /// Конёк вдоль x: по длинной стороне, `turn` — поперёк.
-    fn along_x(&self) -> bool {
+    pub(crate) fn along_x(&self) -> bool {
         let (w, h) = (self.b[0] - self.a[0], self.b[1] - self.a[1]);
         (w >= h) != (self.turn % 2 == 1)
     }

@@ -471,7 +471,11 @@ impl App {
     /// ошибается — нарисовал скатную вместо плоской, — правится тут.
     pub(super) fn outline_panel(&mut self, ui: &mut egui::Ui, i: usize, k: usize) {
         let mut st = self.map.outline_roofs[i].pieces[k].clone();
-        ui.strong(if k == 0 { "Крыша дома из OSM" } else { "Часть крыши из OSM" });
+        ui.strong(match (st.overhang.is_some(), k) {
+            (true, _) => "Крыша по контуру",
+            (false, 0) => "Крыша дома из OSM",
+            _ => "Часть крыши из OSM",
+        });
         let was = st.form;
         ui.horizontal_wrapped(|ui| {
             for form in map::RoofForm::ALL {
@@ -488,6 +492,9 @@ impl App {
             }
             ui.label(format!("Покрытие: {}", library::label(&st.paint)));
         });
+        if let Some(o) = &mut st.overhang {
+            ui.add(egui::Slider::new(o, 0.0..=0.75).text("свес, кл."));
+        }
         ui.weak(if k == 0 { "Delete — убрать крышу дома с частями" } else { "Delete — убрать эту часть" });
         if st != self.map.outline_roofs[i].pieces[k] {
             self.checkpoint();

@@ -100,7 +100,7 @@ impl App {
         }
         let ppp = ctx.pixels_per_point();
         let canvas = self.canvas;
-        let idle = self.textures.idle() && !self.library.loading();
+        let idle = self.textures.idle() && !self.library.loading() && !self.outline_pending;
         let Some(e) = &mut self.export else { return };
         ctx.request_repaint();
         if e.asked {
@@ -263,7 +263,28 @@ impl App {
             let light = map.shadows.light();
             let climbs = super::draw_ground::climb_rects(&map.props, &self.textures.sources, &mut seen);
             let mut tiles = Vec::new();
-            for r in &map.roofs {
+            // Крыши, что врезаются друг в друга, — одной отрисовкой на группу; картинка
+            // и тайл у каждой свои: в них только то, что у неё видно поверх соседей.
+            let mut joined: std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)> = std::collections::HashMap::new();
+            for group in roofs::join_groups(&map.roofs, &map.outline_roofs) {
+                let n = map.roofs.len();
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for &id in &group {
+                    let (paint, (a, b)) = if id < n { (&map.roofs[id].paint, (map.roofs[id].outline()[0], map.roofs[id].outline()[2])) } else { (&map.outline_roofs[id - n].pieces[0].paint, map.outline_roofs[id - n].bounds()) };
+                    (lo, hi) = ([lo[0].min(a[0]), lo[1].min(a[1])], [hi[0].max(b[0]), hi[1].max(b[1])]);
+                    if !outline_covers.contains_key(paint) {
+                        let bytes = self.textures.bytes(paint)?;
+                        outline_covers.insert(paint.clone(), roofs::solid_cover(library::decode_tinted(paint, &bytes)?));
+                    }
+                }
+                let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
+                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
+                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &group, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]));
+                for (id, (img, origin)) in group.iter().zip(out) {
+                    joined.insert(*id, (img, origin, ppc));
+                }
+            }
+            for (ri, r) in map.roofs.iter().enumerate() {
                 if !covers.contains_key(&r.paint) {
                     let bytes = self.textures.bytes(&r.paint)?;
                     let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&r.paint)))?.to_rgba8();
@@ -294,7 +315,16 @@ impl App {
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
                 let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &climbs, &items, map.weather == "snow");
+                let (img, origin, ppc) = match joined.remove(&ri) {
+                    Some((mut img, origin, ppc)) => {
+                        roofs::paste_fixtures(&mut img, origin, ppc, &items);
+                        (img, origin, ppc)
+                    }
+                    None => {
+                        let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &climbs, &items, map.weather == "snow");
+                        (img, origin, ppc)
+                    }
+                };
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
@@ -310,9 +340,20 @@ impl App {
                         outline_covers.insert(piece.paint.clone(), roofs::solid_cover(library::decode_tinted(&piece.paint, &bytes)?));
                     }
                 }
-                let ppc = e.px as f32;
+                // Дома из OSM — в масштабе сцены: их сотни. Крыша, заданная руками, — в
+                // родном разрешении покрытия, как прямоугольная: Foundry растянет тайл сам.
+                let p = e.px as f32;
+                let (lo, hi) = r.bounds();
+                let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
+                let ppc = if r.pieces.iter().any(|k| k.overhang.is_some()) { p.max(library::PX_PER_CELL.min(8192.0 / span.max(1.0))) } else { p };
                 let near = casters.near(idx, r.bounds());
-                let (mut img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
+                let (mut img, origin, ppc) = match joined.remove(&(map.roofs.len() + idx)) {
+                    Some(j) => j,
+                    None => {
+                        let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
+                        (img, origin, ppc)
+                    }
+                };
                 if img.width() <= 1 {
                     continue;
                 }
@@ -332,13 +373,13 @@ impl App {
                 }
                 let items: Vec<roofs::Fixture> = mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)).collect();
                 roofs::paste_fixtures(&mut img, origin, ppc, &items);
-                let smoke = smoke_spots(&mine, ppc);
+                let smoke = smoke_spots(&mine, p);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 tiles.push(export::RoofTile {
                     src: export::foundry_src(&file),
-                    rect: [(origin[0] * ppc).round() as i64, (origin[1] * ppc).round() as i64, img.width() as i64, img.height() as i64],
+                    rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64],
                     rotation: 0.0,
                     shelter: true,
                     fade: true,
@@ -351,7 +392,7 @@ impl App {
                     living: None,
                     scuppers: Vec::new(),
                     chimneys: smoke,
-                    outline: roofs::outline(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * ppc, v[1] * ppc]).collect(), hole)).collect(),
+                    outline: roofs::outline(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * p, v[1] * p]).collect(), hole)).collect(),
                     ..Default::default()
                 });
             }

@@ -339,6 +339,8 @@ impl App {
             Some(_) => 0.0,
             None => self.roof_alpha(),
         };
+        self.outline_pending = false;
+        self.joined_rects.clear();
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
         if self.roof_view != RoofView::Hidden || exporting {
             let roofs = self.map.roofs.clone();
@@ -358,7 +360,9 @@ impl App {
                     }
                 }
                 for (i, r) in roofs.iter().enumerate() {
-                    self.draw_roof(painter, canvas, r, roof_alpha, shadows.light());
+                    if !self.joined_rects.contains(&i) {
+                        self.draw_roof(painter, canvas, r, roof_alpha, shadows.light());
+                    }
                     if self.sel == Some(Sel::Roof(i)) {
                         let q: Vec<Pos2> = r.outline().iter().map(|&p| cam.to_screen(canvas, p)).collect();
                         painter.add(Shape::closed_line(q, Stroke::new(2.0, Color32::from_rgb(120, 180, 255))));

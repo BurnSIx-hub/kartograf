@@ -355,7 +355,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, r)| inside(area, [(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0]))
                 .take(limit)
-                .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "name": library::label(&r.paint), "rail": r.rail}))
+                .map(|(i, r)| json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "overhang": r.overhang, "shape": format!("{:?}", r.shape).to_lowercase(), "turn": r.turn, "paint": r.paint, "name": library::label(&r.paint), "rail": r.rail}))
                 .collect();
             let n = m.roofs.len();
             let mut list = list;
@@ -367,7 +367,7 @@ impl App {
                     .take(limit.saturating_sub(list.len()))
                     .map(|(i, r)| {
                         let p = &r.pieces[0];
-                        json!({"index": n + i, "points": p.rings[0].iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>(), "shape": form_name(p.form), "paint": p.paint, "name": library::label(&p.paint), "pieces": r.pieces.len()})
+                        json!({"index": n + i, "points": p.rings[0].iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>(), "overhang": p.overhang, "shape": form_name(p.form), "paint": p.paint, "name": library::label(&p.paint), "pieces": r.pieces.len()})
                     }),
             );
             out.insert("roofs".into(), json!(list));
@@ -538,7 +538,7 @@ impl App {
             })
             .collect();
         for r in &self.map.outline_roofs {
-            out.extend(r.pieces.iter().filter_map(|p| p.rings.first().cloned()));
+            out.extend(r.pieces.iter().filter_map(|p| p.edge_rings().into_iter().next()));
         }
         out
     }
@@ -1029,8 +1029,9 @@ impl App {
         }
         let paint = self.asset_key(a["paint"].as_str().unwrap_or("builtin:roof_metal"))?;
         let form = roof_form(a["shape"].as_str().unwrap_or("tent"))?;
-        let ring = grow_ring(&pts, f(a, "overhang").unwrap_or(0.25).clamp(0.0, 2.0));
-        let mut piece = map::RoofPiece { rings: vec![ring], form, paint, height: 0.0, eaves: 0.0, down: None, across: false };
+        // Точки — контур стен; свес хранится отдельно и ложится при отрисовке.
+        let overhang = f(a, "overhang").unwrap_or(0.25).clamp(0.0, 2.0);
+        let mut piece = map::RoofPiece { rings: vec![pts], form, paint, height: 0.0, eaves: 0.0, down: None, across: false, overhang: Some(overhang) };
         piece.fit_form();
         for _ in 0..a["turn"].as_u64().unwrap_or(0) % 4 {
             piece.turn();
@@ -1039,7 +1040,7 @@ impl App {
         self.map.outline_roofs.push(map::OutlineRoof { pieces: vec![piece] });
         let k = self.map.outline_roofs.len() - 1;
         self.sel = Some(Sel::Outline(k, 0));
-        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(form), "points": self.map.outline_roofs[k].pieces[0].rings[0]}))
+        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(form), "points": self.map.outline_roofs[k].pieces[0].rings[0], "overhang": overhang}))
     }
 
     /// Крыша по контуру по номеру из describe (после прямоугольных).
@@ -1066,15 +1067,24 @@ impl App {
             p.fit_form();
         }
         if pts.len() >= 3 {
-            p.rings = vec![grow_ring(&pts, f(a, "overhang").unwrap_or(0.25).clamp(0.0, 2.0))];
+            // Новые точки — стены: у крыши со старой карты (свес в точках) свес
+            // с этого места хранится отдельно.
+            p.rings = vec![pts];
+            p.overhang = Some(p.overhang.unwrap_or(0.25));
             p.down = None;
             p.fit_form();
+        }
+        if let Some(o) = f(a, "overhang") {
+            if p.overhang.is_none() {
+                return Err("у этой крыши свес уже в точках (карта до 0.2.30): передайте вместе с overhang новые points — контур стен".into());
+            }
+            p.overhang = Some(o.clamp(0.0, 2.0));
         }
         for _ in 0..a["turn"].as_u64().unwrap_or(0) % 4 {
             p.turn();
         }
         self.sel = Some(Sel::Outline(k, 0));
-        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(p.form), "paint": p.paint, "points": p.rings[0]}))
+        Ok(json!({"index": self.map.roofs.len() + k, "shape": form_name(p.form), "paint": p.paint, "points": p.rings[0], "overhang": p.overhang}))
     }
 
     fn tool_edit_roof(&mut self, a: &Value) -> Res {
@@ -1113,7 +1123,13 @@ impl App {
         if let Some(t) = a["turn"].as_u64() {
             r.turn = (t % 4) as u8;
         }
-        Ok(json!({"index": i, "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "turn": r.turn, "rail": r.rail}))
+        if let Some(o) = f(a, "overhang") {
+            r.overhang = o.clamp(0.0, 2.0);
+        }
+        if let Some(q) = area_of(a).filter(|q| q[2] - q[0] >= 1.0 && q[3] - q[1] >= 1.0) {
+            (r.a, r.b) = ([q[0], q[1]], [q[2], q[3]]);
+        }
+        Ok(json!({"index": i, "area": [r.a[0], r.a[1], r.b[0], r.b[1]], "overhang": r.overhang, "shape": format!("{:?}", r.shape).to_lowercase(), "paint": r.paint, "turn": r.turn, "rail": r.rail}))
     }
 
     fn tool_add_path(&mut self, a: &Value) -> Res {
@@ -1457,30 +1473,6 @@ fn form_name(f: map::RoofForm) -> &'static str {
 
 /// Контур, раздвинутый наружу на `d` клеток по нормалям рёбер (вершины — по
 /// биссектрисе, у острых углов вынос не больше тройного).
-fn grow_ring(pts: &[[f32; 2]], d: f32) -> Vec<[f32; 2]> {
-    let n = pts.len();
-    let area: f32 = (0..n).map(|k| pts[k][0] * pts[(k + 1) % n][1] - pts[(k + 1) % n][0] * pts[k][1]).sum();
-    // При площади больше нуля (по часовой на экране, y вниз) наружу — правая нормаль.
-    let out = |a: [f32; 2], b: [f32; 2]| {
-        let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
-        let l = (ex * ex + ey * ey).sqrt().max(1e-6);
-        if area > 0.0 { [ey / l, -ex / l] } else { [-ey / l, ex / l] }
-    };
-    (0..n)
-        .map(|k| {
-            let (p, prev, next) = (pts[k], pts[(k + n - 1) % n], pts[(k + 1) % n]);
-            let (n1, n2) = (out(prev, p), out(p, next));
-            let dot = n1[0] * n2[0] + n1[1] * n2[1];
-            let mut m = [(n1[0] + n2[0]) / (1.0 + dot).max(1e-3), (n1[1] + n2[1]) / (1.0 + dot).max(1e-3)];
-            let ml = (m[0] * m[0] + m[1] * m[1]).sqrt();
-            if ml > 3.0 {
-                m = [m[0] * 3.0 / ml, m[1] * 3.0 / ml];
-            }
-            [p[0] + m[0] * d, p[1] + m[1] * d]
-        })
-        .collect()
-}
-
 fn roof_shape(s: &str) -> Result<map::RoofShape, String> {
     Ok(match s {
         "gable" => map::RoofShape::Gable,
@@ -1620,15 +1612,15 @@ mod tests {
     #[test]
     fn roof_outline_grows_outwards_either_way_round() {
         let sq = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
-        let g = grow_ring(&sq, 0.25);
+        let g = map::grow_ring(&sq, 0.25);
         assert!((g[0][0] + 0.25).abs() < 1e-5 && (g[0][1] + 0.25).abs() < 1e-5, "{g:?}");
         assert!((g[2][0] - 2.25).abs() < 1e-5 && (g[2][1] - 2.25).abs() < 1e-5);
         let back: Vec<[f32; 2]> = sq.iter().rev().copied().collect();
-        let h = grow_ring(&back, 0.25);
+        let h = map::grow_ring(&back, 0.25);
         assert!((h[3][0] + 0.25).abs() < 1e-5 && (h[3][1] + 0.25).abs() < 1e-5, "в обратном обходе — тоже наружу: {h:?}");
         // Восьмиугольник: вершины уходят от середины на d / cos(22,5°).
         let oct: Vec<[f32; 2]> = (0..8).map(|k| { let t = std::f32::consts::FRAC_PI_4 * k as f32 + std::f32::consts::FRAC_PI_8; [5.0 + 3.0 * t.cos(), 5.0 + 3.0 * t.sin()] }).collect();
-        let o = grow_ring(&oct, 0.3);
+        let o = map::grow_ring(&oct, 0.3);
         let r = ((o[0][0] - 5.0).powi(2) + (o[0][1] - 5.0).powi(2)).sqrt();
         assert!((r - (3.0 + 0.3 / (std::f32::consts::FRAC_PI_8).cos())).abs() < 1e-3, "{r}");
         assert!(roof_form("tent").is_ok() && roof_form("pyramid").is_err());

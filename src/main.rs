@@ -29,6 +29,7 @@ mod recovery;
 mod relief;
 mod roofs;
 mod selftest;
+mod skeleton;
 mod sets;
 #[cfg(not(target_arch = "wasm32"))]
 mod update;

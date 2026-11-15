@@ -450,6 +450,14 @@ pub struct App {
     /// Крыши по контуру, уже нарисованные точками: по отпечатку крыши и света —
     /// картинка, левый верхний угол и размер в клетках.
     outline_cache: std::collections::HashMap<u64, (egui::TextureHandle, [f32; 2], [f32; 2])>,
+    /// Какая картинка у крыши по контуру показана последней: пока новая (под другой
+    /// масштаб) не готова, на экране остаётся прежняя.
+    outline_last: std::collections::HashMap<usize, u64>,
+    /// Не все крыши по контуру нарисованы под нынешний масштаб: снимок ждёт.
+    outline_pending: bool,
+    /// Прямоугольные крыши, что врезаются в соседние ([`roofs::join_groups`]): их
+    /// рисует не сетка видеокарты, а общая картинка группы.
+    joined_rects: std::collections::HashSet<usize>,
     /// Покрытия крыш по контуру точками (в цвете ключа).
     cover_cache: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>>,
     roof_from: Option<(i32, i32)>,
@@ -667,6 +675,9 @@ impl App {
                 _ => RoofView::Auto,
             },
             outline_cache: std::collections::HashMap::new(),
+            outline_last: std::collections::HashMap::new(),
+            outline_pending: false,
+            joined_rects: std::collections::HashSet::new(),
             cover_cache: std::collections::HashMap::new(),
             roof_from: None,
             tap_from: None,

@@ -3,6 +3,7 @@
 //! точкам: в Foundry крыша уходит отдельным тайлом с прозрачным фоном.
 
 use crate::map::{self, OutlineRoof, Roof, RoofForm, RoofPiece, RoofShape, convex_depth, roof_shade, segment_distance};
+use crate::skeleton::{self, Side};
 
 /// Ширина гребня на коньке и рёбрах, в клетках.
 pub const CAP: f32 = 0.14;
@@ -10,6 +11,9 @@ pub const CAP: f32 = 0.14;
 pub const RIM_PX: f32 = 1.5;
 /// Гребень темнее самого тёмного ската (тот — 0,6).
 pub const CAP_SHADE: f32 = 0.55;
+/// Ендова: ширина затемнённого жёлоба, в клетках, и как темно у самого стыка.
+pub const VALLEY: f32 = 0.2;
+pub const VALLEY_SHADE: f32 = 0.6;
 /// Парапет плоской крыши: ширина и шаг рисунка вдоль, в клетках.
 pub const PARAPET: f32 = 0.25;
 pub const PARAPET_TILE: f32 = 2.0;
@@ -402,6 +406,63 @@ pub fn solid_cover(img: image::RgbaImage) -> image::RgbaImage {
     out
 }
 
+/// Покрытие под разрешение картинки крыши. В мелком масштабе ряд черепицы — пять-шесть
+/// точек, а читается покрытие по одной точке из десяти: ряды рябили и казались крупнее
+/// (муар). Тогда берётся уменьшенная копия: на точку картинки — не больше полутора
+/// точек покрытия. Размер плитки в клетках — по настоящей картинке.
+pub struct Cover<'a> {
+    img: std::borrow::Cow<'a, image::RgbaImage>,
+    tile: [f32; 2],
+}
+
+impl<'a> Cover<'a> {
+    pub fn new(tex: &'a image::RgbaImage, ppc: f32) -> Self {
+        let tile = tile_cells([tex.width(), tex.height()]);
+        let f = (crate::library::PX_PER_CELL / ppc.max(1.0) / 1.5).floor();
+        if f < 2.0 {
+            return Self { img: std::borrow::Cow::Borrowed(tex), tile };
+        }
+        let (w, h) = (((tex.width() as f32 / f).round() as u32).max(1), ((tex.height() as f32 / f).round() as u32).max(1));
+        Self { img: std::borrow::Cow::Owned(image::imageops::resize(tex, w, h, image::imageops::FilterType::Triangle)), tile }
+    }
+}
+
+/// Точки картинки, чьи середины лежат в выпуклом многоугольнике, — строками, в
+/// рамке `x0..x1`, `y0..y1`. С запасом в сотую точки: соседние грани — без щели.
+fn fill_convex(poly: &[[f32; 2]], origin: [f32; 2], ppc: f32, (x0, y0, x1, y1): (u32, u32, u32, u32), mut put: impl FnMut(u32, u32)) {
+    let (lo, hi) = poly.iter().fold((f32::MAX, f32::MIN), |(l, h), p| (l.min(p[1]), h.max(p[1])));
+    let ya = ((lo - origin[1]) * ppc - 0.51).ceil().max(y0 as f32) as i64;
+    let yb = (((hi - origin[1]) * ppc - 0.49).floor() as i64).min(y1 as i64 - 1);
+    let n = poly.len();
+    for y in ya..=yb {
+        let py = origin[1] + (y as f32 + 0.5) / ppc;
+        let (mut xa, mut xb) = (f32::MAX, f32::MIN);
+        for k in 0..n {
+            let (a, b) = (poly[k], poly[(k + 1) % n]);
+            let (top, low) = (a[1].min(b[1]), a[1].max(b[1]));
+            if py < top - 0.01 / ppc || py > low + 0.01 / ppc {
+                continue;
+            }
+            if low - top < 1e-6 {
+                xa = xa.min(a[0].min(b[0]));
+                xb = xb.max(a[0].max(b[0]));
+            } else {
+                let x = a[0] + (b[0] - a[0]) * ((py - a[1]) / (b[1] - a[1])).clamp(0.0, 1.0);
+                xa = xa.min(x);
+                xb = xb.max(x);
+            }
+        }
+        if xa > xb {
+            continue;
+        }
+        let i0 = ((xa - origin[0]) * ppc - 0.51).ceil().max(x0 as f32) as i64;
+        let i1 = (((xb - origin[0]) * ppc - 0.49).floor() as i64).min(x1 as i64 - 1);
+        for x in i0..=i1 {
+            put(x as u32, y as u32);
+        }
+    }
+}
+
 /// Покрытие в точке `u`, `v` (доли плитки), с размытием между точками картинки.
 fn bilinear(tex: &image::RgbaImage, u: f32, v: f32) -> [f32; 3] {
     let (tw, th) = (tex.width() as f32, tex.height() as f32);
@@ -438,16 +499,22 @@ pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t i
     let (w, h) = (((hi[0] - origin[0]) * ppc).ceil() as u32 + 1, ((hi[1] - origin[1]) * ppc).ceil() as u32 + 1);
     let mut img = image::RgbaImage::new(w, h);
     // Кольца без лишних узлов — раз на кусок: по ним и стыки, и скаты.
-    let rings: Vec<Vec<Vec<[f32; 2]>>> = roof.pieces.iter().map(|k| k.rings.iter().map(|r| simplify_ring(r, OUTLINE_TOL)).filter(|r| r.len() >= 3).collect()).collect();
+    // Крыша, заданная руками (со своим свесом), — точно по своим точкам: уступ
+    // стены в полклетки и срез угла там нарочно. У контура OSM узлы шумят.
+    let rings: Vec<Vec<Vec<[f32; 2]>>> = roof.pieces.iter().map(|k| k.edge_rings().iter().map(|r| simplify_ring(r, if k.overhang.is_some() { 1e-3 } else { OUTLINE_TOL })).filter(|r| r.len() >= 3).collect()).collect();
     // Скаты — от колец без мелких уступов, край — по упрощённым.
-    let slopes: Vec<Vec<Vec<[f32; 2]>>> = rings.iter().map(|rs| rs.iter().map(|r| iron_jogs(r)).collect()).collect();
+    let slopes: Vec<Vec<Vec<[f32; 2]>>> = rings.iter().zip(&roof.pieces).map(|(rs, k)| rs.iter().map(|r| if k.overhang.is_some() { r.clone() } else { iron_jogs(r) }).collect()).collect();
     // Высота видимого куска в каждой точке и чей он — для теней.
-    let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize] };
+    let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize], rise: Vec::new() };
+    let mut covers: std::collections::HashMap<&str, Cover> = std::collections::HashMap::new();
     for (i, piece) in roof.pieces.iter().enumerate() {
         if let Some(t) = tex(&piece.paint) {
+            if !covers.contains_key(piece.paint.as_str()) {
+                covers.insert(piece.paint.as_str(), Cover::new(t, ppc));
+            }
             let open = open_edges(&rings, &roof.pieces, i);
             let slope = (&slopes[i][..], open_edges(&slopes, &roof.pieces, i));
-            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, (slope.0, &slope.1), t, light, (&mut relief, i as u32));
+            paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, (slope.0, &slope.1), &covers[piece.paint.as_str()], light, (&mut relief, i as u32));
         }
     }
     let mut dark = cast_shadows(&relief, w as i32, h as i32, ppc, light);
@@ -642,6 +709,8 @@ const CAST_SOFT: f32 = 0.12;
 struct Relief {
     top: Vec<f32>,
     owner: Vec<u32>,
+    /// Подъём ската над свесом в точке, в клетках: по нему крыши врезаются друг в друга.
+    rise: Vec<f32>,
 }
 
 /// Тени высших кусков на низшие той же крыши: ступени Мавзолея, ярусы башни,
@@ -983,7 +1052,7 @@ fn row_offset(p: [f32; 2], o: [f32; 2], ax: [f32; 2], half: f32, bay: f32) -> (f
 /// длинной стороны, по краю парапет. Двор — дыра, к нему крыша тоже скатывается.
 /// Высоту своей поверхности кусок пишет в `relief` под номером `me`.
 #[allow(clippy::too_many_arguments)]
-fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], (slope_rings, slope_open): (&[Vec<[f32; 2]>], &[bool]), tex: &image::RgbaImage, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
+fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &RoofPiece, rings: &[Vec<[f32; 2]>], open: &[bool], (slope_rings, slope_open): (&[Vec<[f32; 2]>], &[bool]), cover: &Cover, light: [f32; 2], (relief, me): (&mut Relief, u32)) {
     /// Сторона квадрата точек, для которого стороны контура отбираются разом.
     const BLOCK: u32 = 16;
     let edges = edges_of(rings);
@@ -1016,7 +1085,7 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
             [prev, next]
         })
         .collect();
-    let tile = tile_cells([tex.width(), tex.height()]);
+    let (tex, tile) = (&*cover.img, cover.tile);
     let (w, h) = (img.width(), img.height());
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for p in rings.iter().flatten() {
@@ -1092,6 +1161,61 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
         }
         (c1, c2)
     };
+    // Вальма и шатёр — плоскими гранями прямого скелета: у каждой стороны свой
+    // скат до рёбер, ендова из вогнутого угла — прямая. Стык с соседним куском —
+    // сторона без ската. Скелет не вышел (контур вырожден) — по-старому, к
+    // ближайшей стороне.
+    let (lw, lh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let sk = (matches!(form, RoofForm::Pitched | RoofForm::Spire) && lw * lh <= 40_000_000)
+        .then(|| {
+            let free = slope_open.iter().any(|o| *o);
+            let mut k = 0;
+            let sides: Vec<Vec<Side>> = slope_rings
+                .iter()
+                .map(|r| {
+                    (0..r.len())
+                        .filter_map(|i| {
+                            let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                            (dist(a, b) > 1e-4).then(|| {
+                                let w = if !free || slope_open.get(k).copied().unwrap_or(true) { 1.0 } else { 0.0 };
+                                k += 1;
+                                Side { a, b, w }
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            skeleton::skeleton(&sides)
+        })
+        .flatten();
+    // Чей скат в точке: номер стороны (как в `slope_edges`) или пусто.
+    const NO_SIDE: u16 = u16::MAX;
+    let mut label = vec![NO_SIDE; if sk.is_some() { lw * lh } else { 0 }];
+    // Сторона ската: начало, куда смотрит скат (наружу, к свесу) и ось рядов.
+    let mut slope_of: Vec<Option<([f32; 2], [f32; 2], [f32; 2])>> = vec![None; slope_edges.len()];
+    let mut arcs_of: Vec<Vec<&skeleton::Arc>> = vec![Vec::new(); slope_edges.len()];
+    if let Some(sk) = &sk {
+        for f in &sk.faces {
+            let Some(&(a, b)) = slope_edges.get(f.side).filter(|_| f.side < NO_SIDE as usize) else { continue };
+            if slope_of[f.side].is_none() {
+                let len = dist(a, b).max(1e-6);
+                let n = [-(b[1] - a[1]) / len, (b[0] - a[0]) / len];
+                let c = f.poly.iter().fold([0.0, 0.0], |s, q| [s[0] + q[0] / f.poly.len() as f32, s[1] + q[1] / f.poly.len() as f32]);
+                // Внутрь — к середине грани; скат смотрит наружу.
+                let down = if (c[0] - a[0]) * n[0] + (c[1] - a[1]) * n[1] >= 0.0 { [-n[0], -n[1]] } else { n };
+                slope_of[f.side] = Some((a, down, [down[1], -down[0]]));
+            }
+            let side = f.side as u16;
+            fill_convex(&f.poly, origin, ppc, (x0, y0, x1, y1), |x, y| label[(y - y0) as usize * lw + (x - x0) as usize] = side);
+        }
+        for a in &sk.arcs {
+            for s in a.sides {
+                if let Some(list) = arcs_of.get_mut(s) {
+                    list.push(a);
+                }
+            }
+        }
+    }
     for by in (y0..y1).step_by(BLOCK as usize) {
         for bx in (x0..x1).step_by(BLOCK as usize) {
             // Кандидаты квадрата: ближе к его середине, чем вторая по близости
@@ -1151,6 +1275,10 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                         } else if d < d2 {
                             (d2, q2) = (d, q);
                         }
+                    }
+                    let face = label.get((y - y0) as usize * lw + (x - x0) as usize).filter(|s| **s != NO_SIDE).and_then(|s| slope_of[*s as usize].map(|f| (*s as usize, f)));
+                    if let Some((_, (a, down, _))) = face {
+                        d1 = (-((p[0] - a[0]) * down[0] + (p[1] - a[1]) * down[1])).max(0.0);
                     }
                     let flat_here = form == RoofForm::Flat || (form == RoofForm::Pitched && d1 > cap);
                     let mut c = if flat_here {
@@ -1224,6 +1352,38 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                             }
                         }
                         c
+                    } else if let Some((side, (a, down, along_axis))) = face {
+                        // Грань скелета: плоскость от свеса своей стороны. Ряды вдоль
+                        // стороны, низ рисунка — к свесу, рисунок не зеркалится.
+                        let d = [p[0] - a[0], p[1] - a[1]];
+                        let across = -(d[0] * down[0] + d[1] * down[1]);
+                        let along = d[0] * along_axis[0] + d[1] * along_axis[1];
+                        let mut c = bilinear(tex, along / tile[0], -across / tile[1]).map(|k| k * roof_shade(down, light, false));
+                        // Рёбра этой грани: конёк и вальмовое ребро — ряд того же
+                        // покрытия вдоль линии, темнее, с кромками, как у прямоугольной
+                        // крыши; ендова — тёмный жёлоб с тонкой линией стыка.
+                        let (mut hip, mut valley) = ((f32::MAX, 0.0), f32::MAX);
+                        for arc in &arcs_of[side] {
+                            let (dx, dy) = (arc.b[0] - arc.a[0], arc.b[1] - arc.a[1]);
+                            let len = dx.hypot(dy).max(1e-6);
+                            let t = (((p[0] - arc.a[0]) * dx + (p[1] - arc.a[1]) * dy) / len).clamp(0.0, len);
+                            let dd = dist(p, [arc.a[0] + dx / len * t, arc.a[1] + dy / len * t]);
+                            if arc.valley {
+                                valley = valley.min(dd);
+                            } else if dd < hip.0 {
+                                hip = (dd, t);
+                            }
+                        }
+                        if hip.0 < CAP / 2.0 && d1 <= cap {
+                            c = bilinear(tex, hip.1 / tile[0] * 2.0, hip.0 / tile[1]).map(|k| k * CAP_SHADE);
+                            if (CAP / 2.0 - hip.0) * ppc < 1.0 {
+                                c = c.map(|k| k * 0.45);
+                            }
+                        } else if valley < VALLEY / 2.0 && d1 <= cap {
+                            let k = VALLEY_SHADE + (1.0 - VALLEY_SHADE) * valley / (VALLEY / 2.0);
+                            c = c.map(|v| v * if valley * ppc < 0.75 { k * 0.6 } else { k });
+                        }
+                        c
                     } else {
                         // Скат — по линии ближайшей стороны: ряды вдоль неё, смотрит
                         // наружу. К точке на стороне — у вогнутого угла ряды
@@ -1249,7 +1409,9 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                         }
                         c
                     };
-                    if inner && d1 * ppc < RIM_PX {
+                    // Тёмная кромка — по краю куска: у грани скелета `d1` меряется до
+                    // прямой своей стороны, а край рядом может быть и щипцом.
+                    if inner && if sk.is_some() { edge && d0 * ppc < RIM_PX } else { d1 * ppc < RIM_PX } {
                         c = c.map(|k| k * 0.4);
                     }
                     // Поверх того, что уже лежит (основная крыша под частью).
@@ -1279,6 +1441,9 @@ fn paint_piece(img: &mut image::RgbaImage, origin: [f32; 2], ppc: f32, piece: &R
                         };
                         let k = (y * w + x) as usize;
                         (relief.top[k], relief.owner[k]) = (z, me);
+                        if let Some(v) = relief.rise.get_mut(k) {
+                            *v = d1.min(cap);
+                        }
                     }
                 }
             }
@@ -1297,15 +1462,408 @@ pub fn shadow_offset(sh: &map::Shadows) -> [f32; 2] {
     [o[0] * 2.5, o[1] * 2.5]
 }
 
+/// Могут ли крыши врезаться друг в друга: двускатная или вальмовая прямоугольная;
+/// вальма или шатёр по контуру, заданные руками (один кусок без двора). Плоская,
+/// односкатная, шатёр башни, купол и свод кладутся поверх по порядку, как раньше:
+/// у пристройки-навеса и башни свес на другой высоте, чем у дома.
+fn joinable_rect(r: &Roof) -> bool {
+    matches!(r.shape, RoofShape::Gable | RoofShape::Hip)
+}
+
+fn joinable_outline(r: &OutlineRoof) -> bool {
+    r.pieces.len() == 1 && r.pieces[0].overhang.is_some() && r.pieces[0].rings.len() == 1 && r.pieces[0].rings[0].len() >= 3 && matches!(r.pieces[0].form, RoofForm::Pitched | RoofForm::Spire)
+}
+
+/// Заходят ли края двух крыш друг на друга, но не одна целиком на другую (такая
+/// стоит поверх: башенка на крыше).
+fn meets(a: &[[f32; 2]], b: &[[f32; 2]]) -> bool {
+    let frame = |r: &[[f32; 2]]| r.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), p| ([l[0].min(p[0]), l[1].min(p[1])], [h[0].max(p[0]), h[1].max(p[1])]));
+    let ((al, ah), (bl, bh)) = (frame(a), frame(b));
+    if ah[0] <= bl[0] || bh[0] <= al[0] || ah[1] <= bl[1] || bh[1] <= al[1] {
+        return false;
+    }
+    // Вершины, чуть втянутые к середине, — внутри другой крыши?
+    let inner = |r: &[[f32; 2]], other: &[[f32; 2]]| {
+        let c = r.iter().fold([0.0, 0.0], |s, p| [s[0] + p[0] / r.len() as f32, s[1] + p[1] / r.len() as f32]);
+        let other = [other.to_vec()];
+        r.iter()
+            .filter(|p| {
+                let l = dist(**p, c).max(1e-6);
+                inside_rings(&other, [p[0] + (c[0] - p[0]) / l * 0.02, p[1] + (c[1] - p[1]) / l * 0.02])
+            })
+            .count()
+    };
+    let (ia, ib) = (inner(a, b), inner(b, a));
+    if ia == a.len() || ib == b.len() {
+        return false;
+    }
+    if ia > 0 || ib > 0 {
+        return true;
+    }
+    // Крест: вершин внутри нет, а стороны пересекаются.
+    let side = |p: [f32; 2], q: [f32; 2], r: [f32; 2]| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    (0..a.len()).any(|i| {
+        let (p, q) = (a[i], a[(i + 1) % a.len()]);
+        (0..b.len()).any(|j| {
+            let (r, s) = (b[j], b[(j + 1) % b.len()]);
+            side(p, q, r) * side(p, q, s) < 0.0 && side(r, s, p) * side(r, s, q) < 0.0
+        })
+    })
+}
+
+/// Группы крыш этажа, что врезаются друг в друга. Номер крыши — как в MCP: сперва
+/// прямоугольные, за ними — по контуру. В группе крыши рисуются вместе
+/// ([`render_joined`]): где две накрывают одну точку, видна та, что выше.
+pub fn join_groups(roofs: &[Roof], outline: &[OutlineRoof]) -> Vec<Vec<usize>> {
+    let n = roofs.len();
+    let mut items: Vec<(usize, Vec<[f32; 2]>)> = roofs.iter().enumerate().filter(|(_, r)| joinable_rect(r)).map(|(i, r)| (i, r.outline())).collect();
+    items.extend(outline.iter().enumerate().filter(|(_, r)| joinable_outline(r)).filter_map(|(j, r)| Some((n + j, r.pieces[0].edge_rings().into_iter().next()?))));
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for a in 0..items.len() {
+        for b in a + 1..items.len() {
+            if meets(&items[a].1, &items[b].1) {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for k in 0..items.len() {
+        let r = find(&mut parent, k);
+        groups.entry(r).or_default().push(items[k].0);
+    }
+    groups.into_values().filter(|g| g.len() >= 2).collect()
+}
+
+/// Крыша в группе врезки: край, стены, какие стороны — свес со скатом, какие — край
+/// с кромкой.
+struct Solid<'a> {
+    /// Край крыши; у торца, что ушёл под соседа, — продлённый под его скат.
+    ring: Vec<[f32; 2]>,
+    /// Край до продления: что за ним, видно только поверх соседа.
+    plain: Vec<[f32; 2]>,
+    walls: Vec<[f32; 2]>,
+    open: Vec<bool>,
+    eave: Vec<bool>,
+    form: RoofForm,
+    paint: &'a str,
+    /// Торцы прямоугольной (стороны поперёк конька) и её свес.
+    ends: Vec<usize>,
+    overhang: f32,
+}
+
+impl<'a> Solid<'a> {
+    fn rect(r: &'a Roof) -> Self {
+        let ring = r.outline();
+        let (a, b) = (r.a, r.b);
+        // Стороны: верх, право, низ, лево. Торцы — поперёк конька.
+        let ends = if r.along_x() { vec![1, 3] } else { vec![0, 2] };
+        let eave = (0..4).map(|k| r.shape == RoofShape::Hip || !ends.contains(&k)).collect();
+        Self { plain: ring.clone(), ring, walls: vec![a, [b[0], a[1]], b, [a[0], b[1]]], open: vec![true; 4], eave, form: RoofForm::Spire, paint: &r.paint, ends, overhang: r.overhang }
+    }
+
+    fn outline(p: &'a RoofPiece) -> Self {
+        let ring = simplify_ring(&p.edge_rings()[0], 1e-3);
+        let n = ring.len();
+        Self { plain: ring.clone(), ring, walls: p.rings[0].clone(), open: vec![true; n], eave: vec![true; n], form: p.form, paint: &p.paint, ends: Vec::new(), overhang: p.overhang.unwrap_or(0.0) }
+    }
+
+    /// Скаты крыши как есть (без продления): по ним — высота в точке.
+    fn field(&self) -> Option<(skeleton::Skeleton, Vec<Side>)> {
+        let n = self.plain.len();
+        let sides: Vec<Side> = (0..n).map(|k| Side { a: self.plain[k], b: self.plain[(k + 1) % n], w: if self.eave[k] { 1.0 } else { 0.0 } }).collect();
+        Some((skeleton::skeleton(std::slice::from_ref(&sides))?, sides))
+    }
+}
+
+/// Высота ската над свесом в точке, в клетках (уклон — клетка на клетку); мимо крыши — пусто.
+fn height_at((sk, sides): &(skeleton::Skeleton, Vec<Side>), p: [f32; 2], cap: f32) -> Option<f32> {
+    let within = |poly: &[[f32; 2]]| {
+        let n = poly.len();
+        let s: Vec<f32> = (0..n).map(|i| (poly[(i + 1) % n][0] - poly[i][0]) * (p[1] - poly[i][1]) - (poly[(i + 1) % n][1] - poly[i][1]) * (p[0] - poly[i][0])).collect();
+        s.iter().all(|v| *v >= -1e-4) || s.iter().all(|v| *v <= 1e-4)
+    };
+    let f = sk.faces.iter().find(|f| within(&f.poly))?;
+    let s = sides.get(f.side)?;
+    Some((((s.b[0] - s.a[0]) * (p[1] - s.a[1]) - (s.b[1] - s.a[1]) * (p[0] - s.a[0])).abs() / dist(s.a, s.b).max(1e-6)).min(cap))
+}
+
+/// Крыши группы врезки ([`join_groups`]) картинками — по одной на крышу, в порядке
+/// группы; у каждой свой левый верхний угол в клетках. Высота ската — расстояние от
+/// свеса (свесы на одной высоте, уклон один): где две крыши накрывают одну точку,
+/// видна та, что выше, вдоль линии равных высот — ендова. Торец двускатной или
+/// вальмовой, что упирается в стену соседа, а сосед по ходу конька поднимается
+/// выше него, продлевается под скат соседа: пристройка врезается в дом, её конёк
+/// обрывается там, где уходит под скат. Раньше её крыша обрубалась прямым краем
+/// поверх чужого ската.
+pub fn render_joined<'t>(roofs: &[Roof], outline: &[OutlineRoof], group: &[usize], tex: &dyn Fn(&str) -> Option<&'t image::RgbaImage>, ppc: f32, light: [f32; 2], clip: ([f32; 2], [f32; 2])) -> Vec<(image::RgbaImage, [f32; 2])> {
+    let n = roofs.len();
+    let mut solids: Vec<Solid> = group.iter().map(|&id| if id < n { Solid::rect(&roofs[id]) } else { Solid::outline(&outline[id - n].pieces[0]) }).collect();
+    let fields: Vec<Option<(skeleton::Skeleton, Vec<Side>)>> = solids.iter().map(Solid::field).collect();
+    let cap_of = |s: &Solid| if s.form == RoofForm::Pitched { SLOPE_MAX } else { f32::MAX };
+    // Торцы, что уходят под соседа.
+    for k in 0..solids.len() {
+        for e in solids[k].ends.clone() {
+            let (a, b) = (solids[k].plain[e], solids[k].plain[(e + 1) % 4]);
+            let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+            let c = solids[k].plain.iter().fold([0.0, 0.0], |s, p| [s[0] + p[0] / 4.0, s[1] + p[1] / 4.0]);
+            let l = dist(mid, c).max(1e-6);
+            let ax = [(mid[0] - c[0]) / l, (mid[1] - c[1]) / l];
+            // Высота конька — полуширина по свесам; проба — сразу за стеной торца.
+            let half = dist(a, b) / 2.0;
+            let o = solids[k].overhang;
+            let probe = [mid[0] + ax[0] * (0.1 - o), mid[1] + ax[1] * (0.1 - o)];
+            let mut reach = None;
+            for m in 0..solids.len() {
+                let Some(field) = fields[m].as_ref().filter(|_| m != k) else { continue };
+                if !inside_rings(std::slice::from_ref(&solids[m].walls), probe) {
+                    continue;
+                }
+                // По продолжению конька: поднимается ли сосед до его высоты.
+                let mut s = 0.0;
+                while s <= 2.0 * half + 2.0 {
+                    match height_at(field, [mid[0] + ax[0] * s, mid[1] + ax[1] * s], cap_of(&solids[m])) {
+                        Some(z) if z >= half - 1e-3 => {
+                            reach = Some(s);
+                            break;
+                        }
+                        None if s > 0.5 => break,
+                        _ => {}
+                    }
+                    s += 0.05;
+                }
+                if reach.is_some() {
+                    break;
+                }
+            }
+            if let Some(s) = reach {
+                let d = s + 0.3;
+                for v in [e, (e + 1) % 4] {
+                    solids[k].ring[v] = [solids[k].plain[v][0] + ax[0] * d, solids[k].plain[v][1] + ax[1] * d];
+                }
+                solids[k].eave[e] = false;
+                solids[k].open[e] = false;
+            }
+        }
+    }
+    // Каждая крыша — своей картинкой, с высотой ската в каждой точке.
+    let mut out: Vec<(image::RgbaImage, [f32; 2])> = Vec::new();
+    let mut rise: Vec<Vec<f32>> = Vec::new();
+    for s in &solids {
+        let (lo, hi) = s.ring.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), p| ([l[0].min(p[0]), l[1].min(p[1])], [h[0].max(p[0]), h[1].max(p[1])]));
+        let (lo, hi) = ([lo[0].max(clip.0[0]), lo[1].max(clip.0[1])], [hi[0].min(clip.1[0]), hi[1].min(clip.1[1])]);
+        let origin = [(lo[0] * ppc).floor() / ppc, (lo[1] * ppc).floor() / ppc];
+        let (w, h) = if hi[0] <= lo[0] || hi[1] <= lo[1] { (1, 1) } else { (((hi[0] - origin[0]) * ppc).ceil() as u32 + 1, ((hi[1] - origin[1]) * ppc).ceil() as u32 + 1) };
+        let mut img = image::RgbaImage::new(w, h);
+        let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize], rise: vec![0.0; (w * h) as usize] };
+        if let Some(t) = tex(s.paint).filter(|_| w > 1) {
+            let cover = Cover::new(t, ppc);
+            let piece = RoofPiece { rings: vec![s.ring.clone()], form: s.form, paint: s.paint.to_owned(), height: 0.0, eaves: 0.0, down: None, across: false, overhang: None };
+            let rings = [s.ring.clone()];
+            paint_piece(&mut img, origin, ppc, &piece, &rings, &s.open, (&rings, &s.eave), &cover, light, (&mut relief, 0));
+        }
+        out.push((img, origin));
+        rise.push(relief.rise);
+    }
+    // Сведение на общей сетке: начала картинок стоят на целых точках.
+    let off: Vec<[i64; 2]> = out.iter().map(|(_, o)| [(o[0] * ppc).round() as i64, (o[1] * ppc).round() as i64]).collect();
+    let (g0, g1) = out.iter().zip(&off).fold(([i64::MAX; 2], [i64::MIN; 2]), |(l, h), ((img, _), o)| ([l[0].min(o[0]), l[1].min(o[1])], [h[0].max(o[0] + img.width() as i64), h[1].max(o[1] + img.height() as i64)]));
+    let (gw, gh) = ((g1[0] - g0[0]).max(1) as usize, (g1[1] - g0[1]).max(1) as usize);
+    let at = |k: usize, x: u32, y: u32| (off[k][1] - g0[1] + y as i64) as usize * gw + (off[k][0] - g0[0] + x as i64) as usize;
+    let mut owner = vec![u16::MAX; gw * gh];
+    let mut top = vec![f32::MIN; gw * gh];
+    let mut count = vec![0u8; gw * gh];
+    // Точка в продлении (за прежним краем) — только там, где уже лежит сосед.
+    let starts: Vec<[f32; 2]> = out.iter().map(|o| o.1).collect();
+    let extra = |k: usize, x: u32, y: u32| {
+        let s = &solids[k];
+        s.ring != s.plain && !inside_rings(std::slice::from_ref(&s.plain), [starts[k][0] + (x as f32 + 0.5) / ppc, starts[k][1] + (y as f32 + 0.5) / ppc])
+    };
+    // Чей тайл держит точку: крыша, что лежит там сама, без продлений. Клин
+    // пристройки под скатом дома рисуется в тайле дома — он над комнатой дома и
+    // должен таять вместе с его крышей, а не висеть над вошедшим.
+    let mut host = Vec::new();
+    for pass in [false, true] {
+        if pass {
+            host = owner.clone();
+        }
+        for k in 0..out.len() {
+            if pass && solids[k].ring == solids[k].plain {
+                continue;
+            }
+            let (w, h) = out[k].0.dimensions();
+            for y in 0..h {
+                for x in 0..w {
+                    if out[k].0.get_pixel(x, y).0[3] < 128 || extra(k, x, y) != pass {
+                        continue;
+                    }
+                    let g = at(k, x, y);
+                    if pass && owner[g] == u16::MAX {
+                        continue;
+                    }
+                    count[g] = count[g].saturating_add(1);
+                    let z = rise[k][(y * w + x) as usize];
+                    // При равных высотах — первая по порядку: граница не дрожит.
+                    if owner[g] == u16::MAX || z > top[g] + 1e-3 {
+                        (owner[g], top[g]) = (k as u16, z);
+                    }
+                }
+            }
+        }
+    }
+    // Ендова — вдоль границы владений, где по обе стороны лежат обе крыши.
+    let mut seam = vec![f32::MAX; gw * gh];
+    let r = (VALLEY / 2.0 * ppc).ceil() as i64;
+    let stamp = |gx: usize, gy: usize, seam: &mut Vec<f32>| {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (gx as i64 + dx, gy as i64 + dy);
+                if x >= 0 && y >= 0 && (x as usize) < gw && (y as usize) < gh {
+                    let d = ((dx * dx + dy * dy) as f32).sqrt() / ppc;
+                    let v = &mut seam[y as usize * gw + x as usize];
+                    *v = v.min(d);
+                }
+            }
+        }
+    };
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let g = gy * gw + gx;
+            if owner[g] == u16::MAX || count[g] < 2 {
+                continue;
+            }
+            for (nx, ny) in [(gx + 1, gy), (gx, gy + 1)] {
+                if nx < gw && ny < gh {
+                    let q = ny * gw + nx;
+                    if owner[q] != u16::MAX && owner[q] != owner[g] && count[q] >= 2 {
+                        stamp(gx, gy, &mut seam);
+                        stamp(nx, ny, &mut seam);
+                    }
+                }
+            }
+        }
+    }
+    // Ендова по границе и перенос продлений в тайл хозяина места.
+    let dims: Vec<(u32, u32)> = out.iter().map(|o| o.0.dimensions()).collect();
+    let px_of = |k: usize, g: usize| {
+        let (x, y) = ((g % gw) as i64 + g0[0] - off[k][0], (g / gw) as i64 + g0[1] - off[k][1]);
+        (x >= 0 && y >= 0 && (x as u32) < dims[k].0 && (y as u32) < dims[k].1).then_some((x as u32, y as u32))
+    };
+    for g in 0..gw * gh {
+        let (o, h) = (owner[g], host[g]);
+        if o == u16::MAX {
+            continue;
+        }
+        let Some((x, y)) = px_of(o as usize, g) else { continue };
+        let px = out[o as usize].0.get_pixel(x, y).0;
+        let f = if seam[g] < VALLEY / 2.0 {
+            let f = VALLEY_SHADE + (1.0 - VALLEY_SHADE) * seam[g] / (VALLEY / 2.0);
+            if seam[g] * ppc < 0.75 { f * 0.6 } else { f }
+        } else {
+            1.0
+        };
+        let shaded = image::Rgba([(px[0] as f32 * f) as u8, (px[1] as f32 * f) as u8, (px[2] as f32 * f) as u8, px[3]]);
+        if h != o && h != u16::MAX {
+            if let Some((hx, hy)) = px_of(h as usize, g) {
+                out[h as usize].0.put_pixel(hx, hy, shaded);
+            }
+            out[o as usize].0.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+        } else if f < 1.0 {
+            out[o as usize].0.put_pixel(x, y, shaded);
+        }
+    }
+    // У каждой крыши остаётся только то, что держит её тайл.
+    for k in 0..out.len() {
+        let (w, h) = dims[k];
+        for y in 0..h {
+            for x in 0..w {
+                if out[k].0.get_pixel(x, y).0[3] == 0 {
+                    continue;
+                }
+                let g = at(k, x, y);
+                let holder = if host[g] != u16::MAX { host[g] } else { owner[g] };
+                if holder != k as u16 && (holder != u16::MAX || extra(k, x, y)) {
+                    out[k].0.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn a_side_roof_cuts_into_the_main_slope_along_a_valley() {
+        // Дом 10×8 под вальмой и пристройка 4×4 к восточной стене, конёк к дому.
+        let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
+        let tex = |_: &str| Some(&grey);
+        let main = Roof::new([0.0, 0.0], [10.0, 8.0], RoofShape::Hip, "grey".into());
+        for shape in [RoofShape::Hip, RoofShape::Gable] {
+            let side = Roof::new([10.0, 2.0], [14.0, 6.0], shape, "grey".into());
+            let roofs = [main.clone(), side];
+            let groups = join_groups(&roofs, &[]);
+            assert_eq!(groups, vec![vec![0, 1]]);
+            let out = render_joined(&roofs, &[], &groups[0], &tex, 20.0, [-0.6, -0.8], ([-5.0, -5.0], [40.0, 40.0]));
+            let pixel = |k: usize, p: [f32; 2]| {
+                let (img, o) = &out[k];
+                let (x, y) = (((p[0] - o[0]) * 20.0) as i64, ((p[1] - o[1]) * 20.0) as i64);
+                (x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height()).then(|| img.get_pixel(x as u32, y as u32).0).filter(|q| q[3] > 200)
+            };
+            let seen = |k: usize, p: [f32; 2]| pixel(k, p).is_some();
+            // Конёк пристройки (высота 2,25) идёт под скат дома: на клетку вглубь скат
+            // дома ещё ниже (1,25) — там северный скат пристройки, светлый (к свету);
+            // восточный скат дома — тёмный. Клин лежит над комнатой дома и потому
+            // нарисован в тайле дома: растает вместе с его крышей.
+            let wedge = pixel(0, [9.0, 3.8]).expect("клин пристройки не в тайле дома");
+            assert!(wedge[0] > 125, "{shape:?}: пристройка не врезалась в скат: {wedge:?}");
+            assert!(!seen(1, [9.0, 3.8]), "{shape:?}: клин остался в тайле пристройки");
+            // На 2,75 вглубь — уже скат самого дома.
+            assert!(pixel(0, [7.3, 3.8]).is_some_and(|q| q[0] < 100) && !seen(1, [7.3, 3.8]), "{shape:?}: конёк пристройки не ушёл под скат");
+            // В стороне от конька пристройка ниже ската дома: ендова идёт наискось.
+            assert!(pixel(0, [9.0, 2.3]).is_some_and(|q| q[0] < 100) && !seen(1, [9.0, 2.3]), "{shape:?}: ендова не наискось");
+            // Вне дома пристройка как была; свес дома поверх её края не лезет.
+            assert!(seen(1, [12.0, 4.0]) && seen(1, [13.0, 2.5]));
+            assert!(seen(0, [5.0, 4.0]) && seen(0, [10.1, 7.0]));
+        }
+    }
+
+    #[test]
+    fn roofs_side_by_side_and_towers_on_top_are_left_as_they_were() {
+        let roof = |a: [f32; 2], b: [f32; 2], shape| Roof::new(a, b, shape, "grey".into());
+        // Башенка целиком на крыше дома — поверх, не врезается.
+        assert!(join_groups(&[roof([0.0, 0.0], [10.0, 8.0], RoofShape::Hip), roof([4.0, 3.0], [6.0, 5.0], RoofShape::Hip)], &[]).is_empty());
+        // Навес и шатёр башни — по порядку, как раньше.
+        assert!(join_groups(&[roof([0.0, 0.0], [10.0, 8.0], RoofShape::Hip), roof([10.0, 2.0], [13.0, 6.0], RoofShape::Shed), roof([-3.0, 2.0], [0.0, 5.0], RoofShape::Tent)], &[]).is_empty());
+        // Дома поодаль — каждая сама по себе.
+        assert!(join_groups(&[roof([0.0, 0.0], [6.0, 4.0], RoofShape::Gable), roof([8.0, 0.0], [14.0, 4.0], RoofShape::Gable)], &[]).is_empty());
+        // Дома стена к стене, коньки вдоль общей стены: свесы сходятся в жёлоб, но
+        // крыши друг под друга не продлеваются.
+        let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
+        let tex = |_: &str| Some(&grey);
+        let row = [roof([0.0, 0.0], [4.0, 8.0], RoofShape::Gable), roof([4.0, 0.0], [8.0, 8.0], RoofShape::Gable)];
+        let groups = join_groups(&row, &[]);
+        assert_eq!(groups, vec![vec![0, 1]]);
+        let out = render_joined(&row, &[], &groups[0], &tex, 20.0, [-0.6, -0.8], ([-5.0, -5.0], [40.0, 40.0]));
+        assert_eq!(out[0].0.width(), (4.5f32 * 20.0) as u32 + 1, "крыша продлилась под соседа");
+        let a = |k: usize, x: f32| out[k].0.get_pixel(((x - out[k].1[0]) * 20.0) as u32, 80).0[3];
+        assert!(a(0, 3.9) > 200 && a(0, 4.2) == 0 && a(1, 4.1) > 200 && a(1, 3.8) == 0, "жёлоб не посередине");
+    }
+
+    #[test]
     fn fixtures_are_pasted_over_an_outline_roof() {
         // Свод ангара 6×4 по контуру: дымоход 2×2 ложится поверх ската в своей
         // клетке, на остальное не влезает; точка вне дома — под крышей нет.
-        let piece = crate::map::RoofPiece { rings: vec![vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]]], form: crate::map::RoofForm::Round, paint: String::new(), height: 0.0, eaves: 0.0, down: None, across: false };
+        let piece = crate::map::RoofPiece { rings: vec![vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]]], form: crate::map::RoofForm::Round, paint: String::new(), height: 0.0, eaves: 0.0, down: None, across: false, overhang: None };
         let roof = crate::map::OutlineRoof { pieces: vec![piece] };
         assert!(roof.contains([3.0, 2.0]) && !roof.contains([7.0, 2.0]));
         let mut img = image::RgbaImage::from_pixel(6 * 32, 4 * 32, image::Rgba([90, 90, 90, 255]));
@@ -1335,7 +1893,7 @@ mod tests {
     fn yard_house(form: RoofForm) -> OutlineRoof {
         let outer = vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]];
         let yard = vec![[3.0, 3.0], [5.0, 3.0], [5.0, 5.0], [3.0, 5.0]];
-        OutlineRoof { pieces: vec![RoofPiece { rings: vec![outer, yard], form, paint: "grey".into(), height: 0.0, eaves: 0.0, down: None, across: false }] }
+        OutlineRoof { pieces: vec![RoofPiece { rings: vec![outer, yard], form, paint: "grey".into(), height: 0.0, eaves: 0.0, down: None, across: false, overhang: None }] }
     }
 
     #[test]
@@ -1343,7 +1901,7 @@ mod tests {
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let tex = |_: &str| Some(&grey);
         let sq = |a: f32, b: f32| vec![vec![[a, a], [b, a], [b, b], [a, b]]];
-        let roof = OutlineRoof { pieces: vec![RoofPiece { rings: sq(0.0, 6.0), form: RoofForm::Flat, paint: "grey".into(), height: 2.0, eaves: 2.0, down: None, across: false }] };
+        let roof = OutlineRoof { pieces: vec![RoofPiece { rings: sq(0.0, 6.0), form: RoofForm::Flat, paint: "grey".into(), height: 2.0, eaves: 2.0, down: None, across: false, overhang: None }] };
         let light = [-0.6, -0.8];
         let draw = |near: &Near| render_outline(&roof, &tex, 10.0, light, ([-10.0, -10.0], [50.0, 50.0]), near);
         let (plain, o) = draw(&Near::default());
@@ -1369,7 +1927,7 @@ mod tests {
         m.props.push(tree([18.0, 6.0]));
         // Дом с плоской крышей там, куда легла бы тень второго дерева.
         let wall = vec![vec![[19.0, 7.0], [26.0, 7.0], [26.0, 14.0], [19.0, 14.0]]];
-        m.outline_roofs.push(OutlineRoof { pieces: vec![RoofPiece { rings: wall, form: RoofForm::Flat, paint: "grey".into(), height: 3.0, eaves: 3.0, down: None, across: false }] });
+        m.outline_roofs.push(OutlineRoof { pieces: vec![RoofPiece { rings: wall, form: RoofForm::Flat, paint: "grey".into(), height: 3.0, eaves: 3.0, down: None, across: false, overhang: None }] });
         let s = tree_shade(&m).expect("тени крон нет");
         let res = crate::mask::RES as f32;
         let at = |x: f32, y: f32| s.data[(y * res) as usize * s.w + (x * res) as usize];
@@ -1427,7 +1985,7 @@ mod tests {
 
     /// Кусок-прямоугольник `lo`..`hi` ровного серого покрытия.
     fn slab(lo: [f32; 2], hi: [f32; 2], form: RoofForm, height: f32, eaves: f32, down: Option<[f32; 2]>) -> RoofPiece {
-        RoofPiece { rings: vec![vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]], form, paint: "grey".into(), height, eaves, down, across: false }
+        RoofPiece { rings: vec![vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]], form, paint: "grey".into(), height, eaves, down, across: false, overhang: None }
     }
 
     #[test]
@@ -1497,7 +2055,7 @@ mod tests {
             let a = k as f32 * std::f32::consts::TAU / 16.0;
             [5.0 + 4.0 * a.cos(), 5.0 + 4.0 * a.sin()]
         }).collect();
-        let roof = OutlineRoof { pieces: vec![RoofPiece { rings: vec![ring], form: RoofForm::Dome, paint: "grey".into(), height: 30.0, eaves: 26.0, down: None, across: false }] };
+        let roof = OutlineRoof { pieces: vec![RoofPiece { rings: vec![ring], form: RoofForm::Dome, paint: "grey".into(), height: 30.0, eaves: 26.0, down: None, across: false, overhang: None }] };
         let (img, o) = render_outline(&roof, &tex, 20.0, [0.6, -0.8], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0[0] as i32;
         // Свет с северо-востока: северный бок светлее южного, а по обе стороны
@@ -1539,7 +2097,7 @@ mod tests {
         // Над уступом — крыша до самой стены.
         let grey = image::RgbaImage::from_pixel(16, 16, image::Rgba([160, 160, 160, 255]));
         let paint = |_: &str| Some(&grey);
-        let piece = RoofPiece { rings: vec![ring], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
+        let piece = RoofPiece { rings: vec![ring], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false, overhang: None };
         let (img, o) = render_outline(&OutlineRoof { pieces: vec![piece] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let alpha = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0[3];
         assert_eq!(alpha(2.0, 4.3), 255, "край крыши срезал уступ");
@@ -1568,7 +2126,7 @@ mod tests {
         // Плитка в 4 клетки, низ — «свес» красный.
         let tex = image::RgbaImage::from_fn(16, 1024, |_, y| if y >= 960 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([160, 160, 160, 255]) });
         let paint = |_: &str| Some(&tex);
-        let l = RoofPiece { rings: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 4.0], [4.0, 4.0], [4.0, 10.0], [0.0, 10.0]]], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false };
+        let l = RoofPiece { rings: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 4.0], [4.0, 4.0], [4.0, 10.0], [0.0, 10.0]]], form: RoofForm::Pitched, paint: "grey".into(), height: 6.0, eaves: 3.0, down: None, across: false, overhang: None };
         let (img, o) = render_outline(&OutlineRoof { pieces: vec![l] }, &paint, 20.0, [0.0, -1.0], ([-5.0, -5.0], [50.0, 50.0]), &Near::default());
         let at = |x: f32, y: f32| img.get_pixel(((x - o[0]) * 20.0) as u32, ((y - o[1]) * 20.0) as u32).0;
         for (x, y) in [(2.5, 3.95), (1.5, 3.95), (3.95, 2.5), (3.95, 1.5)] {
