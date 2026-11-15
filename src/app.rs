@@ -369,21 +369,69 @@ struct Export {
     roof_alpha: f32,
     /// Кадров до раскладки плиток: развёрнутому окну дать принять размер.
     wait: u32,
-    /// Проход снимка этажа, когда предметы идут тайлами: 0 — пол без стен, 1 и 2 —
-    /// одни стены на чёрном и на белом. Из пары выходит прозрачный слой стен: в
-    /// Foundry он тайлом над мебелью и токенами. В фоне стены лежали под мебелью.
+    /// Номер прохода снимка этажа в [`Export::shots`]. Когда предметы идут тайлами,
+    /// пол снимается без стен, а стены — отдельно на чёрном и на белом: из пары
+    /// выходит прозрачный слой стен, в Foundry он лежит над мебелью и токенами.
+    /// Верхний этаж снимается ещё раз на белой пустоте: где на нём ничего не
+    /// нарисовано, фон прозрачен, и в Foundry сквозь него виден этаж ниже.
     wall_pass: u8,
-    /// Пол снимаемого этажа и стены на чёрном, пока идут следующие проходы.
+    /// Первый снимок этажа, он же на белой пустоте и стены на чёрном, пока идут
+    /// следующие проходы.
     floor: Option<image::RgbImage>,
+    floor_white: Option<image::RgbImage>,
     wall_shot: Option<image::RgbImage>,
+    /// Снятые этажи на белой пустоте (у первого этажа и снимка области — нет).
+    whites: Vec<Option<image::RgbImage>>,
     /// Стены снятых этажей: на чёрном и на белом.
     walls: Vec<[image::RgbImage; 2]>,
 }
 
+/// Что снимает проход выгрузки.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Shot {
+    /// Всё одной картинкой: снимок для ИИ, выгрузка без тайлов.
+    Whole,
+    /// Пол без стен.
+    Floor,
+    /// То же, что первый снимок, на белой пустоте.
+    White,
+    /// Одни стены на чёрном и на белом.
+    WallsBlack,
+    WallsWhite,
+}
+
 impl Export {
-    /// Какой проход идёт; пусто — всё одной картинкой (снимок для ИИ, выгрузка без тайлов).
+    /// Проходы снимка этажа по порядку.
+    fn shots(&self) -> &'static [Shot] {
+        let tiles = !self.picture && self.canopies;
+        let upper = !self.picture && self.doing > 0;
+        match (tiles, upper) {
+            (true, true) => &[Shot::Floor, Shot::White, Shot::WallsBlack, Shot::WallsWhite],
+            (true, false) => &[Shot::Floor, Shot::WallsBlack, Shot::WallsWhite],
+            (false, true) => &[Shot::Whole, Shot::White],
+            (false, false) => &[Shot::Whole],
+        }
+    }
+
+    fn shot(&self) -> Shot {
+        self.shots()[(self.wall_pass as usize).min(self.shots().len() - 1)]
+    }
+
+    /// Что рисовать: 0 — пол без стен, 1 и 2 — одни стены на чёрном и на белом;
+    /// пусто — всё одной картинкой.
     fn pass(&self) -> Option<u8> {
-        (!self.picture && self.canopies).then_some(self.wall_pass)
+        let tiles = !self.picture && self.canopies;
+        match self.shot() {
+            Shot::WallsBlack => Some(1),
+            Shot::WallsWhite => Some(2),
+            _ => tiles.then_some(0),
+        }
+    }
+
+    /// Цвет пустоты — места, где на этаже ничего не нарисовано: у верхнего этажа
+    /// чёрная, во втором снимке белая (`true`); пусто — обычная серая.
+    fn void(&self) -> Option<bool> {
+        (!self.picture && self.doing > 0).then(|| self.shot() == Shot::White)
     }
 }
 

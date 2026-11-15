@@ -8,7 +8,14 @@ impl App {
         let s = cam.scale;
         let (mw, mh) = (self.map.width as i32, self.map.height as i32);
         let map_rect = cam.map_rect(canvas, self.map.width, self.map.height);
-        painter.rect_filled(map_rect, 0.0, Color32::from_gray(38));
+        // Пустота: где на этаже ничего не нарисовано. В выгрузке верхнего этажа она
+        // снимается чёрной и белой — по разнице снимков фон там выходит прозрачным.
+        let void = match self.export.as_ref().and_then(|e| e.void()) {
+            Some(true) => Color32::WHITE,
+            Some(false) => Color32::BLACK,
+            None => Color32::from_gray(38),
+        };
+        painter.rect_filled(map_rect, 0.0, void);
 
         // Рисуется только видимая часть: на большой карте при сильном приближении
         // остальное всё равно за краем окна.

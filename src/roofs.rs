@@ -990,6 +990,21 @@ pub fn outline(roof: &OutlineRoof) -> Vec<(Vec<[f32; 2]>, bool)> {
         .collect()
 }
 
+/// Край крыши по контуру для Foundry: кольца дома (первого куска) со свесом, в
+/// клетках, и двор ли кольцо. По нему встаёт область-поверхность крыши.
+pub fn eaves(roof: &OutlineRoof) -> Vec<(Vec<[f32; 2]>, bool)> {
+    let Some(base) = roof.pieces.first() else { return Vec::new() };
+    let walls: Vec<(usize, &Vec<[f32; 2]>)> = base.rings.iter().enumerate().filter(|(_, r)| r.len() >= 3).collect();
+    let edge = base.edge_rings();
+    walls
+        .iter()
+        .map(|&(i, r)| {
+            let others: Vec<Vec<[f32; 2]>> = walls.iter().filter(|&&(j, _)| j != i).map(|&(_, o)| o.clone()).collect();
+            (edge[i].clone(), inside_rings(&others, r[0]))
+        })
+        .collect()
+}
+
 /// Внутри ли колец точка (по чётности: двор — снаружи).
 pub(crate) fn inside_rings(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
     let mut c = false;

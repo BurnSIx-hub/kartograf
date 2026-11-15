@@ -692,9 +692,10 @@ pub struct RoofTile {
     pub tint: Option<[u8; 3]>,
     /// Куст: на земле под токенами, не гаснет — он по колено, а не над головой.
     pub ground: bool,
-    /// Слой стен этажа: над мебелью и токенами, под крышами; закреплён, не гаснет,
-    /// свет и дождь не держит.
-    pub walls: bool,
+    /// Край крыши в точках сцены, двор — `true`: по нему встаёт область-поверхность
+    /// Foundry (см. [`surface_behavior`]), а тайл гаснет не целиком над токеном, а
+    /// внутри открытой поверхности (режим SURFACE). Пусто — тайл гаснет по-старому.
+    pub surface: Vec<(Vec<[f32; 2]>, bool)>,
     /// Контур крыши OSM в точках сцены, двор — `true` ([`crate::roofs::outline`]).
     /// В тайл он уходит долями тайла: Мастер подвинет или растянет тайл — контур
     /// поедет с ним. Без контура «Wild Canvas» берёт весь прямоугольник тайла.
@@ -752,6 +753,115 @@ pub fn layer_from_pair(black: &image::RgbImage, white: &image::RgbImage) -> imag
         *o = image::Rgba([c(0), c(1), c(2), a.round() as u8]);
     }
     out
+}
+
+/// Фон верхнего этажа из двух снимков — на чёрной и на белой пустоте: где на этаже
+/// ничего не нарисовано, фон прозрачен, и в Foundry сквозь него виден этаж ниже.
+/// `None` — пустоты нет: фон сплошной, как у первого этажа.
+pub fn floor_from_pair(black: &image::RgbImage, white: &image::RgbImage) -> Option<image::RgbaImage> {
+    let mut out = image::RgbaImage::new(black.width(), black.height());
+    let mut holes = false;
+    for ((o, b), w) in out.pixels_mut().zip(black.pixels()).zip(white.pixels()) {
+        let d = (0..3).map(|k| w[k] as i32 - b[k] as i32).sum::<i32>() as f32 / 3.0;
+        let a = (255.0 - d).clamp(0.0, 255.0);
+        // Почти непрозрачное — шум округления снимка: пол сплошной, цвет как есть.
+        if a >= 250.0 {
+            *o = image::Rgba([b[0], b[1], b[2], 255]);
+            continue;
+        }
+        holes = true;
+        if a < 2.5 {
+            continue;
+        }
+        let c = |k: usize| (b[k] as f32 * 255.0 / a).round().clamp(0.0, 255.0) as u8;
+        *o = image::Rgba([c(0), c(1), c(2), a.round() as u8]);
+    }
+    holes.then_some(out)
+}
+
+/// Слой на сплошном цвете: картинка этажа для Universal VTT, где прозрачности нет.
+pub fn over_color(layer: &image::RgbaImage, color: [u8; 3]) -> image::RgbImage {
+    let mut out = image::RgbImage::new(layer.width(), layer.height());
+    for (o, p) in out.pixels_mut().zip(layer.pixels()) {
+        let a = p[3] as f32 / 255.0;
+        *o = image::Rgb([0, 1, 2].map(|k| (p[k] as f32 * a + color[k] as f32 * (1.0 - a)).round() as u8));
+    }
+    out
+}
+
+/// Прозрачный слой во всю сцену — файлом: WebP, а не вышел — PNG. Расширение — вторым.
+pub fn layer_bytes(img: &image::RgbaImage, quality: f32) -> (Vec<u8>, &'static str) {
+    if let Some(bytes) = try_webp(img, quality) {
+        return (bytes, "webp");
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    let _ = img.write_to(&mut out, image::ImageFormat::Png);
+    (out.into_inner(), "png")
+}
+
+/// Где у этажа сплошной пол: сетка по фону с прозрачностью, шаг — в точках сцены.
+/// Порог тот же, что у ядра (`alphaThreshold` 0,75).
+pub struct Solid {
+    step: u32,
+    w: u32,
+    h: u32,
+    cells: Vec<bool>,
+}
+
+impl Solid {
+    pub fn of(img: &image::RgbaImage) -> Self {
+        let step = 8;
+        let (w, h) = (img.width().div_ceil(step), img.height().div_ceil(step));
+        let at = |x: u32, y: u32| img.get_pixel((x * step + step / 2).min(img.width() - 1), (y * step + step / 2).min(img.height() - 1))[3] >= 191;
+        let cells = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| at(x, y)).collect();
+        Self { step, w, h, cells }
+    }
+
+    /// Контуры сплошного пола в точках сцены, дыра — `true`. Мелочь — щели решётки
+    /// люка, шов по кромке борта — отбрасывается: дыра меньше клетки `px`, островок
+    /// меньше её четверти.
+    pub fn loops(&self, px: u32) -> Vec<(Vec<[f32; 2]>, bool)> {
+        let mask = mask::Mask { w: self.w as usize, h: self.h as usize, data: self.cells.iter().map(|&c| if c { 255 } else { 0 }).collect() };
+        // Одна «клетка» контура маски — `RES` отсчётов сетки.
+        let k = (mask::RES as u32 * self.step) as f32;
+        let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&mask)).into_iter().map(|l| simplify(&l, true, 0.2)).filter(|l| l.len() >= 4).collect();
+        let area = |l: &[[f32; 2]]| (0..l.len() - 1).map(|i| l[i][0] * l[i + 1][1] - l[i + 1][0] * l[i][1]).sum::<f32>().abs() / 2.0 * k * k;
+        let cell = (px * px) as f32;
+        loops
+            .iter()
+            .filter_map(|l| {
+                let hole = loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1;
+                (area(l) >= if hole { cell } else { cell / 4.0 }).then(|| (l[..l.len() - 1].iter().map(|v| [v[0] * k, v[1] * k]).collect(), hole))
+            })
+            .collect()
+    }
+
+    /// Доля прямоугольника `[x, y, ширина, высота]` (точки сцены) над сплошным полом.
+    pub fn share(&self, rect: [i64; 4]) -> f32 {
+        let s = self.step as i64;
+        let (ax, ay) = (rect[0].div_euclid(s), rect[1].div_euclid(s));
+        let (bx, by) = ((rect[0] + rect[2] - 1).div_euclid(s) + 1, (rect[1] + rect[3] - 1).div_euclid(s) + 1);
+        let all = ((bx - ax) * (by - ay)).max(1);
+        let mut hit = 0;
+        for y in ay.max(0)..by.min(self.h as i64) {
+            for x in ax.max(0)..bx.min(self.w as i64) {
+                hit += self.cells[(y * self.w as i64 + x) as usize] as i64;
+            }
+        }
+        hit as f32 / all as f32
+    }
+}
+
+/// Слои этажа сверх фона.
+#[derive(Default)]
+pub struct LevelLayers {
+    /// Слой стен (с их тенью, окнами, косяками и слоем «над стенами») картинкой во
+    /// всю сцену — `foreground` уровня: ядро держит его на верхе этажа, над токенами
+    /// и под тайлами крыш, а створки дверей рисует прямо под ним.
+    pub foreground: Option<String>,
+    /// У фона этажа есть пустота (он с прозрачностью), сквозь неё видны этажи ниже:
+    /// где его пол сплошной. Пусто — фон без дыр.
+    pub solid: Option<Solid>,
 }
 
 /// Рамка нарисованного в слое: x, y, ширина, высота; слой пуст — `None`.
@@ -860,16 +970,65 @@ pub fn with_shadow(img: &image::RgbaImage, cells: [f32; 2], rot: f32, sh: &map::
     (out, [ow as f32 / w as f32, oh as f32 / h as f32])
 }
 
+/// Поведение области «поверхность» (ядро Foundry 14): сквозь неё по вертикали не
+/// проходят свет, движение и взгляд. С `occlusion` она ещё и открывается — над
+/// фишкой под ней, под мышью и по Alt («подсветить объекты») — и прячет внутри себя
+/// тайлы с режимом SURFACE на своей высоте и выше: так крыша уходит и без фишки в доме.
+fn surface_behavior(n: usize, occlusion: bool) -> Value {
+    json!({"_id": doc_id('s', n), "type": "defineSurface", "system": {"placement": "bottom", "light": true, "move": true, "sight": true, "sound": false, "occlusion": occlusion}})
+}
+
+/// Кольца в точках сцены — фигурами области.
+fn polygons(rings: &[(Vec<[f32; 2]>, bool)]) -> Vec<Value> {
+    rings.iter().filter(|(r, _)| r.len() >= 3).map(|(r, hole)| json!({"type": "polygon", "points": r.iter().flat_map(|v| [v[0].round() as i64, v[1].round() as i64]).collect::<Vec<_>>(), "hole": hole})).collect()
+}
+
+/// Низ и верх этажа `k`, футы. Один этаж — уровень Foundry по умолчанию, 0 и 20;
+/// у нескольких — 10·k и 10·k + 9 (зачем зазор — см. [`foundry_layered`]).
+fn level_span(k: usize, multi: bool) -> (i64, i64) {
+    if multi { (k as i64 * 10, k as i64 * 10 + 9) } else { (0, 20) }
+}
+
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
 pub fn level_id(k: usize) -> String {
     if k == 0 { LEVEL_ID.to_owned() } else { format!("kartografLevel{k:02}") }
 }
 
-/// Сцена с этажами: каждый — уровень Foundry 14 со своей картинкой, высота этажа
-/// 10 футов; стены и огни этажа видны только на нём. Один этаж — как раньше,
-/// без высот и привязки к уровню.
+/// Сцена с этажами без слоёв стен и без пустоты в фоне (см. [`foundry_layered`]).
+#[cfg(test)]
 pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
+    foundry_layered(map, name, levels, &[], px, leaves)
+}
+
+/// Сцена с этажами: каждый — уровень Foundry 14 со своей картинкой; стены и огни
+/// этажа видны только на нём. Один этаж — как раньше, без высот и привязки к
+/// уровню. `layers` — слои этажей по порядку: стены уходят в `foreground` уровня;
+/// у верхнего этажа с пустотой в фоне видны этажи ниже (`visibility.levels`), а их
+/// тайлы входят и в него — ядро показывает только тайлы просматриваемого уровня.
+///
+/// Этаж `k` занимает высоты от 10·k до 10·k + 9: между его верхом и полом
+/// следующего — фут зазора. Ядро сортирует по высоте, потом по слою (картинки
+/// уровней ниже тайлов): крыша нижнего этажа на его верхе лежит выше его стен и
+/// створок, но ниже фона верхнего — пол второго этажа сам закрывает всё, что под ним.
+pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[LevelLayers], px: u32, leaves: &std::collections::HashMap<String, LeafFile>) -> Value {
     let multi = levels.len() > 1;
+    let solid = |k: usize| layers.get(k).and_then(|l| l.solid.as_ref());
+    let open = |k: usize| solid(k).is_some();
+    // Что видно сквозь пустоту этажа: этажи ниже, до первого сплошного включительно.
+    let sees: Vec<Vec<usize>> = (0..levels.len())
+        .map(|k| {
+            let mut out = Vec::new();
+            if open(k) {
+                for j in (0..k).rev() {
+                    out.push(j);
+                    if !open(j) {
+                        break;
+                    }
+                }
+            }
+            out
+        })
+        .collect();
     let mut walls = Vec::new();
     let mut lights = Vec::new();
     let mut regions = Vec::new();
@@ -889,6 +1048,10 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         }
         for l in &mut lights[l0..] {
             *l = tag(l.take());
+            // Огонь стоит на полу своего этажа: с нуля он светил бы из-под перекрытия.
+            if multi {
+                l["elevation"] = json!(level_span(k, true).0);
+            }
         }
         // Крыша — тайл выше токенов этажа: гаснет, когда под ней токен,
         // и не пускает свет и дождь. Высота выше дверей: ниже 20 они просвечивают сквозь крышу.
@@ -896,24 +1059,16 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         // миграции сдвинули бы тайл на полразмера и обнулили `occlusion.modes`.
         // Высоты — от границ этажа: низ `b`, верх `t` (один этаж — 0 и 20, как у
         // уровня Foundry по умолчанию). Предметы и кусты — на `b`, под токенами;
-        // стены, крыши и кроны — на `t`: над токенами этажа и над створками дверей
-        // (ядро рисует их на верхе этажа слоем ниже тайлов). Раньше крыше любого
-        // этажа давалось +20 от его низа — выше потолка этажа.
-        let (b, t) = if multi { (k as i64 * 10, (k as i64 + 1) * 10) } else { (0, 20) };
+        // крыши и кроны — на `t`: над токенами этажа, над его стенами (`foreground`
+        // уровня) и створками дверей — ядро рисует их на верхе этажа слоем ниже тайлов.
+        let (b, t) = level_span(k, multi);
+        // Над крышами: у одного этажа с запасом, у нескольких — в зазоре под полом следующего.
+        let over = if multi { json!(t as f64 + 0.5) } else { json!(t + 5) };
         for r in &lv.roofs {
             let [x, y, w, h] = r.rect;
-            if r.walls {
-                // Ниже крыш и крон той же высоты — по `sort`.
-                tiles.push(tag(json!({
-                    "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5, "alphaThreshold": 0.75},
-                    "x": x + w / 2, "y": y + h / 2, "width": w, "height": h, "rotation": 0, "elevation": t, "sort": -1, "locked": true,
-                    "occlusion": {"modes": [], "alpha": 0}, "restrictions": {"light": false, "weather": false}
-                })));
-                continue;
-            }
             let mut tile = json!({
                 "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
-                "elevation": if r.low { b + 10 } else { t }, "sort": tiles.len(), "rotation": r.rotation,
+                "elevation": if r.low { (b + 10).min(t) } else { t }, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
@@ -926,7 +1081,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             }
             if r.item && r.living.is_none() && r.web.is_none() && r.chest.is_none() {
                 // Над крышами — выше крыши этажа, иначе на полу.
-                tile["elevation"] = json!(if r.above { t + 5 } else { b });
+                tile["elevation"] = if r.above { over.clone() } else { json!(b) };
                 tile["occlusion"]["modes"] = json!([]);
                 if r.hover {
                     tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});
@@ -937,7 +1092,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             } else if let Some((key, value)) = &r.living {
                 // Живой предмет под токенами: колонка играет сразу. Дирижабль над
                 // крышами так и остаётся над ними — винты крутятся там.
-                tile["elevation"] = json!(if r.above { t + 5 } else { b });
+                tile["elevation"] = if r.above { over.clone() } else { json!(b) };
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = json!({LIVE_MODULE: {*key: value}});
                 if r.hover {
@@ -988,7 +1143,28 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                     .collect();
                 tile["flags"][LIVE_MODULE]["outline"] = json!(rings);
             }
-            tiles.push(tag(tile));
+            // Крыша — поверхность: область по её краю на высоте тайла. Тайл с режимом
+            // SURFACE прячется внутри открытой поверхности — над фишкой в доме, под мышью
+            // и по Alt; сквозь крышу не пролететь, не светит и не видно.
+            if !r.surface.is_empty() {
+                tile["occlusion"]["modes"] = json!([2]);
+                let high = tile["elevation"].clone();
+                regions.push(tag(json!({
+                    "_id": doc_id('r', regions.len()), "name": "Крыша", "color": "#8a6a44", "shapes": polygons(&r.surface),
+                    "elevation": {"bottom": high, "top": high}, "behaviors": [surface_behavior(regions.len(), true)]
+                })));
+            }
+            // Тайл входит и в этажи выше, сквозь пустоту которых виден его этаж: ядро
+            // показывает тайлы только просматриваемого уровня. Он весь ниже их пола —
+            // что под полом, то им и закрыто. Крыша, что больше чем наполовину под
+            // полом этажа выше, — «крыша» первого этажа под вторым, нужная лишь при
+            // взгляде снизу: сверху её нет, иначе из-под пола торчал бы её свес.
+            if multi {
+                let hidden = |up: usize| r.shelter && solid(up).is_some_and(|s| s.share(r.rect) > 0.5);
+                let on: Vec<String> = std::iter::once(k).chain((k + 1..levels.len()).filter(|&up| sees[up].contains(&k) && !hidden(up))).map(level_id).collect();
+                tile["levels"] = json!(on);
+            }
+            tiles.push(tile);
         }
         let p = px as f32;
         for z in &lv.layout.zones {
@@ -1041,11 +1217,47 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             regions.push(tag(region));
         }
         let mut doc = json!({"_id": level_id(k), "name": lv.name, "background": {"src": lv.image_src, "color": "#999999"}});
+        // Верх этажа — явно и у одного этажа: у уровня без него верх бесконечный, и
+        // `foreground` со стенами лёг бы выше крыш.
+        let (bottom, top) = level_span(k, multi);
+        doc["elevation"] = json!({"bottom": bottom, "top": top});
         if multi {
-            doc["elevation"] = json!({"bottom": k as i64 * 10, "top": (k as i64 + 1) * 10});
             doc["sort"] = json!(k as i64 * 100);
         }
+        // Стены — родным слоем уровня: на верхе этажа, над токенами, под крышами.
+        if let Some(src) = layers.get(k).and_then(|l| l.foreground.as_ref()) {
+            doc["foreground"] = json!({"src": src, "alphaThreshold": 0.75});
+        }
+        // Фон с пустотой: сплошное — где прозрачность не ниже порога; этажи ниже видны.
+        if !sees[k].is_empty() {
+            doc["background"]["alphaThreshold"] = json!(0.75);
+            let mut below = sees[k].clone();
+            below.sort_unstable();
+            doc["visibility"] = json!({"levels": below.into_iter().map(level_id).collect::<Vec<_>>()});
+        }
         docs.push(doc);
+    }
+    // Перекрытия: пол этажа выше — поверхность. Нижнему этажу она потолок на его
+    // верхе, верхнему — пол на его низе; у каждого уровня своя область: открывшись
+    // на верхнем из-за фишки внизу, общая вырезала бы его пол. Лестнице поверхность
+    // не мешает: смена уровня в ядре её не проверяет.
+    for k in 1..levels.len() {
+        let rings = match solid(k) {
+            Some(s) => s.loops(px),
+            None => {
+                let (w, h) = ((map.width * px) as f32, (map.height * px) as f32);
+                vec![(vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], false)]
+            }
+        };
+        if rings.is_empty() {
+            continue;
+        }
+        for (level, high, name, occlusion) in [(k - 1, level_span(k - 1, true).1, format!("Потолок: {}", levels[k].name), true), (k, level_span(k, true).0, format!("Пол: {}", levels[k].name), false)] {
+            regions.push(json!({
+                "_id": doc_id('r', regions.len()), "name": name, "color": "#7a6a5a", "shapes": polygons(&rings),
+                "elevation": {"bottom": high, "top": high}, "levels": [level_id(level)], "behaviors": [surface_behavior(regions.len(), occlusion)]
+            }));
+        }
     }
     // Переходы между этажами: лестница или люк в одном месте на соседних уровнях —
     // область на обоих, с поведением ядра «Сменить уровень» (токен вошёл — вопрос, куда).
@@ -1538,36 +1750,170 @@ mod tests {
     #[test]
     fn walls_go_above_furniture_and_tokens_and_bushes_stay_on_the_ground() {
         // Один этаж: низ 0, верх 20 (уровень Foundry по умолчанию). Предмет — на полу
-        // под токенами, стены — тайлом на верхе этажа ниже крыши по `sort`, куст — на земле.
+        // под токенами, куст — на земле, крыша — на верхе этажа; стены — не тайлом, а
+        // слоем `foreground` уровня: ядро держит его на верхе этажа под тайлами крыш.
         let map = Map::new(8, 6);
         let lay = layout(&map, &map.room_edges());
         let item = RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100) };
         let bush = RoofTile { ground: true, fade: false, wind: 0.35, ..canopy_tile("k/bush.webp".into(), [5.0, 2.0], [2.0, 2.0], 0.0, 100) };
-        let roof = RoofTile { src: "k/roof.webp".into(), rect: [100, 100, 400, 300], shelter: true, fade: true, wind: 1.0, ..Default::default() };
-        let walls = RoofTile { src: "k/walls.webp".into(), rect: [90, 90, 420, 320], walls: true, ..Default::default() };
-        let one = [SceneLevel { name: "Дом".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![item, bush, roof, walls] }];
-        let scene = foundry_levels(&map, "Дом", &one, 100, &Default::default());
+        let eaves = vec![(vec![[100.0, 100.0], [500.0, 100.0], [500.0, 400.0], [100.0, 400.0]], false)];
+        let roof = RoofTile { src: "k/roof.webp".into(), rect: [100, 100, 400, 300], shelter: true, fade: true, wind: 1.0, surface: eaves, ..Default::default() };
+        let one = [SceneLevel { name: "Дом".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![item, bush, roof] }];
+        let walls = [LevelLayers { foreground: Some("k/walls.webp".into()), solid: None }];
+        let scene = foundry_layered(&map, "Дом", &one, &walls, 100, &Default::default());
         let t = scene["tiles"].as_array().unwrap();
+        assert_eq!(t.len(), 3, "стены — не тайл");
         assert_eq!((t[0]["elevation"].as_i64(), t[0]["occlusion"]["modes"].as_array().map(Vec::len)), (Some(0), Some(0)), "предмет — на полу");
         assert_eq!((t[1]["elevation"].as_i64(), t[1]["occlusion"]["modes"].as_array().map(Vec::len)), (Some(0), Some(0)), "куст — на земле и не гаснет");
         assert!(t[1]["flags"][LIVE_MODULE]["wind"].as_f64().is_some(), "куст колышется");
-        assert_eq!((t[2]["elevation"].as_i64(), t[2]["occlusion"]["modes"][0].as_i64()), (Some(20), Some(1)), "крыша — на верхе этажа, гаснет");
-        let w = &t[3];
-        assert_eq!((w["elevation"].as_i64(), w["sort"].as_i64(), w["locked"].as_bool()), (Some(20), Some(-1), Some(true)));
-        assert!(w["sort"].as_i64() < t[2]["sort"].as_i64(), "стены ниже крыши той же высоты");
-        assert_eq!(w["occlusion"]["modes"].as_array().map(Vec::len), Some(0), "стены не гаснут над токеном");
-        assert_eq!((w["restrictions"]["light"].as_bool(), w["restrictions"]["weather"].as_bool()), (Some(false), Some(false)));
-        assert_eq!((w["x"].as_i64(), w["y"].as_i64(), w["width"].as_i64()), (Some(300), Some(250), Some(420)));
-        assert_eq!(w["texture"]["alphaThreshold"].as_f64(), Some(0.75));
-        // Два этажа: у каждого свои границы — предметы на низе, стены и крыши на верхе.
+        assert_eq!((t[2]["elevation"].as_i64(), t[2]["occlusion"]["modes"].clone()), (Some(20), json!([2])), "крыша — на верхе этажа, прячется поверхностью");
+        // Над крышей — область-поверхность на её высоте: открывается над фишкой, под
+        // мышью и по Alt, не пускает свет, движение и взгляд.
+        let regions = scene["regions"].as_array().unwrap();
+        assert_eq!(regions.len(), 1, "один этаж: перекрытий нет, поверхность только у крыши");
+        let s = &regions[0];
+        assert_eq!((s["elevation"].clone(), s["shapes"][0]["points"].clone()), (json!({"bottom": 20, "top": 20}), json!([100, 100, 500, 100, 500, 400, 100, 400])));
+        assert_eq!(s["behaviors"][0]["type"], "defineSurface");
+        assert_eq!(s["behaviors"][0]["system"], json!({"placement": "bottom", "light": true, "move": true, "sight": true, "sound": false, "occlusion": true}));
+        assert!(s.get("levels").is_none());
+        let lv = &scene["levels"][0];
+        assert_eq!((lv["foreground"]["src"].as_str(), lv["foreground"]["alphaThreshold"].as_f64()), (Some("k/walls.webp"), Some(0.75)));
+        assert!(lv.get("visibility").is_none() && lv["background"].get("alphaThreshold").is_none(), "один этаж — фон сплошной");
+        assert_eq!(lv["elevation"], json!({"bottom": 0, "top": 20}), "верх задан: стены — под крышами, а не над всем");
+        // Без слоя стен (выгрузка без тайлов) `foreground` нет.
+        assert!(foundry_levels(&map, "Дом", &one, 100, &Default::default())["levels"][0].get("foreground").is_none());
+        // Два этажа: у каждого свои границы — предметы на низе, крыши на верхе, стены у каждого свои.
         let two = [
-            SceneLevel { name: "Низ".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![RoofTile { src: "k/w1.webp".into(), rect: [0, 0, 10, 10], walls: true, ..Default::default() }] },
-            SceneLevel { name: "Верх".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: vec![RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100) }, RoofTile { src: "k/w2.webp".into(), rect: [0, 0, 10, 10], walls: true, ..Default::default() }] },
+            SceneLevel { name: "Низ".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: Vec::new() },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: vec![RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100) }] },
         ];
-        let scene = foundry_levels(&map, "Дом", &two, 100, &Default::default());
+        let walls = [LevelLayers { foreground: Some("k/w1.webp".into()), solid: None }, LevelLayers { foreground: Some("k/w2.webp".into()), solid: None }];
+        let scene = foundry_layered(&map, "Дом", &two, &walls, 100, &Default::default());
         let t = scene["tiles"].as_array().unwrap();
-        assert_eq!([t[0]["elevation"].as_i64(), t[1]["elevation"].as_i64(), t[2]["elevation"].as_i64()], [Some(10), Some(10), Some(20)]);
-        assert_eq!(t[2]["levels"][0], scene["levels"][1]["_id"]);
+        assert_eq!(t[0]["elevation"].as_i64(), Some(10));
+        assert_eq!(t[0]["levels"], json!([scene["levels"][1]["_id"]]));
+        assert_eq!(scene["levels"][1]["elevation"], json!({"bottom": 10, "top": 19}));
+        // Перекрытие — двумя областями: потолок нижнего этажа (на его верхе, открывается)
+        // и пол верхнего (на его низе, не открывается). Фон верхнего без пустоты — во всю сцену.
+        let r = scene["regions"].as_array().unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0]["levels"].clone(), r[0]["elevation"].clone(), r[0]["behaviors"][0]["system"]["occlusion"].clone()), (json!([scene["levels"][0]["_id"]]), json!({"bottom": 9, "top": 9}), json!(true)));
+        assert_eq!((r[1]["levels"].clone(), r[1]["elevation"].clone(), r[1]["behaviors"][0]["system"]["occlusion"].clone()), (json!([scene["levels"][1]["_id"]]), json!({"bottom": 10, "top": 10}), json!(false)));
+        assert_eq!(r[1]["shapes"][0]["points"], json!([0, 0, 800, 0, 800, 600, 0, 600]));
+        assert_eq!(r[1]["behaviors"][0]["system"]["move"], true);
+        let ids: std::collections::HashSet<&str> = r.iter().flat_map(|x| [x["_id"].as_str().unwrap(), x["behaviors"][0]["_id"].as_str().unwrap()]).collect();
+        assert_eq!(ids.len(), 4, "id областей и поведений не повторяются");
+        assert_eq!([scene["levels"][0]["foreground"]["src"].as_str(), scene["levels"][1]["foreground"]["src"].as_str()], [Some("k/w1.webp"), Some("k/w2.webp")]);
+    }
+
+    #[test]
+    fn the_floor_below_shows_through_the_void_of_an_upper_floor() {
+        // Второй этаж 8×6 клеток по 100 точек: пол — правая половина, слева пустота.
+        let map = Map::new(8, 6);
+        let lay = layout(&map, &map.room_edges());
+        let mut bg = image::RgbaImage::new(800, 600);
+        for (x, _, p) in bg.enumerate_pixels_mut() {
+            *p = image::Rgba([90, 70, 50, if x >= 400 { 255 } else { 0 }]);
+        }
+        let floor = || Some(Solid::of(&bg));
+        let solid = Solid::of(&bg);
+        assert!(solid.share([400, 0, 400, 600]) > 0.99 && solid.share([0, 0, 400, 600]) < 0.01);
+        assert!((solid.share([300, 100, 200, 200]) - 0.5).abs() < 0.03);
+        assert!(solid.share([-500, -500, 100, 100]) == 0.0, "за краем сцены пола нет");
+        // Контур пола — правая половина сцены одним кольцом, с точностью до шага сетки.
+        let rings = solid.loops(100);
+        assert_eq!(rings.len(), 1);
+        let (lo, hi) = rings[0].0.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), v| ([lo[0].min(v[0]), lo[1].min(v[1])], [hi[0].max(v[0]), hi[1].max(v[1])]));
+        assert!((lo[0] - 400.0).abs() <= 8.0 && lo[1].abs() <= 8.0 && (hi[0] - 800.0).abs() <= 8.0 && (hi[1] - 600.0).abs() <= 8.0 && !rings[0].1, "{lo:?} {hi:?}");
+        // Щель решётки (10×150 точек) — не дыра в перекрытии; люк 150×150 — дыра.
+        let mut holed = bg.clone();
+        for (x, y, p) in holed.enumerate_pixels_mut() {
+            if ((500..510).contains(&x) && (100..250).contains(&y)) || ((600..750).contains(&x) && (300..450).contains(&y)) {
+                p[3] = 0;
+            }
+        }
+        let rings = Solid::of(&holed).loops(100);
+        assert_eq!(rings.iter().filter(|r| r.1).count(), 1, "{rings:?}");
+        // Внизу: стул, крыша крыла (на треть под полом второго), крона и дирижабль над
+        // крышами; наверху — стул.
+        let chair = |x: f32| RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [x, 3.0], [1.0, 1.0], 0.0, 100) };
+        let roof = |x: i64| RoofTile { src: "k/roof.webp".into(), rect: [x, 100, 300, 300], shelter: true, fade: true, wind: 1.0, ..Default::default() };
+        let tree = canopy_tile("k/tree.webp".into(), [5.5, 3.0], [3.0, 3.0], 0.0, 100);
+        let ship = RoofTile { item: true, above: true, ..canopy_tile("k/ship.webp".into(), [4.0, 3.0], [2.0, 4.0], 0.0, 100) };
+        let levels = [
+            SceneLevel { name: "Низ".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![chair(1.5), roof(200), tree, ship] },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: vec![chair(6.0)] },
+        ];
+        let layers = [LevelLayers::default(), LevelLayers { foreground: None, solid: floor() }];
+        let scene = foundry_layered(&map, "Дом", &levels, &layers, 100, &Default::default());
+        let (lo, up) = (scene["levels"][0]["_id"].clone(), scene["levels"][1]["_id"].clone());
+        // Верхний уровень: фон с порогом прозрачности, нижний виден сквозь пустоту.
+        assert_eq!(scene["levels"][1]["visibility"]["levels"], json!([lo]));
+        assert_eq!(scene["levels"][1]["background"]["alphaThreshold"].as_f64(), Some(0.75));
+        assert!(scene["levels"][0].get("visibility").is_none(), "снизу верхний этаж не виден");
+        // Между верхом нижнего этажа и полом верхнего — зазор: всё нижнее, вместе с
+        // крышей на его верхе и тем, что над крышами, лежит ниже фона верхнего этажа.
+        assert_eq!((&scene["levels"][0]["elevation"], &scene["levels"][1]["elevation"]), (&json!({"bottom": 0, "top": 9}), &json!({"bottom": 10, "top": 19})));
+        let t = scene["tiles"].as_array().unwrap();
+        let high: Vec<f64> = t.iter().map(|x| x["elevation"].as_f64().unwrap()).collect();
+        assert_eq!(high, vec![0.0, 9.0, 9.0, 9.5, 10.0]);
+        // Тайлы нижнего этажа — в обоих уровнях: ядро показывает только тайлы
+        // просматриваемого; тайл верхнего — только на нём.
+        let both = json!([lo, up]);
+        assert!(t[..4].iter().all(|x| x["levels"] == both), "{t:#?}");
+        assert_eq!(t[4]["levels"], json!([up]));
+        // «Крыша» первого этажа под полом второго сверху не показывается: она только
+        // для взгляда снизу. Крона там же остаётся — пол закрывает её сам.
+        let under = [
+            SceneLevel { name: "Низ".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![roof(450)] },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: Vec::new() },
+        ];
+        assert_eq!(foundry_layered(&map, "Дом", &under, &layers, 100, &Default::default())["tiles"][0]["levels"], json!([lo]));
+        // Фон верхнего этажа без пустоты: ничего не меняется.
+        let plain = foundry_layered(&map, "Дом", &levels, &[], 100, &Default::default());
+        assert!(plain["levels"][1].get("visibility").is_none() && plain["levels"][1]["background"].get("alphaThreshold").is_none());
+        assert_eq!(plain["tiles"][0]["levels"], json!([lo]));
+        // Три этажа: сквозь третий видны второй и — сквозь его пустоту — первый;
+        // сплошной второй закрыл бы первый.
+        let three = [
+            SceneLevel { name: "1".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![chair(1.5)] },
+            SceneLevel { name: "2".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: Vec::new() },
+            SceneLevel { name: "3".into(), image_src: "k/c.webp".into(), layout: &lay, roofs: Vec::new() },
+        ];
+        let open = || LevelLayers { foreground: None, solid: floor() };
+        let all = foundry_layered(&map, "Дом", &three, &[LevelLayers::default(), open(), open()], 100, &Default::default());
+        let ids: Vec<Value> = all["levels"].as_array().unwrap().iter().map(|l| l["_id"].clone()).collect();
+        assert_eq!(all["levels"][2]["visibility"]["levels"], json!([ids[0], ids[1]]));
+        assert_eq!(all["tiles"][0]["levels"], json!(ids));
+        let shut = foundry_layered(&map, "Дом", &three, &[LevelLayers::default(), LevelLayers::default(), open()], 100, &Default::default());
+        assert_eq!(shut["levels"][2]["visibility"]["levels"], json!([ids[1]]));
+        assert_eq!(shut["tiles"][0]["levels"], json!([ids[0]]));
+    }
+
+    #[test]
+    fn an_upper_floor_keeps_only_what_is_drawn_on_it() {
+        // Два снимка этажа: пол (снимки равны), мягкий край в полсилы, пустота.
+        let mut black = image::RgbImage::new(3, 1);
+        let mut white = image::RgbImage::from_pixel(3, 1, image::Rgb([255, 255, 255]));
+        for img in [&mut black, &mut white] {
+            img.put_pixel(0, 0, image::Rgb([120, 90, 60]));
+        }
+        black.put_pixel(1, 0, image::Rgb([60, 45, 30]));
+        white.put_pixel(1, 0, image::Rgb([188, 173, 158]));
+        let bg = floor_from_pair(&black, &white).expect("пустота есть");
+        assert_eq!(bg.get_pixel(0, 0).0, [120, 90, 60, 255]);
+        let edge = bg.get_pixel(1, 0).0;
+        assert!((edge[3] as i32 - 127).abs() <= 1 && (edge[0] as i32 - 120).abs() <= 2, "{edge:?}");
+        assert_eq!(bg.get_pixel(2, 0).0[3], 0);
+        // Шум снимка в единицу-другую дыр не делает: этаж, закрашенный целиком, — сплошной.
+        let mut noisy = black.clone();
+        noisy.put_pixel(2, 0, image::Rgb([40, 40, 40]));
+        let mut same = noisy.clone();
+        same.put_pixel(0, 0, image::Rgb([122, 92, 62]));
+        assert!(floor_from_pair(&noisy, &same).is_none());
+        // Для Universal VTT пустота — прежняя серая.
+        let flat = over_color(&bg, [38, 38, 38]);
+        assert_eq!((flat.get_pixel(0, 0).0, flat.get_pixel(2, 0).0), ([120, 90, 60], [38, 38, 38]));
     }
 
     #[test]
@@ -1701,12 +2047,14 @@ mod tests {
         assert!(walls.iter().filter(|w| w["levels"][0] == lv[0]["_id"]).count() >= 4);
         let ids: std::collections::HashSet<_> = walls.iter().map(|w| w["_id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), walls.len());
-        // Крыша — тайл над токенами первого этажа, гаснет над токеном. Высота — потолок
-        // своего этажа (10), а не +20 от его низа: это уже потолок второго.
+        // Крыша — тайл над токенами первого этажа, гаснет над токеном. Высота — верх
+        // своего этажа (9): ниже пола второго (10), а не +20 от низа.
         let t = &scene["tiles"][0];
-        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(200), Some(300), Some(10)));
-        // Крона второго этажа — на его потолке.
-        assert_eq!(scene["tiles"][1]["elevation"], 20);
+        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(200), Some(300), Some(9)));
+        // Крона второго этажа — на его верхе.
+        assert_eq!(scene["tiles"][1]["elevation"], 19);
+        // Тайл без контура поверхности гаснет по-старому, над токеном.
+        assert_eq!(scene["tiles"][0]["occlusion"]["modes"], json!([1]));
         assert_eq!(t["occlusion"]["modes"][0], 1);
         assert_eq!(scene["_stats"]["coreVersion"], "14.355");
         assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));

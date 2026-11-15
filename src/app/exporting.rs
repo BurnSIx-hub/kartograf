@@ -38,7 +38,9 @@ impl App {
             wait: 0,
             wall_pass: 0,
             floor: None,
+            floor_white: None,
             wall_shot: None,
+            whites: Vec::new(),
             walls: Vec::new(),
         });
     }
@@ -76,7 +78,9 @@ impl App {
             wait: 0,
             wall_pass: 0,
             floor: None,
+            floor_white: None,
             wall_shot: None,
+            whites: Vec::new(),
             walls: Vec::new(),
         });
     }
@@ -173,26 +177,33 @@ impl App {
             self.picture = Some(e.image);
             return;
         }
-        // С тайлами этаж снимается трижды: пол без стен, стены на чёрном, стены на белом.
-        if e.pass().is_some() {
-            if e.wall_pass < 2 {
-                let fresh = image::RgbImage::new(e.image.width(), e.image.height());
-                let shot = std::mem::replace(&mut e.image, fresh);
-                if e.wall_pass == 0 {
-                    e.floor = Some(shot);
-                } else {
-                    e.wall_shot = Some(shot);
-                }
-                e.wall_pass += 1;
-                e.next = 0;
-                return;
+        // Этаж снимается в несколько проходов: с тайлами — пол без стен, стены на
+        // чёрном и на белом; верхний этаж — ещё раз на белой пустоте.
+        let (shots, at) = (e.shots(), e.wall_pass as usize);
+        if at + 1 < shots.len() {
+            let fresh = image::RgbImage::new(e.image.width(), e.image.height());
+            let shot = std::mem::replace(&mut e.image, fresh);
+            match shots[at] {
+                Shot::Whole | Shot::Floor => e.floor = Some(shot),
+                Shot::White => e.floor_white = Some(shot),
+                Shot::WallsBlack | Shot::WallsWhite => e.wall_shot = Some(shot),
             }
-            if let (Some(floor), Some(black)) = (e.floor.take(), e.wall_shot.take()) {
-                let white = std::mem::replace(&mut e.image, floor);
-                e.walls.push([black, white]);
-            }
-            e.wall_pass = 0;
+            e.wall_pass += 1;
+            e.next = 0;
+            return;
         }
+        // Последний проход: в `image` возвращается первый снимок этажа.
+        if let Some(floor) = e.floor.take() {
+            let last = std::mem::replace(&mut e.image, floor);
+            match (shots[at], e.wall_shot.take()) {
+                (Shot::WallsWhite, Some(black)) => e.walls.push([black, last]),
+                (Shot::White, _) => e.floor_white = Some(last),
+                _ => {}
+            }
+        }
+        let white = e.floor_white.take();
+        e.whites.push(white);
+        e.wall_pass = 0;
         // Этаж снят — следующий, пока не кончатся.
         if e.doing + 1 < self.levels.len() {
             let fresh = image::RgbImage::new(e.image.width(), e.image.height());
@@ -236,14 +247,24 @@ impl App {
         let mut layouts = Vec::new();
         // Контуры палаток по картинке — один раз на картинку.
         let mut hulls: std::collections::HashMap<String, Vec<[f32; 2]>> = std::collections::HashMap::new();
+        // Фон верхнего этажа, где на нём есть пустота, — с прозрачностью: в Foundry
+        // сквозь неё виден этаж ниже. Закрашенный целиком — сплошной, как у первого.
+        let mut open: Vec<Option<image::RgbaImage>> = Vec::new();
         for (k, img) in e.done.iter().enumerate() {
+            let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
             // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
             let mut jpg = Vec::new();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
-            // Не вышел WebP (велика или libwebp не справился) — JPEG.
-            let webp = (img.width().max(img.height()) <= export::WEBP_MAX_SIDE).then(|| export::try_webp(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0)).flatten();
-            let img_path = e.dir.join(format!("{}.{}", stem(k), if webp.is_some() { "webp" } else { "jpg" }));
-            let bytes = webp.unwrap_or_else(|| jpg.clone());
+            let (bytes, ext) = match &holes {
+                Some(rgba) => export::layer_bytes(rgba, 88.0),
+                // Не вышел WebP (велика или libwebp не справился) — JPEG.
+                None => match (img.width().max(img.height()) <= export::WEBP_MAX_SIDE).then(|| export::try_webp(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0)).flatten() {
+                    Some(webp) => (webp, "webp"),
+                    None => (jpg.clone(), "jpg"),
+                },
+            };
+            open.push(holes);
+            let img_path = e.dir.join(format!("{}.{ext}", stem(k)));
             files.push((img_path.clone(), bytes));
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             // Вырез воды под мостом — по нарисованному: рамка картинки, по разу на картинку.
@@ -286,9 +307,10 @@ impl App {
         let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut seen = std::collections::HashMap::new();
-        // Слой стен каждого этажа (для Universal VTT) и во сколько раз тайл предмета
-        // шире картинки без тени.
-        let mut wall_layers: std::collections::HashMap<usize, (image::RgbaImage, [u32; 2])> = std::collections::HashMap::new();
+        // Слой стен каждого этажа (он же для Universal VTT), его файл и во сколько раз
+        // тайл предмета шире картинки без тени.
+        let mut wall_layers: std::collections::HashMap<usize, image::RgbaImage> = std::collections::HashMap::new();
+        let mut foregrounds: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         let mut grows: std::collections::HashMap<String, [f32; 2]> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
@@ -297,25 +319,37 @@ impl App {
             let mut tiles = Vec::new();
             // Крыши, что врезаются друг в друга, — одной отрисовкой на группу; картинка
             // и тайл у каждой свои: в них только то, что у неё видно поверх соседей.
+            // Группа рисуется, когда очередь доходит до первой её крыши, а не все заранее:
+            // у города в сотни крыш картинки всех групп разом — гигабайты памяти.
             let mut joined: std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)> = std::collections::HashMap::new();
-            for group in roofs::raster_groups(&map.roofs, &map.outline_roofs) {
-                let n = map.roofs.len();
+            let groups = roofs::raster_groups(&map.roofs, &map.outline_roofs);
+            let group_of: std::collections::HashMap<usize, usize> = groups.iter().enumerate().flat_map(|(g, ids)| ids.iter().map(move |&id| (id, g))).collect();
+            let rects = map.roofs.len();
+            let mut spans = Vec::new();
+            for group in &groups {
                 let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-                for &id in &group {
-                    let (paint, (a, b)) = if id < n { (&map.roofs[id].paint, (map.roofs[id].outline()[0], map.roofs[id].outline()[2])) } else { (&map.outline_roofs[id - n].pieces[0].paint, map.outline_roofs[id - n].bounds()) };
+                for &id in group {
+                    let (paint, (a, b)) = if id < rects { (&map.roofs[id].paint, (map.roofs[id].outline()[0], map.roofs[id].outline()[2])) } else { (&map.outline_roofs[id - rects].pieces[0].paint, map.outline_roofs[id - rects].bounds()) };
                     (lo, hi) = ([lo[0].min(a[0]), lo[1].min(a[1])], [hi[0].max(b[0]), hi[1].max(b[1])]);
                     if !outline_covers.contains_key(paint) {
                         let bytes = self.textures.bytes(paint)?;
                         outline_covers.insert(paint.clone(), roofs::solid_cover(library::decode_tinted(paint, &bytes)?));
                     }
                 }
-                let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
-                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &group, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), map.weather == "snow");
-                for (id, (img, origin)) in group.iter().zip(out) {
+                spans.push((hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5);
+            }
+            let mut drawn = std::collections::HashSet::new();
+            let mut draw_group = |id: usize, joined: &mut std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)>, covers: &std::collections::HashMap<String, image::RgbaImage>| {
+                let Some(&g) = group_of.get(&id) else { return };
+                if !drawn.insert(g) {
+                    return;
+                }
+                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / spans[g].max(1.0)));
+                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &groups[g], &|k: &str| covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), map.weather == "snow");
+                for (id, (img, origin)) in groups[g].iter().zip(out) {
                     joined.insert(*id, (img, origin, ppc));
                 }
-            }
+            };
             for (ri, r) in map.roofs.iter().enumerate() {
                 if !covers.contains_key(&r.paint) {
                     let bytes = self.textures.bytes(&r.paint)?;
@@ -347,6 +381,7 @@ impl App {
                 // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
                 let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
                 let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
+                draw_group(ri, &mut joined, &outline_covers);
                 let (img, origin, ppc) = match joined.remove(&ri) {
                     Some((mut img, origin, ppc)) => {
                         roofs::paste_fixtures(&mut img, origin, ppc, &items);
@@ -361,7 +396,7 @@ impl App {
                 let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, ..Default::default() });
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() });
             }
             // Крыши по контуру (из OSM) — тоже по одной, в масштабе сцены: их сотни.
             let casters = roofs::Casters::new(&map.outline_roofs, &map.props);
@@ -379,7 +414,8 @@ impl App {
                 let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
                 let ppc = if r.pieces.iter().any(|k| k.overhang.is_some()) { p.max(library::PX_PER_CELL.min(8192.0 / span.max(1.0))) } else { p };
                 let near = casters.near(idx, r.bounds());
-                let (mut img, origin, ppc) = match joined.remove(&(map.roofs.len() + idx)) {
+                draw_group(rects + idx, &mut joined, &outline_covers);
+                let (mut img, origin, ppc) = match joined.remove(&(rects + idx)) {
                     Some(j) => j,
                     None => {
                         let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
@@ -425,6 +461,7 @@ impl App {
                     scuppers: Vec::new(),
                     chimneys: smoke,
                     outline: roofs::outline(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * p, v[1] * p]).collect(), hole)).collect(),
+                    surface: roofs::eaves(r).into_iter().map(|(ring, hole)| (ring.iter().map(|v| [v[0] * p, v[1] * p]).collect(), hole)).collect(),
                     ..Default::default()
                 });
             }
@@ -537,16 +574,17 @@ impl App {
                 }
                 tiles.push(tile);
             }
-            // Стены этажа — одним тайлом по рамке нарисованного: над мебелью и токенами,
-            // под крышами. В нём же тень стен, окна, косяки и слой «над стенами».
+            // Стены этажа — слоем во всю сцену, в `foreground` уровня: ядро держит его на
+            // верхе этажа, над мебелью и токенами и под крышами. В нём же тень стен,
+            // окна, косяки и слой «над стенами».
             if let Some([black, white]) = e.walls.get(k) {
                 let layer = export::layer_from_pair(black, white);
-                if let Some([x, y, w, h]) = export::opaque_box(&layer, 8) {
-                    let cut = image::imageops::crop_imm(&layer, x, y, w, h).to_image();
-                    let file = e.dir.join(format!("{}_стены.webp", stem(k)));
-                    files.push((file.clone(), export::webp_bytes(&cut, 90.0)));
-                    tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [x as i64, y as i64, w as i64, h as i64], walls: true, ..Default::default() });
-                    wall_layers.insert(k, (cut, [x, y]));
+                if export::opaque_box(&layer, 8).is_some() {
+                    let (bytes, ext) = export::layer_bytes(&layer, 90.0);
+                    let file = e.dir.join(format!("{}_стены.{ext}", stem(k)));
+                    files.push((file.clone(), bytes));
+                    foregrounds.insert(k, export::foundry_src(&file));
+                    wall_layers.insert(k, layer);
                 }
             }
             roof_tiles.push(tiles);
@@ -554,7 +592,8 @@ impl App {
         let levels: Vec<export::SceneLevel> = (0..n)
             .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
-        let mut scene = export::foundry_levels(&self.map, &e.name, &levels, e.px, &leaves);
+        let layers: Vec<export::LevelLayers> = (0..n).map(|k| export::LevelLayers { foreground: foregrounds.remove(&k), solid: open[k].as_ref().map(export::Solid::of) }).collect();
+        let mut scene = export::foundry_layered(&self.map, &e.name, &levels, &layers, e.px, &leaves);
         // Пути картинок — с меткой содержимого: Foundry не покажет прежнюю под тем же именем.
         let tags: std::collections::HashMap<String, String> = files.iter().map(|(p, b)| (export::foundry_src(p), export::content_tag(b))).collect();
         export::tag_sources(&mut scene, &tags);
@@ -573,7 +612,11 @@ impl App {
             let mut pics: std::collections::HashMap<String, Option<(image::RgbaImage, [f32; 2])>> = std::collections::HashMap::new();
             for k in 0..n {
                 let map = if k == self.level { &self.map } else { &self.levels[k] };
-                let mut flat = e.done[k].clone();
+                // Прозрачности в нём нет: пустота верхнего этажа — прежняя серая.
+                let mut flat = match &open[k] {
+                    Some(rgba) => export::over_color(rgba, [38, 38, 38]),
+                    None => e.done[k].clone(),
+                };
                 // Крыш в Universal VTT нет — нет и крышного.
                 let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !p.with_walls() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
                 items.sort_by_key(|p| p.layer());
@@ -583,6 +626,10 @@ impl App {
                     // Тень предмета в фоне больше не лежит — впечатывается вместе с ним.
                     let shade = map.shadows.on && prop.carries_shadow();
                     let slot = if shade { format!("{}#тень{k}|{:.0}|{:.3}", prop.asset, prop.rot.rem_euclid(360.0), prop.scale) } else { prop.asset.clone() };
+                    // У города тысячи предметов со своим поворотом: помнить картинку каждого — гигабайты.
+                    if pics.len() >= 64 && !pics.contains_key(&slot) {
+                        pics.clear();
+                    }
                     let pic = pics.entry(slot).or_insert_with(|| {
                         let raw = self.textures.rgba(&prop.asset).ok()?;
                         Some(if shade { export::with_shadow(&raw, size, prop.rot, &map.shadows) } else { (raw, [1.0, 1.0]) })
@@ -592,8 +639,8 @@ impl App {
                     }
                 }
                 // Стены — поверх предметов, как в редакторе.
-                if let Some((layer, at)) = wall_layers.get(&k) {
-                    export::stamp_layer(&mut flat, layer, *at);
+                if let Some(layer) = wall_layers.get(&k) {
+                    export::stamp_layer(&mut flat, layer, [0, 0]);
                 }
                 let mut jpg = Vec::new();
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&flat).map_err(|x| x.to_string())?;
