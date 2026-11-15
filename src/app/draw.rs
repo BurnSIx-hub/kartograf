@@ -81,6 +81,13 @@ impl App {
         }
 
         let exporting = self.export.is_some();
+        // Проходы выгрузки с тайлами: пол без стен — или одни стены (с их тенью,
+        // окнами, косяками и слоем «над стенами») на чёрном и на белом.
+        let pass = self.export.as_ref().and_then(|e| e.pass());
+        let (floor_only, walls_only) = (pass == Some(0), matches!(pass, Some(1 | 2)));
+        if walls_only {
+            painter.rect_filled(canvas, 0.0, if pass == Some(1) { Color32::BLACK } else { Color32::WHITE });
+        }
         // Протянутая заливка — рамкой, пока кнопку не отпустили.
         if let (Some(a), Some(p)) = (self.drag_from, self.hover.filter(|_| !exporting)) {
             let b = self.drag_corner(a, cam.cell(canvas, p), painter.ctx().input(|i| i.modifiers.shift));
@@ -131,7 +138,9 @@ impl App {
 
         // Объекты — под стенами, как мебель у стены; что выше слоем — позже.
         let shadows = self.map.shadows.clone();
-        self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS, 1.0);
+        if !walls_only {
+            self.draw_props(painter, canvas, view, exporting, i16::MIN..map::ABOVE_WALLS, 1.0);
+        }
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
         // ложатся и на объекты у стены.
@@ -147,7 +156,7 @@ impl App {
         for l in &mut looks {
             l.1 = map::cut_portals_wide(&l.1, &self.map.portals, l.0.width / 2.0);
         }
-        if shadows.on {
+        if shadows.on && !floor_only {
             // Стена под крышей своей тени не даёт: её накрывает тень крыши, а вдвоём они
             // чернили двери и всё у стены на теневой стороне дома.
             let roofs = if self.roof_view == RoofView::Hidden && self.export.is_none() { Vec::new() } else { self.map.roofs.clone() };
@@ -195,7 +204,7 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, a), cam.to_screen(canvas, b)], Stroke::new(width * s + 6.0, Color32::from_rgb(120, 180, 255)));
             }
         }
-        for (st, edges) in &looks {
+        for (st, edges) in looks.iter().filter(|_| !floor_only) {
             self.draw_walls(painter, canvas, st, edges);
         }
         let walls = self.map.walls.clone();
@@ -207,7 +216,9 @@ impl App {
                     painter.line_segment([cam.to_screen(canvas, *a), cam.to_screen(canvas, *b)], Stroke::new(own.width * s + 6.0, Color32::from_rgb(120, 180, 255)));
                 }
             }
-            self.draw_walls(painter, canvas, own, &map::cut_portals_wide(&segs, &self.map.portals, own.width / 2.0));
+            if !floor_only {
+                self.draw_walls(painter, canvas, own, &map::cut_portals_wide(&segs, &self.map.portals, own.width / 2.0));
+            }
         }
 
         let portals = self.map.portals.clone();
@@ -222,7 +233,9 @@ impl App {
                 .map(|w| w.style.clone().unwrap_or_else(|| style.clone()))
                 .or_else(|| edges.iter().find(|s| map::segment_distance(c, s.0, s.1) < 0.06).map(|s| self.map.edge_look(map::edge_key(s))))
                 .unwrap_or_else(|| style.clone());
-            self.draw_portal(painter, canvas, portal, &own);
+            if !floor_only {
+                self.draw_portal(painter, canvas, portal, &own);
+            }
             if self.sel == Some(Sel::Portal(i)) {
                 painter.line_segment([cam.to_screen(canvas, portal.a), cam.to_screen(canvas, portal.b)], Stroke::new(3.0, Color32::from_rgb(120, 180, 255)));
             }
@@ -328,7 +341,9 @@ impl App {
         }
 
         // Слой «над стенами» — между стенами и крышами.
-        self.draw_props(painter, canvas, view, exporting, map::ABOVE_WALLS..map::ON_ROOF, 1.0);
+        if !floor_only {
+            self.draw_props(painter, canvas, view, exporting, map::ABOVE_WALLS..map::ON_ROOF, 1.0);
+        }
 
         // Крыши — над всем, что в доме; тень их ложится и в выгрузку, а сами
         // они уходят в Foundry отдельными тайлами.
@@ -342,7 +357,7 @@ impl App {
         self.outline_pending = false;
         self.joined_rects.clear();
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
-        if self.roof_view != RoofView::Hidden || exporting {
+        if (self.roof_view != RoofView::Hidden || exporting) && !walls_only {
             let roofs = self.map.roofs.clone();
             if shadows.on {
                 for (i, r) in roofs.iter().enumerate() {
@@ -382,12 +397,14 @@ impl App {
         // Крышное — поверх крыш и тает вместе с ними: скрытые крыши — нет и его;
         // в выгрузке его нет в картинке, оно запечено в тайлы крыш.
         let on_roof = if self.roof_view == RoofView::Hidden && !exporting { 0.0 } else { roof_alpha };
-        self.draw_props(painter, canvas, view, exporting, map::ON_ROOF..map::ABOVE_ROOFS, on_roof);
-        self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX, 1.0);
+        if !walls_only {
+            self.draw_props(painter, canvas, view, exporting, map::ON_ROOF..map::ABOVE_ROOFS, on_roof);
+            self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX, 1.0);
+        }
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {
-            if exporting && label.gm {
+            if (exporting && label.gm) || walls_only {
                 continue;
             }
             self.draw_label(painter, canvas, label);

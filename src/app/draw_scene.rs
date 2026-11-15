@@ -312,9 +312,11 @@ impl App {
         // нужен `&mut self` (картинки грузятся), а карту оно не читает.
         let props = std::mem::take(&mut self.map.props);
         let shadows = self.map.shadows.clone();
+        // Выгрузка с тайлами: тень предмета едет в картинке его тайла, в фоне её нет.
+        let tiles = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
         if shadows.on && fade >= 1.0 {
             // Тень кроны — своя, сдвинутая на высоту дерева ([`roofs::tree_shade`]).
-            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow() && !p.is_canopy()) {
+            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow() && !p.is_canopy() && !(tiles && p.carries_shadow())) {
                 let c = prop.corners();
                 let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
                 if bounds.intersects(view) {
@@ -332,7 +334,7 @@ impl App {
                 continue;
             }
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
-            if up && !prop.is_canopy() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || prop.own_tile()) {
+            if up && !prop.is_canopy() && !prop.with_walls() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || prop.own_tile()) {
                 // Куст, навес, бельё и всякий предмет уйдут в свой тайл целиком; тень — в фоне.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.

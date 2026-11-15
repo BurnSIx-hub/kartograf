@@ -690,6 +690,11 @@ pub struct RoofTile {
     pub swing: Option<[f32; 4]>,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
+    /// Куст: на земле под токенами, не гаснет — он по колено, а не над головой.
+    pub ground: bool,
+    /// Слой стен этажа: над мебелью и токенами, под крышами; закреплён, не гаснет,
+    /// свет и дождь не держит.
+    pub walls: bool,
     /// Контур крыши OSM в точках сцены, двор — `true` ([`crate::roofs::outline`]).
     /// В тайл он уходит долями тайла: Мастер подвинет или растянет тайл — контур
     /// поедет с ним. Без контура «Wild Canvas» берёт весь прямоугольник тайла.
@@ -731,6 +736,130 @@ pub fn stamp(dst: &mut image::RgbImage, src: &image::RgbaImage, center: [f32; 2]
     }
 }
 
+/// Прозрачный слой из двух снимков одного и того же — на чёрном и на белом:
+/// прозрачность точки — по разнице снимков, цвет — с чёрного. Так стены с их
+/// мягкой тенью снимаются с холста отдельно от пола.
+pub fn layer_from_pair(black: &image::RgbImage, white: &image::RgbImage) -> image::RgbaImage {
+    let mut out = image::RgbaImage::new(black.width(), black.height());
+    for ((o, b), w) in out.pixels_mut().zip(black.pixels()).zip(white.pixels()) {
+        let d = (0..3).map(|k| w[k] as i32 - b[k] as i32).sum::<i32>() as f32 / 3.0;
+        let a = (255.0 - d).clamp(0.0, 255.0);
+        // Единица-другая — шум округления снимка, а не тень.
+        if a < 2.5 {
+            continue;
+        }
+        let c = |k: usize| (b[k] as f32 * 255.0 / a).round().clamp(0.0, 255.0) as u8;
+        *o = image::Rgba([c(0), c(1), c(2), a.round() as u8]);
+    }
+    out
+}
+
+/// Рамка нарисованного в слое: x, y, ширина, высота; слой пуст — `None`.
+pub fn opaque_box(img: &image::RgbaImage, min_alpha: u8) -> Option<[u32; 4]> {
+    let (mut lo, mut hi) = ([u32::MAX; 2], [0u32; 2]);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p[3] >= min_alpha {
+            lo = [lo[0].min(x), lo[1].min(y)];
+            hi = [hi[0].max(x), hi[1].max(y)];
+        }
+    }
+    (lo[0] <= hi[0]).then(|| [lo[0], lo[1], hi[0] - lo[0] + 1, hi[1] - lo[1] + 1])
+}
+
+/// Слой поверх картинки: левый верхний угол слоя — в точке `at`.
+pub fn stamp_layer(dst: &mut image::RgbImage, src: &image::RgbaImage, at: [u32; 2]) {
+    for (x, y, p) in src.enumerate_pixels() {
+        let (dx, dy) = (x + at[0], y + at[1]);
+        if p[3] == 0 || dx >= dst.width() || dy >= dst.height() {
+            continue;
+        }
+        let a = p[3] as f32 / 255.0;
+        let d = dst.get_pixel_mut(dx, dy);
+        for k in 0..3 {
+            d[k] = (p[k] as f32 * a + d[k] as f32 * (1.0 - a)).round() as u8;
+        }
+    }
+}
+
+/// Предмет вместе со своей тенью — одной картинкой для тайла: Мастер сдвинет или
+/// уберёт тайл в Foundry — тень уйдёт с ним, а не останется пятном на полу.
+/// `cells` — размер предмета в клетках, `rot` — его поворот: тень в картинке
+/// развёрнута навстречу, тайл повернётся вместе с ней. Тень та же, что в
+/// редакторе: размытый силуэт, сдвинутый от света, слоями ([`map::Shadows::layers`]).
+/// Возвращает картинку с полями под тень и во сколько раз она шире и выше.
+pub fn with_shadow(img: &image::RgbaImage, cells: [f32; 2], rot: f32, sh: &map::Shadows) -> (image::RgbaImage, [f32; 2]) {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let ppc = [w as f32 / cells[0].max(1e-3), h as f32 / cells[1].max(1e-3)];
+    let (s, c) = (-rot).to_radians().sin_cos();
+    // Слой: сдвиг в осях картинки (клетки), размытие (клетки), плотность.
+    let layers: Vec<([f32; 2], f32, f32)> = sh
+        .layers()
+        .iter()
+        .map(|l| {
+            let o = l.offset();
+            ([o[0] * c - o[1] * s, o[0] * s + o[1] * c], (l.blur * 10.0).round().clamp(1.0, 10.0) / 10.0, l.opacity)
+        })
+        .collect();
+    let blur = layers.iter().map(|l| l.1).fold(0.0, f32::max);
+    let reach = |k: usize| layers.iter().map(|l| l.0[k].abs()).fold(0.0, f32::max) + 1.6 * blur;
+    let (px, py) = ((reach(0) * ppc[0]).ceil() as u32, (reach(1) * ppc[1]).ceil() as u32);
+    let (ow, oh) = (w + 2 * px, h + 2 * py);
+    // Тень мягкая: считается в 32 точки на клетку.
+    let k = [(32.0 / ppc[0]).min(1.0), (32.0 / ppc[1]).min(1.0)];
+    let (gw, gh) = ((ow as f32 * k[0]).ceil() as usize + 1, (oh as f32 * k[1]).ceil() as usize + 1);
+    let mut light = vec![1.0f32; gw * gh];
+    let mut a = vec![0.0f32; gw * gh];
+    let mut tmp = vec![0.0f32; gw * gh];
+    for (o, b, opacity) in &layers {
+        for j in 0..gh {
+            for i in 0..gw {
+                let (x, y) = ((i as f32 + 0.5) / k[0] - px as f32 - o[0] * ppc[0], (j as f32 + 0.5) / k[1] - py as f32 - o[1] * ppc[1]);
+                a[j * gw + i] = if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 { 0.0 } else { img.get_pixel(x as u32, y as u32).0[3] as f32 / 255.0 };
+            }
+        }
+        // Три прохода ящика — почти по Гауссу, как у тени в редакторе.
+        let r = [((b * ppc[0] * k[0]) / 2.0).round().max(1.0) as i64, ((b * ppc[1] * k[1]) / 2.0).round().max(1.0) as i64];
+        for _ in 0..3 {
+            for j in 0..gh {
+                for i in 0..gw as i64 {
+                    let (lo, hi) = ((i - r[0]).max(0), (i + r[0]).min(gw as i64 - 1));
+                    tmp[j * gw + i as usize] = (lo..=hi).map(|q| a[j * gw + q as usize]).sum::<f32>() / (2 * r[0] + 1) as f32;
+                }
+            }
+            for j in 0..gh as i64 {
+                let (lo, hi) = ((j - r[1]).max(0), (j + r[1]).min(gh as i64 - 1));
+                for i in 0..gw {
+                    a[j as usize * gw + i] = (lo..=hi).map(|q| tmp[q as usize * gw + i]).sum::<f32>() / (2 * r[1] + 1) as f32;
+                }
+            }
+        }
+        for (t, v) in light.iter_mut().zip(&a) {
+            *t *= 1.0 - (v * opacity).clamp(0.0, 1.0);
+        }
+    }
+    let mut out = image::RgbaImage::new(ow, oh);
+    for y in 0..oh {
+        for x in 0..ow {
+            let (fx, fy) = (((x as f32 + 0.5) * k[0] - 0.5).max(0.0), ((y as f32 + 0.5) * k[1] - 0.5).max(0.0));
+            let (ix, iy) = ((fx as usize).min(gw - 2), (fy as usize).min(gh - 2));
+            let (tx, ty) = ((fx - ix as f32).min(1.0), (fy - iy as f32).min(1.0));
+            let g = |i: usize, j: usize| light[j * gw + i];
+            let lit = (g(ix, iy) * (1.0 - tx) + g(ix + 1, iy) * tx) * (1.0 - ty) + (g(ix, iy + 1) * (1.0 - tx) + g(ix + 1, iy + 1) * tx) * ty;
+            let shade = 1.0 - lit;
+            let p = if x >= px && y >= py && x < px + w && y < py + h { img.get_pixel(x - px, y - py).0 } else { [0; 4] };
+            let pa = p[3] as f32 / 255.0;
+            let oa = pa + shade * (1.0 - pa);
+            if oa <= 0.002 {
+                continue;
+            }
+            // Тень чёрная: цвет — только от предмета.
+            let col = |v: u8| (v as f32 * pa / oa).round().clamp(0.0, 255.0) as u8;
+            out.put_pixel(x, y, image::Rgba([col(p[0]), col(p[1]), col(p[2]), (oa * 255.0).round() as u8]));
+        }
+    }
+    (out, [ow as f32 / w as f32, oh as f32 / h as f32])
+}
+
 /// Id уровня: первый — уровень по умолчанию Foundry, остальные свои, 16 знаков.
 pub fn level_id(k: usize) -> String {
     if k == 0 { LEVEL_ID.to_owned() } else { format!("kartografLevel{k:02}") }
@@ -765,11 +894,26 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
         // и не пускает свет и дождь. Высота выше дверей: ниже 20 они просвечивают сквозь крышу.
         // `x`, `y` — середина, режим 1 — затухание всего тайла. Без `_stats` сцены (см. ниже)
         // миграции сдвинули бы тайл на полразмера и обнулили `occlusion.modes`.
+        // Высоты — от границ этажа: низ `b`, верх `t` (один этаж — 0 и 20, как у
+        // уровня Foundry по умолчанию). Предметы и кусты — на `b`, под токенами;
+        // стены, крыши и кроны — на `t`: над токенами этажа и над створками дверей
+        // (ядро рисует их на верхе этажа слоем ниже тайлов). Раньше крыше любого
+        // этажа давалось +20 от его низа — выше потолка этажа.
+        let (b, t) = if multi { (k as i64 * 10, (k as i64 + 1) * 10) } else { (0, 20) };
         for r in &lv.roofs {
             let [x, y, w, h] = r.rect;
+            if r.walls {
+                // Ниже крыш и крон той же высоты — по `sort`.
+                tiles.push(tag(json!({
+                    "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5, "alphaThreshold": 0.75},
+                    "x": x + w / 2, "y": y + h / 2, "width": w, "height": h, "rotation": 0, "elevation": t, "sort": -1, "locked": true,
+                    "occlusion": {"modes": [], "alpha": 0}, "restrictions": {"light": false, "weather": false}
+                })));
+                continue;
+            }
             let mut tile = json!({
                 "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
-                "elevation": k as i64 * 10 + if r.low { 10 } else { 20 }, "sort": tiles.len(), "rotation": r.rotation,
+                "elevation": if r.low { b + 10 } else { t }, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
@@ -782,7 +926,7 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             }
             if r.item && r.living.is_none() && r.web.is_none() && r.chest.is_none() {
                 // Над крышами — выше крыши этажа, иначе на полу.
-                tile["elevation"] = json!(k as i64 * 10 + if r.above { 25 } else { 0 });
+                tile["elevation"] = json!(if r.above { t + 5 } else { b });
                 tile["occlusion"]["modes"] = json!([]);
                 if r.hover {
                     tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});
@@ -793,14 +937,14 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
             } else if let Some((key, value)) = &r.living {
                 // Живой предмет под токенами: колонка играет сразу. Дирижабль над
                 // крышами так и остаётся над ними — винты крутятся там.
-                tile["elevation"] = json!(k as i64 * 10 + if r.above { 25 } else { 0 });
+                tile["elevation"] = json!(if r.above { t + 5 } else { b });
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = json!({LIVE_MODULE: {*key: value}});
                 if r.hover {
                     tile["flags"][LIVE_MODULE]["hover"] = json!(1);
                 }
             } else if r.web.is_some() || r.chest.is_some() {
-                tile["elevation"] = json!(k as i64 * 10);
+                tile["elevation"] = json!(b);
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = match &r.chest {
                     Some((open, empty)) => json!({OWN_MODULE: {"chest": {"open": open, "empty": empty}}}),
@@ -820,6 +964,10 @@ pub fn foundry_levels(map: &Map, name: &str, levels: &[SceneLevel], px: u32, lea
                 if !map.particles.is_empty() && r.leaves {
                     tile["flags"][LIVE_MODULE]["particles"] = json!(map.particles);
                 }
+            }
+            if r.ground {
+                tile["elevation"] = json!(b);
+                tile["occlusion"]["modes"] = json!([]);
             }
             if !r.scuppers.is_empty() {
                 // Сливы крыши: середина и поворот; размер — клетка сцены.
@@ -1388,6 +1536,90 @@ mod tests {
     }
 
     #[test]
+    fn walls_go_above_furniture_and_tokens_and_bushes_stay_on_the_ground() {
+        // Один этаж: низ 0, верх 20 (уровень Foundry по умолчанию). Предмет — на полу
+        // под токенами, стены — тайлом на верхе этажа ниже крыши по `sort`, куст — на земле.
+        let map = Map::new(8, 6);
+        let lay = layout(&map, &map.room_edges());
+        let item = RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100) };
+        let bush = RoofTile { ground: true, fade: false, wind: 0.35, ..canopy_tile("k/bush.webp".into(), [5.0, 2.0], [2.0, 2.0], 0.0, 100) };
+        let roof = RoofTile { src: "k/roof.webp".into(), rect: [100, 100, 400, 300], shelter: true, fade: true, wind: 1.0, ..Default::default() };
+        let walls = RoofTile { src: "k/walls.webp".into(), rect: [90, 90, 420, 320], walls: true, ..Default::default() };
+        let one = [SceneLevel { name: "Дом".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![item, bush, roof, walls] }];
+        let scene = foundry_levels(&map, "Дом", &one, 100, &Default::default());
+        let t = scene["tiles"].as_array().unwrap();
+        assert_eq!((t[0]["elevation"].as_i64(), t[0]["occlusion"]["modes"].as_array().map(Vec::len)), (Some(0), Some(0)), "предмет — на полу");
+        assert_eq!((t[1]["elevation"].as_i64(), t[1]["occlusion"]["modes"].as_array().map(Vec::len)), (Some(0), Some(0)), "куст — на земле и не гаснет");
+        assert!(t[1]["flags"][LIVE_MODULE]["wind"].as_f64().is_some(), "куст колышется");
+        assert_eq!((t[2]["elevation"].as_i64(), t[2]["occlusion"]["modes"][0].as_i64()), (Some(20), Some(1)), "крыша — на верхе этажа, гаснет");
+        let w = &t[3];
+        assert_eq!((w["elevation"].as_i64(), w["sort"].as_i64(), w["locked"].as_bool()), (Some(20), Some(-1), Some(true)));
+        assert!(w["sort"].as_i64() < t[2]["sort"].as_i64(), "стены ниже крыши той же высоты");
+        assert_eq!(w["occlusion"]["modes"].as_array().map(Vec::len), Some(0), "стены не гаснут над токеном");
+        assert_eq!((w["restrictions"]["light"].as_bool(), w["restrictions"]["weather"].as_bool()), (Some(false), Some(false)));
+        assert_eq!((w["x"].as_i64(), w["y"].as_i64(), w["width"].as_i64()), (Some(300), Some(250), Some(420)));
+        assert_eq!(w["texture"]["alphaThreshold"].as_f64(), Some(0.75));
+        // Два этажа: у каждого свои границы — предметы на низе, стены и крыши на верхе.
+        let two = [
+            SceneLevel { name: "Низ".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![RoofTile { src: "k/w1.webp".into(), rect: [0, 0, 10, 10], walls: true, ..Default::default() }] },
+            SceneLevel { name: "Верх".into(), image_src: "k/b.webp".into(), layout: &lay, roofs: vec![RoofTile { item: true, ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100) }, RoofTile { src: "k/w2.webp".into(), rect: [0, 0, 10, 10], walls: true, ..Default::default() }] },
+        ];
+        let scene = foundry_levels(&map, "Дом", &two, 100, &Default::default());
+        let t = scene["tiles"].as_array().unwrap();
+        assert_eq!([t[0]["elevation"].as_i64(), t[1]["elevation"].as_i64(), t[2]["elevation"].as_i64()], [Some(10), Some(10), Some(20)]);
+        assert_eq!(t[2]["levels"][0], scene["levels"][1]["_id"]);
+    }
+
+    #[test]
+    fn a_layer_comes_off_the_canvas_from_shots_on_black_and_white() {
+        // Точка стены непрозрачна (снимки равны), тень — чёрная в полсилы, пустое — разница во весь белый.
+        let mut black = image::RgbImage::new(4, 1);
+        let mut white = image::RgbImage::from_pixel(4, 1, image::Rgb([255, 255, 255]));
+        black.put_pixel(1, 0, image::Rgb([120, 90, 60]));
+        white.put_pixel(1, 0, image::Rgb([120, 90, 60]));
+        white.put_pixel(2, 0, image::Rgb([128, 128, 128]));
+        // Полупрозрачный рыжий край стены (плотность 0,5): на чёрном вдвое темнее.
+        black.put_pixel(3, 0, image::Rgb([100, 50, 0]));
+        white.put_pixel(3, 0, image::Rgb([228, 178, 128]));
+        let layer = layer_from_pair(&black, &white);
+        assert_eq!(layer.get_pixel(0, 0).0[3], 0);
+        assert_eq!(layer.get_pixel(1, 0).0, [120, 90, 60, 255]);
+        assert_eq!(layer.get_pixel(2, 0).0, [0, 0, 0, 127]);
+        let edge = layer.get_pixel(3, 0).0;
+        assert!((edge[0] as i32 - 200).abs() <= 2 && (edge[1] as i32 - 100).abs() <= 2 && (edge[3] as i32 - 127).abs() <= 1, "{edge:?}");
+        assert_eq!(opaque_box(&layer, 8), Some([1, 0, 3, 1]));
+        assert_eq!(opaque_box(&image::RgbaImage::new(3, 3), 8), None);
+        // Слой обратно на пол: непрозрачное заменяет, тень темнит вдвое.
+        let mut floor = image::RgbImage::from_pixel(6, 1, image::Rgb([200, 200, 200]));
+        stamp_layer(&mut floor, &layer, [1, 0]);
+        assert_eq!(floor.get_pixel(1, 0).0, [200, 200, 200]);
+        assert_eq!(floor.get_pixel(2, 0).0, [120, 90, 60]);
+        assert!((floor.get_pixel(3, 0).0[0] as i32 - 100).abs() <= 2);
+    }
+
+    #[test]
+    fn an_item_tile_carries_its_own_shadow() {
+        // Ящик 1×1 (64 точки), тень вправо-вниз на 0,2 клетки: картинка шире, тень —
+        // по ту сторону, куда падает; у повёрнутого на 180° предмета — по другую.
+        let pic = image::RgbaImage::from_pixel(64, 64, image::Rgba([180, 120, 60, 255]));
+        let sh = crate::map::Shadows { on: true, angle: 45.0, dist: 0.2, blur: 0.2, opacity: 0.6, fade: 0.0, ..Map::new(2, 2).shadows };
+        let (out, grow) = with_shadow(&pic, [1.0, 1.0], 0.0, &sh);
+        assert!(grow[0] > 1.2 && grow[1] > 1.2 && grow[0] < 2.5, "{grow:?}");
+        let pad = (out.width() - 64) / 2;
+        // Сам предмет не тронут и стоит посередине.
+        assert_eq!(out.get_pixel(pad + 32, pad + 32).0, [180, 120, 60, 255]);
+        // Тень: чёрная, полупрозрачная, справа-снизу плотнее, чем слева-сверху.
+        let at = |dx: i32, dy: i32| out.get_pixel((pad as i32 + 32 + dx) as u32, (pad as i32 + 32 + dy) as u32).0;
+        let (far, near) = (at(38, 38), at(-38, -38));
+        assert!(far[3] > 40 && far[0] < 30, "тени справа-снизу нет: {far:?}");
+        assert!(near[3] < far[3] / 3, "тень легла и против света: {near:?} и {far:?}");
+        // Предмет повёрнут на 180°: тайл повернётся в Foundry, поэтому в картинке тень с другой стороны.
+        let (turned, _) = with_shadow(&pic, [1.0, 1.0], 180.0, &sh);
+        let tat = |dx: i32, dy: i32| turned.get_pixel((pad as i32 + 32 + dx) as u32, (pad as i32 + 32 + dy) as u32).0;
+        assert!(tat(-38, -38)[3] > 40 && tat(38, 38)[3] < tat(-38, -38)[3] / 3);
+    }
+
+    #[test]
     fn osm_roof_tile_carries_its_outline_in_tile_fractions() {
         let a = Map::new(6, 4);
         let la = layout(&a, &a.room_edges());
@@ -1469,9 +1701,12 @@ mod tests {
         assert!(walls.iter().filter(|w| w["levels"][0] == lv[0]["_id"]).count() >= 4);
         let ids: std::collections::HashSet<_> = walls.iter().map(|w| w["_id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), walls.len());
-        // Крыша — тайл над токенами первого этажа, гаснет над токеном.
+        // Крыша — тайл над токенами первого этажа, гаснет над токеном. Высота — потолок
+        // своего этажа (10), а не +20 от его низа: это уже потолок второго.
         let t = &scene["tiles"][0];
-        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(200), Some(300), Some(20)));
+        assert_eq!((t["x"].as_i64(), t["width"].as_i64(), t["elevation"].as_i64()), (Some(200), Some(300), Some(10)));
+        // Крона второго этажа — на его потолке.
+        assert_eq!(scene["tiles"][1]["elevation"], 20);
         assert_eq!(t["occlusion"]["modes"][0], 1);
         assert_eq!(scene["_stats"]["coreVersion"], "14.355");
         assert_eq!(t["texture"]["anchorX"].as_f64(), Some(0.5));

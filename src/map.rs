@@ -725,6 +725,20 @@ impl Prop {
         !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs)
     }
 
+    /// Слой «над стенами» — колонны, столбики перил: в Foundry они в тайле стен
+    /// этажа (поверх стен, над токенами), своего тайла у них нет.
+    pub fn with_walls(&self) -> bool {
+        (ABOVE_WALLS..ON_ROOF).contains(&self.layer())
+    }
+
+    /// Тень предмета — в картинке его же тайла, а не в фоне: Мастер сдвинет или
+    /// уберёт тайл в Foundry — тень уйдёт с ним. Кроме того, что «Wild Canvas»
+    /// двигает и размечает по долям тайла (парящее, гамак, машины, паутина): у них
+    /// тень остаётся в фоне.
+    pub fn carries_shadow(&self) -> bool {
+        self.own_tile() && self.casts_shadow() && self.layer() < ABOVE_WALLS && !hover_by_name(&self.asset) && !swing_by_name(&self.asset) && !web_by_name(&self.asset) && living_by_name(&self.asset).is_none()
+    }
+
     pub fn layer(&self) -> i16 {
         self.layer.unwrap_or_else(|| layer_by_name(&self.asset))
     }

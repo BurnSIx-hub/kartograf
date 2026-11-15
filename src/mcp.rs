@@ -173,7 +173,7 @@ fn tools() -> Value {
         tool("new_map", "Start an empty map.", json!({"width": int("Cells"), "height": int("Cells")}), &["width", "height"]),
         tool("open_map", "Open a .karta file.", json!({"path": text("File path")}), &["path"]),
         tool("save_map", "Save the map to a .karta file (the current file if no path).", json!({"path": text("File path")}), &[]),
-        tool("export_foundry", "Export the map for Foundry VTT and Universal VTT into a folder: picture, scene JSON with walls, doors and lights, .dd2vtt.", json!({"dir": text("Folder"), "px": int("Pixels per cell, default 140")}), &["dir"]),
+        tool("export_foundry", "Export the map for Foundry VTT and Universal VTT into a folder: picture, scene JSON with walls, doors and lights, .dd2vtt. In Foundry the walls of every floor (with their shadow, windows, door frames and the above_walls layer) go as one locked tile above furniture and tokens and below roofs; objects are tiles on the floor that carry their own shadows, so a moved tile takes its shadow along; bushes lie on the ground under tokens; roofs and tree crowns sit at the top of their own floor.", json!({"dir": text("Folder"), "px": int("Pixels per cell, default 140")}), &["dir"]),
     ])
 }
 

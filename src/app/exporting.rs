@@ -36,6 +36,10 @@ impl App {
             origin: [0.0, 0.0],
             roof_alpha: 0.0,
             wait: 0,
+            wall_pass: 0,
+            floor: None,
+            wall_shot: None,
+            walls: Vec::new(),
         });
     }
 
@@ -70,6 +74,10 @@ impl App {
             origin: [area[0], area[1]],
             roof_alpha,
             wait: 0,
+            wall_pass: 0,
+            floor: None,
+            wall_shot: None,
+            walls: Vec::new(),
         });
     }
 
@@ -165,6 +173,26 @@ impl App {
             self.picture = Some(e.image);
             return;
         }
+        // С тайлами этаж снимается трижды: пол без стен, стены на чёрном, стены на белом.
+        if e.pass().is_some() {
+            if e.wall_pass < 2 {
+                let fresh = image::RgbImage::new(e.image.width(), e.image.height());
+                let shot = std::mem::replace(&mut e.image, fresh);
+                if e.wall_pass == 0 {
+                    e.floor = Some(shot);
+                } else {
+                    e.wall_shot = Some(shot);
+                }
+                e.wall_pass += 1;
+                e.next = 0;
+                return;
+            }
+            if let (Some(floor), Some(black)) = (e.floor.take(), e.wall_shot.take()) {
+                let white = std::mem::replace(&mut e.image, floor);
+                e.walls.push([black, white]);
+            }
+            e.wall_pass = 0;
+        }
         // Этаж снят — следующий, пока не кончатся.
         if e.doing + 1 < self.levels.len() {
             let fresh = image::RgbImage::new(e.image.width(), e.image.height());
@@ -258,6 +286,10 @@ impl App {
         let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut seen = std::collections::HashMap::new();
+        // Слой стен каждого этажа (для Universal VTT) и во сколько раз тайл предмета
+        // шире картинки без тени.
+        let mut wall_layers: std::collections::HashMap<usize, (image::RgbaImage, [u32; 2])> = std::collections::HashMap::new();
+        let mut grows: std::collections::HashMap<String, [f32; 2]> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let light = map.shadows.light();
@@ -439,9 +471,12 @@ impl App {
                     tile.leaves = false;
                     tile.rope = true;
                 }
-                // Куст ниже кроны и жёстче: лишь колышется.
+                // Куст ниже кроны и жёстче: лишь колышется. Он по колено: лежит на
+                // земле под токенами и не гаснет, как крона над головой.
                 if map::bush_by_name(&prop.asset) {
                     tile.wind = 0.35;
+                    tile.ground = true;
+                    tile.fade = false;
                 }
                 tiles.push(tile);
             }
@@ -451,25 +486,30 @@ impl App {
             // по слою: кто выше, тот позже.
             // Крышное над крышей уже в её картинке — и над прямоугольной, и по контуру.
             let baked = |p: &Prop| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && (map.roofs.iter().any(|r| r.contains(p.pos)) || map.outline_roofs.iter().any(|r| r.contains(p.pos)));
-            let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !baked(p)).collect();
+            let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !baked(p) && !p.with_walls()).collect();
             items.sort_by_key(|p| p.layer());
             for prop in items {
-                let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
-                    if let Some(src) = canopies.get(key) {
-                        return Ok(src.clone());
+                let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
+                // Тень — в картинку тайла: своя на каждый поворот и размер предмета.
+                let shade = (map.shadows.on && prop.carries_shadow()).then(|| format!("#тень{k}|{:.0}|{:.3}", prop.rot.rem_euclid(360.0), prop.scale));
+                let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<(String, [f32; 2]), String> {
+                    let slot = format!("{key}{}", shade.as_deref().unwrap_or(""));
+                    if let Some(src) = canopies.get(&slot) {
+                        return Ok((src.clone(), grows.get(&slot).copied().unwrap_or([1.0, 1.0])));
                     }
                     let img = image::DynamicImage::ImageRgba8(self.textures.rgba(key)?);
                     let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
+                    let (img, grow) = if shade.is_some() { export::with_shadow(&img.to_rgba8(), size, prop.rot, &map.shadows) } else { (img.to_rgba8(), [1.0, 1.0]) };
+                    grows.insert(slot.clone(), grow);
                     let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
-                    files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
+                    files.push((file.clone(), export::webp_bytes(&img, 90.0)));
                     let src = export::foundry_src(&file);
-                    canopies.insert(key.to_owned(), src.clone());
-                    Ok(src)
+                    canopies.insert(slot, src.clone());
+                    Ok((src, grow))
                 };
-                let src = save(&prop.asset, &mut files)?;
-                let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
-                let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                let (src, grow) = save(&prop.asset, &mut files)?;
+                let mut tile = export::canopy_tile(src.clone(), prop.pos, [size[0] * grow[0], size[1] * grow[1]], prop.rot, e.px);
                 tile.fade = false;
                 tile.leaves = false;
                 tile.item = true;
@@ -489,13 +529,25 @@ impl App {
                 match map::chest_variants(&prop.asset) {
                     // Нет открытого или пустого в библиотеке — тот же закрытый.
                     Some((open, empty)) => {
-                        let open = save(&open, &mut files).unwrap_or_else(|_| src.clone());
-                        let empty = save(&empty, &mut files).unwrap_or_else(|_| open.clone());
+                        let open = save(&open, &mut files).map_or_else(|_| src.clone(), |s| s.0);
+                        let empty = save(&empty, &mut files).map_or_else(|_| open.clone(), |s| s.0);
                         tile.chest = Some((open, empty));
                     }
                     None => tile.web = Some(library::strand_ends(&self.textures.sources, &prop.asset)),
                 }
                 tiles.push(tile);
+            }
+            // Стены этажа — одним тайлом по рамке нарисованного: над мебелью и токенами,
+            // под крышами. В нём же тень стен, окна, косяки и слой «над стенами».
+            if let Some([black, white]) = e.walls.get(k) {
+                let layer = export::layer_from_pair(black, white);
+                if let Some([x, y, w, h]) = export::opaque_box(&layer, 8) {
+                    let cut = image::imageops::crop_imm(&layer, x, y, w, h).to_image();
+                    let file = e.dir.join(format!("{}_стены.webp", stem(k)));
+                    files.push((file.clone(), export::webp_bytes(&cut, 90.0)));
+                    tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [x as i64, y as i64, w as i64, h as i64], walls: true, ..Default::default() });
+                    wall_layers.insert(k, (cut, [x, y]));
+                }
             }
             roof_tiles.push(tiles);
         }
@@ -518,19 +570,30 @@ impl App {
             use base64::Engine;
             // В Universal VTT тайлов нет: предметы, ушедшие в тайлы, впечатываются
             // в его картинку.
-            let mut pics: std::collections::HashMap<String, Option<image::RgbaImage>> = std::collections::HashMap::new();
+            let mut pics: std::collections::HashMap<String, Option<(image::RgbaImage, [f32; 2])>> = std::collections::HashMap::new();
             for k in 0..n {
                 let map = if k == self.level { &self.map } else { &self.levels[k] };
                 let mut flat = e.done[k].clone();
                 // Крыш в Universal VTT нет — нет и крышного.
-                let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
+                let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !p.with_walls() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
                 items.sort_by_key(|p| p.layer());
                 let p = e.px as f32;
                 for prop in items {
-                    let pic = pics.entry(prop.asset.clone()).or_insert_with(|| self.textures.rgba(&prop.asset).ok());
-                    if let Some(pic) = pic {
-                        export::stamp(&mut flat, pic, [prop.pos[0] * p, prop.pos[1] * p], [prop.size[0] * prop.scale * p, prop.size[1] * prop.scale * p], prop.rot, prop.tint);
+                    let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
+                    // Тень предмета в фоне больше не лежит — впечатывается вместе с ним.
+                    let shade = map.shadows.on && prop.carries_shadow();
+                    let slot = if shade { format!("{}#тень{k}|{:.0}|{:.3}", prop.asset, prop.rot.rem_euclid(360.0), prop.scale) } else { prop.asset.clone() };
+                    let pic = pics.entry(slot).or_insert_with(|| {
+                        let raw = self.textures.rgba(&prop.asset).ok()?;
+                        Some(if shade { export::with_shadow(&raw, size, prop.rot, &map.shadows) } else { (raw, [1.0, 1.0]) })
+                    });
+                    if let Some((pic, grow)) = pic {
+                        export::stamp(&mut flat, pic, [prop.pos[0] * p, prop.pos[1] * p], [size[0] * grow[0] * p, size[1] * grow[1] * p], prop.rot, prop.tint);
                     }
+                }
+                // Стены — поверх предметов, как в редакторе.
+                if let Some((layer, at)) = wall_layers.get(&k) {
+                    export::stamp_layer(&mut flat, layer, *at);
                 }
                 let mut jpg = Vec::new();
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(&flat).map_err(|x| x.to_string())?;
