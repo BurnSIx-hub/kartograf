@@ -336,8 +336,9 @@ impl App {
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
             if up && !prop.is_canopy() && !prop.with_walls() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || prop.own_tile()) {
                 // Куст, навес, бельё и всякий предмет уйдут в свой тайл целиком; тень — в фоне.
-            } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && map::is_bare_tree(&prop.asset) {
+            } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && (map::is_bare_tree(&prop.asset) || !map::has_trunk(&prop.asset)) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
+                // У паруса и полога ствола нет: под ними в картинке ничего.
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() {
                 // Крона уйдёт в свой тайл: под ней в картинке пень.
                 // Пень размером со ствол, а не со всю крону.

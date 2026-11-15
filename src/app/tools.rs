@@ -331,12 +331,12 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| inside(area, p.pos))
                 .take(limit)
-                .map(|(i, p)| json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0}))
+                .map(|(i, p)| object_row(i, p))
                 .collect();
             out.insert("objects".into(), json!(list));
         }
         if want("walls") {
-            let list: Vec<Value> = m.walls.iter().enumerate().filter(|(_, w)| w.points.iter().any(|&p| inside(area, p))).take(limit).map(|(i, w)| json!({"index": i, "points": w.points, "closed": w.closed})).collect();
+            let list: Vec<Value> = m.walls.iter().enumerate().filter(|(_, w)| w.points.iter().any(|&p| inside(area, p))).take(limit).map(|(i, w)| wall_row(i, w)).collect();
             out.insert("walls".into(), json!(list));
             out.insert("room_walls".into(), json!("walls along painted rooms are automatic and not listed; change them by painting/erasing rooms"));
         }
@@ -1023,6 +1023,7 @@ impl App {
     /// Крыша по контуру: башня, ротонда, эркер. Контур — по стенам, вынос — наружу
     /// по нормалям рёбер. Шатёр — грани к вершине, вальма — скаты ко всем сторонам.
     fn tool_add_outline_roof(&mut self, a: &Value) -> Res {
+        no_outline_rail(a)?;
         let pts = points_of(a);
         if pts.len() < 3 {
             return Err("points: хотя бы три точки [x, y] по стенам".into());
@@ -1045,6 +1046,7 @@ impl App {
 
     /// Крыша по контуру по номеру из describe (после прямоугольных).
     fn tool_edit_outline_roof(&mut self, a: &Value, k: usize) -> Res {
+        no_outline_rail(a)?;
         let paint = match a["paint"].as_str() {
             Some(p) => Some(self.asset_key(p)?),
             None => None,
@@ -1508,6 +1510,27 @@ fn layer_of(a: &Value) -> Result<Option<Option<i16>>, String> {
 }
 
 /// Как светит объект — словом для ИИ; не светит — `null`.
+/// Перила рисуются только по краю прямоугольной крыши: у крыши по контуру `rail`
+/// не молчаливо теряется, а отклоняется с подсказкой.
+fn no_outline_rail(a: &Value) -> Result<(), String> {
+    match a["rail"].as_str() {
+        Some(k) if !k.is_empty() => Err("rail — только у прямоугольной крыши (area): перила по контуру не рисуются. Край крыши по контуру огородите низкой стеной на этаже выше или возьмите area".into()),
+        _ => Ok(()),
+    }
+}
+
+/// Предмет в `describe`. `canopy` — уходит ли тайлом над фишками (кроны, паруса): проверке
+/// карты такое не наложение на палубу под ним.
+fn object_row(i: usize, p: &map::Prop) -> Value {
+    let r2 = |v: f32| (v * 100.0).round() / 100.0;
+    json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "canopy": p.is_canopy(), "tint": p.tint, "recolor": library::untint(&p.asset).0})
+}
+
+/// Стена в `describe`; `low` — фальшборт, парапет: держит шаг, взгляд идёт поверх.
+fn wall_row(i: usize, w: &map::Wall) -> Value {
+    json!({"index": i, "points": w.points, "closed": w.closed, "low": w.low})
+}
+
 fn glow_name(g: Option<Glow>) -> Option<String> {
     g.filter(|g| *g != Glow::Off).map(|g| format!("{g:?}").to_lowercase())
 }
@@ -1607,6 +1630,24 @@ mod tests {
         let (_, n4) = wall_side(seg, [2.05, 2.05], 0.2, None, |p| p[0] + p[1] < 4.0);
         assert!(n4[0] < 0.0 && n4[1] < 0.0, "из толщи стены — в комнату: {n4:?}");
         assert_eq!(back_extent("right", [-0.3, -0.5, 0.5, 0.5], [1.0, 1.0]), 0.3);
+    }
+
+    #[test]
+    fn outline_roof_refuses_a_rail_instead_of_dropping_it() {
+        assert!(no_outline_rail(&json!({"points": [[0, 0], [2, 0], [2, 2]], "rail": "Доски"})).is_err());
+        assert!(no_outline_rail(&json!({"points": [[0, 0], [2, 0], [2, 2]], "rail": ""})).is_ok(), "пустая строка — снять перила, не ошибка");
+        assert!(no_outline_rail(&json!({"points": [[0, 0], [2, 0], [2, 2]]})).is_ok());
+    }
+
+    #[test]
+    fn describe_tells_canopies_and_low_walls() {
+        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None };
+        assert_eq!(object_row(0, &prop("objects/Sail_Yard_Light_Tan_A1_14x3.webp", Some(true)))["canopy"], json!(true), "парус, отмеченный кроной");
+        assert_eq!(object_row(1, &prop("objects/Crate_Wood_Dark_A_1x1.webp", None))["canopy"], json!(false));
+        let mut wall = map::Wall { points: vec![[0.0, 0.0], [3.0, 0.0]], closed: false, bends: vec![], low: true, style: None };
+        assert_eq!(wall_row(2, &wall)["low"], json!(true), "фальшборт");
+        wall.low = false;
+        assert_eq!(wall_row(2, &wall)["low"], json!(false));
     }
 
     #[test]

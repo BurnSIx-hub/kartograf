@@ -93,7 +93,7 @@ fn tools() -> Value {
             "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
             "shape": {"type": "string", "enum": ["gable", "hip", "shed", "flat", "tent", "dome", "vault"], "description": "Default gable for area, tent for points (a faceted spire with a ridge from every corner); dome and vault only with points"},
             "turn": int("Quarter turns of the ridge, 0..3"), "overhang": num("Cells the roof reaches over the walls, default 0.25, for area and points alike. It is kept apart from the outline: area and points stay the walls, describe shows them with overhang"),
-            "rail": text("Railing along the edge of a flat roof (a ship's quarterdeck, a balcony): a wall asset key from find_assets (kind wall). It opens where a ladder or stairs object reaches the edge")
+            "rail": text("Railing along the edge of a flat rectangular roof (area only; a polygon roof refuses it): a ship's quarterdeck, a balcony. A wall asset key from find_assets (kind wall). It opens where a ladder or stairs object reaches the edge")
         }), &[]),
         tool("edit_roof", "Change a roof by index (see describe with roofs): covering picture, shape, ridge direction; a polygon roof also takes new points.", json!({
             "index": int("Roof index"), "paint": text("Roof covering asset key from find_assets (kind roof), e.g. builtin:roof_copper"),

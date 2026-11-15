@@ -559,6 +559,13 @@ pub fn is_bare_tree(key: &str) -> bool {
     lower.contains("bare_tree") || lower.contains("tree_bare") || lower.ends_with("builtin:tree_bare")
 }
 
+/// У кроны есть ствол — в картинке под её тайлом остаётся пень: деревья по имени и
+/// из папки `trees`. Парус, полог и прочее, отмеченное кроной рукой, ствола не имеют.
+pub fn has_trunk(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    key == crate::library::TREE || lower.contains("tree") || lower.contains("дерев")
+}
+
 /// Куст: в Foundry уходит тайлом, который качает ветер «Wild Canvas», как крону.
 pub fn bush_by_name(key: &str) -> bool {
     // Ключ своей папки — путь Windows с `\`: папку `bushes` иначе не узнать.
@@ -2313,6 +2320,10 @@ mod tests {
         assert!(!prop("builtin:stump").is_canopy());
         assert!(is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Bare_Trees/Bare_Tree_A1_6x6.webp"));
         assert!(!is_bare_tree("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp"));
+        // Пень под кроной — только у дерева; парус, отмеченный кроной, уходит в тайл целиком.
+        assert!(has_trunk("builtin:tree") && has_trunk("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp"));
+        assert!(has_trunk("C:\\Картограф\\ассеты\\objects\\trees\\Willow_Black_Ancient_A_9x9.webp"));
+        assert!(!has_trunk("pack:fa.dungeondraft_pack|textures/objects/Vehicles/Ships/Sails/Sail_Yard_Light_Tan_A1_14x3.webp"));
         assert!(prop("pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp").is_canopy());
         assert!(!Prop { canopy: Some(false), ..prop("builtin:tree") }.is_canopy());
         // Слой по имени: ковёр на полу, дерево выше обычного, своё — как выбрано.

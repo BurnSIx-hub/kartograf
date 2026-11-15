@@ -65,6 +65,16 @@ def roof_at(p, pad=0.0):
     return False
 
 
+def deck_at(p):
+    """Плоская крыша — палуба, терраса: по ней ходят, на ней стоит что угодно."""
+    for r in roofs:
+        if r.get("shape") != "flat":
+            continue
+        if r.get("points") and in_poly(p, r["points"]) or not r.get("points") and r.get("area") and inside_box(p, r["area"]):
+            return True
+    return False
+
+
 for _r in roofs:
     if _r.get("points"):
         ROOMS[f"дом {_r['index']}"] = _r["points"]
@@ -91,7 +101,7 @@ OUTDOOR = ("Lamp_Street", "Mooring_Post", "Windsock", "Gyrocopter", "Landing_Pad
 # 1. Крыши и полёт
 for o in objs:
     if 800 <= o["layer"] < 900:
-        if not has(o, *ROOF_OK):
+        if not has(o, *ROOF_OK) and not deck_at((o["x"], o["y"])):
             issues.append(f"[крыша] #{o['index']} {name(o)} — такому не место на крыше")
         if not roof_at((o["x"], o["y"]), 0.1):
             issues.append(f"[крыша] #{o['index']} {name(o)} на крыше, но не над крышей ({o['x']:.1f}, {o['y']:.1f})")
@@ -124,7 +134,11 @@ for o, e in ends:
 # 4. Наложения одного слоя
 SKIP = ("Steam", "Track_", "Rug", "Pipe_Brass", "Manhole", "Floor_", "Landing_Pad", "Puddle", "Map_", "Lantern", "Toolbox", "Cattail", "Lilypad", "Reeds_", "Skull_Decor",
         "Gauge", "Propeller_Metal", "Box_Luggage_Lid_Leather_Brown_Metal_Brass_A11", "Valve")
-cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800]
+# Части одного устройства: лафет и ствол, мачта и кофель-планка вокруг неё.
+PARTS = (("Cannon_Base", "Cannon_Metal"), ("Mast_Wood", "Rigging_Mast"))
+# Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску.
+ON_TOP = ("Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle")
+cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800 and not o.get("canopy")]
 for i, a in enumerate(cand):
     ba = box(a, 0.8)
     for b in cand[i + 1:]:
@@ -132,6 +146,10 @@ for i, a in enumerate(cand):
             continue
         # Вещь на помосте — не наложение; два куска моста внахлёст — наложение.
         if bridge(a) != bridge(b):
+            continue
+        if any(has(a, x) and has(b, y) or has(a, y) and has(b, x) for x, y in PARTS):
+            continue
+        if has(a, *ON_TOP) or has(b, *ON_TOP):
             continue
         # Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
         if any(has(x, "Table", "Desk", "Counter", "Bar_") for x in (a, b)) and min(a["w"] * a["h"], b["w"] * b["h"]) <= 2:
@@ -149,7 +167,7 @@ for dd in doors:
     (x1, y1), (x2, y2) = dd["a"], dd["b"]
     L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2 or 1
     for o in objs:
-        if o["layer"] >= 800 or bridge(o) or has(o, "Rug", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
+        if o["layer"] >= 800 or o.get("canopy") or bridge(o) or has(o, "Rug", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp"):
             continue
         tt = max(0, min(1, ((o["x"] - x1) * (x2 - x1) + (o["y"] - y1) * (y2 - y1)) / L2))
         dseg = math.dist((o["x"], o["y"]), (x1 + tt * (x2 - x1), y1 + tt * (y2 - y1)))
@@ -163,14 +181,47 @@ for o in objs:
     rs = {room_of(c) for c in corners(o, 0.7)}
     if len(rs) > 1:
         issues.append(f"[стена] #{o['index']} {name(o)} ({o['x']:.1f}, {o['y']:.1f}) стоит поперёк стены: {rs}")
-# 7. Уличное не в домах, домашнее не на улице
+# 7. Уличное не в домах, домашнее не на улице. Обнесённое стенами со всех сторон — палуба корабля
+# под фальшбортом, трюм, двор за оградой — не улица: стены растром, заливка от края карты.
+STEP = 0.25
+GW, GH = int(W / STEP) + 2, int(H / STEP) + 2
+solid = bytearray(GW * GH)
+for w in walls:
+    pts = w["points"] + ([w["points"][0]] if w.get("closed") else [])
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        n = max(1, int(math.dist((x1, y1), (x2, y2)) / 0.05))
+        for k in range(n + 1):
+            gx, gy = int((x1 + (x2 - x1) * k / n) / STEP) + 1, int((y1 + (y2 - y1) * k / n) / STEP) + 1
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if 0 <= gx + dx < GW and 0 <= gy + dy < GH:
+                        solid[(gy + dy) * GW + gx + dx] = 1
+# Проход в ограде, где стоит трап или лестница, ведёт на другой этаж, а не на улицу.
+for o in objs:
+    if has(o, "Ladder", "Stairs", "Trapdoor", "Hatch"):
+        b = box(o, 0.8)
+        for gy in range(int(b[1] / STEP) + 1, int(b[3] / STEP) + 2):
+            for gx in range(int(b[0] / STEP) + 1, int(b[2] / STEP) + 2):
+                if 0 <= gx < GW and 0 <= gy < GH:
+                    solid[gy * GW + gx] = 1
+outside = bytearray(GW * GH)
+todo = [i for i in range(GW)] + [(GH - 1) * GW + i for i in range(GW)] + [j * GW for j in range(GH)] + [j * GW + GW - 1 for j in range(GH)]
+for i in todo:
+    outside[i] = 1
+while todo:
+    i = todo.pop()
+    for j in (i - 1, i + 1, i - GW, i + GW):
+        if 0 <= j < GW * GH and not outside[j] and not solid[j] and abs(j % GW - i % GW) <= 1:
+            outside[j] = 1
+            todo.append(j)
+walled = lambda x, y: not outside[(int(y / STEP) + 1) * GW + int(x / STEP) + 1] if 0 <= x < W and 0 <= y < H else False
 for o in objs:
     if o["layer"] >= 800:
         continue
     r = room_of((o["x"], o["y"]))
     if r and has(o, *OUTDOOR):
         issues.append(f"[улица] #{o['index']} {name(o)} внутри: {r}")
-    if not r and has(o, *INDOOR):
+    if not r and has(o, *INDOOR) and not walled(o["x"], o["y"]):
         issues.append(f"[дом] #{o['index']} {name(o)} на улице ({o['x']:.1f}, {o['y']:.1f})")
 # 8. За краем карты
 for o in objs:
