@@ -942,7 +942,7 @@ impl App {
         self.redo.clear();
         self.touch();
         self.refresh_below();
-        Ok(json!({"width": w, "height": h, "levels": self.levels.len().max(1)}))
+        Ok(json!({"width": w, "height": h, "levels": self.levels.len().max(1), "origin": self.map.origin}))
     }
 
     fn tool_switch_level(&mut self, a: &Value) -> Res {

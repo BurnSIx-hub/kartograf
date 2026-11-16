@@ -85,7 +85,7 @@ fn tools() -> Value {
         tool("switch_level", "Switch to another floor (0 — the lowest, see map_info level_names) and/or rename the current one.", json!({
             "level": int("Floor number"), "name": text("New name for the floor")
         }), &[]),
-        tool("grow_map", "Add margins to the map, in cells, on every floor: everything drawn moves by left/top. Build the surroundings around a finished map — a harbour around a ship, a street around a house. Undo history is cleared.", json!({
+        tool("grow_map", "Add margins to the map, in cells, on every floor: everything drawn moves by left/top. Build the surroundings around a finished map — a harbour around a ship, a street around a house. Undo history is cleared. The map remembers how far it grew left and up (`origin`): when a Foundry scene is updated from a new export, the module moves the tokens already placed there by the same amount.", json!({
             "left": int("Cells to add on the left"), "top": int("Cells to add on top"), "right": int("Cells to add on the right"), "bottom": int("Cells to add at the bottom")
         }), &[]),
         tool("add_roof", "Put a roof over a house: the rectangle of its walls (area) or, for towers, rotundas and slanted wings, the polygon of its walls (points). Players see the roof from outside; it fades when they walk in. Polygon roofs get roof index after the rectangular ones in describe.", json!({

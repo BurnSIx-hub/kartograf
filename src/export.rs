@@ -58,6 +58,8 @@ fn open_sky(map: &Map) -> bool {
 /// Флаги сцены: формат Картографа и звук места для «Wild Canvas».
 fn scene_flags(map: &Map) -> Value {
     let mut flags = json!({"kartograf": {"format": 1}});
+    // Насколько карта выросла влево и вверх: модуль сдвигает по этому фишки старой сцены.
+    flags[OWN_MODULE] = json!({"origin": map.origin});
     if !map.ambience.is_empty() {
         flags[LIVE_MODULE] = json!({"ambience": map.ambience});
         // Под открытым небом — тени облаков «Wild Canvas».
@@ -2126,6 +2128,10 @@ mod tests {
         assert_eq!(s["cells"], "orrrorrw");
         let flags = scene_flags(&m);
         assert_eq!(flags[LIVE_MODULE]["surfaces"]["cells"], "orrrorrw");
+        assert_eq!(flags[OWN_MODULE]["origin"], json!([0, 0]));
+        let mut grown = m.clone();
+        grown.grow(3, 18, 0, 0);
+        assert_eq!(scene_flags(&grown)[OWN_MODULE]["origin"], json!([3, 18]));
         // Песчаник — камень, иней — снег, брусчатка — камень, песок — песок.
         let sf = |i: usize| m.materials[i].surface();
         let by = |name: &str| m.materials.iter().position(|x| x.name == name).unwrap();

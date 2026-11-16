@@ -1471,6 +1471,10 @@ fn drift_down() -> f32 {
     90.0
 }
 
+fn at_start(o: &[i32; 2]) -> bool {
+    *o == [0, 0]
+}
+
 fn is_down(v: &f32) -> bool {
     (*v - 90.0).abs() < 1e-3
 }
@@ -1513,6 +1517,11 @@ pub struct Map {
     /// Куда течёт вода, градусы по часовой от «вправо»: 90 — вниз, корабль идёт вверх.
     #[serde(default = "drift_down", skip_serializing_if = "is_down")]
     pub drift: f32,
+    /// На сколько клеток карта выросла влево и вверх (`grow`) с тех пор, как её начали:
+    /// всё нарисованное сдвинулось на столько же. Выгрузка отдаёт это модулю Foundry —
+    /// обновляя сцену, он сдвигает поставленные там фишки вслед за картой.
+    #[serde(default, skip_serializing_if = "at_start")]
+    pub origin: [i32; 2],
     pub width: u32,
     pub height: u32,
     pub materials: Vec<Material>,
@@ -1660,6 +1669,7 @@ impl Map {
             indoor: String::new(),
             current: 0.0,
             drift: drift_down(),
+            origin: [0, 0],
             width,
             height,
             materials: builtin_materials(),
@@ -1942,6 +1952,8 @@ impl Map {
         self.edge_looks = std::mem::take(&mut self.edge_looks).into_iter().map(|((x, y), v)| ((x + kx, y + ky), v)).collect();
         self.width = w;
         self.height = h;
+        self.origin[0] += left as i32;
+        self.origin[1] += top as i32;
         for l in &mut self.levels {
             l.grow(left, top, right, bottom);
         }
@@ -1952,6 +1964,7 @@ impl Map {
         m.materials = self.materials.clone();
         m.wall_style = self.wall_style.clone();
         m.shadows = self.shadows.clone();
+        m.origin = self.origin;
         m
     }
 
@@ -2112,6 +2125,17 @@ mod tests {
         assert_eq!((m.roofs[0].a, m.roofs[0].b), ([3.0, 2.0], [5.0, 3.0]));
         assert_eq!(m.edge_looks.get(&(64 + 128, 64)), Some(&1));
         assert_eq!((m.levels[0].width, m.levels[0].height, m.levels[0].props[0].pos), (9, 4, [5.5, 2.5]));
+        // Сдвиг копится и есть у каждого этажа: по нему модуль Foundry двигает фишки.
+        assert_eq!((m.origin, m.levels[0].origin), ([2, 1], [2, 1]));
+        m.grow(0, 5, 0, 0);
+        assert_eq!((m.origin, m.new_level().origin), ([2, 6], [2, 6]));
+        // В файле — только если карта росла; старый файл без поля читается с нулём.
+        let fresh = serde_json::to_value(Map::new(2, 2)).unwrap();
+        assert!(fresh.get("origin").is_none());
+        let mut old = serde_json::to_value(&m).unwrap();
+        assert_eq!(old["origin"], serde_json::json!([2, 6]));
+        old.as_object_mut().unwrap().remove("origin");
+        assert_eq!(serde_json::from_value::<Map>(old).unwrap().origin, [0, 0]);
     }
 
     #[test]

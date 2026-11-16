@@ -71,9 +71,15 @@ export function close() {
 }
 
 // Выгрузка из Картографа: картинки — в данные Foundry, `.json` — новой сценой
-// или поверх последней. Зовёт её Rust (plat::to_scene) с массивом { path, bytes }.
-// Что поставили на сцену в Foundry сами, при обновлении остаётся.
+// или поверх уже стоящей. Из Картографа в Foundry её зовёт Rust (plat::to_scene)
+// с массивом { path, bytes }; выгрузку программы на ПК, уже лежащую в данных
+// Foundry, берёт кнопка «Из выгрузки» в каталоге сцен.
+// При обновлении остаётся то, что Мастер сделал в Foundry: поставленное на сцену
+// (KEEP) и настройки сцены (KEEP_FIELDS) — имя, меню навигации, тьма и общий
+// свет, музыка, заметка, туман. Флаги других модулей тоже остаются.
 const KEEP = ["tokens", "notes", "sounds", "drawings", "templates"];
+const KEEP_FIELDS = ["name", "navigation", "navName", "navOrder", "environment", "playlist", "playlistSound", "journal", "journalEntryPage", "fog"];
+const FOLDER = "Картограф";
 
 function lastScene() {
   return game.scenes.get(game.settings.get(MODULE_ID, "lastScene"));
@@ -99,21 +105,162 @@ async function toScene(files, update) {
     await FP.upload("data", dir, new File([body], name, { type }), {}, { notify: false });
   }
   if (!scene) return;
+  return applyScene(scene, update ? lastScene() : null);
+}
+
+// Новая сцена — в папку «Картограф», вне меню навигации; поверх старой — её
+// содержимое меняется на выгрузку, своё у сцены остаётся (см. KEEP). Потом —
+// сундуки и миниатюра. `source` — путь к .json выгрузки: по нему при следующем
+// импорте той же выгрузки сцена находится сама.
+async function applyScene(scene, old, { source } = {}) {
   delete scene._id;
-  const old = update ? lastScene() : null;
+  scene.flags ??= {};
+  scene.flags[MODULE_ID] = { ...(scene.flags[MODULE_ID] ?? {}), ...(source ? { source } : {}) };
   let doc;
   if (old) {
-    // Как «Import Data» у сцены: всё заменяется данными из файла, кроме сохранённого.
-    for (const k of KEEP) scene[k] = old.toObject()[k] ?? [];
-    doc = await old.importFromJSON(JSON.stringify(scene));
+    doc = await refresh(old, scene);
     ui.notifications.info(`Картограф: сцена «${doc.name}» обновлена`);
   } else {
-    doc = await Scene.implementation.create(scene);
+    const folder = game.folders.find((f) => f.type === "Scene" && f.name === FOLDER) ?? (await Folder.implementation.create({ name: FOLDER, type: "Scene" }));
+    Object.assign(scene, { folder: folder.id, navigation: false });
+    doc = await Scene.implementation.create(scene, { keepEmbeddedIds: true });
     ui.notifications.info(`Картограф: сцена «${doc.name}» создана`);
   }
   await game.settings.set(MODULE_ID, "lastScene", doc.id);
   await chests(doc).catch((err) => console.error(`${MODULE_ID} | сундуки`, err));
+  try {
+    const t = await doc.createThumbnail();
+    await doc.update({ thumb: t.thumb });
+  } catch (err) { console.warn(`${MODULE_ID} | миниатюра`, err); }
   return doc;
+}
+
+// Как «Import Data» у сцены (ClientDocument#importFromJSON), но своё остаётся:
+// то, что на сцене поставлено, её настройки и флаги других модулей. Ядро при
+// импорте само бережёт id, папку, права, сортировку и «активна».
+async function refresh(old, scene) {
+  const mine = old.toObject();
+  for (const k of KEEP) scene[k] = mine[k] ?? [];
+  const moved = relocate(old, scene);
+  for (const k of KEEP_FIELDS) if (k in mine) scene[k] = mine[k];
+  scene.flags = foundry.utils.mergeObject(mine.flags ?? {}, scene.flags ?? {}, { inplace: false });
+  const doc = await Scene.implementation.fromImport(scene);
+  const data = game.scenes.fromCompendium(doc, { clearSort: false });
+  for (const k of Scene.implementation.metadata.preserveOnImport) delete data[k];
+  await old.update(data, { diff: false, recursive: false, noHook: true });
+  if (moved) console.info(`${MODULE_ID} | «${old.name}»: сдвинуто вслед за картой — ${moved}`);
+  return old;
+}
+
+// Карта выросла влево или вверх (флаг `origin` — клеток с начала карты) или
+// выгружена с другой клеткой: то, что стоит на сцене, едет туда же, куда уехала
+// карта под ним. Флага нет (выгрузка до 0.2.37) — считаем, что карта не росла.
+// Возвращает, сколько вещей сдвинулось, 0 — ничего не менялось.
+function relocate(old, scene) {
+  const o0 = old.flags?.[MODULE_ID]?.origin ?? [0, 0];
+  const o1 = scene.flags?.[MODULE_ID]?.origin ?? o0;
+  const g0 = old.grid.size;
+  const g1 = scene.grid?.size ?? scene.grid ?? g0;
+  const x0 = old.dimensions.sceneX, y0 = old.dimensions.sceneY;
+  let x1 = x0, y1 = y0;
+  try {
+    const d = new foundry.grid.SquareGrid({ size: g1 }).calculateDimensions(scene.width, scene.height, scene.padding ?? 0);
+    [x1, y1] = [d.x, d.y];
+  } catch (err) { console.warn(`${MODULE_ID} | отступ новой сцены`, err); }
+  const [dx, dy] = [o1[0] - o0[0], o1[1] - o0[1]];
+  const k = g1 / g0;
+  if (!dx && !dy && k === 1 && x0 === x1 && y0 === y1) return 0;
+  const at = (x, y) => [Math.round(x1 + ((x - x0) / g0 + dx) * g1), Math.round(y1 + ((y - y0) / g0 + dy) * g1)];
+  let n = 0;
+  for (const key of KEEP) {
+    for (const d of scene[key] ?? []) {
+      if (typeof d.x !== "number" || typeof d.y !== "number") continue;
+      [d.x, d.y] = at(d.x, d.y);
+      // Рисунок задан в точках сцены — тянется вместе с клеткой.
+      if (key === "drawings" && k !== 1 && d.shape) {
+        if (typeof d.shape.width === "number") d.shape.width *= k;
+        if (typeof d.shape.height === "number") d.shape.height *= k;
+        if (Array.isArray(d.shape.points)) d.shape.points = d.shape.points.map((v) => v * k);
+      }
+      n++;
+    }
+  }
+  return n;
+}
+
+// Выгрузка программы на ПК лежит в данных Foundry (`Data/kartograf/<имя>/`):
+// выбираешь её .json — и она становится сценой или обновляет выбранную.
+async function fromExport() {
+  if (!game.user.isGM) return;
+  const FP = foundry.applications.apps.FilePicker.implementation;
+  return new FP({
+    type: "text",
+    current: "kartograf",
+    callback: (path) => importExport(path).catch((err) => {
+      console.error(`${MODULE_ID} | из выгрузки`, err);
+      ui.notifications.error("Картограф: сцена из выгрузки не получилась, подробности в консоли");
+    })
+  }).render({ force: true });
+}
+
+// Путь — от корня данных: `kartograf/Порт_2/Порт.json`. `target` — id сцены,
+// которую обновить, "" — новая; не задан — спросить в окне.
+async function importExport(path, target) {
+  path = decodeURI(path).replace(/^\/+/, "").split("?")[0];
+  if (!path.endsWith(".json")) throw new Error(`${path}: нужен .json выгрузки Картографа`);
+  const url = path.split("/").map(encodeURIComponent).join("/");
+  const scene = await (await fetch(`${url}?v=${Date.now()}`)).json();
+  if (!scene?.levels && !scene?.background) throw new Error(`${path}: это не сцена`);
+  rebase(scene, path.split("/").slice(0, -1).join("/"));
+  if (target === undefined) target = await chooseScene(scene, path);
+  if (target === null) return;
+  const old = target ? game.scenes.get(target) : null;
+  if (target && !old) throw new Error(`сцены ${target} нет`);
+  return applyScene(scene, old, { source: path });
+}
+
+// Картинки выгрузки — рядом с её .json. Выгрузку, сделанную не прямо в данные
+// Foundry (а в папку карты и потом перенесённую), программа пишет без пути или с
+// путём своей папки: такие пути переводятся на папку, где .json лежит сейчас.
+function rebase(scene, dir) {
+  const bg = scene.levels?.[0]?.background?.src ?? scene.background?.src ?? "";
+  const own = bg.includes("/") ? bg.split("?")[0].split("/").slice(0, -1).join("/") : "";
+  const media = /\.(webp|png|jpe?g|webm|mp4|ogg|mp3|svg)(\?.*)?$/i;
+  const fix = (s) => {
+    if (!media.test(s)) return s;
+    if (!s.includes("/")) return `${dir}/${s}`;
+    if (own && own !== dir && s.startsWith(`${own}/`)) return dir + s.slice(own.length);
+    return s;
+  };
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") { for (const k of Object.keys(v)) v[k] = walk(v[k]); return v; }
+    return typeof v === "string" ? fix(v) : v;
+  };
+  walk(scene);
+}
+
+// Окно: обновить сцену или сделать новую. Сама предлагается сцена, сделанная из
+// этой же выгрузки, — потом сцена с тем же именем. null — отмена.
+async function chooseScene(scene, path) {
+  const same = game.scenes.find((s) => s.flags?.[MODULE_ID]?.source === path) ?? game.scenes.find((s) => s.name === scene.name);
+  const esc = foundry.utils.escapeHTML ?? ((s) => s);
+  const opts = game.scenes.contents.slice().sort((a, b) => a.name.localeCompare(b.name, "ru"))
+    .map((s) => `<option value="${s.id}"${s === same ? " selected" : ""}>${esc(s.name)}${s.folder ? ` — ${esc(s.folder.name)}` : ""}</option>`).join("");
+  const content = `<p>Выгрузка <b>${esc(path)}</b></p>
+    <div class="form-group"><label>Куда</label><select name="target"><option value=""${same ? "" : " selected"}>Новая сцена (папка «${FOLDER}»)</option>${opts}</select></div>
+    <p class="hint">Обновляемая сцена сохранит фишки, заметки, рисунки, шаблоны, звуки, своё имя, тьму и свет, музыку и место в навигации. Если карта выросла, фишки сдвинутся вслед за ней.</p>`;
+  const res = await foundry.applications.api.DialogV2.wait({
+    window: { title: "Картограф: сцена из выгрузки" },
+    position: { width: 520 },
+    content,
+    buttons: [
+      { action: "ok", label: "Готово", icon: "fa-solid fa-check", default: true, callback: (e, button) => button.form.elements.target.value },
+      { action: "cancel", label: "Отмена", icon: "fa-solid fa-xmark" }
+    ],
+    rejectClose: false
+  });
+  return res === "cancel" || res == null ? null : res;
 }
 
 // WebP из wasm — без потерь: libwebp в браузерную сборку не входит. Сжимает с
@@ -156,7 +303,8 @@ async function chests(scene) {
   for (const t of marked) {
     const { open, empty } = t.flags[MODULE_ID].chest;
     const x = Math.round(t.x - t.width / 2), y = Math.round(t.y - t.height / 2);
-    const there = scene.tokens.some((k) => k.flags?.[MODULE_ID]?.chest && Math.abs(k.x - x) < 2 && Math.abs(k.y - y) < 2);
+    // Сундук после обновления сцены мог сдвинуться вслед за картой с округлением — допуск в четверть клетки.
+    const there = scene.tokens.some((k) => k.flags?.[MODULE_ID]?.chest && Math.abs(k.x - x) < grid / 4 && Math.abs(k.y - y) < grid / 4);
     if (!there) {
       await api.createItemPile({
         sceneId: scene.id,
@@ -914,7 +1062,8 @@ Hooks.once("init", () => {
     toScene(files, update).catch((err) => { console.error(`${MODULE_ID} | на сцену`, err); ui.notifications.error("Картограф: сцена не создалась, подробности в консоли"); });
   };
   // `takeFolder(имя, [[путь, File]…])` — своя папка без окна выбора (для проверок и макросов).
-  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs, rebuildSwitches, toggleLight, takeFolder };
+  // `importExport(путь к .json, id сцены | "")` — сцена из выгрузки без окна (для проверок и макросов).
+  game.modules.get(MODULE_ID).api = { open, close, chests, rebuildWebs, rebuildSwitches, toggleLight, takeFolder, fromExport, importExport };
 });
 
 Hooks.on("canvasReady", rebuildWebs);
@@ -938,6 +1087,12 @@ Hooks.on("renderSceneDirectory", (app, html) => {
   btn.className = "kartograf-open";
   btn.innerHTML = `<i class="fa-solid fa-map"></i> Картограф`;
   btn.addEventListener("click", () => open());
+  const imp = document.createElement("button");
+  imp.type = "button";
+  imp.className = "kartograf-import";
+  imp.innerHTML = `<i class="fa-solid fa-file-import"></i> Из выгрузки`;
+  imp.dataset.tooltip = "Сцена из выгрузки Картографа в данных Foundry — новая или поверх старой";
+  imp.addEventListener("click", () => fromExport());
   const header = el.querySelector(".directory-header .header-actions") ?? el.querySelector(".directory-header") ?? el;
-  header.append(btn);
+  header.append(btn, imp);
 });
