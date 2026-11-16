@@ -302,6 +302,51 @@ for o in objs:
         if not near:
             issues.append(f"[лампа] #{o['index']} настенная лампа не у стены")
 
+
+def blocked(x, y):
+    if not (0 <= x < W and 0 <= y < H):
+        return True
+    gx, gy = int(x / STEP) + 1, int(y / STEP) + 1
+    return solid[gy * GW + gx] or roof_at((x, y)) or room_of((x, y)) is not None
+
+
+# 11. Фонарь FA `Lamp_Post` — брус с фонарём на конце, сверху: низ картинки — конец бруса, он упирается
+# в стену или ограду. Брус посреди улицы читается упавшим столбом.
+for o in objs:
+    if not has(o, "Lamp_Post"):
+        continue
+    a = math.radians(o["rotation"] or 0)
+    ux, uy = -math.sin(a), math.cos(a)
+    end = 0.45 * o.get("scale", 1)
+    if not any(blocked(o["x"] + ux * (end + s), o["y"] + uy * (end + s)) for s in (-0.1, 0.05, 0.2, 0.35)):
+        issues.append(f"[фонарь] #{o['index']} {name(o)} ({o['x']:.1f}, {o['y']:.1f}) кронштейн не упирается в стену")
+# 12. Фонарный столб — у края прохода, а не посреди него: не дальше клетки от стены, дома или ограды.
+# Проход — где до краёв по одной из осей с обеих сторон не больше 8 клеток; на площади шире 8 клеток
+# в обе стороны столб может стоять и в середине.
+def free(x, y, dx, dy, far=8.0):
+    s = 0.25
+    while s <= far:
+        if blocked(x + dx * s, y + dy * s):
+            return s
+        s += 0.25
+    return None
+
+
+for o in objs:
+    if not has(o, "Lamp_Post", "Lamp_Street", "Street_Lamp", "Lamppost"):
+        continue
+    spans, dists = [], []
+    for dx, dy in ((1, 0), (0, 1)):
+        a, b = free(o["x"], o["y"], -dx, -dy), free(o["x"], o["y"], dx, dy)
+        dists += [d for d in (a, b) if d is not None]
+        if a is not None and b is not None:
+            spans.append((a + b, "x" if dx else "y", a, b))
+    if not spans or min(dists) <= 1.0:
+        continue
+    span, axis, lo, hi = min(spans)
+    issues.append(f"[фонарь] #{o['index']} {name(o)} ({o['x']:.1f}, {o['y']:.1f}) посреди прохода шириной {span:.1f}: "
+                  f"до краёв по {axis} {lo:.2f} и {hi:.2f}, до ближайшего края {min(dists):.2f}")
+
 for s in issues:
     print(s)
 print(f"ИТОГО нарушений: {len(issues)} (объектов {len(objs)}, крыш {len(roofs)}, дверей {len(doors)})")
