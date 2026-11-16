@@ -973,6 +973,45 @@ impl App {
         let (ambience, particles, weather) = (pick("ambience", &PLACES)?, pick("particles", &PARTICLES)?, pick("weather", &WEATHERS)?);
         let current = f(a, "current").map(|v| v.clamp(0.0, 3.0));
         let drift = f(a, "drift").map(|v| v.rem_euclid(360.0));
+        let pt = |v: &Value| -> Result<[f32; 2], String> {
+            match v.as_array().map(|p| p.iter().filter_map(Value::as_f64).collect::<Vec<_>>()) {
+                Some(p) if p.len() == 2 => Ok([p[0] as f32, p[1] as f32]),
+                _ => Err(format!("точка {v}: нужно [x, y]")),
+            }
+        };
+        // Участки течения: прямоугольник `area` или многоугольник `points`.
+        let flows = match a.get("flows").and_then(Value::as_array) {
+            None => None,
+            Some(list) => Some(
+                list.iter()
+                    .map(|fl| {
+                        let points = if let Some(p) = fl["points"].as_array() {
+                            p.iter().map(pt).collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            let r: Vec<f32> = fl["area"].as_array().map(|v| v.iter().filter_map(Value::as_f64).map(|x| x as f32).collect()).unwrap_or_default();
+                            let [x0, y0, x1, y1] = r[..] else { return Err("участок течения: нужен area [x0, y0, x1, y1] или points".to_owned()) };
+                            vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                        };
+                        if points.len() < 3 {
+                            return Err("участок течения: меньше трёх точек".to_owned());
+                        }
+                        let current = fl["current"].as_f64().ok_or("участок течения: нужен current")? as f32;
+                        Ok(map::Flow { points, current: current.clamp(0.0, 3.0), drift: fl["drift"].as_f64().unwrap_or(90.0).rem_euclid(360.0) as f32 })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+        };
+        let rails = match a.get("rails").and_then(Value::as_array) {
+            None => None,
+            Some(list) => Some(
+                list.iter()
+                    .map(|r| {
+                        let pts = r.as_array().ok_or("путь вагонетки — список точек")?.iter().map(pt).collect::<Result<Vec<_>, _>>()?;
+                        if pts.len() < 2 { Err("путь вагонетки: меньше двух точек".to_owned()) } else { Ok(pts) }
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+        };
         self.checkpoint();
         let m = &mut self.map;
         if let Some(v) = ambience {
@@ -990,7 +1029,14 @@ impl App {
         if let Some(v) = drift {
             m.drift = v;
         }
-        Ok(json!({"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift}))
+        if let Some(v) = flows {
+            m.flows = v;
+        }
+        if let Some(v) = rails {
+            m.rails = v;
+        }
+        let flows: Vec<Value> = m.flows.iter().map(|f| json!({"points": f.points, "current": f.current, "drift": f.drift})).collect();
+        Ok(json!({"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails}))
     }
 
     fn tool_add_roof(&mut self, a: &Value) -> Res {

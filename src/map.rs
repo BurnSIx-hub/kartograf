@@ -449,11 +449,14 @@ pub const ON_ROOF: i16 = 800;
 /// Над крышами, отдельно от них: дирижабль, птицы.
 pub const ABOVE_ROOFS: i16 = 900;
 
-/// Слой по имени: плоское — на пол, деревья — над остальным.
+/// Слой по имени: плоское — на пол, деревья — над остальным, подъёмный кран — над
+/// всем: стрела выше голов и крыш.
 pub fn layer_by_name(key: &str) -> i16 {
     let k = crate::library::label(key).to_lowercase();
     if flat_by_name(key) {
         100
+    } else if k.starts_with("crane_") {
+        ABOVE_ROOFS
     } else if key == crate::library::TREE || ["tree", "дерев"].iter().any(|w| k.contains(w)) {
         400
     } else {
@@ -687,6 +690,27 @@ pub fn prop_rect(p: &Prop, visible: Option<[f32; 4]>) -> [f32; 4] {
 pub fn swing_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
     k.contains("hammock") || k.contains("гамак")
+}
+
+/// Поворотный кран: в Foundry «Wild Canvas» медленно поворачивает его вокруг оси
+/// туда, где стрела ни во что не упрётся. Ось — доли картинки (середина круга
+/// поворотной платформы); стрела — вверх по картинке.
+pub fn slew_by_name(key: &str) -> Option<[f32; 2]> {
+    let file = crate::library::label(key);
+    [("Crane_Steam_Gnome_Brass_A", [0.504, 0.779])].iter().find(|(m, _)| file.starts_with(*m)).map(|(_, p)| *p)
+}
+
+/// Что ездит по рельсам: вагонетка, вагон, паровоз и груз в них (`…_Fill`).
+/// Крепь, фонарь, упор на пути стоят.
+pub fn rides_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    ["cart", "wagon", "locomotive", "trolley", "вагон", "_fill"].iter().any(|w| k.contains(w)) && !k.starts_with("track_")
+}
+
+/// Валун, скала: стоя в воде, в Foundry он препятствие — течение обтекает его.
+pub fn rock_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    ["boulder", "rock_", "rocks_"].iter().any(|w| k.starts_with(w))
 }
 
 /// Мост по имени файла: встроенный и библиотечные (`Log_Bridge_…`, `Bridge_Boardwalk_…`).
@@ -1467,6 +1491,15 @@ fn still(v: &f32) -> bool {
     *v == 0.0
 }
 
+/// Участок текущей воды: многоугольник в клетках, скорость (клеток в секунду) и
+/// куда течёт (градусы по часовой от «вправо»).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Flow {
+    pub points: Vec<[f32; 2]>,
+    pub current: f32,
+    pub drift: f32,
+}
+
 fn drift_down() -> f32 {
     90.0
 }
@@ -1517,6 +1550,14 @@ pub struct Map {
     /// Куда течёт вода, градусы по часовой от «вправо»: 90 — вниз, корабль идёт вверх.
     #[serde(default = "drift_down", skip_serializing_if = "is_down")]
     pub drift: f32,
+    /// Участки, где вода течёт иначе, чем по всей карте: канал бежит, а гавань стоит.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<Flow>,
+    /// Пути вагонеток, точки в клетках. Всё, что стоит на пути (кроме самих рельсов),
+    /// в Foundry ездит по нему туда и обратно сцепкой. Первая точка — депо (рудник,
+    /// тоннель): там вагонетка пропадает в темноте и ждёт.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rails: Vec<Vec<[f32; 2]>>,
     /// На сколько клеток карта выросла влево и вверх (`grow`) с тех пор, как её начали:
     /// всё нарисованное сдвинулось на столько же. Выгрузка отдаёт это модулю Foundry —
     /// обновляя сцену, он сдвигает поставленные там фишки вслед за картой.
@@ -1669,6 +1710,8 @@ impl Map {
             indoor: String::new(),
             current: 0.0,
             drift: drift_down(),
+            flows: Vec::new(),
+            rails: Vec::new(),
             origin: [0, 0],
             width,
             height,
@@ -1935,6 +1978,10 @@ impl Map {
         for p in &mut self.paths {
             p.points.iter_mut().for_each(mv);
         }
+        for f in &mut self.flows {
+            f.points.iter_mut().for_each(mv);
+        }
+        self.rails.iter_mut().flatten().for_each(mv);
         for l in &mut self.labels {
             mv(&mut l.pos);
         }

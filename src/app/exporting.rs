@@ -553,6 +553,8 @@ impl App {
                 tile.above = prop.layer() >= map::ON_ROOF;
                 tile.hover = map::hover_by_name(&prop.asset);
                 tile.swing = if map::swing_by_name(&prop.asset) { library::strand_ends(&self.textures.sources, &prop.asset) } else { None };
+                tile.slew = map::slew_by_name(&prop.asset).and_then(|o| export::slew_arc(map, prop, o).map(|arc| [o[0], o[1], arc]));
+                tile.rail = export::rail_ride(map, prop, e.px);
                 tile.tint = prop.tint;
                 if !(map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
                     tiles.push(tile);

@@ -42,6 +42,9 @@ pub struct Zone {
     /// Доля мутной воды, 0..1 ([`crate::map::Material::murky`]): больше половины —
     /// у области нет пены у берега, бликов на дне и рыб.
     pub murky: f32,
+    /// Своё течение участка воды ([`crate::map::Flow`]): скорость и куда. Нет — как у
+    /// всей карты.
+    pub flow: Option<(f32, f32)>,
 }
 
 /// Модуль Foundry, который оживляет области.
@@ -140,7 +143,7 @@ pub fn surfaces(map: &Map) -> Option<Value> {
 /// Покрытия одного эффекта сливаются в одну маску до обводки: Foundry вычитает
 /// дыры области из всех её фигур, и дыра мха под светлым пятном (тоже болото)
 /// вырезала бы само пятно.
-fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
+fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 4]>) -> Vec<Zone> {
     // Стены твёрдые: под ними живого нет. Без этого пена и рябь воды ложились
     // поверх борта корабля и стен у воды — стены впечатаны в картинку под эффектом.
     // Стена комнаты стоит снаружи края комнаты на всю толщину, свободная — серединой.
@@ -218,19 +221,77 @@ fn zones(map: &Map, room_edges: &[Segment]) -> Vec<Zone> {
                 }
             }
         }
-        if mask.is_empty() {
-            continue;
+        // Валун посреди воды — препятствие: под ним дыра по видимой части картинки.
+        // На течении «Wild Canvas» даёт у такой дыры бурун с носа и след за кормой —
+        // вода обтекает камень.
+        if effect == "water" {
+            let wet: Vec<&map::Prop> = map.props.iter().filter(|p| map::rock_by_name(&p.asset) && mask.get((p.pos[0] * res) as isize, (p.pos[1] * res) as isize) > 0).collect();
+            for p in wet {
+                let v = seen(&p.asset).unwrap_or([-0.4, -0.4, 0.4, 0.4]);
+                let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+                // Эллипс чуть внутри видимой рамки: край камня неровный.
+                let (cx, cy) = ((v[0] + v[2]) / 2.0 * w, (v[1] + v[3]) / 2.0 * h);
+                let (rx, ry) = ((v[2] - v[0]) / 2.0 * w * 0.8, (v[3] - v[1]) / 2.0 * h * 0.8);
+                let (s, c) = p.rot.to_radians().sin_cos();
+                let r = rx.max(ry);
+                let o = [p.pos[0] + cx * c - cy * s, p.pos[1] + cx * s + cy * c];
+                for j in (((o[1] - r) * res).floor().max(0.0) as usize)..(((o[1] + r) * res).ceil().max(0.0) as usize).min(mask.h) {
+                    for i in (((o[0] - r) * res).floor().max(0.0) as usize)..(((o[0] + r) * res).ceil().max(0.0) as usize).min(mask.w) {
+                        let (dx, dy) = ((i as f32 + 0.5) / res - o[0], (j as f32 + 0.5) / res - o[1]);
+                        // В оси картинки: поворот назад.
+                        let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
+                        if (lx / rx).powi(2) + (ly / ry).powi(2) <= 1.0 {
+                            mask.data[j * mask.w + i] = 0;
+                        }
+                    }
+                }
+            }
         }
-        let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&mask)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
-        let tagged = loops
-            .iter()
-            .map(|l| {
-                // Дыра — контур внутри нечётного числа других.
-                let depth = loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count();
-                (l.clone(), depth % 2 == 1)
-            })
-            .collect::<Vec<_>>();
-        out.push(Zone { effect, loops: tagged, place: String::new(), shallow, murky });
+        // Участки течения — своими областями: канал бежит, а гавань рядом стоит.
+        // Шов между ними прятать под мост или ворота шлюза: у края области пена.
+        let mut parts: Vec<(mask::Mask, Option<(f32, f32)>)> = Vec::new();
+        if effect == "water" {
+            for f in map.flows.iter().filter(|f| f.points.len() >= 3) {
+                let mut ring = f.points.clone();
+                ring.push(ring[0]);
+                let mut part = mask.clone();
+                let mut any = false;
+                for (k, v) in part.data.iter_mut().enumerate() {
+                    if *v == 0 {
+                        continue;
+                    }
+                    if inside([((k % mask.w) as f32 + 0.5) / res, ((k / mask.w) as f32 + 0.5) / res], &ring) {
+                        any = true;
+                    } else {
+                        *v = 0;
+                    }
+                }
+                if any {
+                    for (a, b) in mask.data.iter_mut().zip(&part.data) {
+                        if *b > 0 {
+                            *a = 0;
+                        }
+                    }
+                    parts.push((part, Some((f.current.clamp(0.0, 3.0), f.drift.rem_euclid(360.0)))));
+                }
+            }
+        }
+        parts.push((mask, None));
+        for (mask, flow) in parts {
+            if mask.is_empty() {
+                continue;
+            }
+            let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&mask)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
+            let tagged = loops
+                .iter()
+                .map(|l| {
+                    // Дыра — контур внутри нечётного числа других.
+                    let depth = loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count();
+                    (l.clone(), depth % 2 == 1)
+                })
+                .collect::<Vec<_>>();
+            out.push(Zone { effect, loops: tagged, place: String::new(), shallow, murky, flow });
+        }
     }
     out
 }
@@ -331,7 +392,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
         })
         .collect();
-    let mut zones = zones(map, room_edges);
+    let mut zones = zones(map, room_edges, seen);
     // Костёр под открытым небом — маленькая область: пламя и дым рисует модуль.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("campfire")) {
         let r = 0.45 * p.size[0] * p.scale;
@@ -339,7 +400,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let a = i as f32 / 12.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
     }
     // Встроенный фонтан: эффект «Wild Canvas» по его трём чашам — струя, перелив, круги, журчание.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("fountain")) {
@@ -348,11 +409,11 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let a = i as f32 / 24.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
+        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| map::bridge_by_name(&p.asset)) {
-        zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0 });
+        zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
     // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
@@ -370,7 +431,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
             let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
             let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0 });
+            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
         }
     }
     // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
@@ -378,7 +439,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
         let tagged: Vec<_> = loops.iter().map(|l| (l.clone(), loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1)).collect();
         if !tagged.is_empty() {
-            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0, murky: 0.0 });
+            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0, murky: 0.0, flow: None });
         }
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
@@ -649,6 +710,91 @@ pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: 
     RoofTile { src, rect: [x, y, w, h], rotation: rot, fade: true, leaves: true, wind: 1.0, ..Default::default() }
 }
 
+/// Путь вагонетки для «Wild Canvas»: точки в точках сцены (первая — депо, где
+/// она скрыта), на сколько точек предмет отстаёт от головы сцепки и груз ли он
+/// (руда в вагонетке): груз виден только по пути туда — у конца его выгружают.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rail {
+    pub path: Vec<[f32; 2]>,
+    pub lag: f32,
+    pub cargo: bool,
+}
+
+/// На сколько градусов и в какую сторону поворачивать кран с осью `pivot` (доли
+/// картинки, стрела — вверх по ней): стрела не должна заходить на дома — комнаты
+/// и крыши. Пробуем обе стороны шагом 3° до 45° и берём ту, где свободнее; плюс —
+/// по часовой. Свободно меньше 10° или стрела уже над домом — не поворачивать.
+pub fn slew_arc(map: &Map, p: &map::Prop, pivot: [f32; 2]) -> Option<f32> {
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let (s, c) = p.rot.to_radians().sin_cos();
+    let local = [(pivot[0] - 0.5) * w, (pivot[1] - 0.5) * h];
+    let o = [p.pos[0] + local[0] * c - local[1] * s, p.pos[1] + local[0] * s + local[1] * c];
+    // От края поворотной платформы до конца стрелы.
+    let (from, reach) = (0.45 * w, pivot[1] * h * 0.97);
+    let res = mask::RES as f32;
+    let house = |q: [f32; 2]| {
+        map.rooms.get((q[0] * res).floor() as isize, (q[1] * res).floor() as isize) > 0 || map.roofs.iter().any(|r| r.contains(q)) || map.outline_roofs.iter().any(|r| r.contains(q))
+    };
+    let free = |a: f32| {
+        let (ts, tc) = (p.rot + a).to_radians().sin_cos();
+        let (dir, side) = ([ts, -tc], [tc, ts]);
+        let n = ((reach - from) / 0.25).ceil().max(1.0) as i32;
+        (0..=n).all(|i| {
+            let r = from + (reach - from) * i as f32 / n as f32;
+            [-0.4f32, 0.0, 0.4].iter().all(|d| !house([o[0] + dir[0] * r + side[0] * d, o[1] + dir[1] * r + side[1] * d]))
+        })
+    };
+    if !free(0.0) {
+        return None;
+    }
+    let side = |sign: f32| {
+        let mut best = 0.0;
+        let mut a = 3.0;
+        while a <= 45.0 + 1e-3 && free(sign * a) {
+            best = a;
+            a += 3.0;
+        }
+        best
+    };
+    let (cw, ccw) = (side(1.0), side(-1.0));
+    let (arc, sign) = if cw >= ccw { (cw, 1.0) } else { (ccw, -1.0) };
+    (arc >= 10.0).then_some(sign * arc)
+}
+
+/// Едет ли предмет по пути вагонеток: вагонетка, вагон или груз в них
+/// ([`map::rides_by_name`]) на линии пути (не дальше 0,4 клетки). Всё, что едет по
+/// одному пути, — сцепка: голова дальше всех от депо, `lag` — отставание от неё
+/// вдоль пути. Точки — в точках сцены (`px` на клетку).
+pub fn rail_ride(map: &Map, p: &map::Prop, px: u32) -> Option<Rail> {
+    if !map::rides_by_name(&p.asset) {
+        return None;
+    }
+    // Где на пути точка: длина вдоль пути до ближайшего места, если рядом.
+    let along = |route: &[[f32; 2]], q: [f32; 2]| -> Option<f32> {
+        let (mut acc, mut best) = (0.0f32, None::<(f32, f32)>);
+        for w in route.windows(2) {
+            let d = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+            let len = d[0].hypot(d[1]);
+            if len < 1e-6 {
+                continue;
+            }
+            let u = (((q[0] - w[0][0]) * d[0] + (q[1] - w[0][1]) * d[1]) / (len * len)).clamp(0.0, 1.0);
+            let off = (w[0][0] + d[0] * u - q[0]).hypot(w[0][1] + d[1] * u - q[1]);
+            if off <= 0.4 && best.is_none_or(|(b, _)| off < b) {
+                best = Some((off, acc + u * len));
+            }
+            acc += len;
+        }
+        best.map(|b| b.1)
+    };
+    let k = px as f32;
+    map.rails.iter().filter(|r| r.len() >= 2).find_map(|route| {
+        let s = along(route, p.pos)?;
+        let head = map.props.iter().filter(|q| map::rides_by_name(&q.asset)).filter_map(|q| along(route, q.pos)).fold(s, f32::max);
+        Some(Rail { path: route.iter().map(|v| [v[0] * k, v[1] * k]).collect(), lag: (head - s) * k, cargo: crate::library::label(&p.asset).to_lowercase().contains("_fill") })
+    })
+}
+
 /// Крыша, уже лежащая картинкой рядом со сценой: путь и место в пикселях сцены.
 #[derive(Default)]
 pub struct RoofTile {
@@ -690,6 +836,11 @@ pub struct RoofTile {
     pub hover: bool,
     /// Гамак («Wild Canvas» качает): концы-крюки в долях картинки от середины.
     pub swing: Option<[f32; 4]>,
+    /// Поворотный кран («Wild Canvas» поворачивает): ось в долях картинки и на
+    /// сколько градусов (знак — сторона, плюс — по часовой).
+    pub slew: Option<[f32; 3]>,
+    /// Едет по пути вагонеток («Wild Canvas»).
+    pub rail: Option<Rail>,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
     /// Куст: на земле под токенами, не гаснет — он по колено, а не над головой.
@@ -1106,6 +1257,13 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 if let Some(e) = r.swing {
                     tile["flags"][LIVE_MODULE]["swing"] = json!(e.map(|v| (v as f64 * 1000.0).round() / 1000.0));
                 }
+                if let Some([ax, ay, arc]) = r.slew {
+                    tile["flags"][LIVE_MODULE]["slew"] = json!([(ax as f64 * 1000.0).round() / 1000.0, (ay as f64 * 1000.0).round() / 1000.0, arc.round() as i64]);
+                }
+                if let Some(rail) = &r.rail {
+                    let path: Vec<[i64; 2]> = rail.path.iter().map(|v| [v[0].round() as i64, v[1].round() as i64]).collect();
+                    tile["flags"][LIVE_MODULE]["rail"] = json!({"path": path, "lag": rail.lag.round() as i64, "cargo": rail.cargo});
+                }
             } else if let Some((key, value)) = &r.living {
                 // Живой предмет под токенами: колонка играет сразу. Дирижабль над
                 // крышами так и остаётся над ними — винты крутятся там.
@@ -1220,16 +1378,21 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
             if z.effect == "water" && z.shallow < 0.95 {
                 region["flags"][LIVE_MODULE]["caustic"] = json!(((z.shallow.max(0.15) as f64) * 100.0).round() / 100.0);
             }
-            // Мутная вода (болото, тёмный пруд): ни пены у берега, ни бликов на дне, ни рыб.
+            // Корабль на ходу: вода уходит мимо борта.
+            // Участок со своим течением — его скорость (и стоячая вода, если 0).
+            let (current, drift) = z.flow.unwrap_or((map.current, map.drift));
+            // Мутная вода (болото, тёмный пруд): ни бликов на дне, ни рыб, а стоячая — и
+            // без пены у берега. Бегущая и мутная пенится у камня и за кормой.
             if z.effect == "water" && z.murky >= 0.5 {
-                region["flags"][LIVE_MODULE]["foam"] = json!(0);
+                if current <= 0.0 {
+                    region["flags"][LIVE_MODULE]["foam"] = json!(0);
+                }
                 region["flags"][LIVE_MODULE]["caustic"] = json!(0);
                 region["flags"][LIVE_MODULE]["fish"] = json!(false);
             }
-            // Корабль на ходу: вода уходит мимо борта.
-            if z.effect == "water" && map.current > 0.0 {
-                region["flags"][LIVE_MODULE]["current"] = json!((map.current as f64 * 10.0).round() / 10.0);
-                region["flags"][LIVE_MODULE]["drift"] = json!(map.drift.rem_euclid(360.0).round() as i64);
+            if z.effect == "water" && current > 0.0 {
+                region["flags"][LIVE_MODULE]["current"] = json!((current as f64 * 10.0).round() / 10.0);
+                region["flags"][LIVE_MODULE]["drift"] = json!(drift.rem_euclid(360.0).round() as i64);
             }
             regions.push(tag(region));
         }
@@ -2256,5 +2419,105 @@ mod tests {
             assert!(cross < 0.0);
             assert!((a[1] + b[1]) / 2.0 < 10.0 + 0.5 || (a[0] - b[0]).abs() < 0.2, "{a:?} {b:?}");
         }
+    }
+
+    fn thing(asset: &str, pos: [f32; 2], size: [f32; 2], rot: f32) -> crate::map::Prop {
+        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None }
+    }
+
+    #[test]
+    fn crane_slews_away_from_houses_and_flies_over_all() {
+        let key = "objects/steampunk/Crane_Steam_Gnome_Brass_A_4x9.webp";
+        let pivot = crate::map::slew_by_name(key).expect("кран поворотный");
+        assert_eq!(crate::map::layer_by_name(key), crate::map::ABOVE_ROOFS, "кран над всем");
+        assert_eq!(crate::map::layer_by_name("x/Crane_Wood_Dark_A_2x4.webp"), crate::map::ABOVE_ROOFS);
+        assert!(crate::map::slew_by_name("x/Crane_Wood_Dark_A_2x4.webp").is_none(), "у деревянной стрелы оси нет");
+        // Стрела вверх; справа сверху — дом: крутить можно только против часовой.
+        let mut m = Map::new(30, 30);
+        let crane = thing(key, [10.0, 15.0], [4.0, 9.0], 0.0);
+        assert_eq!(slew_arc(&m, &crane, pivot), Some(45.0), "кругом пусто — по часовой");
+        let house = crate::mask::cells(m.rooms.w, m.rooms.h, (12, 6), (18, 13));
+        m.paint(crate::map::Layer::Rooms, 3, &house);
+        assert_eq!(slew_arc(&m, &crane, pivot), Some(-45.0));
+        // Дом и слева — поворот там, где свободнее, но меньше 10° не крутится.
+        let left = crate::mask::cells(m.rooms.w, m.rooms.h, (4, 6), (9, 13));
+        m.paint(crate::map::Layer::Rooms, 3, &left);
+        assert_eq!(slew_arc(&m, &crane, pivot), None);
+        // Пометка в сцене: ось и угол.
+        let la = layout(&m, &[]);
+        let mut t = canopy_tile("k/c.webp".into(), [10.0, 15.0], [4.0, 9.0], 0.0, 100);
+        (t.item, t.above, t.slew) = (true, true, Some([pivot[0], pivot[1], -45.0]));
+        let scene = foundry_levels(&m, "Порт", &[SceneLevel { name: "Порт".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![t] }], 100, &Default::default());
+        let tile = &scene["tiles"][0];
+        assert_eq!(tile["flags"][LIVE_MODULE]["slew"], json!([0.504, 0.779, -45]));
+        assert_eq!(tile["elevation"], 25, "над крышами");
+    }
+
+    #[test]
+    fn carts_on_a_rail_ride_as_one_train() {
+        let mut m = Map::new(20, 24);
+        m.rails = vec![vec![[5.0, 1.0], [5.0, 20.0], [9.0, 20.0]]];
+        let head = thing("x/MineCart_Metal_Gray_B1_1x2.webp", [5.0, 10.0], [1.0, 2.0], 0.0);
+        let ore = thing("x/Ore_Minecart_Fill_Black_C1_1x2.webp", [5.05, 10.0], [1.0, 2.0], 0.0);
+        let tail = thing("x/MineCart_Metal_Gray_C1_1x2.webp", [5.0, 7.8], [1.0, 2.0], 0.0);
+        let track = thing("x/Track_Dark_Straight_D1_1x5.webp", [5.0, 14.0], [1.0, 5.0], 0.0);
+        let aside = thing("x/Barrel_A1_1x1.webp", [6.0, 10.0], [1.0, 1.0], 0.0);
+        // Брус крепи над входом стоит прямо на пути, но не едет и не сдвигает голову.
+        let beam = thing("x/Fence_Wood_Dark_B_Beam_B1_1x1.webp", [5.0, 15.0], [1.0, 1.0], 90.0);
+        m.props = vec![head.clone(), ore.clone(), tail.clone(), track.clone(), aside.clone(), beam.clone()];
+        let r = rail_ride(&m, &head, 100).expect("вагонетка едет");
+        assert_eq!(r.path, vec![[500.0, 100.0], [500.0, 2000.0], [900.0, 2000.0]]);
+        assert_eq!((r.lag, r.cargo), (0.0, false), "голова сцепки");
+        let o = rail_ride(&m, &ore, 100).unwrap();
+        assert!(o.cargo && o.lag.abs() < 1e-3, "руда едет в голове и выгружается");
+        assert!((rail_ride(&m, &tail, 100).unwrap().lag - 220.0).abs() < 1e-2, "хвост отстаёт на 2,2 клетки");
+        assert!(rail_ride(&m, &track, 100).is_none() && rail_ride(&m, &aside, 100).is_none(), "рельсы и то, что рядом, стоят");
+        assert!(rail_ride(&m, &beam, 100).is_none(), "крепь на пути стоит");
+        // Пометка в сцене.
+        let la = layout(&m, &[]);
+        let mut t = canopy_tile("k/c.webp".into(), [5.0, 7.8], [1.0, 2.0], 0.0, 100);
+        (t.item, t.rail) = (true, rail_ride(&m, &tail, 100));
+        let scene = foundry_levels(&m, "Рудник", &[SceneLevel { name: "Рудник".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![t] }], 100, &Default::default());
+        assert_eq!(scene["tiles"][0]["flags"][LIVE_MODULE]["rail"], json!({"path": [[500, 100], [500, 2000], [900, 2000]], "lag": 220, "cargo": false}));
+        assert_eq!(scene["tiles"][0]["elevation"], 0, "по земле, под фишками");
+        // Путь сдвигается вместе с картой.
+        m.grow(2, 1, 0, 0);
+        assert_eq!(m.rails[0][0], [7.0, 2.0]);
+    }
+
+    #[test]
+    fn canal_runs_while_harbour_stands_and_water_flows_round_a_rock() {
+        let mut m = Map::new(12, 12);
+        let water = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        // Тёмная непрозрачная вода — мутная: блики и рыбы гаснут, а пена у бегущей остаётся.
+        m.materials[water].name = "Мутная вода".into();
+        assert!(m.materials[water].murky());
+        let all = crate::mask::cells(m.rooms.w, m.rooms.h, (0, 0), (12, 12));
+        m.paint(crate::map::Layer::Floor, water, &all);
+        m.prune();
+        // Канал слева бежит вниз, справа — стоячая гавань.
+        m.flows = vec![crate::map::Flow { points: vec![[0.0, 0.0], [5.0, 0.0], [5.0, 12.0], [0.0, 12.0]], current: 0.8, drift: 90.0 }];
+        // Валун в канале — дыра в воде; на берегу — нет.
+        m.props = vec![thing("x/Boulder_Stone_Earthy_A3_3x3.webp", [2.5, 4.0], [3.0, 3.0], 0.0)];
+        m.props[0].scale = 0.5;
+        assert!(crate::map::rock_by_name(&m.props[0].asset) && !crate::map::rock_by_name("x/Barrel_A1_1x1.webp"));
+        let lay = layout(&m, &[]);
+        let water_zones: Vec<&Zone> = lay.zones.iter().filter(|z| z.effect == "water").collect();
+        assert_eq!(water_zones.len(), 2);
+        let canal = water_zones.iter().find(|z| z.flow.is_some()).expect("канал");
+        assert_eq!(canal.flow, Some((0.8, 90.0)));
+        assert_eq!(canal.loops.iter().filter(|l| l.1).count(), 1, "дыра под валуном");
+        let harbour = water_zones.iter().find(|z| z.flow.is_none()).unwrap();
+        assert_eq!(harbour.loops.iter().filter(|l| l.1).count(), 0);
+        let scene = foundry_levels(&m, "Канал", &[SceneLevel { name: "Канал".into(), image_src: "p.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+        let regions = scene["regions"].as_array().unwrap();
+        let flowing: Vec<&Value> = regions.iter().filter(|r| r["flags"][LIVE_MODULE]["current"].is_number()).collect();
+        assert_eq!(flowing.len(), 1, "течёт только канал");
+        assert_eq!((flowing[0]["flags"][LIVE_MODULE]["current"].as_f64(), flowing[0]["flags"][LIVE_MODULE]["drift"].as_i64()), (Some(0.8), Some(90)));
+        assert!(flowing[0]["flags"][LIVE_MODULE].get("foam").is_none(), "бегущая мутная вода пенится у камня");
+        let still = regions.iter().find(|r| r["flags"][LIVE_MODULE]["effect"] == "water" && !r["flags"][LIVE_MODULE]["current"].is_number()).unwrap();
+        assert_eq!((still["flags"][LIVE_MODULE]["foam"].as_i64(), still["flags"][LIVE_MODULE]["fish"].as_bool()), (Some(0), Some(false)));
+        m.grow(1, 0, 0, 0);
+        assert_eq!(m.flows[0].points[0], [1.0, 0.0]);
     }
 }
