@@ -336,6 +336,11 @@ impl App {
             let up = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
             if up && !prop.is_canopy() && !prop.with_walls() && (map::bush_by_name(&prop.asset) || map::awning_by_name(&prop.asset) || map::line_by_name(&prop.asset) || prop.own_tile()) {
                 // Куст, навес, бельё и всякий предмет уйдут в свой тайл целиком; тень — в фоне.
+                // У предмета в воде в тайл уходит сухой верх, низ — здесь, под водой «Wild Canvas».
+                if prop.sunk() > 0.0 {
+                    let tint = prop.tint.map_or(Color32::WHITE, |[r, g, b]| Color32::from_rgb(r, g, b));
+                    self.draw_prop_in_water(painter, canvas, prop, tint, false);
+                }
             } else if exporting && self.export.as_ref().is_some_and(|e| e.canopies) && prop.is_canopy() && (map::is_bare_tree(&prop.asset) || !map::has_trunk(&prop.asset)) {
                 // Голое дерево целиком уйдёт в тайл; пень под ветками смотрится плохо.
                 // У паруса и полога ствола нет: под ними в картинке ничего.

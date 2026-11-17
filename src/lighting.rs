@@ -128,7 +128,7 @@ impl Scene {
                 at: l.at,
                 bright: l.bright,
                 dim: l.dim.max(l.bright + 0.1),
-                color: hex(l.color).map(|c| 0.5 + 0.5 * c),
+                color: hex(&l.color).map(|c| 0.5 + 0.5 * c),
                 power: if l.animation == "energy" { 0.75 } else { 1.0 },
                 roofed: roofs.iter().any(|r| inside_poly(l.at, r)),
             })
@@ -314,7 +314,7 @@ mod tests {
     use super::*;
 
     fn light(at: [f32; 2], color: &'static str, animation: &'static str) -> crate::export::Light {
-        crate::export::Light { at, bright: 2.0, dim: 5.0, color, animation, look: (0.35, 1, 0.5, 0.5), tempo: (3, 3) }
+        crate::export::Light { at, bright: 2.0, dim: 5.0, color: color.into(), animation: animation.into(), look: (0.35, 1, 0.5, 0.5), tempo: (3, 3) }
     }
 
     fn layout(walls: Vec<Vec<[f32; 2]>>, portals: Vec<PortalOut>, lights: Vec<crate::export::Light>) -> Layout {

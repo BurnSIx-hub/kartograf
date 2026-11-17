@@ -447,6 +447,13 @@ pub struct Prop {
     /// Нет — снизу, как у встроенных лавок. С остальных сторон в Foundry — стены полога.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<u8>,
+    /// Свой свет поверх вида (`light`): радиус, цвет, анимация, её скорость и сила.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glow: Option<GlowTune>,
+    /// Какая доля предмета под водой, от низа картинки (0–1): кресло по спинку, упавшая
+    /// капсула. Нет — предмет над водой целиком.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sunk: Option<f32>,
 }
 
 /// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
@@ -571,6 +578,49 @@ impl Glow {
             _ => (3, 3),
         }
     }
+}
+
+/// Анимации источника света в Foundry 14 (`CONFIG.Canvas.lightAnimations`).
+pub const LIGHT_ANIMATIONS: [&str; 23] = [
+    "flame", "torch", "revolving", "siren", "pulse", "reactivepulse", "chroma", "wave", "fog", "sunburst", "dome", "emanation", "hexa", "ghost", "energy", "vortex", "witchwave",
+    "rainbowswirl", "radialrainbow", "fairy", "grid", "starlight", "smokepatch",
+];
+
+/// Свой свет предмета поверх вида света ([`Glow`]): что задано — вместо того, что даёт вид.
+/// Так одна лампа на одной карте светит по-своему, а вид света у всех карт остаётся прежним.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GlowTune {
+    /// Радиус тусклого света в клетках; яркий меняется в той же доле.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    /// Анимация Foundry из [`LIGHT_ANIMATIONS`]; пустая строка — горит ровно.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation: Option<String>,
+    /// Скорость анимации, 0–10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u8>,
+    /// Сила анимации, 1–10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<u8>,
+}
+
+impl GlowTune {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Свет предмета целиком — вид света и свои поправки: то, что уходит в Foundry и в ночной снимок.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shine {
+    pub bright: f32,
+    pub dim: f32,
+    pub color: String,
+    pub animation: String,
+    pub look: (f32, u8, f32, f32),
+    pub tempo: (u8, u8),
 }
 
 /// Слова имени ассета в нижнем регистре: `Oak_Tree_A_3x3` → oak, tree, a, 3x3.
@@ -708,6 +758,41 @@ pub fn living_by_name(key: &str) -> Option<(&'static str, String)> {
         return Some(("sock", "1".into()));
     }
     ["Cooling_Unit_A", "Server_Rack_A", "Server_Rack_B", "Generator_Portable_A", "Robot_Arm_Industrial_A", "Floor_Fan_Industrial_A", "Drone_Delivery_A", "Treadmill_A", "Airship_Gnome_Brass_A", "Signal_Beacon_Arcane_A"].iter().find(|m| file.starts_with(**m)).map(|m| ("machine", (*m).to_owned()))
+        // Свой механизм из `live.json` папки ассетов: раскладку «Wild Canvas» получит в пометке плитки.
+        .or_else(|| live_layout(key).map(|(name, _)| ("machine", name)))
+}
+
+/// Свои живые механизмы — из файла `live.json` в папке ассетов: начало имени файла картинки
+/// (как у встроенных) → раскладка для «Wild Canvas»: вентиляторы, лампы, огоньки в долях
+/// картинки. Новый вентилятор или пульт оживает записью в файле, без выпуска программ:
+/// раскладка уходит в пометку плитки, и модулю не нужно знать ассет по имени.
+static LIVE_TABLE: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Заменить таблицу своих механизмов: пары «начало имени файла — раскладка (JSON)».
+pub fn set_live_table(table: Vec<(String, String)>) {
+    if let Ok(mut t) = LIVE_TABLE.write() {
+        *t = table;
+    }
+}
+
+/// Имена своих механизмов из таблицы — для ответа `reload_assets`.
+pub fn live_names() -> Vec<String> {
+    LIVE_TABLE.read().map(|t| t.iter().map(|(name, _)| name.clone()).collect()).unwrap_or_default()
+}
+
+/// Свой механизм по ключу ассета: имя из таблицы и раскладка (JSON). Из подходящих имён —
+/// самое длинное: `Fan_Wall_B` главнее `Fan_`.
+pub fn live_layout(key: &str) -> Option<(String, String)> {
+    let file = crate::library::label(key);
+    let t = LIVE_TABLE.read().ok()?;
+    t.iter().filter(|(name, _)| file.starts_with(name.as_str())).max_by_key(|(name, _)| name.len()).cloned()
+}
+
+/// Разобрать `live.json`: объект «имя → раскладка-объект». Всё остальное пропускается:
+/// испорченный файл не мешает открыть папку ассетов.
+pub fn parse_live_table(text: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')) else { return Vec::new() };
+    o.into_iter().filter(|(name, layout)| !name.is_empty() && layout.is_object()).map(|(name, layout)| (name, layout.to_string())).collect()
 }
 
 /// Дымоход, из которого идёт дым («Wild Canvas» пускает клубы над крышей): не
@@ -845,12 +930,42 @@ impl Prop {
     }
 
     pub fn casts_shadow(&self) -> bool {
-        self.shadow.unwrap_or_else(|| !flat_by_name(&self.asset))
+        // Предмет в воде тени не даёт: низ его под водой, а тень всей картинки легла бы на воду.
+        self.shadow.unwrap_or_else(|| !flat_by_name(&self.asset) && self.sunk() <= 0.0)
+    }
+
+    /// Какая доля предмета под водой, от низа картинки: 0 — весь над водой, 1 — весь под ней.
+    pub fn sunk(&self) -> f32 {
+        self.sunk.filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 1.0))
     }
 
     /// Чем светит в Foundry: выбранное вручную или узнанное по имени.
     pub fn light(&self) -> Option<Glow> {
         self.light.or_else(|| glow_by_name(&self.asset)).filter(|g| *g != Glow::Off)
+    }
+
+    /// Свет предмета: вид ([`Prop::light`]) с размером по масштабу и своими поправками (`glow`).
+    pub fn shine(&self) -> Option<Shine> {
+        let glow = self.light()?;
+        let (bright, dim, color, animation) = glow.params()?;
+        let k = self.scale.sqrt();
+        let (mut bright, mut dim) = (bright * k, dim * k);
+        let (mut color, mut animation, mut tempo) = (color.to_owned(), animation.to_owned(), glow.tempo());
+        if let Some(t) = &self.glow {
+            if let Some(r) = t.radius {
+                let r = r.clamp(0.2, 30.0);
+                bright *= r / dim;
+                dim = r;
+            }
+            if let Some([r, g, b]) = t.color {
+                color = format!("#{r:02x}{g:02x}{b:02x}");
+            }
+            if let Some(a) = &t.animation {
+                animation = a.clone();
+            }
+            tempo = (t.speed.unwrap_or(tempo.0).min(10), t.intensity.unwrap_or(tempo.1).clamp(1, 10));
+        }
+        Some(Shine { bright, dim, color, animation, look: glow.look(), tempo })
     }
 
     /// Крона: в Foundry тайлом над токенами, в картинке пень.
@@ -870,7 +985,10 @@ impl Prop {
         // Вентилятор в полу плоский, но крутится, а «Wild Canvas» крутит только тайл:
         // живое плоское — своим тайлом, без тени.
         let alive = living_by_name(&self.asset).is_some();
-        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs || alive)
+        // Целиком под водой — лежит на дне, в картинке карты: вода «Wild Canvas» идёт поверх.
+        // Наполовину в воде — тайлом идёт сухой верх, низ остаётся в фоне.
+        let on_bottom = self.sunk() >= 1.0;
+        !on_bottom && !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs || alive)
     }
 
     /// Слой «над стенами» — колонны, столбики перил: в Foundry они в тайле стен
@@ -888,7 +1006,8 @@ impl Prop {
     }
 
     pub fn layer(&self) -> i16 {
-        self.layer.unwrap_or_else(|| layer_by_name(&self.asset))
+        // Целиком под водой — на дне, слоем пола: под всем остальным.
+        self.layer.unwrap_or_else(|| if self.sunk() >= 1.0 { 100 } else { layer_by_name(&self.asset) })
     }
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
@@ -1617,6 +1736,10 @@ pub struct Map {
     /// «Wild Canvas», внутри неё играет он, снаружи — `ambience`. Пусто — без неё.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub indoor: String,
+    /// Свет сцены Foundry (`day`, `dim`, `dark`, см. `plan::SCENE_LIGHTS`); пусто — по звуку
+    /// места. Отдельно от звука: станция гудит как станция, а светло в ней или темно — выбор карты.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scene_light: String,
     /// Течение воды в «Wild Canvas», клеток в секунду: корабль на ходу стоит, а
     /// вода уходит мимо борта, за кормой след. 0 — вода стоит.
     #[serde(default, skip_serializing_if = "still")]
@@ -1672,6 +1795,9 @@ pub struct Map {
     /// Крыши по контурам домов из OSM (см. [`OutlineRoof`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outline_roofs: Vec<OutlineRoof>,
+    /// Помосты: площадки выше пола со стенкой, тенью и лестницами (см. [`crate::platform`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<crate::platform::Platform>,
     /// Имя этажа; пусто — «Этаж N».
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -1782,6 +1908,7 @@ impl Map {
             weather: String::new(),
             ambience: String::new(),
             indoor: String::new(),
+            scene_light: String::new(),
             current: 0.0,
             drift: drift_down(),
             flows: Vec::new(),
@@ -1806,6 +1933,7 @@ impl Map {
             labels: Vec::new(),
             roofs: Vec::new(),
             outline_roofs: Vec::new(),
+            platforms: Vec::new(),
             name: String::new(),
             levels: Vec::new(),
         }
@@ -2098,6 +2226,10 @@ impl Map {
                 piece.rings.iter_mut().flatten().for_each(mv);
             }
         }
+        for p in &mut self.platforms {
+            p.points.iter_mut().for_each(mv);
+            p.stairs.iter_mut().for_each(|s| mv(&mut s.at));
+        }
         // Ключ отрезка — середина с шагом 1/64 клетки.
         let (kx, ky) = (64 * left as i32, 64 * top as i32);
         self.edge_looks = std::mem::take(&mut self.edge_looks).into_iter().map(|((x, y), v)| ((x + kx, y + ky), v)).collect();
@@ -2249,6 +2381,20 @@ mod tests {
         assert_eq!(living_by_name("objects/steampunk/Windsock_Striped_A_3x1.webp"), Some(("sock", "1".to_owned())));
         assert_eq!(living_by_name("objects/steampunk/Signal_Beacon_Arcane_A_2x2.webp"), Some(("machine", "Signal_Beacon_Arcane_A".to_owned())));
         assert_eq!(living_by_name("objects/steampunk/Airship_Gnome_Brass_A_5x10.webp").map(|l| l.0), Some("machine"));
+        // Свой механизм — из `live.json` папки ассетов: оживает без правки программы, плоский идёт плиткой.
+        let fan = "objects/scifi/Vent_Fan_Probe_Zeta_B_2x2.webp";
+        assert_eq!(living_by_name(fan), None);
+        let table = parse_live_table(r#"{"Vent_Fan_Probe_Zeta": {"fans": [[0.5, 0.5, 0.4, 2]]}, "Vent_Fan_Probe_Zeta_B": {"fans": [[0.5, 0.5, 0.3]]}, "плохая": 5, "": {}}"#);
+        assert_eq!(table.len(), 2, "раскладка — только объект с именем: {table:?}");
+        set_live_table(table);
+        assert_eq!(living_by_name(fan), Some(("machine", "Vent_Fan_Probe_Zeta_B".to_owned())), "из двух имён — длинное");
+        assert_eq!(live_layout(fan).map(|l| l.1).as_deref(), Some(r#"{"fans":[[0.5,0.5,0.3]]}"#));
+        assert_eq!(live_layout("objects/scifi/Vent_Fan_Probe_Zeta_A_1x1.webp").map(|l| l.0).as_deref(), Some("Vent_Fan_Probe_Zeta"));
+        assert!(live_names().contains(&"Vent_Fan_Probe_Zeta".to_owned()));
+        assert_eq!(living_by_name("objects/scifi/Cooling_Unit_A_2x1.webp"), Some(("machine", "Cooling_Unit_A".to_owned())), "встроенные — как были");
+        assert!(parse_live_table("не json").is_empty() && parse_live_table("[1, 2]").is_empty());
+        set_live_table(Vec::new());
+        assert_eq!(living_by_name(fan), None);
     }
 
     #[test]
@@ -2259,7 +2405,7 @@ mod tests {
         m.rooms.data[(crate::mask::RES * 1 + 1) * m.rooms.w + crate::mask::RES + 1] = 255;
         m.walls.push(Wall { points: vec![[0.0, 0.0], [4.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         m.portals.push(Portal { a: [1.0, 3.0], b: [2.0, 3.0], kind: PortalKind::Door, asset: None, frame: None });
-        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
+        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
         m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
         m.edge_looks.insert((64, 0), 1);
         let mut deck = m.new_level();
@@ -2406,7 +2552,7 @@ mod tests {
         assert!(afloat_by_name("pack:fa|textures/objects/Paper_Sheet_A_White_1x1.webp") && !afloat_by_name("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
         // Вентилятор в полу плоский, но живой: своим тайлом (иначе «Wild Canvas» нечего
         // крутить), без своей тени. Ковёр — плоский и неживой: остаётся в картинке карты.
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         let fan = prop("set:cyberpunk/objects/Floor_Fan_Industrial_A_2x2.webp");
         assert!(flat_by_name(&fan.asset) && fan.own_tile() && !fan.carries_shadow());
         assert!(!prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp").own_tile());
@@ -2414,7 +2560,7 @@ mod tests {
 
     #[test]
     fn bridges_are_baked_under_walls_not_own_tiles() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         assert!(!prop("C:/a/objects/bridges/Bridge_Boardwalk_Platform_A_5x4.webp").own_tile());
         assert!(!prop("pack:fa|textures/objects/Log_Bridge_Wood_Dark_A1_11x4.webp").own_tile());
         // Мост тень бросает, как раньше.
@@ -2521,7 +2667,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -2577,6 +2723,33 @@ mod tests {
         // Рукой: выключить похожее по имени и зажечь непохожее.
         assert_eq!(Prop { light: Some(Glow::Off), ..prop("builtin:campfire") }.light(), None);
         assert_eq!(Prop { light: Some(Glow::Brazier), ..prop("pack:x|textures/objects/Barrel_A.webp") }.light(), Some(Glow::Brazier));
+        // Свой свет: что задано — вместо того, что даёт вид; остальное от вида.
+        let lamp = Prop { light: Some(Glow::Alarm), ..prop("pack:x|textures/objects/Barrel_A.webp") };
+        let plain = lamp.shine().unwrap();
+        assert_eq!((plain.dim, plain.color.as_str(), plain.animation.as_str(), plain.tempo), (2.2, "#ff3020", "revolving", (7, 8)));
+        let tuned = Prop { glow: Some(GlowTune { radius: Some(4.4), color: Some([0, 128, 255]), animation: Some(String::new()), speed: Some(2), intensity: None }), ..lamp.clone() }.shine().unwrap();
+        assert_eq!((tuned.dim, tuned.color.as_str(), tuned.animation.as_str(), tuned.tempo), (4.4, "#0080ff", "", (2, 8)));
+        assert!((tuned.bright - 0.8).abs() < 1e-5, "яркий круг — в той же доле: {}", tuned.bright);
+        assert_eq!(tuned.look, plain.look);
+        // В файле карты пустые поля не пишутся, старая карта читается без них.
+        let saved = serde_json::to_string(&Prop { glow: Some(GlowTune { speed: Some(1), ..Default::default() }), ..lamp.clone() }).unwrap();
+        assert!(saved.contains(r#""glow":{"speed":1}"#) && !saved.contains("sunk"), "{saved}");
+        let old: Prop = serde_json::from_str(&serde_json::to_string(&lamp).unwrap()).unwrap();
+        assert_eq!((old.glow, old.sunk), (None, None));
+        assert!(prop("builtin:tree").shine().is_none());
+        // Ватерлиния: кресло по спинку в воде — без тени, сухой верх своим тайлом; целиком под
+        // водой — на дне, слоем пола, в картинке карты.
+        let seat = prop("set:scifi/objects/Cinema_Seat_Blue_A_1x1.webp");
+        assert!((seat.sunk(), seat.casts_shadow(), seat.own_tile()) == (0.0, true, true));
+        let half = Prop { sunk: Some(0.6), ..seat.clone() };
+        assert!((half.sunk(), half.casts_shadow(), half.own_tile(), half.carries_shadow()) == (0.6, false, true, false));
+        assert_eq!(half.layer(), seat.layer());
+        let drowned = Prop { sunk: Some(1.0), ..seat.clone() };
+        assert!((drowned.own_tile(), drowned.casts_shadow(), drowned.layer()) == (false, false, 100));
+        assert_eq!(Prop { sunk: Some(7.5), ..seat.clone() }.sunk(), 1.0);
+        assert_eq!(Prop { sunk: Some(f32::NAN), ..seat.clone() }.sunk(), 0.0);
+        assert!(Prop { sunk: Some(0.6), shadow: Some(true), ..seat.clone() }.casts_shadow(), "тень рукой — главнее");
+        assert!(serde_json::to_string(&half).unwrap().contains(r#""sunk":0.6"#));
         assert!(prop("builtin:tree").is_canopy());
         // Чужие деревья — только рукой: листва у них любая, сухим крона ни к чему.
         assert!(!prop("pack:fa.dungeondraft_pack|textures/objects/Oak_Tree_A_3x3.webp").is_canopy());
@@ -2622,7 +2795,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();

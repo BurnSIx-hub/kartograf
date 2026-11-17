@@ -87,6 +87,15 @@ impl App {
         i
     }
 
+    /// Помост по рамке клеток: площадка со стенкой в три ступени.
+    pub fn place_platform(&mut self, a: (i32, i32), b: (i32, i32)) -> usize {
+        let lo = [a.0.min(b.0) as f32, a.1.min(b.1) as f32];
+        let hi = [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0];
+        self.checkpoint();
+        self.map.platforms.push(crate::platform::Platform::new(vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]], 0.25));
+        self.map.platforms.len() - 1
+    }
+
     /// Поставить начатую дорогу. Из одной точки дороги не бывает.
     pub fn finish_path(&mut self) {
         let points = std::mem::take(&mut self.path_draft);
@@ -177,7 +186,7 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -244,7 +253,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -307,7 +316,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));

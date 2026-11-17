@@ -199,6 +199,8 @@ impl App {
             "set_wall_style" => self.tool_wall_style(a),
             "edit_roof" => self.tool_edit_roof(a),
             "add_roof" => self.tool_add_roof(a),
+            "add_platform" => self.tool_add_platform(a),
+            "edit_platform" => self.tool_edit_platform(a),
             "set_scene" => self.tool_set_scene(a),
             "add_level" => self.tool_add_level(a),
             "switch_level" => self.tool_switch_level(a),
@@ -208,7 +210,7 @@ impl App {
                     self.library.set_folder(&dir);
                 }
                 let count = |k: Kind| self.library.assets.iter().filter(|x| x.kind == k).count();
-                Ok(json!({"folder": self.settings.textures_dir, "objects": count(Kind::Object), "floors": count(Kind::Floor), "walls": count(Kind::Wall), "doors": count(Kind::Door), "library_loading": self.library.loading()}))
+                Ok(json!({"folder": self.settings.textures_dir, "live": crate::map::live_names(), "objects": count(Kind::Object), "floors": count(Kind::Floor), "walls": count(Kind::Wall), "doors": count(Kind::Door), "library_loading": self.library.loading()}))
             }
             "undo" => {
                 let n = a["steps"].as_u64().unwrap_or(1).clamp(1, 50);
@@ -303,9 +305,9 @@ impl App {
             "level": self.level, "levels": self.levels.len(),
             "level_names": (0..self.levels.len()).map(|k| self.level_name(k)).collect::<Vec<_>>(),
             "seed": m.seed,
-            "scene": {"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift},
+            "scene": {"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift},
             "objects": m.props.len(), "walls": m.walls.len(), "doors": m.portals.len(),
-            "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(),
+            "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(), "platforms": m.platforms.len(),
             "materials": m.materials.iter().enumerate().map(|(i, x)| {
                 let mut j = json!({"index": i, "name": x.name, "texture": match &x.paint { Paint::Texture(t) => Some(t.clone()), Paint::Color(_) => None }});
                 if x.rot != 0.0 {
@@ -324,14 +326,29 @@ impl App {
         let m = &self.map;
         let mut out = serde_json::Map::new();
         let r2 = |v: f32| (v * 100.0).round() / 100.0;
+        let asked = |s: &str| a["include"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str() == Some(s)));
         if want("objects") {
+            // Видимая часть картинки — только по прямой просьбе (`visible`): картинку ради неё
+            // приходится раскрывать. Самопроверке карты по ней видно, сколько места предмет занимает
+            // на самом деле: у FA вокруг предмета поля под тень, у своих ассетов холст занят весь.
+            let visible = asked("visible");
+            let mut boxes: std::collections::HashMap<&str, Option<[f32; 4]>> = std::collections::HashMap::new();
             let list: Vec<Value> = m
                 .props
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| inside(area, p.pos))
                 .take(limit)
-                .map(|(i, p)| object_row(i, p))
+                .map(|(i, p)| {
+                    let mut row = object_row(i, p);
+                    if visible {
+                        let seen = *boxes.entry(p.asset.as_str()).or_insert_with(|| library::visible_box(&self.textures.sources, &p.asset));
+                        if let Some(v) = seen {
+                            row["vis"] = json!(visible_cells(v, p));
+                        }
+                    }
+                    row
+                })
                 .collect();
             out.insert("objects".into(), json!(list));
         }
@@ -342,7 +359,6 @@ impl App {
         }
         // Стены по краю закрашенных комнат — только по прямой просьбе: на большой карте их много.
         // Самопроверка карт без крыш (станция, подземелье) узнаёт по ним, что внутри, а что снаружи.
-        let asked = |s: &str| a["include"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str() == Some(s)));
         if asked("room_walls") {
             let list: Vec<Value> = m.room_edges().into_iter().filter(|(p, q)| inside(area, *p) || inside(area, *q)).map(|(p, q)| json!([[r2(p[0]), r2(p[1])], [r2(q[0]), r2(q[1])]])).collect();
             out.insert("room_walls".into(), json!(list));
@@ -378,6 +394,21 @@ impl App {
                     }),
             );
             out.insert("roofs".into(), json!(list));
+        }
+        if want("platforms") && !m.platforms.is_empty() {
+            let list: Vec<Value> = m
+                .platforms
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.points.iter().any(|&q| inside(area, q)))
+                .take(limit)
+                .map(|(i, p)| {
+                    let mut row = platform_row(i, p);
+                    row["points"] = json!(p.points.iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>());
+                    row
+                })
+                .collect();
+            out.insert("platforms".into(), json!(list));
         }
         if want("paths") {
             let list: Vec<Value> = m
@@ -441,14 +472,16 @@ impl App {
         let shadow = shadow_of(a)?.flatten();
         let canopy = canopy_of(a)?.flatten();
         let tint = color_of(a, "tint")?.flatten();
+        let glow = glow_tune_of(a, None)?.flatten();
+        let sunk = sunk_of(a)?.flatten();
         let scale = f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0);
         let (pos, rot, wall) = self.facing(a, &asset, size, scale, [x, y], 0.0)?;
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None });
+        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None, glow, sunk });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         let p = &self.map.props[i];
-        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "size_cells": size, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
+        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "size_cells": size, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
     }
 
     fn tool_edit_object(&mut self, a: &Value) -> Res {
@@ -467,6 +500,8 @@ impl App {
         let canopy = canopy_of(a)?;
         let tint = color_of(a, "tint")?;
         let recolor = color_of(a, "recolor")?;
+        let glow = glow_tune_of(a, self.map.props[i].glow.as_ref())?;
+        let sunk = sunk_of(a)?;
         let now = &self.map.props[i];
         let pos = [f(a, "x").unwrap_or(now.pos[0]), f(a, "y").unwrap_or(now.pos[1])];
         let scale = f(a, "scale").map_or(now.scale, |s| s.clamp(0.05, 20.0));
@@ -478,6 +513,12 @@ impl App {
         p.rot = rot;
         if let Some(g) = light {
             p.light = g;
+        }
+        if let Some(g) = glow {
+            p.glow = g;
+        }
+        if let Some(s) = sunk {
+            p.sunk = s;
         }
         if let Some(s) = shadow {
             p.shadow = s;
@@ -502,7 +543,7 @@ impl App {
             None => {}
         }
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
+        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
     }
 
     /// Где встанет предмет и как повернётся: `look_at` — лицом (`front`) к точке,
@@ -563,6 +604,58 @@ impl App {
         faces.into_iter().map(|f| (map::segment_distance(p, f.0.0, f.0.1), f)).filter(|(d, _)| *d <= reach).min_by(|x, y| x.0.total_cmp(&y.0)).map(|(_, f)| f)
     }
 
+    /// Помост: площадка выше пола. Контур — `points`, рамка `area`, круг `circle` (с `area` —
+    /// часть круга в рамке) или рамка без круга (`outside_circle` с `area`: ярус за дугой).
+    fn tool_add_platform(&mut self, a: &Value) -> Res {
+        let mut pl = crate::platform::Platform::new(platform_outline(a)?, f(a, "height").unwrap_or(0.3).clamp(0.02, 1.5));
+        if let Some(Some(c)) = color_of(a, "color")? {
+            pl.color = c;
+        }
+        if let Some(Some(c)) = color_of(a, "side")? {
+            pl.side = c;
+        }
+        if let Some(s) = f(a, "strength") {
+            pl.strength = s.clamp(0.0, 1.0);
+        }
+        if let Some(stairs) = stairs_of(a)? {
+            pl.stairs = stairs;
+        }
+        self.checkpoint();
+        self.map.platforms.push(pl);
+        let i = self.map.platforms.len() - 1;
+        Ok(platform_row(i, &self.map.platforms[i]))
+    }
+
+    fn tool_edit_platform(&mut self, a: &Value) -> Res {
+        let i = a["index"].as_u64().ok_or("нужен index")? as usize;
+        if i >= self.map.platforms.len() {
+            return Err(format!("помоста {i} нет: их {}", self.map.platforms.len()));
+        }
+        let outline = if ["points", "area", "circle", "outside_circle"].iter().any(|k| a.get(*k).is_some()) { Some(platform_outline(a)?) } else { None };
+        let (color, side, stairs) = (color_of(a, "color")?, color_of(a, "side")?, stairs_of(a)?);
+        self.checkpoint();
+        let pl = &mut self.map.platforms[i];
+        if let Some(points) = outline {
+            pl.points = points;
+        }
+        if let Some(h) = f(a, "height") {
+            pl.height = h.clamp(0.02, 1.5);
+        }
+        if let Some(c) = color {
+            pl.color = c.unwrap_or_else(crate::platform::light);
+        }
+        if let Some(c) = side {
+            pl.side = c.unwrap_or_else(crate::platform::steel);
+        }
+        if let Some(s) = f(a, "strength") {
+            pl.strength = s.clamp(0.0, 1.0);
+        }
+        if let Some(stairs) = stairs {
+            pl.stairs = stairs;
+        }
+        Ok(platform_row(i, pl))
+    }
+
     fn tool_remove(&mut self, a: &Value) -> Res {
         let mut idx: Vec<usize> = a["indices"].as_array().map(|l| l.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect()).unwrap_or_default();
         idx.sort_unstable();
@@ -575,7 +668,8 @@ impl App {
             "labels" => self.map.labels.len(),
             "paths" => self.map.paths.len(),
             "roofs" => self.map.roofs.len() + self.map.outline_roofs.len(),
-            _ => return Err("what: objects, walls, doors, labels, paths или roofs".into()),
+            "platforms" => self.map.platforms.len(),
+            _ => return Err("what: objects, walls, doors, labels, paths, roofs или platforms".into()),
         };
         if let Some(&bad) = idx.iter().find(|&&i| i >= len) {
             return Err(format!("{what}: номера {bad} нет, их {len}"));
@@ -589,6 +683,7 @@ impl App {
                 "labels" => drop(self.map.labels.remove(i)),
                 "roofs" if i >= self.map.roofs.len() => drop(self.map.outline_roofs.remove(i - self.map.roofs.len())),
                 "roofs" => drop(self.map.roofs.remove(i)),
+                "platforms" => drop(self.map.platforms.remove(i)),
                 _ => drop(self.map.paths.remove(i)),
             }
         }
@@ -975,7 +1070,7 @@ impl App {
 
     /// Живое сцены для «Wild Canvas»: звук места, что летит от крон, погода, течение.
     fn tool_set_scene(&mut self, a: &Value) -> Res {
-        use crate::plan::{PARTICLES, PLACES, WEATHERS};
+        use crate::plan::{PARTICLES, PLACES, SCENE_LIGHTS, WEATHERS};
         let pick = |key: &str, list: &[(&str, &str)]| -> Result<Option<String>, String> {
             match a[key].as_str() {
                 None => Ok(None),
@@ -984,6 +1079,7 @@ impl App {
             }
         };
         let (ambience, particles, weather) = (pick("ambience", &PLACES)?, pick("particles", &PARTICLES)?, pick("weather", &WEATHERS)?);
+        let light = pick("light", &SCENE_LIGHTS)?;
         let current = f(a, "current").map(|v| v.clamp(0.0, 3.0));
         let drift = f(a, "drift").map(|v| v.rem_euclid(360.0));
         let pt = |v: &Value| -> Result<[f32; 2], String> {
@@ -1030,6 +1126,9 @@ impl App {
         if let Some(v) = ambience {
             m.ambience = v;
         }
+        if let Some(v) = light {
+            m.scene_light = v;
+        }
         if let Some(v) = particles {
             m.particles = v;
         }
@@ -1049,7 +1148,7 @@ impl App {
             m.rails = v;
         }
         let flows: Vec<Value> = m.flows.iter().map(|f| json!({"points": f.points, "current": f.current, "drift": f.drift})).collect();
-        Ok(json!({"ambience": m.ambience, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails}))
+        Ok(json!({"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails}))
     }
 
     fn tool_add_roof(&mut self, a: &Value) -> Res {
@@ -1417,6 +1516,62 @@ fn back_extent(front: &str, vb: [f32; 4], size: [f32; 2]) -> f32 {
 }
 
 /// Точки `[[x, y], …]` из поля `points`.
+/// Контур помоста из ответа ИИ: `points`, либо `circle` (с `area` — часть круга внутри
+/// рамки), либо `outside_circle` с `area` (рамка без круга), либо одна рамка `area`.
+fn platform_outline(a: &Value) -> Result<Vec<[f32; 2]>, String> {
+    use crate::platform as pf;
+    let round = |k: &str| -> Result<Option<([f32; 2], f32)>, String> {
+        match a.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n: Vec<f32> = v.as_array().map(|l| l.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
+                if n.len() == 3 && n[2] > 0.1 { Ok(Some(([n[0], n[1]], n[2]))) } else { Err(format!("{k}: [cx, cy, радиус]")) }
+            }
+        }
+    };
+    let (area, points) = (area_of(a), points_of(a));
+    let out = if points.len() >= 3 {
+        pf::tidy(&points)
+    } else if let Some((c, r)) = round("circle")? {
+        match area {
+            Some(rect) => pf::within(&pf::circle(c, r), rect),
+            None => pf::circle(c, r),
+        }
+    } else if let Some((c, r)) = round("outside_circle")? {
+        let rect = area.ok_or("outside_circle: нужна и рамка area")?;
+        pf::bitten(rect, c, r).ok_or("outside_circle: круг должен резать рамку area ровно в двух местах")?
+    } else if let Some([x0, y0, x1, y1]) = area {
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    } else {
+        return Err("нужен контур помоста: points (от трёх точек), area [x0, y0, x1, y1] или circle [cx, cy, r]".into());
+    };
+    if out.len() < 3 || pf::area(&out).abs() < 0.05 {
+        return Err("контур помоста пуст".into());
+    }
+    Ok(out)
+}
+
+/// Лестницы помоста: нет поля — не трогать, пустой список — убрать.
+fn stairs_of(a: &Value) -> Result<Option<Vec<crate::platform::Stair>>, String> {
+    let Some(v) = a.get("stairs") else { return Ok(None) };
+    let list = v.as_array().ok_or("stairs: список {at: [x, y], width, steps}")?;
+    list.iter()
+        .map(|s| {
+            let at = point_at(s, "at").ok_or("лестница: нужна точка at: [x, y] у края помоста")?;
+            Ok(crate::platform::Stair { at, width: f(s, "width").unwrap_or(2.0).clamp(0.4, 12.0), steps: s["steps"].as_u64().unwrap_or(3).clamp(1, 16) as u8 })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
+}
+
+/// Помост в ответе: рамка, высота стенки, цвета, лестницы.
+fn platform_row(i: usize, p: &crate::platform::Platform) -> Value {
+    let r2 = |v: f32| (v as f64 * 100.0).round() / 100.0;
+    let (lo, hi) = p.bounds();
+    let stairs: Vec<Value> = p.stairs.iter().map(|s| json!({"at": [r2(s.at[0]), r2(s.at[1])], "width": s.width, "steps": s.steps})).collect();
+    json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs})
+}
+
 fn points_of(a: &Value) -> Vec<[f32; 2]> {
     a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default()
 }
@@ -1503,6 +1658,57 @@ fn live_of(a: &Value) -> Result<Option<map::Live>, String> {
 }
 
 /// Свет из ответа ИИ: нет поля — не трогать; `auto` — по имени; иначе свой.
+/// Свой свет из ответа ИИ (`light_radius`, `light_color`, `light_animation`, `light_speed`,
+/// `light_intensity`) поверх того, что у предмета уже есть: нет поля — не трогать, `null` — как у вида.
+fn glow_tune_of(a: &Value, now: Option<&map::GlowTune>) -> Result<Option<Option<map::GlowTune>>, String> {
+    if ["light_radius", "light_color", "light_animation", "light_speed", "light_intensity"].iter().all(|k| a.get(*k).is_none()) {
+        return Ok(None);
+    }
+    let mut t = now.cloned().unwrap_or_default();
+    match a.get("light_radius") {
+        None => {}
+        Some(Value::Null) => t.radius = None,
+        Some(v) => t.radius = Some(v.as_f64().filter(|r| (0.2..=30.0).contains(r)).ok_or("light_radius: клетки, 0.2..30; null — как у вида света")? as f32),
+    }
+    if let Some(c) = color_of(a, "light_color")? {
+        t.color = c;
+    }
+    match a.get("light_animation") {
+        None => {}
+        Some(Value::Null) => t.animation = None,
+        Some(Value::String(s)) if s == "auto" => t.animation = None,
+        Some(Value::String(s)) if s == "none" => t.animation = Some(String::new()),
+        Some(Value::String(s)) if map::LIGHT_ANIMATIONS.contains(&s.as_str()) => t.animation = Some(s.clone()),
+        _ => return Err(format!("light_animation: none (ровно), auto или {}", map::LIGHT_ANIMATIONS.join(", "))),
+    }
+    let whole = |k: &str, lo: u64, hi: u64| -> Result<Option<Option<u8>>, String> {
+        match a.get(k) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(v) => v.as_u64().filter(|n| (lo..=hi).contains(n)).map(|n| Some(Some(n as u8))).ok_or(format!("{k}: целое {lo}..{hi}; null — как у вида света")),
+        }
+    };
+    if let Some(v) = whole("light_speed", 0, 10)? {
+        t.speed = v;
+    }
+    if let Some(v) = whole("light_intensity", 1, 10)? {
+        t.intensity = v;
+    }
+    Ok(Some((!t.is_empty()).then_some(t)))
+}
+
+/// Доля предмета под водой (`sunk`): нет поля — не трогать; `null` и 0 — весь над водой.
+fn sunk_of(a: &Value) -> Result<Option<Option<f32>>, String> {
+    match a.get("sunk") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => match v.as_f64() {
+            Some(s) if (0.0..=1.0).contains(&s) => Ok(Some((s > 0.0).then_some(s as f32))),
+            _ => Err("sunk: доля предмета под водой, 0..1 от низа картинки; null — весь над водой".into()),
+        },
+    }
+}
+
 fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
     let Some(s) = a["light"].as_str() else { return Ok(None) };
     let g = match s {
@@ -1598,7 +1804,27 @@ fn no_outline_rail(a: &Value) -> Result<(), String> {
 /// карты такое не наложение на палубу под ним.
 fn object_row(i: usize, p: &map::Prop) -> Value {
     let r2 = |v: f32| (v * 100.0).round() / 100.0;
+    let mut row = object_row_base(i, p, r2);
+    // Свой свет — только у кого он есть: у большинства предметов строка остаётся короткой.
+    if let Some(own) = &p.glow {
+        row["light_own"] = json!(own);
+    }
+    if p.sunk() > 0.0 {
+        row["sunk"] = json!((p.sunk() as f64 * 100.0).round() / 100.0);
+    }
+    row
+}
+
+fn object_row_base(i: usize, p: &map::Prop, r2: impl Fn(f32) -> f32) -> Value {
     json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "canopy": p.is_canopy(), "tint": p.tint, "recolor": library::untint(&p.asset).0})
+}
+
+/// Видимая часть предмета в клетках от его центра, до поворота: лево, верх, право, низ
+/// (`visible` — доли холста от середины, `library::visible_box`).
+fn visible_cells(visible: [f32; 4], p: &map::Prop) -> [f32; 4] {
+    let r2 = |v: f32| (v * 100.0).round() / 100.0;
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    [r2(visible[0] * w), r2(visible[1] * h), r2(visible[2] * w), r2(visible[3] * h)]
 }
 
 /// Стена в `describe`; `low` — фальшборт, парапет: держит шаг, взгляд идёт поверх.
@@ -1724,9 +1950,12 @@ mod tests {
 
     #[test]
     fn describe_tells_canopies_and_low_walls() {
-        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None };
+        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None, glow: None, sunk: None };
         assert_eq!(object_row(0, &prop("objects/Sail_Yard_Light_Tan_A1_14x3.webp", Some(true)))["canopy"], json!(true), "парус, отмеченный кроной");
         assert_eq!(object_row(1, &prop("objects/Crate_Wood_Dark_A_1x1.webp", None))["canopy"], json!(false));
+        // Видимая часть — в клетках: холст 2×1 в масштабе 1,5, картинка занимает его середину.
+        let wide = map::Prop { size: [2.0, 1.0], scale: 1.5, ..prop("objects/Crate_Wood_Dark_A_1x1.webp", None) };
+        assert_eq!(visible_cells([-0.4, -0.25, 0.3, 0.5], &wide), [-1.2, -0.38, 0.9, 0.75]);
         let mut wall = map::Wall { points: vec![[0.0, 0.0], [3.0, 0.0]], closed: false, bends: vec![], low: true, style: None };
         assert_eq!(wall_row(2, &wall)["low"], json!(true), "фальшборт");
         wall.low = false;

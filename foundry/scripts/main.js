@@ -77,6 +77,8 @@ export function close() {
 // При обновлении остаётся то, что Мастер сделал в Foundry: поставленное на сцену
 // (KEEP) и настройки сцены (KEEP_FIELDS) — имя, меню навигации, тьма и общий
 // свет, музыка, заметка, туман. Флаги других модулей тоже остаются.
+// Тьма и общий свет берутся из выгрузки в одном случае: на карте сменили «Свет сцены»
+// (флаг `light`) — иначе выбор карты не дошёл бы до уже стоящей сцены.
 const KEEP = ["tokens", "notes", "sounds", "drawings", "templates"];
 const KEEP_FIELDS = ["name", "navigation", "navName", "navOrder", "environment", "playlist", "playlistSound", "journal", "journalEntryPage", "fog"];
 const FOLDER = "Картограф";
@@ -142,7 +144,8 @@ async function refresh(old, scene) {
   const mine = old.toObject();
   for (const k of KEEP) scene[k] = mine[k] ?? [];
   const moved = relocate(old, scene);
-  for (const k of KEEP_FIELDS) if (k in mine) scene[k] = mine[k];
+  const relit = (scene.flags?.[MODULE_ID]?.light ?? "") !== (old.flags?.[MODULE_ID]?.light ?? "");
+  for (const k of KEEP_FIELDS) if (k in mine && !(k === "environment" && relit)) scene[k] = mine[k];
   scene.flags = foundry.utils.mergeObject(mine.flags ?? {}, scene.flags ?? {}, { inplace: false });
   const doc = await Scene.implementation.fromImport(scene);
   const data = game.scenes.fromCompendium(doc, { clearSort: false });
@@ -249,7 +252,7 @@ async function chooseScene(scene, path) {
     .map((s) => `<option value="${s.id}"${s === same ? " selected" : ""}>${esc(s.name)}${s.folder ? ` — ${esc(s.folder.name)}` : ""}</option>`).join("");
   const content = `<p>Выгрузка <b>${esc(path)}</b></p>
     <div class="form-group"><label>Куда</label><select name="target"><option value=""${same ? "" : " selected"}>Новая сцена (папка «${FOLDER}»)</option>${opts}</select></div>
-    <p class="hint">Обновляемая сцена сохранит фишки, заметки, рисунки, шаблоны, звуки, своё имя, тьму и свет, музыку и место в навигации. Если карта выросла, фишки сдвинутся вслед за ней.</p>`;
+    <p class="hint">Обновляемая сцена сохранит фишки, заметки, рисунки, шаблоны, звуки, своё имя, тьму и свет (пока на карте не сменят «Свет сцены»), музыку и место в навигации. Если карта выросла, фишки сдвинутся вслед за ней.</p>`;
   const res = await foundry.applications.api.DialogV2.wait({
     window: { title: "Картограф: сцена из выгрузки" },
     position: { width: 520 },

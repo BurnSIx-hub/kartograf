@@ -2157,7 +2157,7 @@ mod tests {
     #[test]
     fn tree_shadow_lies_beside_the_crown_and_not_under_roofs() {
         let mut m = map::Map::new(30, 30);
-        let tree = |pos: [f32; 2]| map::Prop { asset: crate::library::TREE.into(), pos, size: [4.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let tree = |pos: [f32; 2]| map::Prop { asset: crate::library::TREE.into(), pos, size: [4.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         m.props.push(tree([6.0, 6.0]));
         m.props.push(tree([18.0, 6.0]));
         // Дом с плоской крышей там, куда легла бы тень второго дерева.

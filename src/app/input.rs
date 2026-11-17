@@ -285,7 +285,8 @@ impl App {
                     && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
                 {
                     let w = self.cam.to_world(rect, o);
-                    match self.roof_at(w) {
+                    // В режиме помоста рамка всегда ставит помост, и над крышей тоже.
+                    match if self.platform_mode { None } else { self.roof_at(w) } {
                         Some(i) => {
                             self.checkpoint();
                             let r = &self.map.roofs[i];
@@ -309,7 +310,11 @@ impl App {
                     self.roof_grab = None;
                     if let (Some(a), Some(p)) = (self.roof_from.take(), pointer) {
                         let b = self.cam.cell(rect, p);
-                        self.place_roof(a, b);
+                        if self.platform_mode {
+                            self.place_platform(a, b);
+                        } else {
+                            self.place_roof(a, b);
+                        }
                     }
                 } else if resp.clicked()
                     && let Some(p) = pointer

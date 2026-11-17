@@ -894,6 +894,85 @@ impl SelfTest {
                 self.check("вариант из шторки выбран, шторка закрылась", got.contains("chest") && app.drawer.is_none(), &got);
                 app.query.clear();
             }
+            74 => {
+                // Свой свет предмета: лампа со своим радиусом и ритмом — раздел в панели раскрыт.
+                app.set_tool(Tool::Select);
+                app.checkpoint();
+                let w = app.cam.to_world(app.canvas, app.canvas.center());
+                let own = map::GlowTune { radius: Some(4.0), animation: Some("pulse".into()), speed: Some(2), ..Default::default() };
+                app.map.props.push(map::Prop {
+                    asset: format!("{}street_lamp", crate::library::BUILTIN),
+                    pos: [w[0].floor() + 0.5, w[1].floor() + 0.5],
+                    size: [1.0, 1.0],
+                    rot: 0.0,
+                    scale: 1.0,
+                    shadow: None,
+                    light: Some(map::Glow::Alarm),
+                    canopy: None,
+                    layer: None,
+                    tint: None,
+                    open: None,
+                    glow: Some(own),
+                    sunk: None,
+                });
+                app.sel = Some(Sel::Prop(app.map.props.len() - 1));
+                self.resume_at = now + 0.3;
+            }
+            75 => {
+                let shine = app.map.props.last().and_then(|p| p.shine());
+                let ok = shine.as_ref().is_some_and(|s| s.dim == 4.0 && s.animation == "pulse" && s.tempo == (2, 8) && s.color == "#ff3020");
+                self.check("свой свет лампы: радиус 4 и пульс на скорости 2, цвет и сила — от вида «тревога»", ok, &format!("{shine:?}"));
+                self.snap(ctx, "свой свет");
+            }
+            76 => {
+                // Тот же предмет наполовину в воде.
+                if let Some(p) = app.map.props.last_mut() {
+                    p.sunk = Some(0.5);
+                }
+                self.resume_at = now + 0.2;
+            }
+            77 => {
+                let p = app.map.props.last();
+                self.check("предмет в воде: тени нет, сухой верх — своим тайлом", p.is_some_and(|p| !p.casts_shadow() && p.own_tile() && p.sunk() == 0.5), "");
+                self.snap(ctx, "под водой");
+            }
+            78 => {
+                // Меню «Биом»: свет сцены рядом со звуком места.
+                self.click(app.biome_button.center());
+                self.resume_at = now + CLICK_GAP;
+            }
+            79 => {
+                self.check("кнопка «Биом» на месте", app.biome_button.is_positive(), &format!("{:?}", app.biome_button));
+                self.snap(ctx, "свет сцены");
+            }
+            80 => {
+                // Второй щелчок по кнопке закрывает меню.
+                self.click(app.biome_button.center());
+                self.resume_at = now + CLICK_GAP;
+            }
+            81 => {
+                // Помост: инструмент «Крыша» в режиме помоста ставит его рамкой — на свободном
+                // месте внизу слева, где нет крыш.
+                app.set_tool(Tool::Roof);
+                app.platform_mode = true;
+                app.sel = None;
+                let (x, y) = (3.0, 9.0);
+                self.world = [x, y];
+                let (a, b) = (cell(app, x - 1.0, y - 1.0), cell(app, x + 2.0, y + 1.0));
+                self.drag(a, b, PointerButton::Primary);
+            }
+            82 => {
+                let got = app.map.platforms.first().map(|p| p.bounds());
+                let [x, y] = self.world;
+                let ok = app.map.platforms.len() == 1 && got == Some(([x - 1.0, y - 1.0], [x + 3.0, y + 2.0]));
+                self.check("рамка в режиме помоста поставила помост 4×3 клетки", ok, &format!("{got:?}, помостов {}", app.map.platforms.len()));
+                self.snap(ctx, "помост");
+            }
+            83 => self.key(Key::Z, CTRL),
+            84 => {
+                self.check("Ctrl+Z убрал помост", app.map.platforms.is_empty(), &format!("помостов {}", app.map.platforms.len()));
+                app.platform_mode = false;
+            }
             _ => return false,
         }
         true

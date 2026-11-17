@@ -165,6 +165,9 @@ impl App {
             }
         }
 
+        // Помосты — на полу: нарисованная тень и тени крон ложатся и на них.
+        self.draw_platforms(painter, canvas);
+
         // Нарисованная тень — поверх пола и дорог.
         if let Some(shade) = self.map.shade.take() {
             let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto, rot: 0.0 };
@@ -403,7 +406,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -574,10 +577,86 @@ impl App {
         true
     }
 
+    /// Цвет, в который красится низ предмета под водой: по среднему цвету того, что налито
+    /// под ним (криожидкость — бирюза, болото — бурое), и полупрозрачный — вода видна сквозь него.
+    /// `clear` — насколько предмет виден сквозь воду: у лежащего на дне воды над ним больше.
+    fn wet_tint(&mut self, at: [f32; 2], tint: Color32, clear: f32) -> Color32 {
+        let key = self.map.material_under(at).and_then(|m| self.map.materials.get(m)).and_then(|m| match &m.paint {
+            Paint::Texture(k) => Some(k.clone()),
+            Paint::Color(_) => None,
+        });
+        let tone = match key {
+            Some(k) => match self.water_tones.get(&k) {
+                Some(t) => *t,
+                None => {
+                    let found = self.textures.bytes(&k).ok().and_then(|b| library::decode_tinted(&k, &b).ok()).map(|img| {
+                        let (mut sum, mut n) = ([0u64; 3], 0u64);
+                        for p in img.pixels().step_by(7) {
+                            (0..3).for_each(|c| sum[c] += p[c] as u64);
+                            n += 1;
+                        }
+                        [0, 1, 2].map(|c| (sum[c] / n.max(1)) as u8)
+                    });
+                    match found {
+                        Some(t) => {
+                            self.water_tones.insert(k, t);
+                            t
+                        }
+                        None => [70, 110, 125],
+                    }
+                }
+            },
+            None => [70, 110, 125],
+        };
+        let mean = (tone[0] as f32 + tone[1] as f32 + tone[2] as f32) / 3.0;
+        let part = |c: usize, base: u8| ((tone[c] as f32 / mean.max(1.0) * 0.8).min(1.0) * base as f32).round() as u8;
+        Color32::from_rgba_unmultiplied(part(0, tint.r()), part(1, tint.g()), part(2, tint.b()), (tint.a() as f32 * clear).round() as u8)
+    }
+
+    /// Предмет, часть которого под водой (`sunk` — доля от низа картинки): низ — в цвете
+    /// воды и полупрозрачный, верх — как есть, по ватерлинии тёмная полоска, что сходит на нет
+    /// книзу. `dry` — рисовать ли сухой верх: в выгрузке с тайлами он уходит своим тайлом,
+    /// в картинке карты остаётся низ, и вода «Wild Canvas» идёт поверх него.
+    pub(super) fn draw_prop_in_water(&mut self, painter: &egui::Painter, canvas: Rect, prop: &Prop, tint: Color32, dry: bool) -> bool {
+        let c = prop.corners();
+        let line = 1.0 - prop.sunk();
+        let band = (line + 0.045).min(1.0);
+        let at = |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let row = |v: f32| (at(c[0], c[3], v), at(c[1], c[2], v));
+        let (wet, dark) = (self.wet_tint(prop.pos, tint, if prop.sunk() >= 1.0 { 0.64 } else { 0.78 }), tint.gamma_multiply(1.0));
+        let dusk = Color32::from_rgba_unmultiplied((dark.r() as f32 * 0.5) as u8, (dark.g() as f32 * 0.55) as u8, (dark.b() as f32 * 0.6) as u8, dark.a());
+        let Some((tex, _)) = self.textures.get(&prop.asset, false) else { return false };
+        let [tw, th] = tex.size().map(|v| v.max(2) as f32);
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        let cam = self.cam;
+        let mut strip = |v0: f32, v1: f32, c0: Color32, c1: Color32| {
+            let ((l0, r0), (l1, r1)) = (row(v0), row(v1));
+            let base = mesh.vertices.len() as u32;
+            for (p, u, v, color) in [(l0, 0.0, v0, c0), (r0, 1.0, v0, c0), (r1, 1.0, v1, c1), (l1, 0.0, v1, c1)] {
+                let uv = pos2((0.5 + u * (tw - 1.0)) / tw, (0.5 + v * (th - 1.0)) / th);
+                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv, color });
+            }
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+        };
+        if dry && line > 0.0 {
+            strip(0.0, line, tint, tint);
+        }
+        if band > line {
+            strip(line, band, dusk, wet);
+        }
+        if band < 1.0 {
+            strip(band, 1.0, wet, wet);
+        }
+        painter.add(Shape::mesh(mesh));
+        true
+    }
+
     pub(super) fn draw_prop(&mut self, painter: &egui::Painter, canvas: Rect, prop: &Prop, tint: Color32) {
         let c = prop.corners();
         let full = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
-        if !self.quad(painter, canvas, &prop.asset, c, full, tint) {
+        let drawn = if prop.sunk() > 0.0 { self.draw_prop_in_water(painter, canvas, prop, tint, true) } else { self.quad(painter, canvas, &prop.asset, c, full, tint) };
+        if !drawn {
             // Картинка ещё грузится или не нашлась.
             let q: Vec<Pos2> = c.iter().map(|&p| self.cam.to_screen(canvas, p)).collect();
             let color = if self.textures.failed(&prop.asset, false) { Color32::from_rgb(200, 60, 60) } else { Color32::from_gray(140) };

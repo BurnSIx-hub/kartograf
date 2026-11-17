@@ -67,11 +67,45 @@ fn open_sky(map: &Map) -> bool {
     map.ambience.starts_with("forest-") || map.ambience.starts_with("town-")
 }
 
+/// Сухой верх предмета, стоящего в воде: всё ниже ватерлинии (доля `sunk` от низа картинки)
+/// прозрачно, по самой линии край смягчён на пару точек. Низ остаётся в картинке карты.
+pub fn dry_part(img: &image::RgbaImage, sunk: f32) -> image::RgbaImage {
+    let mut out = img.clone();
+    if sunk <= 0.0 {
+        return out;
+    }
+    let line = (1.0 - sunk.clamp(0.0, 1.0)) * img.height() as f32;
+    for (_, y, p) in out.enumerate_pixels_mut() {
+        let keep = ((line - y as f32 - 0.5) / 2.0 + 0.5).clamp(0.0, 1.0);
+        p[3] = (p[3] as f32 * keep).round() as u8;
+    }
+    out
+}
+
+/// Насколько сцена притемнена в полумраке (`darknessLevel` Foundry): общий свет остаётся,
+/// фишка видит всё в поле зрения, лампы выделяются. Подобрано на станции с полусотней ламп:
+/// при 0,6 мелочь на полу читается с трудом, при 0,3 лампы теряются.
+const DIM_DARKNESS: f64 = 0.5;
+
+/// Свет сцены Foundry: включён ли общий свет и насколько сцена притемнена. Выбор карты
+/// (`scene_light`) — прежде догадки по звуку места.
+fn scene_light(map: &Map) -> (bool, f64) {
+    match map.scene_light.as_str() {
+        "day" => (true, 0.0),
+        "dim" => (true, DIM_DARKNESS),
+        "dark" => (false, 0.0),
+        _ => (open_sky(map), 0.0),
+    }
+}
+
 /// Флаги сцены: формат Картографа и звук места для «Wild Canvas».
 fn scene_flags(map: &Map) -> Value {
     let mut flags = json!({"kartograf": {"format": 1}});
     // Насколько карта выросла влево и вверх: модуль сдвигает по этому фишки старой сцены.
-    flags[OWN_MODULE] = json!({"origin": map.origin});
+    // `light` — свет сцены, выбранный на карте (пусто — по звуку места): модуль при обновлении
+    // сцены берёт новый свет, только если этот выбор с прошлой выгрузки сменился, — иначе
+    // остаётся то, что Мастер настроил в Foundry.
+    flags[OWN_MODULE] = json!({"origin": map.origin, "light": map.scene_light});
     if !map.ambience.is_empty() {
         flags[LIVE_MODULE] = json!({"ambience": map.ambience});
         // Под открытым небом — тени облаков «Wild Canvas».
@@ -353,9 +387,9 @@ pub struct Light {
     pub at: [f32; 2],
     pub bright: f32,
     pub dim: f32,
-    pub color: &'static str,
+    pub color: String,
     /// Анимация Foundry: «torch», «flame» и т. п.; пусто — горит ровно.
-    pub animation: &'static str,
+    pub animation: String,
     /// Плотность цвета, способ окраски, мягкость края и высветление ([`crate::map::Glow::look`]).
     pub look: (f32, u8, f32, f32),
     /// Скорость и сила анимации ([`crate::map::Glow::tempo`]).
@@ -408,10 +442,10 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
         .props
         .iter()
         .filter_map(|p| {
-            // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой.
-            let glow = p.light()?;
-            let (bright, dim, color, animation) = glow.params()?;
-            Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation, look: glow.look(), tempo: glow.tempo() })
+            // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой;
+            // поверх вида света — свой свет предмета (радиус, цвет, анимация).
+            let s = p.shine()?;
+            Some(Light { at: p.pos, bright: s.bright, dim: s.dim, color: s.color, animation: s.animation, look: s.look, tempo: s.tempo })
         })
         .collect();
     let mut zones = zones(map, room_edges, seen);
@@ -844,6 +878,9 @@ pub struct RoofTile {
     pub chest: Option<(String, String)>,
     /// Живой предмет «Wild Canvas»: пометка (ключ, значение) — колонка, машины.
     pub living: Option<(&'static str, String)>,
+    /// Раскладка своего механизма (JSON из `live.json` папки ассетов): уходит в пометку плитки
+    /// рядом с `machine` — «Wild Canvas» оживляет по ней и ассет, которого не знает по имени.
+    pub layout: Option<String>,
     /// Сливы на крыше (вшиты в картинку): середина в точках сцены и поворот —
     /// «Wild Canvas» пускает по ним воду в дождь.
     pub scuppers: Vec<[f32; 3]>,
@@ -1297,6 +1334,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 tile["elevation"] = if r.above { over.clone() } else { json!(b) };
                 tile["occlusion"]["modes"] = json!([]);
                 tile["flags"] = json!({LIVE_MODULE: {*key: value}});
+                if let Some(layout) = r.layout.as_deref().and_then(|l| serde_json::from_str::<Value>(l).ok()) {
+                    tile["flags"][LIVE_MODULE]["layout"] = layout;
+                }
                 if r.hover {
                     tile["flags"][LIVE_MODULE]["hover"] = json!(1);
                 }
@@ -1432,6 +1472,8 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 flags["caustic"] = json!((caustic * STILL_WATER.1 * 100.0).round() / 100.0);
                 flags["glint"] = json!(STILL_WATER.2);
                 flags["speed"] = json!(STILL_WATER.3);
+                // Стоячая вода не журчит: звук области «вода» в «Wild Canvas» — ручей.
+                flags["sound"] = json!("off");
             }
             if z.effect == "water" && current > 0.0 {
                 region["flags"][LIVE_MODULE]["current"] = json!((current as f64 * 10.0).round() / 10.0);
@@ -1503,6 +1545,7 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
             }
         }
     }
+    let (global_light, darkness) = scene_light(map);
     json!({
         "name": name,
         "width": map.width * px,
@@ -1517,8 +1560,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
         "tokenVision": true,
         // Под открытым небом — день: без общего света Foundry 14 оставляет токену
         // лишь его собственный обзор (у Рэндала у брода — круг в клетку, вокруг тьма).
-        // Пещера и подземелье — во тьме, светят их огни.
-        "environment": {"globalLight": {"enabled": open_sky(map)}},
+        // Пещера и подземелье — во тьме, светят их огни. Свет сцены, выбранный на карте,
+        // главнее: станция в полумраке видна вся, а не пятнами у ламп.
+        "environment": {"darknessLevel": darkness, "globalLight": {"enabled": global_light}},
         // Зимний лес — со снегом Foundry.
         "weather": map.weather,
         "walls": walls,
@@ -1821,7 +1865,7 @@ mod tests {
         let hold = Map::new(10, 10);
         let mut deck = hold.new_level();
         let mut hold = hold;
-        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 5.0, 5.0));
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 8.0, 2.0));
         deck.props.push(prop("Trapdoor_Wood_Ashen_A2_Open_1x1.webp", 5.2, 4.6));
@@ -1928,6 +1972,8 @@ mod tests {
         let cryo = flags("Криожидкость");
         assert_eq!((cryo["fish"].as_bool(), cryo["fishKind"].as_i64()), (Some(false), Some(3)));
         assert_eq!((cryo["foam"].as_f64(), cryo["ripple"].as_f64(), cryo["caustic"].as_f64(), cryo["glint"].as_f64(), cryo["speed"].as_f64()), (Some(0.0), Some(0.15), Some(0.65), Some(0.3), Some(0.5)));
+        // Стоячая жидкость молчит; у кислоты с её рябью звук воды остаётся.
+        assert_eq!((cryo["sound"].as_str(), acid.get("sound")), (Some("off"), None));
         // Лужа чистой воды стоит так же, но рыбы в ней по имени не запрещены.
         let pool = flags("Лужа");
         assert_eq!((pool["foam"].as_f64(), pool["ripple"].as_f64(), pool.get("fishKind")), (Some(0.0), Some(0.15), None));
@@ -1937,7 +1983,7 @@ mod tests {
     fn bridge_pieces_cut_water_end_to_end() {
         use crate::map::Prop;
         let mut m = Map::new(12, 14);
-        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         m.props.push(piece(4.0, 0.0));
         m.props.push(piece(8.0, 180.0));
         // Кусок нарисован во всю длину холста, по ширине — настил со сваями.
@@ -1967,7 +2013,7 @@ mod tests {
         assert_eq!(m.materials[floor].live(), Live::Neon);
         let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (8, 6));
         m.paint(crate::map::Layer::Rooms, floor, &all);
-        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         m.props.push(prop("pack:cp|textures/objects/Armchair_Neon_A_2x1.webp", [4.0, 4.0]));
         m.props.push(prop("pack:cp|textures/objects/Neon_Lamp_Floor_A_1x1.webp", [6.0, 3.0]));
         m.props.push(prop("pack:cp|textures/objects/Floor_Vent_Grate_A_1x1.webp", [3.0, 3.0]));
@@ -2242,8 +2288,11 @@ mod tests {
         (hammock.item, hammock.swing) = (true, Some([-0.4371, -0.42, 0.43, 0.41]));
         let mut paper = canopy_tile("k/p.webp".into(), [5.0, 3.0], [1.0, 1.0], 0.0, 100);
         (paper.item, paper.afloat) = (true, true);
+        // Свой механизм: имя и раскладка из `live.json` — в пометке плитки.
+        let mut fan = canopy_tile("k/f.webp".into(), [1.0, 3.0], [1.0, 1.0], 0.0, 100);
+        (fan.item, fan.living, fan.layout) = (true, Some(("machine", "Vent_Fan_Wall_B".to_owned())), Some(r#"{"fans":[[0.5,0.5,0.4,2.0]]}"#.to_owned()));
         assert!(crate::map::swing_by_name("objects/Hammock_Wood_Dark_Blue_A_2x2.webp") && !crate::map::swing_by_name("x/Rope_A.webp"));
-        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon, hammock, paper] }];
+        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon, hammock, paper, fan] }];
         let scene = foundry_levels(&a, "Город", &levels, 100, &Default::default());
         let t = &scene["tiles"][0];
         assert_eq!(t["elevation"], 25, "над крышами, а не на полу, как колонка");
@@ -2258,13 +2307,29 @@ mod tests {
         // Бумага на воде покачивается; гамак — нет.
         assert_eq!(scene["tiles"][3]["flags"][LIVE_MODULE]["afloat"], 1);
         assert!(h["flags"][LIVE_MODULE].get("afloat").is_none());
+        // Свой вентилятор: имя и раскладка в пометке; у дирижабля раскладки нет — её знает модуль.
+        let f = &scene["tiles"][4]["flags"][LIVE_MODULE];
+        assert_eq!((f["machine"].as_str(), &f["layout"]), (Some("Vent_Fan_Wall_B"), &json!({"fans": [[0.5, 0.5, 0.4, 2.0]]})));
+        assert!(t["flags"][LIVE_MODULE].get("layout").is_none());
+    }
+
+    #[test]
+    fn dry_part_keeps_what_is_above_the_waterline() {
+        let img = image::RgbaImage::from_pixel(4, 10, image::Rgba([200, 100, 50, 255]));
+        let dry = dry_part(&img, 0.6);
+        // Ватерлиния — на 0,4 высоты: строки 0–2 целы, строка 4 и ниже прозрачны.
+        assert_eq!((dry.get_pixel(0, 0)[3], dry.get_pixel(3, 2)[3]), (255, 255));
+        assert_eq!((dry.get_pixel(0, 5)[3], dry.get_pixel(3, 9)[3]), (0, 0));
+        assert!(dry.get_pixel(0, 3)[3] > 0 && dry.get_pixel(0, 3)[3] < 255, "край смягчён");
+        assert_eq!(dry.get_pixel(1, 1).0[..3], [200, 100, 50], "цвет не тронут");
+        assert_eq!(dry_part(&img, 0.0), img);
     }
 
     #[test]
     fn alarm_light_blinks_slowly() {
         use crate::map::Prop;
         let mut m = Map::new(6, 6);
-        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         m.props.push(prop("set:scifi/objects/Alarm_Light_Red_A_1x1.webp", [2.0, 2.0]));
         m.props.push(prop("pack:fa|textures/objects/Lantern_Metal_A_1x1.webp", [4.0, 4.0]));
         let lay = layout(&m, &[]);
@@ -2273,6 +2338,17 @@ mod tests {
         assert_eq!((alarm["type"].as_str(), alarm["speed"].as_i64(), alarm["intensity"].as_i64()), (Some("revolving"), Some(7), Some(8)));
         assert_eq!(scene["lights"][0]["config"]["coloration"], 2);
         assert_eq!((lamp["type"].as_str(), lamp["speed"].as_i64()), (Some("torch"), Some(3)));
+        // Свой свет одной лампы: медленнее, шире и другого цвета — вид «тревога» у остальных прежний.
+        m.props[0].glow = Some(crate::map::GlowTune { radius: Some(3.0), color: Some([255, 160, 0]), animation: Some("pulse".into()), speed: Some(2), intensity: Some(4) });
+        let lay = layout(&m, &[]);
+        let scene = foundry_levels(&m, "Станция", &[SceneLevel { name: "Станция".into(), image_src: "s.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+        let own = &scene["lights"][0]["config"];
+        assert_eq!((own["animation"]["type"].as_str(), own["animation"]["speed"].as_i64(), own["animation"]["intensity"].as_i64()), (Some("pulse"), Some(2), Some(4)));
+        assert_eq!((own["color"].as_str(), own["dim"].as_f64()), (Some("#ffa000"), Some(15.0)));
+        m.props[0].glow = Some(crate::map::GlowTune { animation: Some(String::new()), ..Default::default() });
+        let lay = layout(&m, &[]);
+        let scene = foundry_levels(&m, "Станция", &[SceneLevel { name: "Станция".into(), image_src: "s.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+        assert!(scene["lights"][0]["config"]["animation"]["type"].is_null(), "ровный свет");
     }
 
     #[test]
@@ -2347,6 +2423,21 @@ mod tests {
         autumn.ambience = "cave-1".into();
         assert!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE].get("clouds").is_none());
         assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["environment"]["globalLight"]["enabled"], false, "пещера — во тьме");
+        // Свет сцены — отдельно от звука места: пещера в полумраке, станция днём, лес во тьме.
+        let env = |m: &Map| foundry_levels(m, "Дом", &levels, 100, &Default::default())["environment"].clone();
+        autumn.scene_light = "dim".into();
+        assert_eq!((env(&autumn)["globalLight"]["enabled"].as_bool(), env(&autumn)["darknessLevel"].as_f64()), (Some(true), Some(0.5)));
+        autumn.scene_light = "day".into();
+        assert_eq!((env(&autumn)["globalLight"]["enabled"].as_bool(), env(&autumn)["darknessLevel"].as_f64()), (Some(true), Some(0.0)));
+        autumn.ambience = "forest-autumn".into();
+        autumn.scene_light = "dark".into();
+        assert_eq!(env(&autumn)["globalLight"]["enabled"], false, "лес ночью — по выбору карты");
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][OWN_MODULE]["light"], "dark");
+        autumn.scene_light.clear();
+        autumn.ambience = "station-1".into();
+        assert_eq!(env(&autumn)["globalLight"]["enabled"], false, "станция без выбора — во тьме, как подземелье");
+        assert_eq!(foundry_levels(&autumn, "Дом", &levels, 100, &Default::default())["flags"][LIVE_MODULE]["ambience"], "station-1");
+        autumn.ambience = "cave-1".into();
         // Зерно — рыбкам; и без звука места.
         autumn.ambience.clear();
         autumn.seed = "озеро".into();
@@ -2401,9 +2492,9 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
         // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
-        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None };
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
@@ -2486,7 +2577,7 @@ mod tests {
         let hull = alpha_hull(&img);
         assert!((3..=8).contains(&hull.len()), "{hull:?}");
         assert!(hull.iter().all(|v| v[0] >= 0.09 && v[0] <= 0.91 && v[1] >= 0.09 && v[1] <= 0.91), "{hull:?}");
-        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2) };
+        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2), glow: None, sunk: None };
         let walls = tent_walls(&p, Some(&hull));
         assert!(!walls.is_empty() && walls.len() < hull.len());
         for (a, b) in &walls {
@@ -2498,7 +2589,7 @@ mod tests {
     }
 
     fn thing(asset: &str, pos: [f32; 2], size: [f32; 2], rot: f32) -> crate::map::Prop {
-        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None }
+        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None }
     }
 
     #[test]

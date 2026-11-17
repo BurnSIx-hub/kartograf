@@ -1216,6 +1216,9 @@ impl Default for Library {
 
 impl Library {
     pub fn set_folder(&mut self, dir: &Path) {
+        // Свои живые механизмы: `live.json` в корне папки — «начало имени файла → раскладка».
+        let live = crate::plat::fs::read(&dir.join("live.json")).ok().and_then(|b| String::from_utf8(b).ok());
+        crate::map::set_live_table(live.map(|text| crate::map::parse_live_table(&text)).unwrap_or_default());
         self.folder = scan(dir)
             .into_iter()
             .filter_map(|p| {

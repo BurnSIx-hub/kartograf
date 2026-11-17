@@ -529,8 +529,10 @@ impl App {
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 // Тень — в картинку тайла: своя на каждый поворот и размер предмета.
                 let shade = (map.shadows.on && prop.carries_shadow()).then(|| format!("#тень{k}|{:.0}|{:.3}", prop.rot.rem_euclid(360.0), prop.scale));
+                // Предмет в воде: в тайле — только сухой верх, своя картинка на каждую ватерлинию.
+                let sunk = prop.sunk();
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<(String, [f32; 2]), String> {
-                    let slot = format!("{key}{}", shade.as_deref().unwrap_or(""));
+                    let slot = format!("{key}{}{}", shade.as_deref().unwrap_or(""), if sunk > 0.0 { format!("#сухое{sunk:.3}") } else { String::new() });
                     if let Some(src) = canopies.get(&slot) {
                         return Ok((src.clone(), grows.get(&slot).copied().unwrap_or([1.0, 1.0])));
                     }
@@ -538,6 +540,7 @@ impl App {
                     let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
                     let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
                     let (img, grow) = if shade.is_some() { export::with_shadow(&img.to_rgba8(), size, prop.rot, &map.shadows) } else { (img.to_rgba8(), [1.0, 1.0]) };
+                    let img = if sunk > 0.0 { export::dry_part(&img, sunk) } else { img };
                     grows.insert(slot.clone(), grow);
                     let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
                     files.push((file.clone(), export::webp_bytes(&img, 90.0)));
@@ -563,6 +566,7 @@ impl App {
                 }
                 if let Some(living) = map::living_by_name(&prop.asset) {
                     tile.living = Some(living);
+                    tile.layout = map::live_layout(&prop.asset).map(|(_, layout)| layout);
                     tiles.push(tile);
                     continue;
                 }

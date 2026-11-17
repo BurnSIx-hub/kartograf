@@ -95,7 +95,8 @@ impl App {
                     self.place_form.get_or_insert(PlaceForm { text: String::new(), cells: [40, 30], trees: 0.0 });
                 }
             });
-            ui.menu_button("Биом", |ui| self.biome_ui(ui));
+            let biome = ui.menu_button("Биом", |ui| self.biome_ui(ui));
+            self.biome_button = biome.response.rect;
             ui.menu_button("Вид", |ui| {
                 if item(ui, "Вся карта", "Home") {
                     self.fitted = false;
@@ -159,7 +160,7 @@ impl App {
     /// карта ставит их сама, нарисованной руками — отсюда. Выбор звука леса
     /// подставляет его листву и погоду, их можно сменить следом.
     pub(super) fn biome_ui(&mut self, ui: &mut egui::Ui) {
-        use crate::plan::{PARTICLES, PLACES, WEATHERS, place_defaults};
+        use crate::plan::{PARTICLES, PLACES, SCENE_LIGHTS, WEATHERS, place_defaults};
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         ui.label("Звук места");
         let mut place = self.map.ambience.clone();
@@ -172,6 +173,19 @@ impl App {
             self.map.ambience = place;
             self.map.particles = particles.to_owned();
             self.map.weather = weather.to_owned();
+        }
+        ui.separator();
+        ui.label("Свет сцены").on_hover_text("В Foundry: день — видно всё; полумрак — видно всё в поле зрения, но сцена притемнена, лампы выделяются; темнота — видно только у огней");
+        let mut light = self.map.scene_light.clone();
+        // В одну строку: меню и без того длинное, а вариантов четыре коротких.
+        ui.horizontal(|ui| {
+            for (key, label) in SCENE_LIGHTS {
+                ui.selectable_value(&mut light, key.to_owned(), label);
+            }
+        });
+        if light != self.map.scene_light {
+            self.checkpoint();
+            self.map.scene_light = light;
         }
         ui.separator();
         ui.label("От крон");
@@ -203,6 +217,52 @@ impl App {
             self.checkpoint();
         }
         (self.map.current, self.map.drift) = (current, drift);
+    }
+
+    /// Помосты этажа списком: высота стенки, цвет площадки и его сила, цвет стенки, удаление.
+    /// Лестницы и контур не по рамке ставит ИИ (`add_platform`, `edit_platform`).
+    pub(super) fn platform_panel(&mut self, ui: &mut egui::Ui) {
+        if self.map.platforms.is_empty() {
+            ui.label("Помостов нет: протяните рамку по полу.");
+            return;
+        }
+        let held = ui.input(|i| i.pointer.any_down());
+        let (mut drop, mut changed) = (None, false);
+        for i in 0..self.map.platforms.len() {
+            let before = self.map.platforms[i].clone();
+            let mut pl = before.clone();
+            ui.horizontal(|ui| {
+                ui.strong(format!("Помост {}", i + 1));
+                if ui.small_button("удалить").clicked() {
+                    drop = Some(i);
+                }
+            });
+            ui.add(egui::Slider::new(&mut pl.height, 0.05..=1.0).text("высота стенки, кл."));
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut pl.color);
+                ui.add(egui::Slider::new(&mut pl.strength, 0.0..=1.0).text("сила цвета"));
+            });
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut pl.side);
+                ui.label(format!("стенка и ступени; лестниц: {}", pl.stairs.len()));
+            });
+            if pl != before {
+                // Один шаг отмены на одно движение ползунка.
+                if !self.glow_hold {
+                    self.checkpoint();
+                }
+                self.glow_hold = held;
+                self.map.platforms[i] = pl;
+                changed = true;
+            }
+        }
+        if !changed && !held {
+            self.glow_hold = false;
+        }
+        if let Some(i) = drop {
+            self.checkpoint();
+            self.map.platforms.remove(i);
+        }
     }
 
     pub(super) fn swatch(&mut self, ui: &mut egui::Ui, paint: &Paint, size: f32) -> egui::Response {
@@ -605,7 +665,12 @@ impl App {
                             self.outline_panel(ui, i, k);
                         }
                     }
+                    Tool::Roof if self.platform_mode => {
+                        ui.checkbox(&mut self.platform_mode, "Помост вместо крыши");
+                        self.platform_panel(ui);
+                    }
                     Tool::Roof => {
+                        ui.checkbox(&mut self.platform_mode, "Помост вместо крыши").on_hover_text("Протяжка рамкой ставит не крышу, а помост: площадку выше пола, со стенкой по краю и тенью у подножия");
                         let chosen = match self.sel {
                             Some(Sel::Roof(i)) => Some(i),
                             _ => None,
@@ -726,6 +791,16 @@ impl App {
                         self.checkpoint();
                         self.map.props[i].shadow = Some(casts);
                     }
+                    let mut sunk = self.map.props[i].sunk();
+                    let wet = ui
+                        .add(egui::Slider::new(&mut sunk, 0.0..=1.0).fixed_decimals(2).text("под водой"))
+                        .on_hover_text("Какая доля предмета под водой, от низа картинки: кресло по спинку — 0,6; лежит на дне — 1. Низ красится в цвет воды, в Foundry вода идёт поверх него, верх остаётся над водой");
+                    if wet.drag_started() || (wet.changed() && !wet.dragged()) {
+                        self.checkpoint();
+                    }
+                    if wet.changed() {
+                        self.map.props[i].sunk = (sunk > 0.0).then_some(sunk);
+                    }
                     // Что уйдёт в Foundry: свет и крона. «Авто» — по имени, как у встроенных.
                     let by_name = map::glow_by_name(&self.map.props[i].asset);
                     let mut glow = self.map.props[i].light;
@@ -743,6 +818,81 @@ impl App {
                     if glow != self.map.props[i].light {
                         self.checkpoint();
                         self.map.props[i].light = glow;
+                    }
+                    // Свой свет: радиус, цвет и ритм этой лампы поверх вида света. Без галочки — как у вида.
+                    if let Some(kind) = self.map.props[i].light()
+                        && let Some((_, dim0, color0, _)) = kind.params()
+                    {
+                        let before = self.map.props[i].glow.clone().unwrap_or_default();
+                        let mut tune = before.clone();
+                        let radius0 = dim0 * self.map.props[i].scale.sqrt();
+                        let rgb0 = u32::from_str_radix(color0.trim_start_matches('#'), 16).unwrap_or(0xff_ff_ff);
+                        let (speed0, power0) = kind.tempo();
+                        // У лампы со своим светом раздел раскрыт сразу: видно, что он не как у вида.
+                        egui::CollapsingHeader::new("Свой свет").id_salt("prop_glow").default_open(!before.is_empty()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut own = tune.radius.is_some();
+                                if ui.checkbox(&mut own, "радиус").changed() {
+                                    tune.radius = own.then_some(radius0);
+                                }
+                                if let Some(r) = &mut tune.radius {
+                                    ui.add(egui::Slider::new(r, 0.5..=15.0).text("кл."));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let mut own = tune.color.is_some();
+                                if ui.checkbox(&mut own, "цвет").changed() {
+                                    tune.color = own.then_some([(rgb0 >> 16) as u8, (rgb0 >> 8) as u8, rgb0 as u8]);
+                                }
+                                if let Some(c) = &mut tune.color {
+                                    ui.color_edit_button_srgb(c);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("анимация:");
+                                let shown = match tune.animation.as_deref() {
+                                    None => "как у вида".to_owned(),
+                                    Some("") => "ровно".to_owned(),
+                                    Some(a) => a.to_owned(),
+                                };
+                                egui::ComboBox::from_id_salt("prop_glow_animation").selected_text(shown).show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut tune.animation, None, "как у вида");
+                                    ui.selectable_value(&mut tune.animation, Some(String::new()), "ровно");
+                                    for a in map::LIGHT_ANIMATIONS {
+                                        ui.selectable_value(&mut tune.animation, Some(a.to_owned()), a);
+                                    }
+                                });
+                            });
+                            ui.horizontal(|ui| {
+                                let mut own = tune.speed.is_some();
+                                if ui.checkbox(&mut own, "скорость").changed() {
+                                    tune.speed = own.then_some(speed0);
+                                }
+                                if let Some(v) = &mut tune.speed {
+                                    ui.add(egui::Slider::new(v, 0..=10));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let mut own = tune.intensity.is_some();
+                                if ui.checkbox(&mut own, "сила").changed() {
+                                    tune.intensity = own.then_some(power0);
+                                }
+                                if let Some(v) = &mut tune.intensity {
+                                    ui.add(egui::Slider::new(v, 1..=10));
+                                }
+                            });
+                        });
+                        // Один шаг отмены на одно движение: пока кнопка мыши зажата, правка та же.
+                        let held = ui.input(|i| i.pointer.any_down());
+                        if tune != before {
+                            if !self.glow_hold {
+                                self.checkpoint();
+                            }
+                            self.glow_hold = held;
+                            self.map.props[i].glow = (!tune.is_empty()).then_some(tune);
+                        } else if !held {
+                            self.glow_hold = false;
+                        }
                     }
                     let by_name = map::layer_by_name(&self.map.props[i].asset);
                     let mut layer = self.map.props[i].layer;

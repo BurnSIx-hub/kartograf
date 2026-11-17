@@ -603,6 +603,14 @@ pub struct App {
     shown_for_ai: Option<f64>,
     /// Видимые рамки лестниц и трапов по ассету: размыкают перила у крыши.
     visible_boxes: std::collections::HashMap<String, Option<[f32; 4]>>,
+    /// Идёт одна правка своего света предмета (тянут ползунок): шаг отмены на неё один.
+    glow_hold: bool,
+    /// Средний цвет картинок воды: в него красится низ предмета, стоящего в воде.
+    water_tones: std::collections::HashMap<String, [u8; 3]>,
+    /// Инструмент «Крыша» ставит рамкой не крышу, а помост.
+    pub platform_mode: bool,
+    /// Где в верхней строке кнопка «Биом» — для самопроверки.
+    pub biome_button: Rect,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
     window_glass: std::collections::HashMap<(String, bool), Option<String>>,
     /// Библиотека показывает только то, что уже стоит на карте.
@@ -788,6 +796,10 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             shown_for_ai: None,
             visible_boxes: std::collections::HashMap::new(),
+            glow_hold: false,
+            water_tones: std::collections::HashMap::new(),
+            platform_mode: false,
+            biome_button: Rect::NOTHING,
             window_glass: std::collections::HashMap::new(),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
@@ -862,6 +874,7 @@ mod shelf;
 mod input;
 mod draw;
 mod draw_ground;
+mod draw_platform;
 mod draw_scene;
 mod exporting;
 
@@ -1358,7 +1371,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

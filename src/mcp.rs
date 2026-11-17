@@ -33,6 +33,13 @@ fn tools() -> Value {
     let area = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in cells; x1 and y1 are the far edges (a room [4, 3, 14, 11] gets walls on x=4, x=14, y=3, y=11)"});
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}});
     let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane", "alarm", "neon"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow); alarm — a red emergency light by the wall, its beam slowly sweeping around; neon — a steady cold white electric light (station, lab, future city): never by name, only when chosen"});
+    // Свой свет предмета поверх вида: одна лампа на одной карте, вид света у остальных прежний.
+    let light_radius = json!({"type": ["number", "null"], "description": "This object's own light radius in cells (the dim edge; the bright part scales with it) instead of what its light kind gives; null — back to the kind's. Tune one lamp on one map this way instead of changing a light kind for every map"});
+    let light_color = json!({"type": ["array", "null"], "items": {"type": "integer"}, "description": "Own light colour [r, g, b]; null — the kind's"});
+    let light_animation = json!({"type": ["string", "null"], "description": "Own Foundry light animation: none (steady), auto or null (the kind's), or flame, torch, revolving, siren, pulse, reactivepulse, chroma, wave, fog, sunburst, dome, emanation, hexa, ghost, energy, vortex, witchwave, rainbowswirl, radialrainbow, fairy, grid, starlight, smokepatch"});
+    let light_speed = json!({"type": ["integer", "null"], "description": "Own animation speed 0..10 (revolving: speed/5 rad per second, 7 — a turn in 4.5 s; siren is 50 times faster; pulse: a period of 12.6/speed s); null — the kind's"});
+    let light_intensity = json!({"type": ["integer", "null"], "description": "Own animation intensity 1..10 (revolving: the beam width); null — the kind's"});
+    let sunk = json!({"type": ["number", "null"], "description": "How much of the object is under water, 0..1 counted from the bottom of its picture (the front): 0.6 — a seat in water up to its backrest, 1 — it lies on the bottom. The part under the waterline is drawn in the colour of the water below it and stays in the map picture, so Wild Canvas runs its water over it; the dry part above goes to Foundry as the object's own tile. One object, no separate sunken picture needed. No shadow. null — all above water"});
     let layer = json!({"type": "string", "enum": ["auto", "floor", "low", "normal", "high", "above_walls", "on_roof", "above_roofs"], "description": "What covers what: floor (rugs), low, normal, high (trees, wardrobes), above_walls, on_roof (chimneys, vents, hatches: part of the roof, gone with it when players enter), above_roofs (airships, birds flying over everything); auto — by its name"});
     let roofs = json!({"type": "string", "enum": ["solid", "ghost", "hidden"], "description": "Roofs: solid as players see them (default), ghost — see-through to check inside, hidden"});
     let canopy = json!({"type": ["boolean", "string"], "description": "A tree crown in Foundry: its own tile above tokens that fades when a token walks under it and sways in the wind (Wild Canvas). Auto (default) — Forgotten Adventures tree tops and the built-in tree; give true for your own tree pictures, false to keep a crown on the ground"});
@@ -49,7 +56,7 @@ fn tools() -> Value {
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
-            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "room_walls"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name)"},
+            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "room_walls", "visible"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},
             "area": area, "limit": int("Max items per section, default 200")
         }), &[]),
         tool("find_assets", "Search the asset library (built-in pictures plus the user's Dungeondraft packs and folder) by words, best matches first: the exact file name, then whole words of the name in order; 'table' does not rank 'tablet'; broken, damaged, fallen, desert, arctic, cyberpunk and similar branches sink unless named. Height, normal and roughness maps are not in the library. Returns keys to use in add_object / paint / add_door.", json!({
@@ -65,15 +72,18 @@ fn tools() -> Value {
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
             "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "tint": tint, "recolor": recolor,
+            "light_radius": light_radius.clone(), "light_color": light_color.clone(), "light_animation": light_animation.clone(), "light_speed": light_speed.clone(), "light_intensity": light_intensity.clone(), "sunk": sunk.clone(),
             "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone(), "inset": inset.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
             "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "tint": tint, "recolor": recolor,
+            "light_radius": light_radius, "light_color": light_color, "light_animation": light_animation, "light_speed": light_speed, "light_intensity": light_intensity, "sunk": sunk,
             "front": front, "look_at": look_at, "against_wall": against_wall, "inset": inset
         }), &["index"]),
-        tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
-            "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, tavern, house"),
+        tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, scene light, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
+            "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, station-1 (ventilation hum), station-2 (reactor hum), tavern, house"),
+            "light": {"type": "string", "enum": ["", "day", "dim", "dark"], "description": "Scene light in Foundry, apart from the place sound: day — global light, everything in sight is lit; dim — global light with the scene darkened (tokens see everything in their line of sight, lamps stand out: a station on emergency power, a dusk street); dark — no global light, tokens see only near light sources (place lamps so there are no black gaps between them, or use dim); '' — by the place sound: forest and town are day, everything else dark"},
             "particles": {"type": "string", "enum": ["", "leaves", "fireflies"]},
             "weather": {"type": "string", "enum": ["", "snow"]},
             "current": num("Water current, cells per second, 0..3; 0 — still water. About 1 for a ship under sail"),
@@ -104,8 +114,26 @@ fn tools() -> Value {
             "points": {"type": "array", "items": point.clone(), "minItems": 3, "description": "Polygon roofs: new outline of the walls"}, "area": area.clone(), "overhang": num("Cells over the walls; changes the eaves only, area and points stay the walls"),
             "rail": text("Railing along the edge of a flat roof: a wall asset key (kind wall); empty string removes it. It opens where a ladder or stairs object reaches the edge")
         }), &["index"]),
-        tool("remove", "Remove items by indices: objects, walls, doors, labels, paths or roofs. Indices of later items shift down.", json!({
-            "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]},
+        tool("add_platform", "A raised platform on the floor: a stage, a dais, a reactor podium, the tiers of an auditorium. Height reads the way hand-drawn battle maps show it: the top is the same floor tinted lighter, a bright lip runs along its edge, a side wall flares outward from the edge (the higher the platform, the wider) and a shadow lies at its foot; stairs are steps running outward from the edge, wider at the top. Edges along a room wall get no side wall or shadow. It is part of the floor: drawn under objects and walls, baked into the map picture for Foundry, moved and resized by edit_platform — no per-map picture needed. Put it down after the floor, before the furniture on it. Several platforms stack in the order added: tiers of a hall are platforms one inside another, each a step (height 0.08) higher.", json!({
+            "points": {"type": "array", "items": point.clone(), "minItems": 3, "description": "Outline of the top in cells, any polygon"},
+            "area": area.clone(),
+            "circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[cx, cy, r]: a round platform; with area — the part of the circle inside that rectangle (a dais by the wall of a hall: area is the hall)"},
+            "outside_circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[cx, cy, r] with area: the rectangle without the circle that bites into it from one side or corner — a tier of an amphitheatre behind the arc of its step"},
+            "height": num("Width of the visible side wall in cells, the platform's height to the eye: about 0.08 a step, 0.4 a dais five steps high; default 0.3"),
+            "color": {"type": ["array", "null"], "items": {"type": "integer"}, "description": "Tint of the top [r, g, b], default white; steps take this colour too"},
+            "strength": num("How strongly the top is tinted, 0..1, default 0.1 (a little lighter than the floor); 0.4–0.6 turns a dark floor into light plating"),
+            "side": {"type": ["array", "null"], "items": {"type": "integer"}, "description": "Colour of the side wall [r, g, b], default dark steel [98, 106, 116]; stone, wood — to match the room"},
+            "stairs": {"type": "array", "items": {"type": "object"}, "description": "Stairs up the platform: each {at: [x, y] — a point near the edge where they join (the nearest point of the outline is taken, the steps run outward from that edge), width — cells at the top, default 2, steps — how many, default 3; a step is 0.4 cells deep}"}
+        }), &[]),
+        tool("edit_platform", "Change a platform by index (see describe with platforms): outline (points, area, circle, outside_circle as in add_platform), height, colours, stairs (the list replaces the old one, [] removes them). To move a platform give it the new outline.", json!({
+            "index": int("Platform index"),
+            "points": {"type": "array", "items": point.clone(), "minItems": 3}, "area": area.clone(),
+            "circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "outside_circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+            "height": num("Width of the visible side wall, cells"), "color": {"type": ["array", "null"], "items": {"type": "integer"}}, "strength": num("0..1"),
+            "side": {"type": ["array", "null"], "items": {"type": "integer"}}, "stairs": {"type": "array", "items": {"type": "object"}}
+        }), &["index"]),
+        tool("remove", "Remove items by indices: objects, walls, doors, labels, paths, roofs or platforms. Indices of later items shift down.", json!({
+            "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms"]},
             "indices": {"type": "array", "items": {"type": "integer"}}
         }), &["what", "indices"]),
         tool("paint", "Paint floor over a rectangle, oval or polygon. Edges are exact to a quarter cell, so fractional areas line up with add_wall (a room [4, 3, 9.5, 7.5] gets walls on x=9.5 and y=7.5). target 'terrain' paints ground; 'room' paints a room floor and puts walls all around it by itself (room_edges) — so open terraces, balconies, porches and wooden piers are terrain with feather 0, edged with add_wall low: true where needed.", json!({
@@ -151,7 +179,7 @@ fn tools() -> Value {
             "asset": text("Wall asset key from find_assets (kind wall)"), "color": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3, "description": "Plain colour [r, g, b] instead of a picture"},
             "width": num("Thickness in cells, default 0.25 (0.35 for pictures)"), "area": area
         }), &[]),
-        tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets.", json!({}), &[]),
+        tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets. Also re-reads live.json in the folder's root — the user's own living machines for Foundry (Wild Canvas 0.30+): {\"File_Name_Start\": {\"fans\": [[cx, cy, r, speed]], \"lamps\": [[x, y, r, \"#rrggbb\"]], \"leds\": [x, y, colour, …], \"ledSize\": 0.006}}, fractions of the picture (leds: x and y in thousandths, colour 0 cyan, 1 magenta or a number 0xRRGGBB). An object whose file name starts with such a key gets its own tile and the layout in the tile flag: fans spin, lamps smoulder and flare, leds blink. Returns the keys read as live.", json!({}), &[]),
         tool("undo", "Undo the last changes. A batch is one step (one per floor it touched).", json!({"steps": int("Default 1")}), &[]),
         tool("batch", "Run many edits in one call; they are undone as one step (one per floor touched). If any edit fails, the whole batch is rolled back and the map stays as it was. Not allowed inside: view, render_picture, preview_assets, export_foundry, save_map, open_map, new_map, generate, build_plan, terrain_from_place, grow_map, add_level, undo, reload_assets, batch.", json!({
             "ops": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "properties": {"tool": text("Tool name, e.g. add_object"), "arguments": {"type": "object", "description": "Its arguments"}}, "required": ["tool"]}}

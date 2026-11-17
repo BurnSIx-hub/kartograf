@@ -24,6 +24,7 @@ mod pck;
 mod place;
 mod plan;
 mod plat;
+mod platform;
 mod procgen;
 mod recovery;
 mod relief;
@@ -41,10 +42,48 @@ mod view;
 use eframe::egui;
 use std::path::PathBuf;
 
+/// Ключи запуска: печатаются по `--help` и при неизвестном ключе.
 #[cfg(not(target_arch = "wasm32"))]
-fn parse_args() -> app::Args {
+const USAGE: &str = "\
+kartograf [карта.karta] [ключи]
+  --data-dir <папка>     папка данных: настройки, паки, свои ассеты
+  --mcp                  без окна: сервер MCP, правит карту в открытом окне
+  --aside                окно за краем экрана и без фокуса
+  --selftest <папка>     самопроверка окна, итог в <папка>/report.txt; данные — только свои, <папка>/data
+  --shot <файл.png>      снимок карты и выход; --size ШxВ — размер окна
+  --export <папка>       выгрузка для Foundry и выход; --px <точек на клетку>
+  --plan <файл.json>     построить карту по плану
+  --osm <файл.osm>       местность из выгрузки OpenStreetMap
+  --place <широта,долгота> местность по координатам; --cells ШxВ, --trees 0..1
+  --update <адрес>       поставить обновление
+  --packinfo <пак…>      что в паке
+  --analyse <участок.osm…> сверка анализа снимка
+  --version, --help";
+
+/// Сказать в консоль. У программы без консоли (выпуск под Windows) сначала подключиться
+/// к консоли того, кто запустил: иначе в cmd и PowerShell ответа не видно.
+#[cfg(not(target_arch = "wasm32"))]
+fn say(text: &str) {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn AttachConsole(process: u32) -> i32;
+        }
+        // SAFETY: вызов без указателей; `u32::MAX` — консоль родителя. Нет её или вывод уже
+        // перенаправлен в канал или файл — ничего не меняется.
+        unsafe {
+            AttachConsole(u32::MAX);
+        }
+    }
+    println!("{text}");
+}
+
+/// Разобрать ключи запуска. `Err` — окно открывать нельзя: ключ не узнан или сочетание
+/// ключей испортит чужие данные.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, String> {
     let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None };
-    let mut it = std::env::args().skip(1);
+    let mut it = list.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--selftest" => args.selftest = it.next().map(PathBuf::from),
@@ -62,10 +101,26 @@ fn parse_args() -> app::Args {
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--analyse" => std::process::exit(place::compare(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
+            "--version" => {
+                say(&format!("kartograf {}", env!("CARGO_PKG_VERSION")));
+                std::process::exit(0)
+            }
+            "--help" | "-h" | "/?" => {
+                say(USAGE);
+                std::process::exit(0)
+            }
+            // Ключ, которого нет, — опечатка, а не имя карты: раньше `--version` открывал
+            // окно с такой «картой» поверх всего.
+            _ if a.starts_with("--") => return Err(format!("неизвестный ключ {a}")),
             _ => args.file = Some(PathBuf::from(a)),
         }
     }
-    args
+    // Самопроверка ставит свою папку текстур и пробный пак и переписывает settings.json:
+    // в рабочей папке данных это ломает настройки пользователя.
+    if args.selftest.is_some() && args.data.is_some() {
+        return Err("--selftest работает только в своей папке данных (<папка>/data): с --data-dir самопроверка переписала бы настройки этой папки. Уберите --data-dir".to_owned());
+    }
+    Ok(args)
 }
 
 /// `--packinfo пак…`: без окна — сколько в паке ассетов каждого вида, за сколько читается
@@ -114,7 +169,13 @@ fn main() -> eframe::Result {
         let explicit = dir.is_some();
         std::process::exit(mcp::serve(dir.unwrap_or_else(app::default_data_dir), explicit));
     }
-    let args = parse_args();
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            say(&format!("{e}\n\n{USAGE}"));
+            std::process::exit(2)
+        }
+    };
     // Самопроверке нужен один и тот же размер окна, иначе точки щелчков поплывут.
     let size = args.size.or(args.selftest.as_ref().map(|_| [1280.0, 800.0])).unwrap_or([1400.0, 900.0]);
     let mut viewport = egui::ViewportBuilder::default().with_title("Картограф").with_inner_size(size).with_min_inner_size([640.0, 420.0]);
@@ -144,4 +205,33 @@ fn main() {
             web_sys::console::error_1(&e);
         }
     });
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn parse(list: &[&str]) -> Result<app::Args, String> {
+        parse_args(list.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn unknown_flag_is_refused_not_opened_as_a_map() {
+        assert_eq!(parse(&["--versoin"]).err().as_deref(), Some("неизвестный ключ --versoin"));
+        let ok = parse(&["карта.karta", "--data-dir", "d", "--aside", "--px", "140"]).ok().expect("знакомые ключи");
+        assert_eq!(ok.file, Some(PathBuf::from("карта.karta")));
+        assert_eq!((ok.data, ok.px), (Some(PathBuf::from("d")), Some(140)));
+        // Каждый ключ, который разбирается, есть в справке.
+        for flag in ["--data-dir", "--mcp", "--aside", "--selftest", "--shot", "--size", "--export", "--px", "--plan", "--osm", "--place", "--cells", "--trees", "--update", "--packinfo", "--analyse", "--version", "--help"] {
+            assert!(USAGE.contains(flag), "{flag}");
+        }
+    }
+
+    #[test]
+    fn selftest_keeps_to_its_own_data_dir() {
+        assert!(parse(&["--aside", "--selftest", "t"]).is_ok());
+        let refused = parse(&["--selftest", "t", "--data-dir", "d"]).err().expect("отказ");
+        assert!(refused.contains("--data-dir"), "{refused}");
+        assert!(parse(&["--data-dir", "d", "--selftest", "t"]).is_err(), "порядок ключей не важен");
+    }
 }
