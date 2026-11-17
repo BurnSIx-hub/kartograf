@@ -904,6 +904,8 @@ pub struct RoofTile {
     pub rail: Option<Rail>,
     /// Подкраска картинки (умножением).
     pub tint: Option<[u8; 3]>,
+    /// Тень от солнца рисует «Wild Canvas» (в картинке её нет): параметры — у сцены.
+    pub shadow: bool,
     /// Куст: на земле под токенами, не гаснет — он по колено, а не над головой.
     pub ground: bool,
     /// Край крыши в точках сцены, двор — `true`: по нему встаёт область-поверхность
@@ -1328,6 +1330,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                     let path: Vec<[i64; 2]> = rail.path.iter().map(|v| [v[0].round() as i64, v[1].round() as i64]).collect();
                     tile["flags"][LIVE_MODULE]["rail"] = json!({"path": path, "lag": rail.lag.round() as i64, "cargo": rail.cargo});
                 }
+                if r.shadow {
+                    tile["flags"][LIVE_MODULE]["shadow"] = json!(1);
+                }
             } else if let Some((key, value)) = &r.living {
                 // Живой предмет под токенами: колонка играет сразу. Дирижабль над
                 // крышами так и остаётся над ними — винты крутятся там.
@@ -1350,6 +1355,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                         None => json!({OWN_MODULE: {"web": true}}),
                     },
                 };
+                if r.shadow {
+                    tile["flags"][LIVE_MODULE]["shadow"] = json!(1);
+                }
             } else if !r.shelter {
                 // Крону качает ветер «Wild Canvas»; крыша стоит.
                 // Осенью с неё летят листья, в магическом лесу — светлячки.
@@ -1737,6 +1745,91 @@ pub fn foundry_src(image: &std::path::Path) -> String {
     image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Путь картинки из общей папки ассетов: от корня данных Foundry, если выгрузка в них;
+/// иначе `../assets/<файл>` — от папки карты (модуль Картографа разворачивает его от
+/// папки, где лежит .json сцены).
+pub fn asset_src(image: &std::path::Path) -> String {
+    let s = foundry_src(image);
+    if s.contains('/') { s } else { format!("../assets/{s}") }
+}
+
+/// Общая папка ассетов: `kartograf/assets` (в данных Foundry и в модуле — у ближайшей
+/// папки `kartograf` по пути), иначе `assets` рядом с папкой выгрузки.
+pub fn shared_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(k) = dir.ancestors().find(|a| a.file_name().is_some_and(|n| n == "kartograf")) {
+        return k.join("assets");
+    }
+    dir.parent().map_or_else(|| dir.join("assets"), |p| p.join("assets"))
+}
+
+/// Имя файла латиницей: Foundry кодирует кириллицу в имени файла длинными `%D0%9A…`.
+/// Русские буквы — транслитом, остальное, кроме букв, цифр и `-`, — `_`.
+pub fn ascii_name(s: &str) -> String {
+    let lat = |c: char| -> Option<&'static str> {
+        Some(match c {
+            'а' => "a", 'б' => "b", 'в' => "v", 'г' => "g", 'д' => "d", 'е' => "e", 'ё' => "yo", 'ж' => "zh", 'з' => "z", 'и' => "i", 'й' => "y",
+            'к' => "k", 'л' => "l", 'м' => "m", 'н' => "n", 'о' => "o", 'п' => "p", 'р' => "r", 'с' => "s", 'т' => "t", 'у' => "u", 'ф' => "f",
+            'х' => "kh", 'ц' => "ts", 'ч' => "ch", 'ш' => "sh", 'щ' => "shch", 'ъ' => "", 'ы' => "y", 'ь' => "", 'э' => "e", 'ю' => "yu", 'я' => "ya",
+            'і' => "i", 'ї' => "yi", 'є' => "ye", 'ґ' => "g",
+            _ => return None,
+        })
+    };
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            out.push(ch);
+            continue;
+        }
+        let low = ch.to_lowercase().next().unwrap_or(ch);
+        match lat(low) {
+            Some(t) if low != ch => {
+                let mut cs = t.chars();
+                if let Some(f) = cs.next() {
+                    out.push(f.to_ascii_uppercase());
+                    out.extend(cs);
+                }
+            }
+            Some(t) => out.push_str(t),
+            None => out.push('_'),
+        }
+    }
+    let mut tidy = String::new();
+    for ch in out.chars() {
+        if !(ch == '_' && (tidy.is_empty() || tidy.ends_with('_'))) {
+            tidy.push(ch);
+        }
+    }
+    let tidy = tidy.trim_end_matches('_').to_owned();
+    if tidy.is_empty() { "map".to_owned() } else { tidy }
+}
+
+/// Имя картинки ассета в общей папке — по самому ассету, латиницей: имя файла без
+/// расширения; у перекрашенного (`tint:rrggbb:…`) — `_c` и тон.
+pub fn asset_stem(key: &str) -> String {
+    let mut rest = key;
+    let mut tones = String::new();
+    while let Some(r) = rest.strip_prefix(crate::library::TINT) {
+        let (hex, tail) = r.split_once(':').unwrap_or((r, ""));
+        tones.push_str(hex);
+        rest = tail;
+    }
+    let file = rest.rsplit(['/', '\\', ':']).next().unwrap_or(rest);
+    let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+    let mut name = ascii_name(stem);
+    if !tones.is_empty() {
+        name.push_str("_c");
+        name.push_str(&ascii_name(&tones));
+    }
+    name
+}
+
+/// Солнце для теней «Wild Canvas» — в пометку сцены: куда (градусы по часовой от
+/// «вправо»), на сколько клеток, размытие в клетках, плотность, затухание.
+pub fn shadow_flags(sh: &map::Shadows) -> Value {
+    let r = |v: f32| (v as f64 * 1000.0).round() / 1000.0;
+    json!({"angle": r(sh.angle), "dist": r(sh.dist), "blur": r(sh.blur), "opacity": r(sh.opacity), "fade": r(sh.fade)})
+}
+
 /// Метка содержимого файла: 8 знаков хэша его байтов (FNV-1a).
 pub fn content_tag(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1777,6 +1870,43 @@ pub fn foundry_data_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_are_latin_and_named_by_the_asset() {
+        assert_eq!(ascii_name("Криогеника"), "Kriogenika");
+        assert_eq!(ascii_name("Воздушная гавань"), "Vozdushnaya_gavan");
+        assert_eq!(ascii_name("Иерихон_2"), "Ierikhon_2");
+        assert_eq!(ascii_name("Щит и Ёж!"), "Shchit_i_Yozh");
+        assert_eq!(ascii_name("***"), "map");
+        assert_eq!(asset_stem("pack:E:\\D&D\\FA\\Barrel_Wood_Dark_A_1x1.webp"), "Barrel_Wood_Dark_A_1x1");
+        assert_eq!(asset_stem("C:/Карты/ассеты/objects/scifi/Cryo_Reactor_Core_A_5x5.webp"), "Cryo_Reactor_Core_A_5x5");
+        assert_eq!(asset_stem("builtin:bar_counter"), "bar_counter");
+        assert_eq!(asset_stem("tint:ec8859:builtin:bar_counter"), "bar_counter_cec8859");
+        assert_eq!(asset_stem("objects/Барная стойка.png"), "Barnaya_stoyka");
+        // Общая папка: у папки `kartograf` по пути, иначе рядом с папкой выгрузки.
+        let p = std::path::Path::new;
+        assert_eq!(shared_dir(p("D:/Foundry/Data/kartograf/cryo")), p("D:/Foundry/Data/kartograf/assets"));
+        assert_eq!(shared_dir(p("D:/Foundry/Data/kartograf")), p("D:/Foundry/Data/kartograf/assets"));
+        assert_eq!(shared_dir(p("kartograf/Kriogenika/1763")), p("kartograf/assets"));
+        assert_eq!(shared_dir(p("C:/Maps/Pulsar/foundry")), p("C:/Maps/Pulsar/assets"));
+        assert_eq!(asset_src(p("C:/nowhere-near-foundry/assets/X.webp")), "../assets/X.webp");
+    }
+
+    #[test]
+    fn shadow_of_an_item_is_a_flag_not_a_picture() {
+        let mut t = canopy_tile("kartograf/assets/Chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 0.0, 100);
+        (t.item, t.fade, t.leaves, t.shadow) = (true, false, false, true);
+        let mut m = Map::new(8, 8);
+        m.shadows.on = true;
+        let lay = layout(&m, &m.room_edges());
+        let lv = SceneLevel { name: "x".into(), image_src: "x.webp".into(), layout: &lay, roofs: vec![t] };
+        let scene = foundry_layered(&m, "x", &[lv], &[LevelLayers { foreground: None, solid: None }], 100, &Default::default());
+        let tile = &scene["tiles"][0];
+        assert_eq!(tile["flags"][LIVE_MODULE]["shadow"], 1);
+        assert_eq!((tile["width"].as_i64(), tile["height"].as_i64()), (Some(100), Some(100)), "тайл — ровно предмет, без поля под тень");
+        let f = shadow_flags(&m.shadows);
+        assert!(f["angle"].as_f64().is_some() && f["dist"].as_f64().is_some() && f["opacity"].as_f64().is_some());
+    }
 
     #[test]
     fn rooms_get_their_own_sound_region() {

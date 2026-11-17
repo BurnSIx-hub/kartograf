@@ -15,6 +15,7 @@ impl App {
         let stumps = if self.settings.gen_library { Palette::from_library(&self.library.assets, Box::new(|_| None)).keys("stump") } else { Vec::new() };
         self.export = Some(Export {
             dir,
+            stem: export::ascii_name(&name),
             name,
             px,
             tile: [0, 0],
@@ -56,6 +57,7 @@ impl App {
         self.export = Some(Export {
             dir: PathBuf::new(),
             name: String::new(),
+            stem: String::new(),
             px,
             tile: [0, 0],
             tiles: Vec::new(),
@@ -241,7 +243,11 @@ impl App {
         // Файлы копятся здесь: программа пишет их на диск, модуль отдаёт Foundry.
         let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
         let n = e.done.len();
-        let stem = |k: usize| if n == 1 { e.name.clone() } else { format!("{}_{}", e.name, k + 1) };
+        // Имена файлов — латиницей: кириллицу Foundry превращает в длинные `%D0%9A…`.
+        let base = if e.stem.is_empty() { export::ascii_name(&e.name) } else { e.stem.clone() };
+        let stem = |k: usize| if n == 1 { base.clone() } else { format!("{}_{}", base, k + 1) };
+        // Картинки ассетов — по одной на ассет, по его имени, в общей папке, как библиотека FA.
+        let mut shelf = Shelf::new(export::shared_dir(&e.dir));
         let mut jpgs = Vec::new();
         let mut srcs = Vec::new();
         let mut layouts = Vec::new();
@@ -296,9 +302,8 @@ impl App {
             // и у встроенных нарисована справа: створка уходит отражённой.
             let img = image::DynamicImage::ImageRgba8(self.textures.rgba(&key)?).fliph();
             let width = img.width();
-            let file = e.dir.join(format!("{}_створка_{}.webp", e.name, leaves.len() + 1));
-            files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 90.0)));
-            leaves.insert(key, export::LeafFile { src: export::foundry_src(&file), width });
+            let src = shelf.put(&format!("{}_leaf", export::asset_stem(&key)), export::webp_bytes(&img.to_rgba8(), 90.0), &mut files);
+            leaves.insert(key, export::LeafFile { src, width });
         }
         // Крыши — картинками по одной, рядом со сценой.
         let mut covers: std::collections::HashMap<String, (image::RgbaImage, [f32; 2])> = std::collections::HashMap::new();
@@ -307,11 +312,9 @@ impl App {
         let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut seen = std::collections::HashMap::new();
-        // Слой стен каждого этажа (он же для Universal VTT), его файл и во сколько раз
-        // тайл предмета шире картинки без тени.
+        // Слой стен каждого этажа (он же для Universal VTT) и его файл.
         let mut wall_layers: std::collections::HashMap<usize, image::RgbaImage> = std::collections::HashMap::new();
         let mut foregrounds: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-        let mut grows: std::collections::HashMap<String, [f32; 2]> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let light = map.shadows.light();
@@ -393,7 +396,7 @@ impl App {
                     }
                 };
                 roof_count += 1;
-                let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
+                let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 let p = e.px as f32;
                 tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() });
@@ -443,7 +446,7 @@ impl App {
                 roofs::paste_fixtures(&mut img, origin, ppc, &items);
                 let smoke = smoke_spots(&mine, p);
                 roof_count += 1;
-                let file = e.dir.join(format!("{}_крыша_{roof_count}.webp", stem(k)));
+                let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
                 files.push((file.clone(), export::webp_bytes(&img, 88.0)));
                 tiles.push(export::RoofTile {
                     src: export::foundry_src(&file),
@@ -480,21 +483,15 @@ impl App {
                         }
                         img = image::DynamicImage::ImageRgba8(rgba);
                     }
-                    let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
-                    let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
-                    // Имя файла — по тому, что это: навес лавки, куст, бельё или крона.
-                    let what = if map::awning_by_name(&prop.asset) {
-                        "навес"
-                    } else if map::bush_by_name(&prop.asset) {
-                        "куст"
-                    } else if map::line_by_name(&prop.asset) {
-                        "бельё"
-                    } else {
-                        "дерево"
+                    // В родном разрешении, как в паке; огромное — не больше 4096 точек.
+                    let img = if img.width().max(img.height()) > 4096 { img.resize(4096, 4096, image::imageops::FilterType::Lanczos3) } else { img };
+                    // Имя — по ассету; подкрашенная крона — с тоном.
+                    let name = match prop.tint {
+                        Some([r, g, b]) => format!("{}_t{r:02x}{g:02x}{b:02x}", export::asset_stem(&prop.asset)),
+                        None => export::asset_stem(&prop.asset),
                     };
-                    let file = e.dir.join(format!("{}_{what}_{}.webp", e.name, canopies.len() + 1));
-                    files.push((file.clone(), export::webp_bytes(&img.to_rgba8(), 88.0)));
-                    canopies.insert(look.clone(), export::foundry_src(&file));
+                    let src = shelf.put(&name, export::webp_bytes(&img.to_rgba8(), 88.0), &mut files);
+                    canopies.insert(look.clone(), src);
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 let mut tile = export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px);
@@ -527,32 +524,25 @@ impl App {
             items.sort_by_key(|p| p.layer());
             for prop in items {
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
-                // Тень — в картинку тайла: своя на каждый поворот и размер предмета.
-                let shade = (map.shadows.on && prop.carries_shadow()).then(|| format!("#тень{k}|{:.0}|{:.3}", prop.rot.rem_euclid(360.0), prop.scale));
-                // Предмет в воде: в тайле — только сухой верх, своя картинка на каждую ватерлинию.
+                // Картинка — одна на ассет и без тени (тень рисует «Wild Canvas» по пометке
+                // плитки); предмет в воде — только сухой верх, своя картинка на ватерлинию.
                 let sunk = prop.sunk();
-                let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<(String, [f32; 2]), String> {
-                    let slot = format!("{key}{}{}", shade.as_deref().unwrap_or(""), if sunk > 0.0 { format!("#сухое{sunk:.3}") } else { String::new() });
+                let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
+                    let slot = format!("{key}{}", if sunk > 0.0 { format!("#dry{sunk:.3}") } else { String::new() });
                     if let Some(src) = canopies.get(&slot) {
-                        return Ok((src.clone(), grows.get(&slot).copied().unwrap_or([1.0, 1.0])));
+                        return Ok(src.clone());
                     }
-                    let img = image::DynamicImage::ImageRgba8(self.textures.rgba(key)?);
-                    let side = (prop.size[0].max(prop.size[1]) * (e.px as f32 * 1.5).max(library::PX_PER_CELL)).round() as u32;
-                    let img = if img.width().max(img.height()) > side { img.resize(side, side, image::imageops::FilterType::Lanczos3) } else { img };
-                    let (img, grow) = if shade.is_some() { export::with_shadow(&img.to_rgba8(), size, prop.rot, &map.shadows) } else { (img.to_rgba8(), [1.0, 1.0]) };
-                    let img = if sunk > 0.0 { export::dry_part(&img, sunk) } else { img };
-                    grows.insert(slot.clone(), grow);
-                    let file = e.dir.join(format!("{}_предмет_{}.webp", e.name, canopies.len() + 1));
-                    files.push((file.clone(), export::webp_bytes(&img, 90.0)));
-                    let src = export::foundry_src(&file);
+                    let name = if sunk > 0.0 { format!("{}_dry{:02}", export::asset_stem(key), (sunk * 100.0).round() as u32) } else { export::asset_stem(key) };
+                    let src = shelf.put(&name, self.asset_webp(key, sunk)?, files);
                     canopies.insert(slot, src.clone());
-                    Ok((src, grow))
+                    Ok(src)
                 };
-                let (src, grow) = save(&prop.asset, &mut files)?;
-                let mut tile = export::canopy_tile(src.clone(), prop.pos, [size[0] * grow[0], size[1] * grow[1]], prop.rot, e.px);
+                let src = save(&prop.asset, &mut files)?;
+                let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
                 tile.fade = false;
                 tile.leaves = false;
                 tile.item = true;
+                tile.shadow = map.shadows.on && prop.carries_shadow();
                 tile.above = prop.layer() >= map::ON_ROOF;
                 tile.hover = map::hover_by_name(&prop.asset);
                 tile.afloat = map::afloat_by_name(&prop.asset) && map.on_water(prop.pos);
@@ -573,8 +563,8 @@ impl App {
                 match map::chest_variants(&prop.asset) {
                     // Нет открытого или пустого в библиотеке — тот же закрытый.
                     Some((open, empty)) => {
-                        let open = save(&open, &mut files).map_or_else(|_| src.clone(), |s| s.0);
-                        let empty = save(&empty, &mut files).map_or_else(|_| open.clone(), |s| s.0);
+                        let open = save(&open, &mut files).unwrap_or_else(|_| src.clone());
+                        let empty = save(&empty, &mut files).unwrap_or_else(|_| open.clone());
                         tile.chest = Some((open, empty));
                     }
                     None => tile.web = Some(library::strand_ends(&self.textures.sources, &prop.asset)),
@@ -588,7 +578,7 @@ impl App {
                 let layer = export::layer_from_pair(black, white);
                 if export::opaque_box(&layer, 8).is_some() {
                     let (bytes, ext) = export::layer_bytes(&layer, 90.0);
-                    let file = e.dir.join(format!("{}_стены.{ext}", stem(k)));
+                    let file = e.dir.join(format!("{}_walls.{ext}", stem(k)));
                     files.push((file.clone(), bytes));
                     foregrounds.insert(k, export::foundry_src(&file));
                     wall_layers.insert(k, layer);
@@ -601,14 +591,19 @@ impl App {
             .collect();
         let layers: Vec<export::LevelLayers> = (0..n).map(|k| export::LevelLayers { foreground: foregrounds.remove(&k), solid: open[k].as_ref().map(export::Solid::of) }).collect();
         let mut scene = export::foundry_layered(&self.map, &e.name, &levels, &layers, e.px, &leaves);
+        // Тени предметов рисует «Wild Canvas»: солнце — у сцены.
+        if self.map.shadows.on {
+            scene["flags"][export::LIVE_MODULE]["shadows"] = export::shadow_flags(&self.map.shadows);
+        }
         // Пути картинок — с меткой содержимого: Foundry не покажет прежнюю под тем же именем.
-        let tags: std::collections::HashMap<String, String> = files.iter().map(|(p, b)| (export::foundry_src(p), export::content_tag(b))).collect();
+        let mut tags: std::collections::HashMap<String, String> = files.iter().map(|(p, b)| (export::foundry_src(p), export::content_tag(b))).collect();
+        tags.extend(shelf.tags.clone());
         export::tag_sources(&mut scene, &tags);
         // Сцена открывается на том этаже, что открыт в редакторе: у корабля — палуба, а не трюм.
         if n > 1 {
             scene["initialLevel"] = serde_json::json!(export::level_id(self.level));
         }
-        let scene_path = e.dir.join(format!("{}.json", e.name));
+        let scene_path = e.dir.join(format!("{base}.json"));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
         // Universal VTT — для других VTT; модулю он не нужен, сцена создаётся сразу.
         #[cfg(not(target_arch = "wasm32"))]
@@ -660,6 +655,9 @@ impl App {
             }
             std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
             for (path, bytes) in &files {
+                if let Some(d) = path.parent() {
+                    std::fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+                }
                 std::fs::write(path, bytes).map_err(|x| format!("{}: {x}", path.display()))?;
             }
         }
@@ -678,6 +676,25 @@ impl App {
             layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
             layouts.iter().map(|l| l.lights.len()).sum::<usize>()
         ))
+    }
+
+    /// Картинка ассета для общей папки: WebP пака как есть, если его не перекрашивали и
+    /// он не в воде; иначе — заново (перекраска, сухой верх), не больше 4096 точек.
+    fn asset_webp(&self, key: &str, sunk: f32) -> Result<Vec<u8>, String> {
+        if sunk <= 0.0 && !key.starts_with(library::TINT) {
+            let raw = self.textures.bytes(key)?;
+            if raw.len() > 12 && &raw[0..4] == b"RIFF" && &raw[8..12] == b"WEBP" {
+                return Ok(raw);
+            }
+        }
+        let mut img = self.textures.rgba(key)?;
+        if img.width().max(img.height()) > 4096 {
+            img = image::DynamicImage::ImageRgba8(img).resize(4096, 4096, image::imageops::FilterType::Lanczos3).to_rgba8();
+        }
+        if sunk > 0.0 {
+            img = export::dry_part(&img, sunk);
+        }
+        Ok(export::webp_bytes(&img, 90.0))
     }
 
     /// `--shot файл.png`: снять окно, когда оно устоялось, и выйти.
@@ -723,4 +740,51 @@ impl App {
 /// и большая сторона в точках сцены — «Wild Canvas» пускает над ними дым.
 fn smoke_spots(mine: &[(String, [f32; 2], f32, [f32; 2])], px: f32) -> Vec<[f32; 3]> {
     mine.iter().filter(|m| map::smokes_by_name(&m.0)).map(|m| [m.1[0] * px, m.1[1] * px, m.3[0].max(m.3[1]) * px]).collect()
+}
+
+/// Общая папка ассетов выгрузки: картинка кладётся по имени ассета; имя уже занято другой
+/// картинкой (другой пак, обновлённый ассет) — к нему метка содержимого. Та же картинка,
+/// что уже лежит на диске, не пишется заново.
+struct Shelf {
+    dir: PathBuf,
+    /// Путь в сцене → метка содержимого (для `?v=`).
+    tags: std::collections::HashMap<String, String>,
+    /// Имя#метка → путь в сцене: в одной выгрузке картинка кладётся раз.
+    placed: std::collections::HashMap<String, String>,
+    /// Имя → метка картинки, что легла под ним в этой выгрузке.
+    used: std::collections::HashMap<String, String>,
+}
+
+impl Shelf {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, tags: Default::default(), placed: Default::default(), used: Default::default() }
+    }
+
+    fn put(&mut self, name: &str, bytes: Vec<u8>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> String {
+        let tag = export::content_tag(&bytes);
+        let key = format!("{name}#{tag}");
+        if let Some(src) = self.placed.get(&key) {
+            return src.clone();
+        }
+        // Что лежит на диске под этим путём: та же картинка, другая или ничего.
+        let disk = |p: &std::path::Path| -> Option<bool> {
+            if cfg!(target_arch = "wasm32") {
+                return None;
+            }
+            std::fs::read(p).ok().map(|old| old == bytes)
+        };
+        let plain = self.dir.join(format!("{name}.webp"));
+        let clash = self.used.get(name).is_some_and(|t| *t != tag) || disk(&plain) == Some(false);
+        let path = if clash { self.dir.join(format!("{name}_{tag}.webp")) } else { plain };
+        if !clash {
+            self.used.insert(name.to_owned(), tag.clone());
+        }
+        let src = export::asset_src(&path);
+        if disk(&path) != Some(true) {
+            files.push((path, bytes));
+        }
+        self.tags.insert(src.clone(), tag);
+        self.placed.insert(key, src.clone());
+        src
+    }
 }

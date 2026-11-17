@@ -719,6 +719,18 @@ impl App {
                 if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
                     self.save_settings();
                 }
+                if self.tool == Tool::Object
+                    && let Some((_, pf)) = self.object_prefab.and_then(|i| self.prefabs.get(i))
+                {
+                    let name = pf.name.clone();
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Префаб: {name}"));
+                        if ui.small_button("одним объектом").on_hover_text("Ставить снова картинку с полки").clicked() {
+                            self.object_prefab = None;
+                        }
+                    });
+                    ui.weak("Щелчок ставит набор целиком, R поворачивает его.");
+                }
                 self.picked.retain(|&k| k < self.map.props.len());
                 if !self.picked.is_empty() {
                     ui.strong(format!("Выбрано объектов: {}", self.picked.len()));
@@ -728,6 +740,19 @@ impl App {
                         }
                         if ui.small_button("снять выбор").clicked() {
                             self.picked.clear();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.prefab_name).hint_text("имя префаба").desired_width(150.0));
+                        if ui.add_enabled(!self.prefab_name.trim().is_empty(), egui::Button::new("Сохранить префабом")).on_hover_text("Набор ляжет на полку, во вкладку «Префабы»").clicked() {
+                            let (name, idx) = (self.prefab_name.clone(), self.picked.clone());
+                            match self.save_prefab(&name, &idx) {
+                                Ok(_) => {
+                                    self.notice = Some(format!("Префаб «{}» сохранён: предметов {}", name.trim(), idx.len()));
+                                    self.prefab_name.clear();
+                                }
+                                Err(e) => self.error = Some(format!("Префаб не сохранён: {e}")),
+                            }
                         }
                     });
                 }

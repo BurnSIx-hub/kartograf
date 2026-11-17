@@ -1017,6 +1017,36 @@ impl SelfTest {
             92 => {
                 self.check("Delete убрал выбранный помост", app.map.platforms.is_empty(), &format!("помостов {}", app.map.platforms.len()));
                 app.platform_mode = false;
+                // Префаб: два предмета рядом, выбранные группой, — кнопкой «Сохранить префабом».
+                if let Some(b) = app.map.props.first().cloned() {
+                    app.map.props.push(crate::map::Prop { pos: [4.0, 10.0], ..b.clone() });
+                    app.map.props.push(crate::map::Prop { pos: [5.5, 10.0], rot: 90.0, ..b });
+                }
+                let n = app.map.props.len();
+                let idx = vec![n.saturating_sub(2), n.saturating_sub(1)];
+                let saved = app.save_prefab("Проба набора", &idx);
+                let file = saved.as_ref().ok().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned());
+                self.check("выбранное сохранилось префабом с именем файла латиницей", n >= 2 && file.as_deref() == Some("Proba_nabora.json") && app.prefabs.iter().any(|(_, p)| p.name == "Проба набора" && p.props.len() == 2), &format!("{saved:?}"));
+                // На полке — вкладка «Префабы»; щелчок по префабу берёт инструмент «Объект».
+                app.prefab_shelf = true;
+                app.object_prefab = app.prefabs.iter().position(|(_, p)| p.name == "Проба набора");
+                app.set_tool(Tool::Object);
+                app.picked.clear();
+                self.world = [n as f32, 0.0];
+                self.click(cell(app, 3.0, 9.0));
+            }
+            93 => {
+                let before = self.world[0] as usize;
+                let ok = app.map.props.len() == before + 2 && app.picked.len() == 2;
+                self.check("щелчок поставил префаб целиком, набор выбран группой", ok, &format!("предметов {} (было {before}), выбрано {}", app.map.props.len(), app.picked.len()));
+                self.snap(ctx, "префаб");
+            }
+            94 => self.key(Key::Z, CTRL),
+            95 => {
+                let before = self.world[0] as usize;
+                self.check("Ctrl+Z убрал префаб одним шагом", app.map.props.len() == before, &format!("предметов {}", app.map.props.len()));
+                app.object_prefab = None;
+                app.prefab_shelf = false;
             }
             _ => return false,
         }

@@ -339,6 +339,8 @@ struct Export {
     stumps: Vec<String>,
     dir: PathBuf,
     name: String,
+    /// Имя файлов выгрузки латиницей; пусто — по имени сцены.
+    stem: String,
     px: u32,
     /// Размер плитки в пикселях экрана: по холсту на первом шаге, когда окно развёрнуто.
     tile: [u32; 2],
@@ -636,6 +638,16 @@ pub struct App {
     pub door_frame: Option<String>,
     pub object_asset: Option<String>,
     pub object_rot: f32,
+    /// Префабы папки данных (`prefabs/`): файл и сам префаб.
+    pub prefabs: Vec<(PathBuf, crate::prefab::Prefab)>,
+    /// Инструмент «Объект» ставит этот префаб, а не одну картинку.
+    pub object_prefab: Option<usize>,
+    /// Имя, под которым сохранить выбранное префабом.
+    prefab_name: String,
+    /// На полке — префабы, а не ассеты.
+    pub prefab_shelf: bool,
+    /// Префаб, который просят удалить: ждёт «да».
+    prefab_drop: Option<usize>,
     pub object_scale: f32,
 
     pub recovery: Recovery,
@@ -788,6 +800,11 @@ impl App {
             shot_asked: false,
             frame: 0,
             title: String::new(),
+            prefabs: crate::prefab::load_all(&crate::prefab::dir(&data_dir)),
+            object_prefab: None,
+            prefab_name: String::new(),
+            prefab_shelf: false,
+            prefab_drop: None,
             data_dir,
             update: crate::update::Updater::start(online.then(|| cc.egui_ctx.clone())),
             settings,

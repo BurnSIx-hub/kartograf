@@ -10,15 +10,67 @@ impl App {
         ui.heading("Библиотека");
         ui.horizontal_wrapped(|ui| {
             for k in Kind::ALL {
-                ui.selectable_value(&mut self.browse, k, k.label());
+                if ui.selectable_label(!self.prefab_shelf && self.browse == k, k.label()).clicked() {
+                    self.browse = k;
+                    self.prefab_shelf = false;
+                }
+            }
+            if ui.selectable_label(self.prefab_shelf, "Префабы").on_hover_text("Наборы предметов, сохранённые целиком").clicked() {
+                self.prefab_shelf = true;
             }
         });
+        if self.prefab_shelf {
+            ui.separator();
+            self.prefab_list(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.used_only, false, "Все");
             ui.selectable_value(&mut self.used_only, true, "На карте").on_hover_text("Только то, что уже стоит на этой карте");
         });
         ui.separator();
         self.browser(ui);
+    }
+
+    /// Префабы списком: щелчок — инструмент «Объект» ставит его; «×» — удалить (с вопросом).
+    fn prefab_list(&mut self, ui: &mut egui::Ui) {
+        if self.prefabs.is_empty() {
+            ui.weak("Префабов нет. Выберите предметы инструментом «Выбор» — рамкой или по одному с Shift — и сохраните их префабом.");
+            return;
+        }
+        let mut drop = None;
+        egui::ScrollArea::vertical().id_salt("prefabs").auto_shrink([false, false]).show(ui, |ui| {
+            for i in 0..self.prefabs.len() {
+                let (name, count, span) = {
+                    let pf = &self.prefabs[i].1;
+                    (pf.name.clone(), pf.props.len(), pf.span())
+                };
+                ui.horizontal(|ui| {
+                    let on = self.object_prefab == Some(i) && self.tool == Tool::Object;
+                    if ui.selectable_label(on, &name).on_hover_text(format!("предметов: {count}, {:.1}×{:.1} кл.", span[0], span[1])).clicked() {
+                        self.object_prefab = Some(i);
+                        self.set_tool(Tool::Object);
+                    }
+                    if self.prefab_drop == Some(i) {
+                        ui.label("Удалить?");
+                        if ui.small_button("да").clicked() {
+                            drop = Some(i);
+                        }
+                        if ui.small_button("нет").clicked() {
+                            self.prefab_drop = None;
+                        }
+                    } else if ui.small_button("×").on_hover_text("Удалить префаб").clicked() {
+                        self.prefab_drop = Some(i);
+                    }
+                });
+            }
+        });
+        if let Some(i) = drop {
+            crate::plat::fs::remove(&self.prefabs[i].0);
+            self.prefabs = crate::prefab::load_all(&crate::prefab::dir(&self.data_dir));
+            self.prefab_drop = None;
+            self.object_prefab = None;
+        }
     }
 
     /// Шторка вариантов над миниатюрой семьи — как у эмодзи с оттенками.
@@ -253,6 +305,7 @@ impl App {
                 }
                 Kind::Object => {
                     self.object_asset = Some(key);
+                    self.object_prefab = None;
                     self.set_tool(Tool::Object);
                 }
             }

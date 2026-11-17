@@ -210,11 +210,11 @@ impl App {
                         let label = last.as_ref().map_or_else(|| "Обновить последнюю сцену".to_owned(), |n| format!("Обновить последнюю сцену («{n}»)"));
                         ui.radio_value(&mut dlg.update, true, label).on_hover_text("Картинка, стены, свет и тайлы заменятся; токены, заметки и звуки останутся.");
                     });
-                    ui.weak("Картинки лягут в данные Foundry, в kartograf/<название сцены>.");
+                    ui.weak("Картинки лягут в данные Foundry: карта — в kartograf/<название латиницей>, предметы — в общую kartograf/assets.");
                     ui.add_space(6.0);
                     go = ui.add_enabled(!dlg.name.trim().is_empty(), egui::Button::new("На сцену")).clicked();
                 } else {
-                    ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt) и картинки створок, крыш и крон — их надо держать рядом со сценой. В Foundry: создать сцену, правой кнопкой — «Import Data», выбрать .json.");
+                    ui.weak("Рядом лягут картинка, сцена для Foundry (.json), Universal VTT (.dd2vtt), стены и крыши; картинки предметов, крон и створок — по одной на ассет в общую папку assets рядом. Держать обе папки вместе. В Foundry: каталог сцен — «Из выгрузки», выбрать .json.");
                     ui.add_space(6.0);
                     go = ui.button("Выбрать место и выгрузить").clicked();
                 }
@@ -224,7 +224,7 @@ impl App {
                 // а обновлённая не берёт старую картинку из кэша браузера.
                 let name: String = dlg.name.trim().chars().map(|c| if "/\\:*?\"<>|".contains(c) { '-' } else { c }).collect();
                 let stamp = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                self.start_export(PathBuf::from("kartograf").join(&name).join(stamp.to_string()), name.clone(), dlg.px, false);
+                self.start_export(PathBuf::from("kartograf").join(export::ascii_name(&name)).join(stamp.to_string()), name.clone(), dlg.px, false);
                 if let Some(e) = &mut self.export {
                     e.update = dlg.update;
                 }
@@ -234,14 +234,19 @@ impl App {
                 if let Some(d) = &dir {
                     let _ = std::fs::create_dir_all(d);
                 }
-                let mut dialog = crate::plat::FileDialog::new().add_filter("Сцена Foundry", &["json"]).set_file_name(format!("{}.json", self.name()));
+                let mut dialog = crate::plat::FileDialog::new().add_filter("Сцена Foundry", &["json"]).set_file_name(format!("{}.json", export::ascii_name(&self.name())));
                 if let Some(d) = dir {
                     dialog = dialog.set_directory(d);
                 }
                 if let Some(file) = dialog.save_file() {
-                    let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| self.name());
+                    // Сцена — с именем карты, файлы — под выбранным именем латиницей.
+                    let stem = file.file_stem().map(|s| export::ascii_name(&s.to_string_lossy()));
                     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+                    let name = self.name();
                     self.start_export(dir, name, dlg.px, false);
+                    if let (Some(e), Some(stem)) = (&mut self.export, stem) {
+                        e.stem = stem;
+                    }
                 }
             } else if open {
                 self.export_dialog = Some(dlg);

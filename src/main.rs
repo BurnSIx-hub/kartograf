@@ -25,6 +25,7 @@ mod place;
 mod plan;
 mod plat;
 mod platform;
+mod prefab;
 mod procgen;
 mod recovery;
 mod relief;

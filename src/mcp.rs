@@ -54,6 +54,13 @@ fn tools() -> Value {
     let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors. Bright light shows the floor as by day and never brighter, however many lights overlap (as in Foundry)"});
     let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
     json!([
+        tool("list_prefabs", "Prefabs saved in the data folder: name, number of objects, size in cells.", json!({}), &[]),
+        tool("save_prefab", "Save objects of the map (indices from describe) as a prefab under a name: a set that is placed again in one go — a table with chairs, a kitchen corner, a console with its chair. The person sees it on the shelf, tab «Префабы».", json!({
+            "name": text("Prefab name"), "indices": {"type": "array", "items": {"type": "integer"}, "description": "Object indices"}
+        }), &["name", "indices"]),
+        tool("place_prefab", "Place a prefab: its centre at x, y, the whole set turned by rotation (degrees clockwise). Returns the indices of the new objects.", json!({
+            "name": text("Prefab name"), "x": num("Centre x"), "y": num("Centre y"), "rotation": num("Degrees clockwise, default 0")
+        }), &["name", "x", "y"]),
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
             "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "room_walls", "visible"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},

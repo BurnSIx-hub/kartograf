@@ -181,6 +181,31 @@ impl App {
     fn run_tool(&mut self, tool: &str, a: &Value) -> Out {
         let r = match tool {
             "map_info" => Ok(self.tool_info()),
+            "list_prefabs" => Ok(json!({"prefabs": self.prefabs.iter().map(|(_, p)| {
+                let s = p.span();
+                json!({"name": p.name, "objects": p.props.len(), "span": [(s[0] * 10.0).round() / 10.0, (s[1] * 10.0).round() / 10.0]})
+            }).collect::<Vec<_>>()})),
+            "save_prefab" => {
+                let idx: Vec<usize> = a["indices"].as_array().map(|l| l.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect()).unwrap_or_default();
+                let name = a["name"].as_str().unwrap_or_default().to_owned();
+                self.save_prefab(&name, &idx).map(|p| json!({"saved": p, "objects": idx.len()}))
+            }
+            "place_prefab" => {
+                let name = a["name"].as_str().unwrap_or_default();
+                match self.prefabs.iter().position(|(_, p)| p.name == name) {
+                    None => Err(format!("префаба «{name}» нет; есть: {}", self.prefabs.iter().map(|(_, p)| p.name.clone()).collect::<Vec<_>>().join(", "))),
+                    Some(i) => match (f(a, "x"), f(a, "y")) {
+                        (Some(x), Some(y)) => {
+                            let keep = self.object_rot;
+                            self.object_rot = f(a, "rotation").unwrap_or(0.0);
+                            let placed = self.place_prefab(i, [x, y], true);
+                            self.object_rot = keep;
+                            Ok(json!({"indices": placed}))
+                        }
+                        _ => Err("нужны x и y — середина префаба".into()),
+                    },
+                }
+            }
             "describe" => Ok(self.tool_describe(a)),
             "find_assets" => self.tool_find(a),
             "add_object" => self.tool_add_object(a),

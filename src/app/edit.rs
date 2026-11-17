@@ -202,6 +202,38 @@ impl App {
         Some(i)
     }
 
+    /// Поставить префаб `i`: середина в точке (с привязкой к сетке, как у объекта), поворот —
+    /// поворот инструмента «Объект». Поставленное выбрано группой: его тащат целиком.
+    pub fn place_prefab(&mut self, i: usize, p: [f32; 2], alt: bool) -> Vec<usize> {
+        let Some((_, pf)) = self.prefabs.get(i) else { return Vec::new() };
+        let props = pf.placed(self.snap_pos(p, alt), self.object_rot);
+        self.checkpoint();
+        let first = self.map.props.len();
+        self.map.props.extend(props);
+        self.picked = (first..self.map.props.len()).collect();
+        self.sel = None;
+        self.picked.clone()
+    }
+
+    /// Сохранить префабом выбранное группой (или один выбранный объект) под именем.
+    pub fn save_prefab(&mut self, name: &str, idx: &[usize]) -> Result<PathBuf, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("нужно имя префаба".into());
+        }
+        let mut idx: Vec<usize> = idx.iter().copied().filter(|&i| i < self.map.props.len()).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        if idx.is_empty() {
+            return Err("не выбрано ни одного предмета".into());
+        }
+        let props: Vec<Prop> = idx.iter().map(|&i| self.map.props[i].clone()).collect();
+        let pf = crate::prefab::Prefab::from_props(name, &props);
+        let path = crate::prefab::save(&crate::prefab::dir(&self.data_dir), &pf)?;
+        self.prefabs = crate::prefab::load_all(&crate::prefab::dir(&self.data_dir));
+        Ok(path)
+    }
+
     /// Что лежит под точкой: сначала объекты (верхний — последний), потом проёмы, потом стены.
     pub fn pick(&self, w: [f32; 2]) -> Option<Sel> {
         if let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
@@ -314,8 +346,9 @@ impl App {
         let (cw, ch) = (w as f32 / PPC, h as f32 / PPC);
         let num = |v: f32| format!("{v:.2}").trim_end_matches('0').trim_end_matches('.').to_owned();
         let taken = crate::plat::fs::list(&dir);
-        let n = (1..).find(|n| !taken.iter().any(|p| p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(&format!("Объединённый {n}_"))))).unwrap_or(1);
-        let file = dir.join(format!("Объединённый {n}_{}x{}.png", num(cw), num(ch)));
+        // Имя латиницей: картинка уходит в Foundry под своим именем, а кириллицу он кодирует в `%D0…`.
+        let n = (1..).find(|n| !taken.iter().any(|p| p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(&format!("Merged_{n}_"))))).unwrap_or(1);
+        let file = dir.join(format!("Merged_{n}_{}x{}.png", num(cw), num(ch)));
         let mut png = Vec::new();
         out.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| format!("{}: {e}", file.display()))?;
         crate::plat::fs::write(&file, &png).map_err(|e| format!("{}: {e}", file.display()))?;

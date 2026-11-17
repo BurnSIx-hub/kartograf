@@ -400,6 +400,16 @@ impl App {
         // Призрак того, что поставит щелчок.
         let hover = self.hover.filter(|p| canvas.contains(*p) && ui);
         match (self.tool, hover) {
+            (Tool::Object, Some(h)) if self.object_prefab.is_some() => {
+                let w = cam.to_world(canvas, h);
+                let alt = painter.ctx().input(|i| i.modifiers.alt);
+                let at = self.snap_pos(w, alt);
+                if let Some((_, pf)) = self.object_prefab.and_then(|i| self.prefabs.get(i)) {
+                    for ghost in pf.placed(at, self.object_rot) {
+                        self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
+                    }
+                }
+            }
             (Tool::Object, Some(h)) => {
                 if let Some(asset) = self.object_asset.clone() {
                     let w = cam.to_world(canvas, h);

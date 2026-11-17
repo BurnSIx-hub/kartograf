@@ -229,8 +229,11 @@ function rebase(scene, dir) {
   const bg = scene.levels?.[0]?.background?.src ?? scene.background?.src ?? "";
   const own = bg.includes("/") ? bg.split("?")[0].split("/").slice(0, -1).join("/") : "";
   const media = /\.(webp|png|jpe?g|webm|mp4|ogg|mp3|svg)(\?.*)?$/i;
+  // Общая папка ассетов выгрузки не в данных Foundry — `../assets/<файл>`: от папки над .json.
+  const up = dir.split("/").slice(0, -1).join("/");
   const fix = (s) => {
     if (!media.test(s)) return s;
+    if (s.startsWith("../")) return up ? `${up}/${s.slice(3)}` : s.slice(3);
     if (!s.includes("/")) return `${dir}/${s}`;
     if (own && own !== dir && s.startsWith(`${own}/`)) return dir + s.slice(own.length);
     return s;

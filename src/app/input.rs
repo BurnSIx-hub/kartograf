@@ -414,10 +414,17 @@ impl App {
                 let moved = self.moving.is_some();
                 self.drag_prop(ui, resp, pointer, alt);
                 if let (Some(p), false) = (tap, moved) {
-                    if self.object_asset.is_none() {
-                        self.browse = Kind::Object;
+                    match self.object_prefab {
+                        Some(i) => {
+                            self.place_prefab(i, self.cam.to_world(rect, p), alt);
+                        }
+                        None => {
+                            if self.object_asset.is_none() {
+                                self.browse = Kind::Object;
+                            }
+                            self.place_prop(self.cam.to_world(rect, p), alt);
+                        }
                     }
-                    self.place_prop(self.cam.to_world(rect, p), alt);
                 }
             }
             Tool::Select => {
