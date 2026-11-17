@@ -552,6 +552,7 @@ impl App {
                 tile.item = true;
                 tile.above = prop.layer() >= map::ON_ROOF;
                 tile.hover = map::hover_by_name(&prop.asset);
+                tile.afloat = map::afloat_by_name(&prop.asset) && map.on_water(prop.pos);
                 tile.swing = if map::swing_by_name(&prop.asset) { library::strand_ends(&self.textures.sources, &prop.asset) } else { None };
                 tile.slew = map::slew_by_name(&prop.asset).and_then(|o| export::slew_arc(map, prop, o).map(|arc| [o[0], o[1], arc]));
                 tile.rail = export::rail_ride(map, prop, e.px);

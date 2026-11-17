@@ -501,7 +501,7 @@ pub enum Glow {
     Lamp,
     /// Магический свет: рунный кристалл, реактор, светящиеся руны — холодный, голубой.
     Arcane,
-    /// Аварийная лампа станции: тихий красный свет у самой стены, без мигалки.
+    /// Аварийная лампа станции: красный свет у стены, луч медленно ходит по кругу.
     Alarm,
     /// Электрический светильник станции, лаборатории, города будущего: холодный белый, горит
     /// ровно. Только по выбору: по имени не узнаётся (у киберпанка «Neon» в имени половины мебели).
@@ -537,9 +537,10 @@ impl Glow {
             Glow::Lamp => Some((3.0, 6.0, "#ffc870", "torch")),
             // Магический светильник тише камина: бра и шары по стенам не заливают зал.
             Glow::Arcane => Some((1.5, 4.0, "#78b8ff", "energy")),
-            // Аварийная лампа тлеет красным у самой стены и не мигает: вращающаяся сирена
-            // Foundry на десятке ламп рябила на весь зал и мешала игре.
-            Glow::Alarm => Some((0.0, 0.9, "#ff3020", "")),
+            // Аварийная лампа: красный луч медленно ходит по кругу — «вращающийся свет» Foundry.
+            // «Сирена» для этого не годится: даже на скорости 1 она делает 1,6 оборота в секунду,
+            // и десяток ламп рябит на весь зал.
+            Glow::Alarm => Some((0.4, 2.2, "#ff3020", "revolving")),
             // Потолочный светильник станции: как магический по размеру, но белее и без
             // «энергии» — та кружит по полу и воде рябью.
             Glow::Neon => Some((1.5, 4.0, "#cfe8ff", "")),
@@ -551,14 +552,23 @@ impl Glow {
     /// высветляет пол (`luminosity`).
     pub fn look(self) -> (f32, u8, f32, f32) {
         match self {
-            // Красный поверх светлого пола и голубой воды при обычной окраске даёт розово-серую
-            // дымку на всё пятно, а в узком переходе высветляет воду до серого пола. Поэтому
-            // пятно узкое (меньше клетки), красит «выжиганием», пол не высветляет и мягко тает:
-            // краснеют стена и вода у самой лампы.
-            Glow::Alarm => (0.3, 4, 0.9, 0.0),
+            // Красный поверх светлого пола и голубой воды при обычной окраске (1) даёт розово-серую
+            // дымку на всё пятно, «выжигание» (4) на радиусе в две клетки делает тёмные предметы
+            // ядовито-красными. «Внутренний ореол» (2) держит красное у самой лампы и мягко тает;
+            // пол свет не высветляет.
+            Glow::Alarm => (0.45, 2, 0.7, 0.0),
             // Почти белый: цвет едва подкрашивает пол, чтобы десяток светильников не синил зал.
             Glow::Neon => (0.2, 1, 0.5, 0.5),
             _ => (0.35, 1, 0.5, 0.5),
+        }
+    }
+
+    /// Скорость и сила анимации света в Foundry (1–10).
+    pub fn tempo(self) -> (u8, u8) {
+        match self {
+            // Тревога: оборот луча за 4,5 с (скорость 7 — 1,4 рад/с), луч шириной 144° (сила 8).
+            Glow::Alarm => (7, 8),
+            _ => (3, 3),
         }
     }
 }
@@ -777,6 +787,13 @@ pub fn hover_by_name(key: &str) -> bool {
     ["airship", "zeppelin", "blimp", "dirigible", "balloon", "дирижабл", "аэростат"].iter().any(|w| k.contains(w))
 }
 
+/// Плавает на воде: лист бумаги, поплавок. На живой воде «Wild Canvas» слегка покачивает
+/// его в Foundry; на сухом полу он лежит смирно.
+pub fn afloat_by_name(key: &str) -> bool {
+    let k = crate::library::label(key).to_lowercase();
+    ["paper", "float", "buoy", "бумаг", "плава", "поплав"].iter().any(|w| k.contains(w))
+}
+
 /// Паутина: в Foundry — свой тайл, его чуть покачивает модуль Картографа.
 pub fn web_by_name(key: &str) -> bool {
     let lower = key.to_lowercase();
@@ -850,7 +867,10 @@ impl Prop {
         let over_stairs = self.asset.ends_with("stairs_shade");
         // Мост и помост — пол над водой: на них стоят хижины, а стены в Foundry
         // впечатаны в фон — тайл моста их бы накрыл.
-        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs)
+        // Вентилятор в полу плоский, но крутится, а «Wild Canvas» крутит только тайл:
+        // живое плоское — своим тайлом, без тени.
+        let alive = living_by_name(&self.asset).is_some();
+        !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs || alive)
     }
 
     /// Слой «над стенами» — колонны, столбики перил: в Foundry они в тайле стен
@@ -1984,6 +2004,19 @@ impl Map {
 
     /// Где лежит материал `m` (сила 0..255): местность, пол комнат в комнатах
     /// и дороги этим материалом — для живых областей выгрузки.
+    /// Материал, что виден сверху в точке (номер): пол комнаты, иначе местность.
+    pub fn material_under(&self, p: [f32; 2]) -> Option<usize> {
+        let (i, j) = ((p[0] * mask::RES as f32).floor() as isize, (p[1] * mask::RES as f32).floor() as isize);
+        let room = if self.rooms.get(i, j) >= 128 { dominant(&self.room_floor, i, j) } else { 0 };
+        let m = if room != 0 { room } else { dominant(&self.terrain, i, j) };
+        (m != 0).then(|| m as usize - 1)
+    }
+
+    /// В точке сверху живая вода (та, что оживает водой «Wild Canvas»).
+    pub fn on_water(&self, p: [f32; 2]) -> bool {
+        self.material_under(p).and_then(|m| self.materials.get(m)).is_some_and(|m| m.live().effect() == Some("water"))
+    }
+
     pub fn material_mask(&self, m: usize) -> Mask {
         let mut out = Mask { data: vec![0; self.rooms.data.len()], ..self.rooms.clone() };
         for c in self.terrain.iter().filter(|c| c.material as usize == m) {
@@ -2365,6 +2398,21 @@ mod tests {
     }
 
     #[test]
+    fn paper_floats_on_live_water_and_floor_fan_gets_a_tile() {
+        let mut m = Map::new(10, 10);
+        let w = m.materials.iter().position(|x| x.name == "Мелководье").unwrap();
+        m.paint(Layer::Floor, w, &crate::mask::cells(m.rooms.w, m.rooms.h, (2, 2), (7, 7)));
+        assert!(m.on_water([4.5, 4.5]) && !m.on_water([8.5, 8.5]));
+        assert!(afloat_by_name("pack:fa|textures/objects/Paper_Sheet_A_White_1x1.webp") && !afloat_by_name("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
+        // Вентилятор в полу плоский, но живой: своим тайлом (иначе «Wild Canvas» нечего
+        // крутить), без своей тени. Ковёр — плоский и неживой: остаётся в картинке карты.
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        let fan = prop("set:cyberpunk/objects/Floor_Fan_Industrial_A_2x2.webp");
+        assert!(flat_by_name(&fan.asset) && fan.own_tile() && !fan.carries_shadow());
+        assert!(!prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp").own_tile());
+    }
+
+    #[test]
     fn bridges_are_baked_under_walls_not_own_tiles() {
         let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
         assert!(!prop("C:/a/objects/bridges/Bridge_Boardwalk_Platform_A_5x4.webp").own_tile());
@@ -2505,12 +2553,12 @@ mod tests {
         assert_eq!((m.materials[still].live(), m.materials[grid].live()), (Live::Off, Live::Neon));
         assert_eq!(m.material_with_live(grid, Live::Off), Some(still));
         assert_eq!(m.material_with_live(grid, Live::Auto), Some(grid));
-        // Аварийная лампа станции — по имени, красная, с мигалкой.
+        // Аварийная лампа станции — по имени, красная, луч медленно ходит по кругу.
         assert_eq!(glow_by_name("set:scifi/objects/Alarm_Light_Red_A_1x1.webp"), Some(Glow::Alarm));
-        // Горит ровно и рядом: без мигалки, тусклее и уже светильника станции; красит
-        // «выжиганием», а не розовой заливкой. У остальных — как было.
-        assert_eq!(Glow::Alarm.params(), Some((0.0, 0.9, "#ff3020", "")));
-        assert_eq!(Glow::Alarm.look(), (0.3, 4, 0.9, 0.0));
+        // «Вращающийся свет» Foundry, а не сирена; красит ореолом у лампы. У остальных — как было.
+        assert_eq!(Glow::Alarm.params().map(|p| (p.2, p.3)), Some(("#ff3020", "revolving")));
+        assert_eq!((Glow::Alarm.tempo(), Glow::Alarm.look().1), ((7, 8), 2));
+        assert_eq!(Glow::Lamp.tempo(), (3, 3));
         assert_eq!(Glow::Lamp.look(), (0.35, 1, 0.5, 0.5));
         // Светильник станции: холодный, ровный, только по выбору — «Neon» в имени мебели не свет.
         assert_eq!(Glow::Neon.params(), Some((1.5, 4.0, "#cfe8ff", "")));

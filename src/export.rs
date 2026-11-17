@@ -358,6 +358,8 @@ pub struct Light {
     pub animation: &'static str,
     /// Плотность цвета, способ окраски, мягкость края и высветление ([`crate::map::Glow::look`]).
     pub look: (f32, u8, f32, f32),
+    /// Скорость и сила анимации ([`crate::map::Glow::tempo`]).
+    pub tempo: (u8, u8),
 }
 
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
@@ -409,7 +411,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой.
             let glow = p.light()?;
             let (bright, dim, color, animation) = glow.params()?;
-            Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation, look: glow.look() })
+            Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation, look: glow.look(), tempo: glow.tempo() })
         })
         .collect();
     let mut zones = zones(map, room_edges, seen);
@@ -854,6 +856,8 @@ pub struct RoofTile {
     pub above: bool,
     /// Парит («Wild Canvas»): дирижабль плывёт, покачивается, под ним тень.
     pub hover: bool,
+    /// Лежит на воде («Wild Canvas» слегка покачивает): лист бумаги, поплавок.
+    pub afloat: bool,
     /// Гамак («Wild Canvas» качает): концы-крюки в долях картинки от середины.
     pub swing: Option<[f32; 4]>,
     /// Поворотный кран («Wild Canvas» поворачивает): ось в долях картинки и на
@@ -1274,6 +1278,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 if r.hover {
                     tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});
                 }
+                if r.afloat {
+                    tile["flags"][LIVE_MODULE]["afloat"] = json!(1);
+                }
                 if let Some(e) = r.swing {
                     tile["flags"][LIVE_MODULE]["swing"] = json!(e.map(|v| (v as f64 * 1000.0).round() / 1000.0));
                 }
@@ -1607,8 +1614,8 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
             "_id": doc_id('l', lights_out.len()), "x": x, "y": y,
             "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color,
                        "alpha": (l.look.0 as f64 * 100.0).round() / 100.0, "coloration": l.look.1, "attenuation": (l.look.2 as f64 * 100.0).round() / 100.0, "luminosity": (l.look.3 as f64 * 100.0).round() / 100.0,
-                       // Пустая анимация — свет горит ровно (аварийная лампа).
-                       "animation": {"type": if l.animation.is_empty() { Value::Null } else { json!(l.animation) }, "speed": 3, "intensity": 3}},
+                       // Пустая анимация — свет горит ровно (светильник станции).
+                       "animation": {"type": if l.animation.is_empty() { Value::Null } else { json!(l.animation) }, "speed": l.tempo.0, "intensity": l.tempo.1}},
             // Модуль Картографа ставит у огня кнопку: гасить и зажигать может и игрок.
             "flags": {OWN_MODULE: {"toggle": true}}
         }));
@@ -2233,8 +2240,10 @@ mod tests {
         (balloon.item, balloon.above, balloon.hover) = (true, true, true);
         let mut hammock = canopy_tile("k/h.webp".into(), [4.0, 1.0], [2.0, 2.0], 45.0, 100);
         (hammock.item, hammock.swing) = (true, Some([-0.4371, -0.42, 0.43, 0.41]));
+        let mut paper = canopy_tile("k/p.webp".into(), [5.0, 3.0], [1.0, 1.0], 0.0, 100);
+        (paper.item, paper.afloat) = (true, true);
         assert!(crate::map::swing_by_name("objects/Hammock_Wood_Dark_Blue_A_2x2.webp") && !crate::map::swing_by_name("x/Rope_A.webp"));
-        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon, hammock] }];
+        let levels = [SceneLevel { name: "Город".into(), image_src: "k/a.jpg".into(), layout: &la, roofs: vec![ship, balloon, hammock, paper] }];
         let scene = foundry_levels(&a, "Город", &levels, 100, &Default::default());
         let t = &scene["tiles"][0];
         assert_eq!(t["elevation"], 25, "над крышами, а не на полу, как колонка");
@@ -2246,6 +2255,24 @@ mod tests {
         let h = &scene["tiles"][2];
         assert_eq!(h["flags"][LIVE_MODULE]["swing"], json!([-0.437, -0.42, 0.43, 0.41]));
         assert_eq!(h["elevation"], 0);
+        // Бумага на воде покачивается; гамак — нет.
+        assert_eq!(scene["tiles"][3]["flags"][LIVE_MODULE]["afloat"], 1);
+        assert!(h["flags"][LIVE_MODULE].get("afloat").is_none());
+    }
+
+    #[test]
+    fn alarm_light_blinks_slowly() {
+        use crate::map::Prop;
+        let mut m = Map::new(6, 6);
+        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None };
+        m.props.push(prop("set:scifi/objects/Alarm_Light_Red_A_1x1.webp", [2.0, 2.0]));
+        m.props.push(prop("pack:fa|textures/objects/Lantern_Metal_A_1x1.webp", [4.0, 4.0]));
+        let lay = layout(&m, &[]);
+        let scene = foundry_levels(&m, "Станция", &[SceneLevel { name: "Станция".into(), image_src: "s.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+        let (alarm, lamp) = (&scene["lights"][0]["config"]["animation"], &scene["lights"][1]["config"]["animation"]);
+        assert_eq!((alarm["type"].as_str(), alarm["speed"].as_i64(), alarm["intensity"].as_i64()), (Some("revolving"), Some(7), Some(8)));
+        assert_eq!(scene["lights"][0]["config"]["coloration"], 2);
+        assert_eq!((lamp["type"].as_str(), lamp["speed"].as_i64()), (Some("torch"), Some(3)));
     }
 
     #[test]

@@ -19,7 +19,7 @@ Lights in Foundry come from objects: lamps, fires and braziers glow by their nam
 
 Rooms and open floors: `paint` with `target: room` puts walls around the painted floor by itself (room_edges) — use it for enclosed rooms only. Open terraces, balconies, porches, piers and courtyards are `target: terrain` with `feather: 0`, edged with `add_wall` `low: true` where a railing belongs.
 
-Facing: most FA furniture is drawn with its back at the TOP of the picture and faces BOTTOM; fireplaces open to the RIGHT. Give `front` (the facing side as `preview_assets` labels it) and `look_at` [x, y] instead of computing `rotation`; `against_wall: true` turns the back to the nearest wall (straight or diagonal) and moves the object so its visible back touches the wall face.
+Facing: most FA furniture is drawn with its back at the TOP of the picture and faces BOTTOM; fireplaces open to the RIGHT. Give `front` (the facing side as `preview_assets` labels it) and `look_at` [x, y] instead of computing `rotation`; `against_wall: true` turns the back to the nearest wall (straight or diagonal) and moves the object so its visible back touches the wall face; `inset` sinks it that many cells into the wall (wall lamps, panels).
 
 Finding assets: `find_assets` ranks results — the exact file name (with or without the `_1x1` size tail) comes first, then whole words of the name in order; broken, damaged, fallen, desert, arctic, cyberpunk and similar side branches sink unless you name them; `exclude` drops words entirely. Before placing furniture whose facing matters (beds, chairs, wall lamps, fireplaces), call `preview_assets`: it shows each picture at rotation 0 with its sides labelled TOP, RIGHT, BOTTOM, LEFT and returns `visible_cells`, the opaque part of the sprite in cells from its centre.
 
@@ -32,7 +32,7 @@ fn tools() -> Value {
     let point = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2});
     let area = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in cells; x1 and y1 are the far edges (a room [4, 3, 14, 11] gets walls on x=4, x=14, y=3, y=11)"});
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}});
-    let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane", "alarm", "neon"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow); alarm — a soft steady red emergency light close to the wall; neon — a steady cold white electric light (station, lab, future city): never by name, only when chosen"});
+    let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane", "alarm", "neon"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow); alarm — a red emergency light by the wall, its beam slowly sweeping around; neon — a steady cold white electric light (station, lab, future city): never by name, only when chosen"});
     let layer = json!({"type": "string", "enum": ["auto", "floor", "low", "normal", "high", "above_walls", "on_roof", "above_roofs"], "description": "What covers what: floor (rugs), low, normal, high (trees, wardrobes), above_walls, on_roof (chimneys, vents, hatches: part of the roof, gone with it when players enter), above_roofs (airships, birds flying over everything); auto — by its name"});
     let roofs = json!({"type": "string", "enum": ["solid", "ghost", "hidden"], "description": "Roofs: solid as players see them (default), ghost — see-through to check inside, hidden"});
     let canopy = json!({"type": ["boolean", "string"], "description": "A tree crown in Foundry: its own tile above tokens that fades when a token walks under it and sways in the wind (Wild Canvas). Auto (default) — Forgotten Adventures tree tops and the built-in tree; give true for your own tree pictures, false to keep a crown on the ground"});
@@ -43,6 +43,7 @@ fn tools() -> Value {
     let front = json!({"type": "string", "enum": ["bottom", "top", "left", "right"], "description": "Which side of the picture is the object's face, as labelled in preview_assets; default bottom (most FA furniture: back drawn at the top). Used by look_at and against_wall"});
     let look_at = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "Point [x, y] in cells the front should face (a chair to its table, a telescope to the lake); sets rotation unless rotation is given"});
     let against_wall = json!({"type": "boolean", "description": "Put the object's back against the nearest wall within 2 cells (room or free-standing, straight or diagonal): it turns to face away from the wall along its normal and moves so its visible back touches the wall face. The reply has the final x, y, rotation and the wall"});
+    let inset = json!({"type": "number", "minimum": 0, "maximum": 1, "description": "With against_wall: how deep, in cells, the back sinks into the wall — a wall lamp, a wall panel sit in the wall instead of standing by it; default 0"});
     let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors. Bright light shows the floor as by day and never brighter, however many lights overlap (as in Foundry)"});
     let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
     json!([
@@ -64,12 +65,12 @@ fn tools() -> Value {
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
             "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "tint": tint, "recolor": recolor,
-            "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone()
+            "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone(), "inset": inset.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
             "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "tint": tint, "recolor": recolor,
-            "front": front, "look_at": look_at, "against_wall": against_wall
+            "front": front, "look_at": look_at, "against_wall": against_wall, "inset": inset
         }), &["index"]),
         tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
             "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, tavern, house"),
@@ -298,7 +299,7 @@ mod tests {
         }
         assert!(props("paint").get("feather").is_some() && props("paint")["shape"]["enum"].as_array().unwrap().iter().any(|v| v == "poly"));
         assert!(props("find_assets").get("exclude").is_some() && props("view").get("grid").is_some());
-        for k in ["front", "look_at", "against_wall"] {
+        for k in ["front", "look_at", "against_wall", "inset"] {
             assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");
         }
         assert!(props("view").get("lighting").is_some() && props("render_picture").get("lighting").is_some());

@@ -528,7 +528,9 @@ impl App {
         let rot = explicit.unwrap_or_else(|| look_rotation(p, [p[0] + n[0], p[1] + n[1]], base).unwrap_or(rot_now));
         let vb = library::visible_box(&self.textures.sources, key).unwrap_or([-0.5, -0.5, 0.5, 0.5]);
         let back = back_extent(front, vb, size) * scale;
-        let d = half + back + 0.01;
+        // `inset` — насколько спинка утоплена в стену: настенная лампа, щиток сидят в ней.
+        let inset = f(a, "inset").unwrap_or(0.0).clamp(0.0, 1.0);
+        let d = half + back + 0.01 - inset;
         Ok(([p[0] + n[0] * d, p[1] + n[1] * d], rot, Some(json!({"a": seg.0, "b": seg.1, "normal": [r3(n[0]), r3(n[1])]}))))
     }
 
