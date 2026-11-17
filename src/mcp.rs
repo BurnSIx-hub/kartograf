@@ -96,6 +96,7 @@ fn tools() -> Value {
             "current": num("Water current, cells per second, 0..3; 0 — still water. About 1 for a ship under sail"),
             "drift": num("Where the water runs, degrees clockwise from right: 90 — down the map, so the ship sails up"),
             "flows": {"type": "array", "description": "Water that runs differently from the rest (a canal runs, the harbour beside it stands still): each {area: [x0, y0, x1, y1] or points: [[x, y]…], current, drift}. Becomes its own Foundry region; put the seam under a bridge or a lock gate — foam shows at a region edge. Replaces the list; [] clears it.", "items": {"type": "object"}},
+            "shadows": {"type": "object", "description": "The sun of the map: {on, angle — where shadows fall, degrees clockwise from right (45 — down-right, 225 — up-left), dist and blur in cells, opacity 0..1, fade 0..1}. Objects, walls and relief tiers cast their shadows this way, in the picture and in Foundry (Wild Canvas object shadows). Only the keys given change"},
             "rails": {"type": "array", "description": "Mine-cart routes, each a list of points [[x, y]…] in cells along the track; the first point is the depot (inside a mine or tunnel), where carts fade into the dark. Carts, wagons and their loads standing on a route ride it back and forth in Foundry as one train, with a rumble heard nearby; '_Fill' cargo is unloaded at the far end. Replaces the list; [] clears it.", "items": {"type": "array"}}
         }), &[]),
         tool("add_level", "Add a floor above or below the current one and switch to it: a ship's lower deck, a cellar, an upper storey. Same size and palette; draw it like any map. In Foundry every floor is a level; a stairs, ladder or hatch object standing in the same place on two neighbouring floors becomes a passage between them. The scene opens on the floor that is current at export. On an upper floor draw only what belongs to it — its rooms, balconies, decks: whatever is left unpainted there (erase clears it) is see-through in Foundry, and the floor below shows through alive, with its ground, furniture, roofs, tree crowns and tokens. Do not copy the ground, roofs or trees of the lower floor up. A roof on the lower floor that lies mostly under the upper floor is shown only from below.", json!({
@@ -159,6 +160,17 @@ fn tools() -> Value {
         tool("erase", "Erase floor and rooms over a rectangle, oval or polygon, exact to a quarter cell.", json!({
             "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"]}, "points": points,
             "feather": num("0..1, default 0: erase with a soft edge")
+        }), &[]),
+        tool("relief", "Shape the ground: raise a ridge, sink a hollow, cut a cliff. Heights are in tiers of 5 ft (one cell). Where the ground rises steeper than 1.5 tiers per cell it is a cliff: a band of rock face runs down from the edge (wider the higher), scree at its foot, and the higher tier casts a shadow; a gentler step is a narrow ridge. In Foundry a cliff edge is a wall: no walking across, sight passes over it. Over a rectangle, oval or polygon, exact to a quarter cell; feather softens the edge into a slope.", json!({
+            "area": area.clone(), "shape": {"type": "string", "enum": ["rect", "oval", "poly"], "description": "Default rect; poly takes points instead of area"},
+            "points": points.clone(),
+            "mode": {"type": "string", "enum": ["set", "raise", "lower", "smooth"], "description": "set (default) — ground goes to height; raise / lower — by height; smooth — rounds the steps off"},
+            "height": num("Tiers (5 ft each): the height for set, the step for raise and lower. Default 1"),
+            "feather": num("0..1, default 0: share of the way from the edge to the middle over which the change fades — 0 a sheer cliff all around, 0.5 a cliff melting into a slope"),
+            "face": text("Picture of the cliff face, a wall asset key from find_assets (kind wall, e.g. a Cliff_… path texture); '' — the built-in rock. Applies to the whole map"),
+            "ridge": text("Picture of a ridge step (kind wall); '' — built-in. Whole map"),
+            "under": text("Picture of the scree under a cliff (kind wall); '' — built-in. Whole map"),
+            "natural": {"type": "boolean", "description": "Real terrain look: lower tiers are not darkened by depth and gentle slopes get no ridge lines; only the cliffs and their shadows show. Whole map"}
         }), &[]),
         tool("add_wall", "Add a free-standing wall through points (cells). Room walls come from painting with target 'room' instead.", json!({
             "points": {"type": "array", "items": point, "minItems": 2}, "closed": {"type": "boolean", "description": "Connect the last point to the first"},
@@ -337,6 +349,10 @@ mod tests {
             assert!(props("add_door").get(k).is_some(), "add_door {k}");
         }
         assert!(props("paint").get("feather").is_some() && props("paint")["shape"]["enum"].as_array().unwrap().iter().any(|v| v == "poly"));
+        assert!(props("set_scene").get("shadows").is_some());
+        for k in ["mode", "height", "feather", "face", "points", "natural"] {
+            assert!(props("relief").get(k).is_some(), "relief {k}");
+        }
         assert!(props("find_assets").get("exclude").is_some() && props("view").get("grid").is_some());
         for k in ["front", "look_at", "against_wall", "inset"] {
             assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");

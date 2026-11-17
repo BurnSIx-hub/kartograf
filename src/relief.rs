@@ -405,6 +405,45 @@ fn edges_and_bare(r: &Relief) -> (Vec<Edge>, Vec<[f32; 2]>) {
     (out, bare)
 }
 
+/// Насколько кромка у края карты продлевается за него, клетки: шире самой широкой полосы.
+const PAST_BORDER: f32 = 4.0;
+
+/// Конец кромки, упёршийся в край карты (не свободный), продлевается по ходу за рамку на
+/// [`PAST_BORDER`] с той же шириной: полосу обрежет край картинки, а не торец поперёк кромки,
+/// который у рамки стоит наискось. Только для рисунка — стены Foundry строятся по [`edges`].
+fn past_border(e: &mut Edge, mw: f32, mh: f32) {
+    let n = e.points.len();
+    if e.closed || n < 2 {
+        return;
+    }
+    let near = |p: [f32; 2]| p[0].min(p[1]).min(mw - p[0]).min(mh - p[1]) < 1.0;
+    let ahead = |from: [f32; 2], to: [f32; 2]| {
+        let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+        let l = dx.hypot(dy).max(1e-6);
+        [dx / l, dy / l]
+    };
+    let steps = (PAST_BORDER / 0.25).round() as usize;
+    if !e.free[1] && near(e.points[n - 1]) {
+        let (end, d) = (e.points[n - 1], ahead(e.points[n.saturating_sub(5)], e.points[n - 1]));
+        let (wd, dr) = (e.width[n - 1], e.drop[n - 1]);
+        for k in 1..=steps {
+            let t = k as f32 * 0.25;
+            e.points.push([end[0] + d[0] * t, end[1] + d[1] * t]);
+            e.width.push(wd);
+            e.drop.push(dr);
+        }
+    }
+    if !e.free[0] && near(e.points[0]) {
+        let m = e.points.len();
+        let (start, d) = (e.points[0], ahead(e.points[4.min(m - 1)], e.points[0]));
+        let (wd, dr) = (e.width[0], e.drop[0]);
+        let pre: Vec<[f32; 2]> = (1..=steps).rev().map(|k| [start[0] + d[0] * k as f32 * 0.25, start[1] + d[1] * k as f32 * 0.25]).collect();
+        e.points.splice(0..0, pre);
+        e.width.splice(0..0, std::iter::repeat_n(wd, steps));
+        e.drop.splice(0..0, std::iter::repeat_n(dr, steps));
+    }
+}
+
 /// Ширина вдоль кромки плавно, а к свободному концу кромка сходит на нет, как
 /// концевые куски скал FA: стенка ниже и ниже и уходит в склон.
 fn soften(e: &mut Edge) {
@@ -480,7 +519,12 @@ pub fn look(r: &Relief, angle: f32, roads: &[(Vec<[f32; 2]>, f32)]) -> Look {
     }
     // Где полосы нет или она гаснет (гребень под дорогой, обрубок, конец обрыва,
     // голая граница), ступени тоже нет: иначе край затемнения торчит голой линией.
-    let (edges, bare) = edges_and_bare(r);
+    let (mut edges, bare) = edges_and_bare(r);
+    // Кромка, упёршаяся в край карты, уходит за него: иначе у рамки виден торец полосы.
+    let (mw, mh) = (w as f32 / RES as f32, h as f32 / RES as f32);
+    for e in edges.iter_mut() {
+        past_border(e, mw, mh);
+    }
     let fade = fades(&edges, roads);
     let hidden = edges.iter().zip(&fade).flat_map(|(e, f)| e.points.iter().copied().zip(f.iter().map(|a| 1.0 - a))).chain(bare.iter().map(|&p| (p, 1.0)));
     for (p, a) in hidden {
@@ -715,6 +759,32 @@ mod tests {
         let mid = c.width[c.width.len() / 2];
         let drop = c.drop[c.drop.len() / 2];
         assert!((mid - (0.35 + 0.35 * drop)).abs() < 0.2 && drop > 2.5, "ширина {mid}, перепад {drop}");
+    }
+
+    /// Плато в углу карты с косой кромкой: на рисунке кромка уходит за оба края карты,
+    /// а стены (`edges`) остаются внутри.
+    #[test]
+    fn cliff_at_the_border_runs_past_it() {
+        let mut r = Relief::for_cells(12, 12);
+        for j in 0..r.h {
+            for i in 0..r.w {
+                if (i + j) < 9 * RES {
+                    r.data[j * r.w + i] = 4.0;
+                }
+            }
+        }
+        let inside = edges(&r).into_iter().filter(|e| e.kind == EdgeKind::Cliff).collect::<Vec<_>>();
+        assert_eq!(inside.len(), 1, "{inside:?}");
+        assert!(inside[0].points.iter().all(|p| p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= 12.0 && p[1] <= 12.0));
+        let l = look(&r, 45.0, &[]);
+        let k = l.edges.iter().position(|e| e.kind == EdgeKind::Cliff).unwrap();
+        let c = &l.edges[k];
+        let (a, b) = (c.points[0], c.points[c.points.len() - 1]);
+        assert!(a[0].min(a[1]) < -2.0 && b[0].min(b[1]) < -2.0, "концы {a:?} {b:?}");
+        // Полоса у края не тоньше, чем на середине: за краем та же ширина.
+        assert!((c.width[0] - c.width[c.width.len() / 2]).abs() < 0.3, "{:?}", c.width);
+        assert_eq!(c.points.len(), c.width.len());
+        assert_eq!(l.fade[k].len(), c.points.len());
     }
 
     #[test]

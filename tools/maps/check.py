@@ -169,9 +169,10 @@ PARTS = (("Cannon_Base", "Cannon_Metal"), ("Mast_Wood", "Rigging_Mast"), ("Raili
          ("Ore_Pile", "Ore_Pile"), ("Slag_", "Slag_"), ("Coal_", "Coal_"), ("Ingot_", "Ingot_"),  # кучи руды, шлака, угля, штабель слитков
          ("_Beam_", "_Beam_"),  # брусья одной крепи: стойки под верхняком
          ("_Seat_", "_Seat_"),  # кресла одного ряда — вплотную, подлокотник к подлокотнику
-         ("Cryo_Dock", "Cryo_Capsule"))  # капсула в своём гнезде: лежит на его рельсах
+         ("Cryo_Dock", "Cryo_Capsule"),  # капсула в своём гнезде: лежит на его рельсах
+         ("Dog_Sled_Wood", "Dog_Sled_Cargo"), ("Drying_Rack", "Fur_Pelt"))  # поклажа на санях, шкура на раме
 # Завал: обломки камня, балки и лом лежат грудой друг на друге — так и задумано.
-HEAP = ("Rubble_", "Debris_", "Scrap_Metal", "Beam_Metal", "IBeam_Metal")
+HEAP = ("Rubble_", "Debris_", "Scrap_Metal", "Beam_Metal", "IBeam_Metal", "Fir_Log_Snowy_B")  # и брёвна штабелем
 # Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску.
 ON_TOP = ("Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle", "Tang_Metal_Molten")
 cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800 and not o.get("canopy")]
@@ -435,7 +436,8 @@ pown = {}                          # точка -> предметы, котор�
 P_FLAT = ("Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light",
           "Decal_", "Shadow_", "Puddle", "Stairs", "Ladder", "Hatch", "Trapdoor", "Tree", "Дерево", "Bush", "Reeds_", "Cattail",
           "Lilypad", "Fern", "Grass", "Pipe_Brass", "Chandelier", "Net_01", "Rope", "Chain_Metal", "Cable", "Sunken", "Paper",
-          "Clothes_Line", "Hammock", "Tarp", "Awning", "Banner", "Flag", "Rigging", "Windsock", "Sail_")
+          "Clothes_Line", "Hammock", "Tarp", "Awning", "Banner", "Flag", "Rigging", "Windsock", "Sail_",
+          "Cliff_Entrance")  # зев в стене обрыва — часть скалы, в него входят
 # Препятствие, но поставлено затем, чтобы загородить: завал, ограда, ворота. В счёт идёт как стена.
 P_BARRIER = HEAP + ("Railing_", "Fence", "Gate", "Barricade", "Palisade", "Portcullis")
 P_OPEN = [dd for dd in doors if dd.get("kind") != "window"]

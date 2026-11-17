@@ -213,6 +213,7 @@ impl App {
             "remove" => self.tool_remove(a),
             "paint" => self.tool_paint(a, false),
             "erase" => self.tool_paint(a, true),
+            "relief" => self.tool_relief(a),
             "add_wall" => self.tool_add_wall(a),
             "add_door" => self.tool_add_door(a),
             "edit_door" => self.tool_edit_door(a),
@@ -330,9 +331,14 @@ impl App {
             "level": self.level, "levels": self.levels.len(),
             "level_names": (0..self.levels.len()).map(|k| self.level_name(k)).collect::<Vec<_>>(),
             "seed": m.seed,
-            "scene": {"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift},
+            "scene": {"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift,
+                "shadows": {"on": m.shadows.on, "angle": m.shadows.angle, "dist": m.shadows.dist, "blur": m.shadows.blur, "opacity": m.shadows.opacity, "fade": m.shadows.fade}},
             "objects": m.props.len(), "walls": m.walls.len(), "doors": m.portals.len(),
             "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(), "platforms": m.platforms.len(),
+            "relief": m.relief.as_ref().map(|r| {
+                let (lo, hi) = r.data.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                json!({"lowest": (lo * 100.0).round() / 100.0, "highest": (hi * 100.0).round() / 100.0, "face": r.face_key(), "ridge": r.ridge_key(), "under": r.under_key(), "natural": r.natural})
+            }),
             "materials": m.materials.iter().enumerate().map(|(i, x)| {
                 let mut j = json!({"index": i, "name": x.name, "texture": match &x.paint { Paint::Texture(t) => Some(t.clone()), Paint::Color(_) => None }});
                 if x.rot != 0.0 {
@@ -779,6 +785,78 @@ impl App {
         Ok(json!({"material": m, "cells": cells, "target": if room { "room" } else { "terrain" }, "feather": feather, "angle": self.map.materials[m].rot}))
     }
 
+    /// Рельеф по прямоугольнику, овалу или многоугольнику — как кисть «Рельеф» в окне:
+    /// `set` ведёт землю к высоте, `raise`/`lower` — на высоту, `smooth` сглаживает.
+    /// Картинки кромок и «настоящий» вид — у рельефа всей карты.
+    fn tool_relief(&mut self, a: &Value) -> Res {
+        let (mw, mh) = (self.map.rooms.w, self.map.rooms.h);
+        let mut probe = self.map.relief.clone().unwrap_or_else(|| crate::relief::Relief::for_cells(self.map.width, self.map.height));
+        for (k, slot) in [("face", 0), ("ridge", 1), ("under", 2)] {
+            if let Some(s) = a[k].as_str() {
+                let key = if s.is_empty() { String::new() } else { self.asset_key(s)? };
+                *[&mut probe.face, &mut probe.ridge, &mut probe.under][slot] = key;
+            }
+        }
+        if let Some(n) = a["natural"].as_bool() {
+            probe.natural = n;
+        }
+        let mode = a["mode"].as_str().unwrap_or("set");
+        let height = f(a, "height").unwrap_or(1.0);
+        let shaped = a.get("area").is_some() || a.get("points").is_some();
+        let mut cells = 0.0;
+        if shaped {
+            let shape = a["shape"].as_str().unwrap_or(if a.get("points").is_some() && a.get("area").is_none() { "poly" } else { "rect" });
+            let mut weights = match shape {
+                "poly" => {
+                    let pts = points_of(a);
+                    if pts.len() < 3 {
+                        return Err("shape poly: нужны points — хотя бы три точки [x, y]".into());
+                    }
+                    mask::poly(mw, mh, &pts)
+                }
+                "rect" | "oval" => {
+                    let r = area_of(a).ok_or("нужна area: [x0, y0, x1, y1]")?;
+                    if shape == "oval" { mask::oval_f(mw, mh, r) } else { mask::rect_f(mw, mh, r) }
+                }
+                other => return Err(format!("shape «{other}»: rect, oval или poly")),
+            };
+            if weights.is_empty() {
+                return Err("область пустая или вне карты".into());
+            }
+            mask::soften(mw, mh, &mut weights, f(a, "feather").unwrap_or(0.0).clamp(0.0, 1.0));
+            cells = (weights.iter().map(|w| w.1).sum::<f32>() / (mask::RES * mask::RES) as f32 * 100.0).round() / 100.0;
+            let base = probe.clone();
+            match mode {
+                "smooth" => {
+                    for _ in 0..3 {
+                        probe.smooth(&weights);
+                    }
+                }
+                "set" | "raise" | "lower" => {
+                    for &(i, v) in &weights {
+                        let b = base.data[i];
+                        probe.data[i] = match mode {
+                            "raise" => b + height * v,
+                            "lower" => b - height * v,
+                            _ => b + (height - b) * v,
+                        };
+                    }
+                }
+                other => return Err(format!("mode «{other}»: set, raise, lower или smooth")),
+            }
+        } else if !["face", "ridge", "under", "natural"].iter().any(|k| a.get(*k).is_some()) {
+            return Err("нужна область (area или points) — или картинки кромок face / ridge / under, natural".into());
+        }
+        self.checkpoint();
+        let (lo, hi) = probe.data.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let summary = json!({"cells": cells, "mode": mode, "height": height, "lowest": (lo * 100.0).round() / 100.0, "highest": (hi * 100.0).round() / 100.0,
+            "face": probe.face_key(), "ridge": probe.ridge_key(), "under": probe.under_key(), "natural": probe.natural});
+        self.map.relief = Some(probe);
+        self.map.prune();
+        self.edges_dirty = true;
+        Ok(summary)
+    }
+
     fn tool_add_wall(&mut self, a: &Value) -> Res {
         let points = points_of(a);
         if points.len() < 2 {
@@ -1160,8 +1238,30 @@ impl App {
                     .collect::<Result<Vec<_>, String>>()?,
             ),
         };
+        let sun = &a["shadows"];
+        if !sun.is_null() && !sun.is_object() {
+            return Err("shadows: {on, angle, dist, blur, opacity, fade}".into());
+        }
         self.checkpoint();
         let m = &mut self.map;
+        if let Some(v) = sun["on"].as_bool() {
+            m.shadows.on = v;
+        }
+        if let Some(v) = sun["angle"].as_f64() {
+            m.shadows.angle = (v as f32).rem_euclid(360.0);
+        }
+        if let Some(v) = sun["dist"].as_f64() {
+            m.shadows.dist = (v as f32).clamp(0.0, 3.0);
+        }
+        if let Some(v) = sun["blur"].as_f64() {
+            m.shadows.blur = (v as f32).clamp(0.0, 3.0);
+        }
+        if let Some(v) = sun["opacity"].as_f64() {
+            m.shadows.opacity = (v as f32).clamp(0.0, 1.0);
+        }
+        if let Some(v) = sun["fade"].as_f64() {
+            m.shadows.fade = (v as f32).clamp(0.0, 1.0);
+        }
         if let Some(v) = ambience {
             m.ambience = v;
         }
@@ -1187,7 +1287,9 @@ impl App {
             m.rails = v;
         }
         let flows: Vec<Value> = m.flows.iter().map(|f| json!({"points": f.points, "current": f.current, "drift": f.drift})).collect();
-        Ok(json!({"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails}))
+        let s = &m.shadows;
+        Ok(json!({"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails,
+            "shadows": {"on": s.on, "angle": s.angle, "dist": s.dist, "blur": s.blur, "opacity": s.opacity, "fade": s.fade}}))
     }
 
     fn tool_add_roof(&mut self, a: &Value) -> Res {
