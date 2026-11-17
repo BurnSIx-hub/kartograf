@@ -170,6 +170,8 @@ PARTS = (("Cannon_Base", "Cannon_Metal"), ("Mast_Wood", "Rigging_Mast"), ("Raili
          ("_Beam_", "_Beam_"),  # брусья одной крепи: стойки под верхняком
          ("_Seat_", "_Seat_"),  # кресла одного ряда — вплотную, подлокотник к подлокотнику
          ("Cryo_Dock", "Cryo_Capsule"))  # капсула в своём гнезде: лежит на его рельсах
+# Завал: обломки камня, балки и лом лежат грудой друг на друге — так и задумано.
+HEAP = ("Rubble_", "Debris_", "Scrap_Metal", "Beam_Metal", "IBeam_Metal")
 # Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску.
 ON_TOP = ("Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle", "Tang_Metal_Molten")
 cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800 and not o.get("canopy")]
@@ -228,6 +230,8 @@ for i, a in enumerate(cand):
             continue
         if has(a, *ON_TOP) or has(b, *ON_TOP):
             continue
+        if has(a, *HEAP) and has(b, *HEAP):
+            continue
         if beam_run(a, b):
             continue
         # Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
@@ -249,6 +253,9 @@ for dd in doors:
     (x1, y1), (x2, y2) = dd["a"], dd["b"]
     L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2 or 1
     for o in objs:
+        # Проём без створки, заваленный обломками, — завал: проход закрыт намеренно.
+        if dd.get("kind") == "opening" and has(o, "Rubble_"):
+            continue
         # Плоское на полу (ковёр, разметка, утопленное на дне) и настенная лампа проход не загораживают.
         if o["layer"] >= 800 or o["layer"] <= 100 or o.get("canopy") or bridge(o) or has(o, "Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light") or has(o, *FACADE):
             continue
