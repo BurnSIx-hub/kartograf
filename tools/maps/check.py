@@ -7,8 +7,11 @@ import json, math, os, sys
 sys.stdout.reconfigure(encoding="utf-8")
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.py"), encoding="utf-8").read())
 
-_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls"], limit=3000)
+_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls", "room_walls"], limit=3000)
 d = json.loads(t)
+# Стены по краю закрашенных комнат (Картограф 0.2.39+): у станции и подземелья без крыш
+# по ним видно, что внутри. У старого Картографа на их месте строка-пояснение.
+ROOM_WALLS = d.get("room_walls") if isinstance(d.get("room_walls"), list) else []
 objs, roofs, doors, labels, walls = d["objects"], d.get("roofs", []), d.get("doors", []), d.get("labels", []), d.get("walls", [])
 _, t = call("map_info")
 W, H = json.loads(t)["width"], json.loads(t)["height"]
@@ -157,16 +160,46 @@ for o, e in ends:
         continue
     issues.append(f"[труба] #{o['index']}: конец ({e[0]:.1f}, {e[1]:.1f}) ни к чему не подключён")
 # 4. Наложения одного слоя
-SKIP = ("Steam", "Track_", "Shadow_", "Rug", "Pipe_Brass", "Manhole", "Floor_", "Landing_Pad", "Puddle", "Map_", "Lantern", "Toolbox", "Cattail", "Lilypad", "Reeds_", "Skull_Decor",
+# Decal_ — плашка пола (разметка, помост, ступени зала): это сам пол, на нём лежат и стоят.
+SKIP = ("Steam", "Track_", "Shadow_", "Rug", "Pipe_Brass", "Manhole", "Floor_", "Landing_Pad", "Puddle", "Map_", "Lantern", "Toolbox", "Cattail", "Lilypad", "Reeds_", "Skull_Decor", "Decal_",
         "Gauge", "Propeller_Metal", "Box_Luggage_Lid_Leather_Brown_Metal_Brass_A11", "Valve")
 # Части одного устройства: лафет и ствол, мачта и кофель-планка вокруг неё.
 PARTS = (("Cannon_Base", "Cannon_Metal"), ("Mast_Wood", "Rigging_Mast"), ("Railing_", "Railing_"),  # куски одного ограждения — внахлёст
          ("MineCart", "Ore_Minecart_Fill"), ("Water_Wheel", "Water_Wheel"), ("Bellows", "_Beam_"),  # груз в вагонетке, колесо и ось, вал мехов
          ("Ore_Pile", "Ore_Pile"), ("Slag_", "Slag_"), ("Coal_", "Coal_"), ("Ingot_", "Ingot_"),  # кучи руды, шлака, угля, штабель слитков
-         ("_Beam_", "_Beam_"))  # брусья одной крепи: стойки под верхняком
+         ("_Beam_", "_Beam_"),  # брусья одной крепи: стойки под верхняком
+         ("_Seat_", "_Seat_"),  # кресла одного ряда — вплотную, подлокотник к подлокотнику
+         ("Cryo_Dock", "Cryo_Capsule"))  # капсула в своём гнезде: лежит на его рельсах
 # Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску.
 ON_TOP = ("Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle", "Tang_Metal_Molten")
 cand = [o for o in objs if not has(o, *SKIP) and o["w"] * o["h"] >= 1 and o["layer"] < 800 and not o.get("canopy")]
+
+
+def clip(subject, clipper):
+    """Пересечение выпуклых многоугольников (Сазерленд — Ходжман); обход любой."""
+    def area2(pts):
+        return sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts)))
+    sgn = 1 if area2(clipper) > 0 else -1
+    out = subject
+    for i in range(len(clipper)):
+        (ax, ay), (bx, by) = clipper[i], clipper[(i + 1) % len(clipper)]
+        side = lambda p: sgn * ((bx - ax) * (p[1] - ay) - (by - ay) * (p[0] - ax))
+        src, out = out, []
+        for j in range(len(src)):
+            p, q = src[j], src[(j + 1) % len(src)]
+            sp, sq = side(p), side(q)
+            if sp >= 0:
+                out.append(p)
+            if (sp >= 0) != (sq >= 0):
+                tt = sp / (sp - sq)
+                out.append((p[0] + (q[0] - p[0]) * tt, p[1] + (q[1] - p[1]) * tt))
+        if not out:
+            return []
+    return out
+
+
+def poly_area(pts):
+    return abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts)))) / 2 if len(pts) > 2 else 0.0
 
 
 def beam_run(a, b):
@@ -180,8 +213,11 @@ def beam_run(a, b):
     return abs((b["x"] - a["x"]) * math.cos(t) + (b["y"] - a["y"]) * math.sin(t)) < 0.05
 
 
+# Наложение — по повёрнутым прямоугольникам видимой части, а не по рамкам вдоль осей:
+# у кресел дугой и перил по кругу рамки раздуты и пересекаются, хотя картинки нет.
 for i, a in enumerate(cand):
     ba = box(a, 0.8)
+    pa = corners(a)
     for b in cand[i + 1:]:
         if a["layer"] != b["layer"]:
             continue
@@ -198,8 +234,11 @@ for i, a in enumerate(cand):
         if any(has(x, "Table", "Desk", "Counter", "Bar_") for x in (a, b)) and min(a["w"] * a["h"], b["w"] * b["h"]) <= 2:
             continue
         bb = box(b, 0.8)
-        ix = max(0, min(ba[2], bb[2]) - max(ba[0], bb[0])) * max(0, min(ba[3], bb[3]) - max(ba[1], bb[1]))
-        small = min((ba[2] - ba[0]) * (ba[3] - ba[1]), (bb[2] - bb[0]) * (bb[3] - bb[1]))
+        if min(ba[2], bb[2]) <= max(ba[0], bb[0]) or min(ba[3], bb[3]) <= max(ba[1], bb[1]):
+            continue
+        pb = corners(b)
+        ix = poly_area(clip(pa, pb))
+        small = min(poly_area(pa), poly_area(pb))
         if small > 0 and ix / small > 0.3:
             issues.append(f"[наложение] #{a['index']} {name(a)} и #{b['index']} {name(b)} ({ix / small:.0%})")
 # 5. Двери: свободный проход
@@ -210,7 +249,8 @@ for dd in doors:
     (x1, y1), (x2, y2) = dd["a"], dd["b"]
     L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2 or 1
     for o in objs:
-        if o["layer"] >= 800 or o.get("canopy") or bridge(o) or has(o, "Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp") or has(o, *FACADE):
+        # Плоское на полу (ковёр, разметка, утопленное на дне) и настенная лампа проход не загораживают.
+        if o["layer"] >= 800 or o["layer"] <= 100 or o.get("canopy") or bridge(o) or has(o, "Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light") or has(o, *FACADE):
             continue
         tt = max(0, min(1, ((o["x"] - x1) * (x2 - x1) + (o["y"] - y1) * (y2 - y1)) / L2))
         dseg = math.dist((o["x"], o["y"]), (x1 + tt * (x2 - x1), y1 + tt * (y2 - y1)))
@@ -242,6 +282,25 @@ for w in walls:
                 for dy in (-1, 0, 1):
                     if 0 <= gx + dx < GW and 0 <= gy + dy < GH:
                         solid[(gy + dy) * GW + gx + dx] = 1
+for (x1, y1), (x2, y2) in ROOM_WALLS:
+    n = max(1, int(math.dist((x1, y1), (x2, y2)) / 0.05))
+    for k in range(n + 1):
+        gx, gy = int((x1 + (x2 - x1) * k / n) / STEP) + 1, int((y1 + (y2 - y1) * k / n) / STEP) + 1
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if 0 <= gx + dx < GW and 0 <= gy + dy < GH:
+                    solid[(gy + dy) * GW + gx + dx] = 1
+# Дверь и проём замыкают стену: помещение за дверью — не улица. Станция без крыш с
+# разломом в космос или двор с воротами — внутри, а не снаружи.
+for dd in doors:
+    (x1, y1), (x2, y2) = dd["a"], dd["b"]
+    n = max(1, int(math.dist((x1, y1), (x2, y2)) / 0.05))
+    for k in range(n + 1):
+        gx, gy = int((x1 + (x2 - x1) * k / n) / STEP) + 1, int((y1 + (y2 - y1) * k / n) / STEP) + 1
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if 0 <= gx + dx < GW and 0 <= gy + dy < GH:
+                    solid[(gy + dy) * GW + gx + dx] = 1
 # Проход в ограде, где стоит трап или лестница, ведёт на другой этаж, а не на улицу.
 for o in objs:
     if has(o, "Ladder", "Stairs", "Trapdoor", "Hatch"):
