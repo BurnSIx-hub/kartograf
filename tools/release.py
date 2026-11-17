@@ -10,6 +10,9 @@ import hashlib, json, os, re, subprocess, sys, tempfile
 REPO = 'BurnSIx-hub/kartograf-releases'
 notes = sys.argv[1] if len(sys.argv) > 1 else ''
 version = re.search(r'^version = "(.+)"', open('Cargo.toml', encoding='utf-8').read(), re.M)[1]
+here = os.path.dirname(os.path.abspath(__file__))
+# Сборщик модуля Foundry — до долгой сборки: без него выпуск всё равно не выйдет.
+subprocess.run([sys.executable, os.path.join(here, 'module_pack.py'), 'check'], check=True)
 subprocess.run(['cargo', 'build', '--release'], check=True)
 exe = 'target/release/kartograf.exe'
 data = open(exe, 'rb').read()
@@ -21,7 +24,6 @@ latest = {
 }
 path = os.path.join(tempfile.mkdtemp(), 'latest.json')
 json.dump(latest, open(path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-here = os.path.dirname(os.path.abspath(__file__))
 out = os.path.dirname(path)
 subprocess.run([sys.executable, os.path.join(here, 'module_pack.py'), 'zip', out], check=True)
 assets = [exe, path, os.path.join(out, 'module.zip'), os.path.join(out, 'module.json')]

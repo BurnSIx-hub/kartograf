@@ -7,7 +7,7 @@ import json, math, os, sys
 sys.stdout.reconfigure(encoding="utf-8")
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.py"), encoding="utf-8").read())
 
-_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls", "room_walls"], limit=3000)
+_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls", "room_walls", "visible"], limit=3000)
 d = json.loads(t)
 # Стены по краю закрашенных комнат (Картограф 0.2.39+): у станции и подземелья без крыш
 # по ним видно, что внутри. У старого Картографа на их месте строка-пояснение.
@@ -412,6 +412,356 @@ for o in objs:
     span, axis, lo, hi = min(spans)
     issues.append(f"[фонарь] #{o['index']} {name(o)} ({o['x']:.1f}, {o['y']:.1f}) посреди прохода шириной {span:.1f}: "
                   f"до краёв по {axis} {lo:.2f} и {hi:.2f}, до ближайшего края {min(dists):.2f}")
+
+# 13. Проход: предметы не перегораживают коридор, выход из комнаты, улочку, галерею. Фишка в клетку
+# должна пройти мимо — или обойти не дальше DETOUR клеток. Дальний обход по кольцу не в счёт:
+# инкубатор посреди коридора «мешает пройти», хотя кругом дойти можно. Затор — когда по обе стороны
+# от предметов есть куда идти: дверь либо место от BIG клеток. Угол обжитой комнаты, куда не
+# протиснуться мимо стола, — не затор. И ряд предметов, что стоит сам по себе, не касаясь стен
+# (грядки и брёвна на поляне, стол посреди зала), — тоже: его обходят. Двери и проёмы открыты,
+# окно — стена.
+# Сетка в 1/10 клетки; центр фишки не ближе RW к линии стены и RO к видимой части предмета:
+# между двумя предметами нужно 0,8 клетки, между предметом и стеной — 0,7.
+PS, RW, RO, MARG, DETOUR, BIG, PAD = 0.1, 0.3, 0.4, 1.2, 8.0, 3.0, 2.0
+MIN_PART, BIG_PART, FAR = int(0.2 / PS / PS), int(BIG / PS / PS), int(DETOUR / PS)
+# За краем карты — поле в PAD клеток: край карты не стена, у леса и улицы за ним то же самое.
+PW, PH = int(round((W + 2 * PAD) / PS)), int(round((H + 2 * PAD) / PS))
+pwall = bytearray(PW * PH)         # точку закрывает стена или то, что поставлено загородить
+pblk = bytearray(PW * PH)          # точку закрывает стена или предмет
+pline = bytearray(PW * PH)         # через точку идёт сама линия стены
+pdoor = set()                      # точки в дверях и проёмах
+pown = {}                          # точка -> предметы, которые её закрывают
+# Не препятствие: плоское, над головой, растения, переходы между этажами.
+P_FLAT = ("Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light",
+          "Decal_", "Shadow_", "Puddle", "Stairs", "Ladder", "Hatch", "Trapdoor", "Tree", "Дерево", "Bush", "Reeds_", "Cattail",
+          "Lilypad", "Fern", "Grass", "Pipe_Brass", "Chandelier", "Net_01", "Rope", "Chain_Metal", "Cable", "Sunken", "Paper",
+          "Clothes_Line", "Hammock", "Tarp", "Awning", "Banner", "Flag", "Rigging", "Windsock", "Sail_")
+# Препятствие, но поставлено затем, чтобы загородить: завал, ограда, ворота. В счёт идёт как стена.
+P_BARRIER = HEAP + ("Railing_", "Fence", "Gate", "Barricade", "Palisade", "Portcullis")
+P_OPEN = [dd for dd in doors if dd.get("kind") != "window"]
+p_cell = lambda x, y: min(PH - 1, max(0, int((y + PAD) / PS))) * PW + min(PW - 1, max(0, int((x + PAD) / PS)))
+P_IN = (int(PAD / PS), int(PAD / PS), int((W + PAD) / PS), int((H + PAD) / PS))
+p_onmap = lambda c: P_IN[0] <= c % PW < P_IN[2] and P_IN[1] <= c // PW < P_IN[3]
+
+
+def p_rect(o):
+    """Видимая часть предмета: центр, полуразмеры, косинус и синус поворота.
+    `vis` отдаёт Картограф 0.2.41+; без него — 80 % холста (у FA вокруг предмета поля под тень)."""
+    a = math.radians(o["rotation"] or 0)
+    ca, sa = math.cos(a), math.sin(a)
+    if o.get("vis"):
+        l, top, r, b = o["vis"]
+        mx, my = (l + r) / 2, (top + b) / 2
+        return o["x"] + mx * ca - my * sa, o["y"] + mx * sa + my * ca, (r - l) / 2, (b - top) / 2, ca, sa
+    return o["x"], o["y"], o["w"] * o.get("scale", 1) * 0.4, o["h"] * o.get("scale", 1) * 0.4, ca, sa
+
+
+def p_span(lo, hi, n):
+    return range(max(0, int((lo + PAD) / PS)), min(n - 1, int((hi + PAD) / PS)) + 1)
+
+
+def p_seg(x1, y1, x2, y2, reach, mark):
+    """Точки не дальше reach от отрезка — в mark(точка, квадрат расстояния)."""
+    dx, dy = x2 - x1, y2 - y1
+    L2 = dx * dx + dy * dy or 1e-9
+    for j in p_span(min(y1, y2) - reach, max(y1, y2) + reach, PH):
+        cy = (j + 0.5) * PS - PAD
+        for i in p_span(min(x1, x2) - reach, max(x1, x2) + reach, PW):
+            cx = (i + 0.5) * PS - PAD
+            tt = ((cx - x1) * dx + (cy - y1) * dy) / L2
+            tt = 0 if tt < 0 else 1 if tt > 1 else tt
+            ex, ey = cx - (x1 + tt * dx), cy - (y1 + tt * dy)
+            if ex * ex + ey * ey < reach * reach:
+                mark(j * PW + i, ex * ex + ey * ey)
+
+
+def p_wall_mark(c, d2):
+    pwall[c] = pblk[c] = 1
+    if d2 < 0.5625 * PS * PS:
+        pline[c] = 1
+
+
+def p_wall(x1, y1, x2, y2):
+    """Стена без кусков под дверями и проёмами. Контур комнат идёт под дверью сплошь, у толстой
+    стены — обеими гранями: вырезается всё, что лежит вдоль двери не дальше 0,75 клетки от неё."""
+    dx, dy = x2 - x1, y2 - y1
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return
+    ux, uy = dx / L, dy / L
+    gaps = []
+    for dd in P_OPEN:
+        (ax, ay), (bx, by) = dd["a"], dd["b"]
+        dl = math.hypot(bx - ax, by - ay) or 1e-9
+        if abs(ux * (by - ay) - uy * (bx - ax)) / dl > 0.2:
+            continue   # дверь не вдоль этой стены
+        if max(abs((ax - x1) * uy - (ay - y1) * ux), abs((bx - x1) * uy - (by - y1) * ux)) > 0.75:
+            continue
+        ta, tb = sorted(((ax - x1) * ux + (ay - y1) * uy, (bx - x1) * ux + (by - y1) * uy))
+        if tb > 0 and ta < L:
+            gaps.append((max(0.0, ta), min(L, tb)))
+    at = 0.0
+    for ta, tb in sorted(gaps) + [(L, L)]:
+        if ta - at > 1e-6:
+            p_seg(x1 + ux * at, y1 + uy * at, x1 + ux * ta, y1 + uy * ta, RW, p_wall_mark)
+        at = max(at, tb)
+
+
+def p_near(c):
+    i = c % PW
+    return [q for q in (c - 1 if i > 0 else -1, c + 1 if i < PW - 1 else -1, c - PW, c + PW) if 0 <= q < PW * PH]
+
+
+def p_obj(o):
+    """Точки, куда центр фишки не встанет из-за предмета: видимая часть со скруглёнными углами.
+    Только по свою сторону стены: купол у стены зала не сужает коридор за ней."""
+    x, y, hw, hh, ca, sa = p_rect(o)
+    rc = 0.3 * min(hw, hh)
+    reach = math.hypot(hw, hh) + RO
+    cells = set()
+    for j in p_span(y - reach, y + reach, PH):
+        dy = (j + 0.5) * PS - PAD - y
+        for i in p_span(x - reach, x + reach, PW):
+            dx = (i + 0.5) * PS - PAD - x
+            lx, ly = abs(dx * ca + dy * sa) - (hw - rc), abs(dy * ca - dx * sa) - (hh - rc)
+            if math.hypot(max(lx, 0.0), max(ly, 0.0)) < RO + rc:
+                cells.add(j * PW + i)
+    c0 = p_cell(x, y)
+    if c0 not in cells or pline[c0]:
+        return sorted(cells)       # середина на самой стене: предмет стоит поперёк неё
+    seen, todo = {c0}, [c0]
+    while todo:
+        c = todo.pop()
+        for q in p_near(c):
+            if q in cells and q not in seen:
+                seen.add(q)
+                if not pline[q]:
+                    todo.append(q)
+    return sorted(seen)
+
+
+def p_solid(o):
+    """Стоит на полу и выше щиколотки: мебель, ящики, станки, стулья. Мелочь на полу (слой 200) — нет."""
+    if not (250 < o["layer"] < 700) or o.get("canopy") or bridge(o) or has(o, *P_FLAT) or has(o, *FACADE):
+        return False
+    _, _, hw, hh, _, _ = p_rect(o)
+    return min(hw, hh) >= 0.22 and 0.25 <= hw * hh * 4 <= 60
+
+
+for w in walls:
+    pts = w["points"] + ([w["points"][0]] if w.get("closed") else [])
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        p_wall(x1, y1, x2, y2)
+for (x1, y1), (x2, y2) in ROOM_WALLS:
+    p_wall(x1, y1, x2, y2)
+for dd in P_OPEN:
+    p_seg(*dd["a"], *dd["b"], 0.45, lambda c, d2: pdoor.add(c))
+pcells, pobj = {}, {}
+p_group = {}                       # предмет -> старший в связке: те, чьи закрытые точки перекрываются
+
+
+def p_top(k):
+    while p_group[k] != k:
+        p_group[k] = p_group[p_group[k]]
+        k = p_group[k]
+    return k
+
+
+for o in objs:
+    if not p_solid(o):
+        continue
+    cells = p_obj(o)
+    if has(o, *P_BARRIER):
+        for c in cells:
+            pwall[c] = pblk[c] = 1
+        continue
+    k = o["index"]
+    pcells[k], pobj[k], p_group[k] = cells, o, k
+    for c in cells:
+        pblk[c] = 1
+        if c in pown:
+            p_group[p_top(pown[c][0])] = p_top(k)
+            pown[c].append(k)
+        else:
+            pown[c] = [k]
+
+# Свободное место целиком: куски, между которыми фишке не пройти.
+glab, gsize = [-1] * (PW * PH), []
+for c0 in range(PW * PH):
+    if pblk[c0] or glab[c0] >= 0:
+        continue
+    glab[c0] = len(gsize)
+    todo, n = [c0], 0
+    while todo:
+        c = todo.pop()
+        n += 1
+        for q in p_near(c):
+            if not pblk[q] and glab[q] < 0:
+                glab[q] = glab[c0]
+                todo.append(q)
+    gsize.append(n)
+# Закуток, куда не попасть (щель между опрокинутой капсулой и дроном), — не проход: он закрыт теми
+# предметами, что его окружают, и связывает их в одно препятствие. Иначе каждый из двух предметов
+# порознь «ничего не отрезает»: за ним только закуток.
+p_nook = {}
+for c in range(PW * PH):
+    if not pblk[c] and gsize[glab[c]] < BIG_PART:
+        p_nook.setdefault(glab[c], []).append(c)
+for cells in p_nook.values():
+    if any(c in pdoor for c in cells):
+        continue                   # закуток с дверью — чулан: туда ходят
+    around = sorted({k for c in cells for q in p_near(c) for k in pown.get(q, ())})
+    for c in cells:
+        pblk[c] = 1
+        if around:
+            pown[c] = list(around)
+        else:
+            pwall[c] = 1
+    for k in around:
+        pcells[k] = pcells[k] + cells
+        p_group[p_top(k)] = p_top(around[0])
+
+
+def p_side(src, stop=()):
+    """Куда фишка дойдёт от куска свободного места не дальше FAR шагов; None — дошла до stop."""
+    dist = dict.fromkeys(src, 0)
+    todo, k = list(src), 0
+    while k < len(todo):
+        c = todo[k]
+        k += 1
+        if c in stop:
+            return None
+        if dist[c] >= FAR:
+            continue
+        for q in p_near(c):
+            if not pblk[q] and q not in dist:
+                dist[q] = dist[c] + 1
+                todo.append(q)
+    return dist
+
+
+def p_walled(group):
+    """Касается ли препятствие, в которое входят эти предметы, стены: остров посреди поляны — нет."""
+    seen = set(c for k in group for c in pcells[k])
+    todo = list(seen)
+    while todo:
+        c = todo.pop()
+        if pwall[c]:
+            return True
+        for q in p_near(c):
+            if pblk[q] and q not in seen:
+                seen.add(q)
+                todo.append(q)
+    return False
+
+
+def p_blocks(group):
+    """Перегородили ли эти предметы проход: убери их — и куски свободного места рядом соединятся,
+    а в обход между ними далеко или никак, и по обе стороны есть куда идти."""
+    group = set(group)
+    own = set(c for k in group for c in pcells[k] if not pwall[c] and all(q in group for q in pown[c]))
+    if not own or not p_walled(group):
+        return False
+    m = int(MARG / PS)
+    i0, i1 = max(0, min(c % PW for c in own) - m), min(PW - 1, max(c % PW for c in own) + m)
+    j0, j1 = max(0, min(c // PW for c in own) - m), min(PH - 1, max(c // PW for c in own) + m)
+    inside = lambda q: i0 <= q % PW <= i1 and j0 <= q // PW <= j1
+    part, parts = {}, []
+    for j in range(j0, j1 + 1):
+        for i in range(i0, i1 + 1):
+            c0 = j * PW + i
+            if pblk[c0] or c0 in part:
+                continue
+            part[c0] = len(parts)
+            todo, cells = [c0], []
+            while todo:
+                c = todo.pop()
+                cells.append(c)
+                for q in p_near(c):
+                    if inside(q) and not pblk[q] and q not in part:
+                        part[q] = part[c0]
+                        todo.append(q)
+            parts.append(cells)
+    if sum(1 for cells in parts if len(cells) >= MIN_PART) < 2:
+        return False
+    # Идём только по точкам, которые закрывают одни эти предметы, и смотрим, каких кусков они касаются.
+    seen, sides = set(), {}
+    # Есть куда идти: дверь или BIG клеток пола на самой карте (поле за её краем не в счёт).
+    goes = lambda side: any(c in pdoor for c in side) or sum(1 for c in side if p_onmap(c)) >= BIG_PART
+    for c0 in own:
+        if c0 in seen:
+            continue
+        seen.add(c0)
+        todo, touched = [c0], set()
+        while todo:
+            c = todo.pop()
+            for q in p_near(c):
+                if q in seen or not inside(q):
+                    continue
+                if not pblk[q]:
+                    touched.add(part[q])
+                elif q in own:
+                    seen.add(q)
+                    todo.append(q)
+        big = sorted((k for k in touched if len(parts[k]) >= MIN_PART), key=lambda k: -len(parts[k]))
+        for k in big[1:]:
+            a = p_side(parts[big[0]], set(parts[k]))
+            if a is None:
+                continue           # обход рядом
+            if k not in sides:
+                sides[k] = p_side(parts[k])
+            if goes(a) and goes(sides[k]):
+                if os.environ.get("KCHECK_PASSDEBUG"):
+                    print("   стороны затора", sorted(group), [(sum(1 for c in s if p_onmap(c)), any(c in pdoor for c in s)) for s in (a, sides[k])],
+                          [(round((min(c % PW for c in s) * PS - PAD), 1), round((min(c // PW for c in s) * PS - PAD), 1), round((max(c % PW for c in s) * PS - PAD), 1), round((max(c // PW for c in s) * PS - PAD), 1)) for s in (parts[big[0]], parts[k])])
+                return True
+    return False
+
+
+def p_say(group):
+    who = " и ".join(f"#{k} {name(pobj[k])} ({pobj[k]['x']:.1f}, {pobj[k]['y']:.1f})" for k in group[:4])
+    more = f" и ещё {len(group) - 4}" if len(group) > 4 else ""
+    how = "перегораживает" if len(group) == 1 else "вместе перегораживают"
+    issues.append(f"[проход] {who}{more} {how} проход: мимо фишке в клетку не пройти, обход дальше {DETOUR:.0f} клеток или его нет")
+    p_blockers.update(group)
+
+
+p_blockers = set()
+p_groups = {}
+for k in pcells:
+    p_groups.setdefault(p_top(k), []).append(k)
+for group in p_groups.values():
+    alone = [k for k in group if p_blocks([k])]
+    for k in alone:
+        p_say([k])
+    if alone or len(group) < 2 or not p_blocks(group):
+        continue
+    # Кто именно: убираем из связки по одному всех, без кого проход остаётся закрыт.
+    need = sorted(group)
+    for k in sorted(group):
+        rest = [q for q in need if q != k]
+        if rest and p_blocks(rest):
+            need = rest
+    p_say(need)
+
+# KCHECK_PASSMAP=файл.ppm — картинка для глаз: где фишка пройдёт (светлое, свой цвет у каждого
+# куска), где нет (тёмное), красным — предметы, перегородившие проход, жёлтым — двери.
+if os.environ.get("KCHECK_PASSMAP"):
+    px = bytearray(PW * PH * 3)
+    for c in range(PW * PH):
+        if pblk[c]:
+            col = (28, 28, 36) if pwall[c] else (70, 70, 86)
+        elif c in pdoor:
+            col = (235, 215, 90)
+        else:
+            g = glab[c]
+            col = (150 + g * 67 % 100, 150 + g * 131 % 100, 150 + g * 29 % 100)
+        px[c * 3:c * 3 + 3] = bytes(col)
+    for k in p_blockers:
+        for c in p_obj(pobj[k]):
+            px[c * 3:c * 3 + 3] = bytes((220, 40, 40))
+    with open(os.environ["KCHECK_PASSMAP"], "wb") as f:
+        f.write(b"P6 %d %d 255 " % (PW, PH) + bytes(px))
 
 for s in issues:
     print(s)
