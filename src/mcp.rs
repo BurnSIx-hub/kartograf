@@ -123,14 +123,18 @@ fn tools() -> Value {
             "color": {"type": ["array", "null"], "items": {"type": "integer"}, "description": "Tint of the top [r, g, b], default white; steps take this colour too"},
             "strength": num("How strongly the top is tinted, 0..1, default 0.1 (a little lighter than the floor); 0.4–0.6 turns a dark floor into light plating"),
             "side": {"type": ["array", "null"], "items": {"type": "integer"}, "description": "Colour of the side wall [r, g, b], default dark steel [98, 106, 116]; stone, wood — to match the room"},
-            "stairs": {"type": "array", "items": {"type": "object"}, "description": "Stairs up the platform: each {at: [x, y] — a point near the edge where they join (the nearest point of the outline is taken, the steps run outward from that edge), width — cells at the top, default 2, steps — how many, default 3; a step is 0.4 cells deep}"}
+            "stairs": {"type": "array", "items": {"type": "object"}, "description": "Stairs up the platform: each {at: [x, y] — a point near the edge where they join (the nearest point of the outline is taken, the steps run outward from that edge), width — cells at the top, default 2, steps — how many, default 3; a step is 0.4 cells deep}"},
+            "rail": {"type": "boolean", "description": "Railing along the free edges (not along room walls), open at every stair and running down both sides of it; posts every 1.6 cells at most. Tokens cannot cross a railed edge: put stairs where people go up"},
+            "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}, "description": "Little lights: short glowing strips along the lip every 2.4 cells, two on every stair tread, a glowing cap on every railing post. true — cold cyan, [r, g, b] — that colour, false or null — none"},
+            "grates": {"type": "array", "items": {"type": "object"}, "description": "Floor grates along the inside of the edge: each {at: [x, y] — a point near the edge (the nearest point of the outline is the middle of the grate), length — cells along the edge, default 3}; a dark slotted strip 0.3–0.68 cells in from the edge, following its curve. The list replaces the old one, [] removes them"}
         }), &[]),
-        tool("edit_platform", "Change a platform by index (see describe with platforms): outline (points, area, circle, outside_circle as in add_platform), height, colours, stairs (the list replaces the old one, [] removes them). To move a platform give it the new outline.", json!({
+        tool("edit_platform", "Change a platform by index (see describe with platforms): outline (points, area, circle, outside_circle as in add_platform), height, colours, stairs (the list replaces the old one, [] removes them), rail, lights, grates. To move a platform give it the new outline.", json!({
             "index": int("Platform index"),
             "points": {"type": "array", "items": point.clone(), "minItems": 3}, "area": area.clone(),
             "circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "outside_circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
             "height": num("Width of the visible side wall, cells"), "color": {"type": ["array", "null"], "items": {"type": "integer"}}, "strength": num("0..1"),
-            "side": {"type": ["array", "null"], "items": {"type": "integer"}}, "stairs": {"type": "array", "items": {"type": "object"}}
+            "side": {"type": ["array", "null"], "items": {"type": "integer"}}, "stairs": {"type": "array", "items": {"type": "object"}},
+            "rail": {"type": "boolean"}, "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}}, "grates": {"type": "array", "items": {"type": "object"}}
         }), &["index"]),
         tool("remove", "Remove items by indices: objects, walls, doors, labels, paths, roofs or platforms. Indices of later items shift down.", json!({
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms"]},

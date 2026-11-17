@@ -499,6 +499,7 @@ impl App {
             self.draft.clear();
             self.path_draft.clear();
             self.sel = None;
+            self.platform_put = None;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace)) {
             if !self.path_draft.is_empty() {

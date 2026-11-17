@@ -219,52 +219,6 @@ impl App {
         (self.map.current, self.map.drift) = (current, drift);
     }
 
-    /// Помосты этажа списком: высота стенки, цвет площадки и его сила, цвет стенки, удаление.
-    /// Лестницы и контур не по рамке ставит ИИ (`add_platform`, `edit_platform`).
-    pub(super) fn platform_panel(&mut self, ui: &mut egui::Ui) {
-        if self.map.platforms.is_empty() {
-            ui.label("Помостов нет: протяните рамку по полу.");
-            return;
-        }
-        let held = ui.input(|i| i.pointer.any_down());
-        let (mut drop, mut changed) = (None, false);
-        for i in 0..self.map.platforms.len() {
-            let before = self.map.platforms[i].clone();
-            let mut pl = before.clone();
-            ui.horizontal(|ui| {
-                ui.strong(format!("Помост {}", i + 1));
-                if ui.small_button("удалить").clicked() {
-                    drop = Some(i);
-                }
-            });
-            ui.add(egui::Slider::new(&mut pl.height, 0.05..=1.0).text("высота стенки, кл."));
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut pl.color);
-                ui.add(egui::Slider::new(&mut pl.strength, 0.0..=1.0).text("сила цвета"));
-            });
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut pl.side);
-                ui.label(format!("стенка и ступени; лестниц: {}", pl.stairs.len()));
-            });
-            if pl != before {
-                // Один шаг отмены на одно движение ползунка.
-                if !self.glow_hold {
-                    self.checkpoint();
-                }
-                self.glow_hold = held;
-                self.map.platforms[i] = pl;
-                changed = true;
-            }
-        }
-        if !changed && !held {
-            self.glow_hold = false;
-        }
-        if let Some(i) = drop {
-            self.checkpoint();
-            self.map.platforms.remove(i);
-        }
-    }
-
     pub(super) fn swatch(&mut self, ui: &mut egui::Ui, paint: &Paint, size: f32) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
         if ui.is_rect_visible(rect) {
@@ -299,6 +253,7 @@ impl App {
             Tool::Erase => "Стирает и комнаты, и местность.",
             Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
             Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите на полке; без картинки — простая плашка.",
+            Tool::Roof if self.platform_mode => "Протяжка по пустому месту ставит помост, щелчок по помосту выбирает его, протяжка за выбранный двигает. Лестницу и решётку — кнопкой в строке над картой и щелчком у края; их можно вести вдоль края протяжкой. Delete удаляет помост.",
             Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
             Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — в строке над картой.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",

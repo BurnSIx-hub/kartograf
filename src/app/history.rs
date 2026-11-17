@@ -128,6 +128,7 @@ impl App {
             Sel::Label(i) => i < self.map.labels.len(),
             Sel::Roof(i) => i < self.map.roofs.len(),
             Sel::Outline(i, k) => self.map.outline_roofs.get(i).is_some_and(|r| k < r.pieces.len()),
+            Sel::Platform(i) => i < self.map.platforms.len(),
         }
     }
 }

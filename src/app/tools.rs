@@ -332,7 +332,7 @@ impl App {
             // приходится раскрывать. Самопроверке карты по ней видно, сколько места предмет занимает
             // на самом деле: у FA вокруг предмета поля под тень, у своих ассетов холст занят весь.
             let visible = asked("visible");
-            let mut boxes: std::collections::HashMap<&str, Option<[f32; 4]>> = std::collections::HashMap::new();
+            let mut boxes: std::collections::HashMap<&str, Option<([f32; 4], Vec<u16>)>> = std::collections::HashMap::new();
             let list: Vec<Value> = m
                 .props
                 .iter()
@@ -342,9 +342,10 @@ impl App {
                 .map(|(i, p)| {
                     let mut row = object_row(i, p);
                     if visible {
-                        let seen = *boxes.entry(p.asset.as_str()).or_insert_with(|| library::visible_box(&self.textures.sources, &p.asset));
-                        if let Some(v) = seen {
-                            row["vis"] = json!(visible_cells(v, p));
+                        let seen = boxes.entry(p.asset.as_str()).or_insert_with(|| library::visible_shape(&self.textures.sources, &p.asset));
+                        if let Some((v, mask)) = seen {
+                            row["vis"] = json!(visible_cells(*v, p));
+                            row["mask"] = json!(mask);
                         }
                     }
                     row
@@ -405,6 +406,15 @@ impl App {
                 .map(|(i, p)| {
                     let mut row = platform_row(i, p);
                     row["points"] = json!(p.points.iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>());
+                    // Перила — ломаными: через них не пройти (проверка прохода в check.py).
+                    if p.rail {
+                        let tidy = crate::platform::tidy(&p.points);
+                        let lines: Vec<Value> = crate::platform::rails(&tidy, &self.platform_free(i), &p.stairs)
+                            .iter()
+                            .map(|(l, _)| json!(l.iter().map(|q| [r2(q[0]), r2(q[1])]).collect::<Vec<_>>()))
+                            .collect();
+                        row["rail_lines"] = json!(lines);
+                    }
                     row
                 })
                 .collect();
@@ -620,6 +630,7 @@ impl App {
         if let Some(stairs) = stairs_of(a)? {
             pl.stairs = stairs;
         }
+        decor_of(a, &mut pl)?;
         self.checkpoint();
         self.map.platforms.push(pl);
         let i = self.map.platforms.len() - 1;
@@ -633,6 +644,8 @@ impl App {
         }
         let outline = if ["points", "area", "circle", "outside_circle"].iter().any(|k| a.get(*k).is_some()) { Some(platform_outline(a)?) } else { None };
         let (color, side, stairs) = (color_of(a, "color")?, color_of(a, "side")?, stairs_of(a)?);
+        let mut decor = self.map.platforms[i].clone();
+        decor_of(a, &mut decor)?;
         self.checkpoint();
         let pl = &mut self.map.platforms[i];
         if let Some(points) = outline {
@@ -653,6 +666,7 @@ impl App {
         if let Some(stairs) = stairs {
             pl.stairs = stairs;
         }
+        (pl.rail, pl.lights, pl.grates) = (decor.rail, decor.lights, decor.grates);
         Ok(platform_row(i, pl))
     }
 
@@ -1564,12 +1578,37 @@ fn stairs_of(a: &Value) -> Result<Option<Vec<crate::platform::Stair>>, String> {
         .map(Some)
 }
 
-/// Помост в ответе: рамка, высота стенки, цвета, лестницы.
+/// Роспись помоста из ответа ИИ: перила, огоньки, решётки. Нет поля — не трогать.
+fn decor_of(a: &Value, pl: &mut crate::platform::Platform) -> Result<(), String> {
+    if let Some(v) = a.get("rail") {
+        pl.rail = v.as_bool().ok_or("rail: true или false")?;
+    }
+    match a.get("lights") {
+        None => {}
+        Some(Value::Bool(true)) => pl.lights = Some(crate::platform::cyan()),
+        Some(Value::Bool(false) | Value::Null) => pl.lights = None,
+        Some(_) => pl.lights = Some(color_of(a, "lights")?.flatten().ok_or("lights: true, false или [r, g, b]")?),
+    }
+    if let Some(v) = a.get("grates") {
+        let list = v.as_array().ok_or("grates: список {at: [x, y], length}")?;
+        pl.grates = list
+            .iter()
+            .map(|g| {
+                let at = point_at(g, "at").ok_or("решётка: нужна точка at: [x, y] у края помоста")?;
+                Ok(crate::platform::Grate { at, length: f(g, "length").unwrap_or(3.0).clamp(0.3, 40.0) })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    }
+    Ok(())
+}
+
+/// Помост в ответе: рамка, высота стенки, цвета, лестницы, роспись.
 fn platform_row(i: usize, p: &crate::platform::Platform) -> Value {
     let r2 = |v: f32| (v as f64 * 100.0).round() / 100.0;
     let (lo, hi) = p.bounds();
     let stairs: Vec<Value> = p.stairs.iter().map(|s| json!({"at": [r2(s.at[0]), r2(s.at[1])], "width": s.width, "steps": s.steps})).collect();
-    json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs})
+    let grates: Vec<Value> = p.grates.iter().map(|g| json!({"at": [r2(g.at[0]), r2(g.at[1])], "length": r2(g.length)})).collect();
+    json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs, "rail": p.rail, "lights": p.lights, "grates": grates})
 }
 
 fn points_of(a: &Value) -> Vec<[f32; 2]> {

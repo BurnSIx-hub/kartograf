@@ -971,6 +971,51 @@ impl SelfTest {
             83 => self.key(Key::Z, CTRL),
             84 => {
                 self.check("Ctrl+Z убрал помост", app.map.platforms.is_empty(), &format!("помостов {}", app.map.platforms.len()));
+                // Снова рамка: новый помост сразу выбран.
+                let (a, b) = (cell(app, 2.0, 8.0), cell(app, 5.0, 10.0));
+                self.drag(a, b, PointerButton::Primary);
+            }
+            85 => {
+                let ok = app.map.platforms.len() == 1 && app.sel == Some(Sel::Platform(0));
+                self.check("новый помост сразу выбран", ok, &format!("{:?}, помостов {}", app.sel, app.map.platforms.len()));
+                // Кнопка «＋ лестница» — и щелчок под нижним краем.
+                app.platform_put = Some(crate::app::PlatformPut::Stair);
+                self.click(at(app, [4.0, 11.3]));
+            }
+            86 => {
+                let st = app.map.platforms.first().map(|p| p.stairs.clone()).unwrap_or_default();
+                let down = app.map.platforms.first().and_then(|p| st.first().and_then(|s| crate::platform::stair_geo(&p.points, s))).map(|g| g.nrm);
+                let ok = st.len() == 1 && down.is_some_and(|n| (n[1] - 1.0).abs() < 1e-4) && app.platform_put.is_none();
+                self.check("щелчок у нижнего края поставил лестницу вниз", ok, &format!("{st:?} {down:?}"));
+                self.click(at(app, [9.5, 10.0]));
+            }
+            87 => {
+                self.check("щелчок мимо помоста снял выбор", app.sel.is_none(), &format!("{:?}", app.sel));
+                self.click(at(app, [3.0, 9.0]));
+            }
+            88 => {
+                self.check("щелчок по помосту выбрал его", app.sel == Some(Sel::Platform(0)), &format!("{:?}", app.sel));
+                self.drag(at(app, [3.0, 9.0]), at(app, [5.0, 9.0]), PointerButton::Primary);
+            }
+            89 => {
+                let p = app.map.platforms.first();
+                let ok = p.is_some_and(|p| p.bounds() == ([4.0, 8.0], [8.0, 11.0]) && p.stairs.first().is_some_and(|s| (s.at[0] - 6.0).abs() < 1e-4));
+                self.check("протяжка за выбранный помост сдвинула его с лестницей на 2 клетки", ok, &format!("{:?}", p.map(|p| (p.bounds(), p.stairs.clone()))));
+                app.platform_put = Some(crate::app::PlatformPut::Grate);
+                self.click(at(app, [6.0, 7.8]));
+            }
+            90 => {
+                let n = app.map.platforms.first().map_or(0, |p| p.grates.len());
+                self.check("щелчок у верхнего края положил решётку", n == 1, &format!("решёток {n}"));
+                if let Some(p) = app.map.platforms.first_mut() {
+                    p.rail = true;
+                    p.lights = Some(crate::platform::cyan());
+                }
+                self.snap(ctx, "помост с перилами");
+            }
+            91 => self.key(Key::Delete, Modifiers::NONE),
+            92 => {
+                self.check("Delete убрал выбранный помост", app.map.platforms.is_empty(), &format!("помостов {}", app.map.platforms.len()));
                 app.platform_mode = false;
             }
             _ => return false,

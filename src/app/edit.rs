@@ -44,6 +44,10 @@ impl App {
             }
             // Стена комнаты стирается вместе с комнатой.
             Sel::Edge(..) => {}
+            Sel::Platform(i) => {
+                self.map.platforms.remove(i);
+                self.platform_put = None;
+            }
         }
     }
 
@@ -87,12 +91,18 @@ impl App {
         i
     }
 
-    /// Помост по рамке клеток: площадка со стенкой в три ступени.
+    /// Помост по рамке клеток: площадка со стенкой в три ступени — прямоугольник или
+    /// вписанный в рамку овал.
     pub fn place_platform(&mut self, a: (i32, i32), b: (i32, i32)) -> usize {
         let lo = [a.0.min(b.0) as f32, a.1.min(b.1) as f32];
         let hi = [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0];
+        let points = if self.platform_oval {
+            crate::platform::ellipse([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], (hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
+        } else {
+            vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]
+        };
         self.checkpoint();
-        self.map.platforms.push(crate::platform::Platform::new(vec![lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]], 0.25));
+        self.map.platforms.push(crate::platform::Platform::new(points, 0.25));
         self.map.platforms.len() - 1
     }
 

@@ -6,12 +6,30 @@
 //! ступени от края наружу, кверху шире. Стенка и тень идут только по свободным краям:
 //! край вдоль стены комнаты их не даёт.
 //!
+//! Роспись по желанию: перила по свободным краям и по бокам лестниц (столбики с шагом
+//! до 1,6 клетки), огоньки (полоски по кромке, на ступенях и на столбиках перил),
+//! решётки у края — полоса с прорезями вдоль контура.
+//!
 //! Здесь — данные и геометрия; рисует `app::draw_platform`.
 
 use serde::{Deserialize, Serialize};
 
 /// Глубина ступени лестницы, клетки.
 pub const TREAD: f32 = 0.4;
+/// Перила стоят внутри площадки на столько от края, клетки.
+pub const RAIL_IN: f32 = 0.12;
+/// Наибольший шаг столбиков перил, клетки.
+pub const POST_STEP: f32 = 1.6;
+/// Решётка у края: от края внутрь — от и до, клетки.
+pub const GRATE_IN: (f32, f32) = (0.3, 0.68);
+
+/// Решётка у края помоста: где (точка у края — берётся ближайшая на контуре) и длина
+/// вдоль края, клетки.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Grate {
+    pub at: [f32; 2],
+    pub length: f32,
+}
 
 /// Лестница на помост: где примыкает (точка у края — берётся ближайшая на контуре),
 /// ширина наверху и число ступеней.
@@ -39,6 +57,14 @@ pub struct Platform {
     pub side: [u8; 3],
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stairs: Vec<Stair>,
+    /// Перила по свободным краям и по бокам лестниц.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rail: bool,
+    /// Огоньки и их цвет: полоски по кромке, на ступенях, на столбиках перил.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lights: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grates: Vec<Grate>,
 }
 
 pub fn light() -> [u8; 3] {
@@ -53,9 +79,14 @@ pub fn steel() -> [u8; 3] {
     [98, 106, 116]
 }
 
+/// Огоньки по умолчанию — холодный голубой.
+pub fn cyan() -> [u8; 3] {
+    [110, 228, 255]
+}
+
 impl Platform {
     pub fn new(points: Vec<[f32; 2]>, height: f32) -> Self {
-        Self { points, height, color: light(), strength: tenth(), side: steel(), stairs: Vec::new() }
+        Self { points, height, color: light(), strength: tenth(), side: steel(), stairs: Vec::new(), rail: false, lights: None, grates: Vec::new() }
     }
 
     /// Рамка контура: левый верхний и правый нижний углы.
@@ -67,6 +98,14 @@ impl Platform {
             hi = [hi[0].max(p[0]), hi[1].max(p[1])];
         }
         (lo, hi)
+    }
+
+    /// Сдвинуть помост целиком — с лестницами и решётками.
+    pub fn shift(&mut self, d: [f32; 2]) {
+        let mv = |q: &mut [f32; 2]| *q = [q[0] + d[0], q[1] + d[1]];
+        self.points.iter_mut().for_each(mv);
+        self.stairs.iter_mut().for_each(|s| mv(&mut s.at));
+        self.grates.iter_mut().for_each(|g| mv(&mut g.at));
     }
 }
 
@@ -170,7 +209,6 @@ pub fn triangulate(p: &[[f32; 2]]) -> Vec<[usize; 3]> {
 }
 
 /// Точка внутри контура.
-#[cfg(test)]
 pub fn contains(p: &[[f32; 2]], q: [f32; 2]) -> bool {
     let n = p.len();
     let mut inside = false;
@@ -185,11 +223,18 @@ pub fn contains(p: &[[f32; 2]], q: [f32; 2]) -> bool {
 
 /// Круг многоугольником: сторона около трети клетки, от 16 до 96 сторон.
 pub fn circle(c: [f32; 2], r: f32) -> Vec<[f32; 2]> {
-    let n = ((std::f32::consts::TAU * r / 0.33).ceil() as usize).clamp(16, 96);
+    ellipse(c, r, r)
+}
+
+/// Овал с полуосями `rx`, `ry` вдоль осей карты — так же многоугольником.
+pub fn ellipse(c: [f32; 2], rx: f32, ry: f32) -> Vec<[f32; 2]> {
+    // Длина эллипса по Рамануджану; у круга — ровно 2πr.
+    let per = std::f32::consts::PI * (3.0 * (rx + ry) - ((3.0 * rx + ry) * (rx + 3.0 * ry)).sqrt());
+    let n = ((per / 0.33).ceil() as usize).clamp(16, 96);
     (0..n)
         .map(|i| {
             let a = std::f32::consts::TAU * i as f32 / n as f32;
-            [c[0] + r * a.cos(), c[1] + r * a.sin()]
+            [c[0] + rx * a.cos(), c[1] + ry * a.sin()]
         })
         .collect()
 }
@@ -296,6 +341,252 @@ pub fn stair_frame(p: &[[f32; 2]], at: [f32; 2]) -> Option<([f32; 2], [f32; 2], 
         .map(|(_, q, i)| (q, nrm[i], i))
 }
 
+/// Лестница на месте: точка у края `o`, нормаль наружу, касательная, полуширина наверху
+/// и внизу, длина марша.
+#[derive(Clone, Copy, Debug)]
+pub struct StairGeo {
+    pub o: [f32; 2],
+    pub nrm: [f32; 2],
+    pub tan: [f32; 2],
+    pub w1: f32,
+    pub w0: f32,
+    pub run: f32,
+}
+
+impl StairGeo {
+    /// Полуширина на расстоянии `s` от края наружу (выше края — как наверху).
+    pub fn half(&self, s: f32) -> f32 {
+        self.w1 + (self.w0 - self.w1) * (s.max(0.0) / self.run)
+    }
+
+    /// Точка: `s` — от края помоста наружу, `u` — поперёк, в долях полуширины.
+    pub fn pt(&self, s: f32, u: f32) -> [f32; 2] {
+        let h = self.half(s);
+        [self.o[0] + self.nrm[0] * s + self.tan[0] * u * h, self.o[1] + self.nrm[1] * s + self.tan[1] * u * h]
+    }
+
+    /// Точка: `s` наружу, `x` поперёк — в клетках от оси.
+    pub fn at(&self, s: f32, x: f32) -> [f32; 2] {
+        [self.o[0] + self.nrm[0] * s + self.tan[0] * x, self.o[1] + self.nrm[1] * s + self.tan[1] * x]
+    }
+
+    /// Контур марша: верх у края, низ у пола.
+    pub fn outline(&self) -> [[f32; 2]; 4] {
+        [self.pt(0.0, -1.0), self.pt(0.0, 1.0), self.pt(self.run, 1.0), self.pt(self.run, -1.0)]
+    }
+
+    /// Точка `q` в осях лестницы: (наружу от края, поперёк).
+    fn local(&self, q: [f32; 2]) -> (f32, f32) {
+        let d = [q[0] - self.o[0], q[1] - self.o[1]];
+        (d[0] * self.nrm[0] + d[1] * self.nrm[1], d[0] * self.tan[0] + d[1] * self.tan[1])
+    }
+}
+
+pub fn stair_geo(p: &[[f32; 2]], st: &Stair) -> Option<StairGeo> {
+    let (o, nrm, _) = stair_frame(p, st.at)?;
+    let steps = st.steps.clamp(1, 16) as f32;
+    let w1 = st.width.clamp(0.4, 12.0) / 2.0;
+    Some(StairGeo { o, nrm, tan: [-nrm[1], nrm[0]], w1, w0: w1 * (1.0 - 0.06 * steps).max(0.6), run: steps * TREAD })
+}
+
+/// Куски ломаной вне прямоугольника лестницы (от `s0` до `s1` наружу, поперёк — до `w`).
+fn outside_of(line: &[[f32; 2]], g: &StairGeo, s0: f32, s1: f32, w: f32) -> Vec<Vec<[f32; 2]>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<[f32; 2]> = Vec::new();
+    let lerp = |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    for k in 0..line.len().saturating_sub(1) {
+        let (a, b) = (line[k], line[k + 1]);
+        let ((sa, ua), (sb, ub)) = (g.local(a), g.local(b));
+        // Лян — Барски: часть отрезка внутри прямоугольника — от t0 до t1.
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for (pp, qq) in [(-(sb - sa), sa - s0), (sb - sa, s1 - sa), (-(ub - ua), ua + w), (ub - ua, w - ua)] {
+            if pp.abs() < 1e-9 {
+                if qq < 0.0 {
+                    t0 = 2.0;
+                }
+            } else {
+                let r = qq / pp;
+                if pp < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+            }
+        }
+        if t0 < t1 {
+            if t0 > 0.0 {
+                if cur.is_empty() {
+                    cur.push(a);
+                }
+                cur.push(lerp(a, b, t0));
+            }
+            if cur.len() >= 2 {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            if t1 < 1.0 {
+                cur = vec![lerp(a, b, t1), b];
+            }
+        } else {
+            if cur.is_empty() {
+                cur.push(a);
+            }
+            cur.push(b);
+        }
+    }
+    if cur.len() >= 2 {
+        out.push(cur);
+    }
+    out
+}
+
+/// Перила: ломаные по свободным краям (на `RAIL_IN` внутри площадки), разомкнутые у каждой
+/// лестницы, и по бокам лестниц до нижней ступени. Второе — замкнута ли ломаная.
+pub fn rails(p: &[[f32; 2]], free: &[bool], stairs: &[Stair]) -> Vec<(Vec<[f32; 2]>, bool)> {
+    let n = p.len();
+    if n < 3 || free.len() != n {
+        return Vec::new();
+    }
+    let ring = offset(p, free, -RAIL_IN);
+    let mut runs: Vec<(Vec<[f32; 2]>, bool)> = Vec::new();
+    if free.iter().all(|&f| f) {
+        let mut l = ring.clone();
+        l.push(ring[0]);
+        runs.push((l, true));
+    } else if let Some(start) = (0..n).find(|&i| !free[i]) {
+        let mut cur: Vec<[f32; 2]> = Vec::new();
+        for k in 1..=n {
+            let i = (start + k) % n;
+            if free[i] {
+                if cur.is_empty() {
+                    cur.push(ring[i]);
+                }
+                cur.push(ring[(i + 1) % n]);
+            } else if !cur.is_empty() {
+                runs.push((std::mem::take(&mut cur), false));
+            }
+        }
+        if !cur.is_empty() {
+            runs.push((cur, false));
+        }
+    }
+    let geos: Vec<StairGeo> = stairs.iter().filter_map(|s| stair_geo(p, s)).collect();
+    for g in &geos {
+        let w = (g.w1 - RAIL_IN).max(0.1);
+        let mut next = Vec::new();
+        for (line, closed) in runs {
+            let mut pieces = outside_of(&line, g, -0.6, g.run, w);
+            let whole = pieces.len() == 1 && pieces[0].len() == line.len();
+            if closed && whole {
+                next.push((line, true));
+                continue;
+            }
+            // Замкнутое кольцо, разрезанное лестницей: конец и начало — один кусок.
+            if closed && pieces.len() >= 2 {
+                let (first, last) = (pieces[0][0], *pieces[pieces.len() - 1].last().unwrap());
+                let same = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5;
+                if same(first, line[0]) && same(last, line[line.len() - 1]) {
+                    let head = pieces.remove(0);
+                    pieces.last_mut().unwrap().extend(head.into_iter().skip(1));
+                }
+            }
+            next.extend(pieces.into_iter().map(|l| (l, false)));
+        }
+        runs = next;
+    }
+    // Концы перил у проходов: от них идут перила лестниц (на кривом крае конец перил
+    // помоста лежит не там, где верх лестницы, — иначе вышло бы два столбика рядом).
+    let ends: Vec<[f32; 2]> = runs.iter().filter(|r| !r.1).flat_map(|r| [r.0[0], r.0[r.0.len() - 1]]).collect();
+    for g in &geos {
+        for side in [-1.0f32, 1.0] {
+            let k = 6;
+            let mut line: Vec<[f32; 2]> = (0..=k)
+                .map(|j| {
+                    let s = -RAIL_IN + (g.run - 0.08 + RAIL_IN) * j as f32 / k as f32;
+                    g.at(s, side * (g.half(s) - RAIL_IN))
+                })
+                .collect();
+            let top = line[0];
+            if let Some(&e) = ends.iter().filter(|e| (e[0] - top[0]).hypot(e[1] - top[1]) < 0.8).min_by(|a, b| (a[0] - top[0]).hypot(a[1] - top[1]).total_cmp(&(b[0] - top[0]).hypot(b[1] - top[1]))) {
+                line[0] = e;
+            }
+            runs.push((line, false));
+        }
+    }
+    runs
+}
+
+/// Столбики перил по ломаной: на концах и через равные шаги не длиннее `POST_STEP`.
+pub fn posts(line: &[[f32; 2]], closed: bool) -> Vec<[f32; 2]> {
+    let lens: Vec<f32> = line.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).collect();
+    let total: f32 = lens.iter().sum();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if total < 0.25 {
+        return vec![line[0]];
+    }
+    let k = ((total / POST_STEP).ceil() as usize).max(1);
+    let last = if closed { k - 1 } else { k };
+    (0..=last)
+        .map(|j| {
+            let mut s = total * j as f32 / k as f32;
+            for (i, &l) in lens.iter().enumerate() {
+                if s <= l || i == lens.len() - 1 {
+                    let t = (s / l.max(1e-6)).clamp(0.0, 1.0);
+                    return [line[i][0] + (line[i + 1][0] - line[i][0]) * t, line[i][1] + (line[i + 1][1] - line[i][1]) * t];
+                }
+                s -= l;
+            }
+            line[0]
+        })
+        .collect()
+}
+
+/// Решётка у края: пары точек (ближе к краю, дальше от края) вдоль контура с шагом около
+/// `step`, по длине решётки с серединой у ближайшей к `at` точки контура.
+pub fn grate_strip(p: &[[f32; 2]], g: &Grate, step: f32) -> Vec<([f32; 2], [f32; 2])> {
+    let n = p.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let all = vec![true; n];
+    let (a, b) = (offset(p, &all, -GRATE_IN.0), offset(p, &all, -GRATE_IN.1));
+    let lens: Vec<f32> = (0..n).map(|i| (p[(i + 1) % n][0] - p[i][0]).hypot(p[(i + 1) % n][1] - p[i][1])).collect();
+    let total: f32 = lens.iter().sum();
+    let mut start = vec![0.0f32; n];
+    for i in 1..n {
+        start[i] = start[i - 1] + lens[i - 1];
+    }
+    // Где на контуре решётка: путь вдоль края до ближайшей к `at` точки.
+    let mid = (0..n)
+        .map(|i| {
+            let (q0, q1) = (p[i], p[(i + 1) % n]);
+            let (dx, dy) = (q1[0] - q0[0], q1[1] - q0[1]);
+            let t = (((g.at[0] - q0[0]) * dx + (g.at[1] - q0[1]) * dy) / (dx * dx + dy * dy).max(1e-9)).clamp(0.0, 1.0);
+            ((q0[0] + dx * t - g.at[0]).hypot(q0[1] + dy * t - g.at[1]), start[i] + lens[i] * t)
+        })
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map_or(0.0, |(_, s)| s);
+    let len = g.length.clamp(0.3, total * 0.9);
+    let k = ((len / step.max(0.02)).ceil() as usize).max(1);
+    (0..=k)
+        .map(|j| {
+            let s = (mid - len / 2.0 + len * j as f32 / k as f32).rem_euclid(total);
+            let i = (0..n).rev().find(|&i| start[i] <= s).unwrap_or(0);
+            let t = ((s - start[i]) / lens[i].max(1e-6)).clamp(0.0, 1.0);
+            let j1 = (i + 1) % n;
+            let e = [p[j1][0] - p[i][0], p[j1][1] - p[i][1]];
+            let ee = (e[0] * e[0] + e[1] * e[1]).max(1e-9);
+            // Точка сдвинутого контура против той же точки края: на прямом крае полоса — ровный
+            // прямоугольник, у угла её точки сходятся к вершине сдвинутого контура.
+            let inner = |r: &[[f32; 2]]| {
+                let proj = |q: [f32; 2]| ((q[0] - p[i][0]) * e[0] + (q[1] - p[i][1]) * e[1]) / ee;
+                let (ta, tb) = (proj(r[i]), proj(r[j1]));
+                let u = if (tb - ta).abs() < 1e-6 { 0.0 } else { ((t - ta) / (tb - ta)).clamp(0.0, 1.0) };
+                [r[i][0] + (r[j1][0] - r[i][0]) * u, r[i][1] + (r[j1][1] - r[i][1]) * u]
+            };
+            (inner(&a), inner(&b))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +649,55 @@ mod tests {
         // Лестница встаёт к ближайшему ребру и смотрит наружу.
         let (at, n, edge) = stair_frame(&SQUARE, [2.2, 3.4]).unwrap();
         assert!(near(at, [2.2, 3.0]) && near(n, [0.0, 1.0]) && edge == 2, "{at:?} {n:?} {edge}");
+    }
+
+    #[test]
+    fn rail_opens_at_the_stairs_and_runs_down_their_sides() {
+        let big = [[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]];
+        // Без лестниц и стен — одно замкнутое кольцо внутри площадки.
+        let ring = rails(&big, &[true; 4], &[]);
+        assert_eq!(ring.len(), 1);
+        assert!(ring[0].1 && near(ring[0].0[0], [RAIL_IN, RAIL_IN]), "{:?}", ring[0].0[0]);
+        // Лестница посреди нижнего края: кольцо размыкается в одну ломаную, плюс два бока лестницы.
+        let st = Stair { at: [3.0, 4.2], width: 2.0, steps: 3 };
+        let runs = rails(&big, &[true; 4], std::slice::from_ref(&st));
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert!(runs.iter().all(|r| !r.1));
+        // Ни одна точка перил на площадке не лежит в проходе лестницы.
+        let g = stair_geo(&big, &st).unwrap();
+        for (line, _) in &runs[..1] {
+            for q in line {
+                let (s, u) = g.local(*q);
+                assert!(!(s > -0.5 && u.abs() < g.w1 - RAIL_IN - 1e-3), "точка {q:?} в проходе");
+            }
+        }
+        // Концы ломаной — у краёв прохода.
+        let l = &runs[0].0;
+        let ends = [g.local(l[0]), g.local(*l.last().unwrap())];
+        assert!(ends.iter().all(|e| (e.1.abs() - (g.w1 - RAIL_IN)).abs() < 1e-3), "{ends:?}");
+        // Край у стены (правый) перил не даёт: ломаная начинается и кончается у стены.
+        let walled = rails(&big, &[true, false, true, true], &[]);
+        assert_eq!(walled.len(), 1);
+        assert!(!walled[0].1);
+        assert!((walled[0].0[0][0] - 6.0).abs() < 1e-4, "начало у стены: {:?}", walled[0].0[0]);
+        // Столбики: на концах и не реже чем через POST_STEP.
+        let posts = posts(&[[0.0, 0.0], [5.0, 0.0]], false);
+        assert_eq!(posts.len(), 5);
+        assert!(near(posts[0], [0.0, 0.0]) && near(posts[4], [5.0, 0.0]));
+    }
+
+    #[test]
+    fn grate_follows_the_edge_inside_the_platform() {
+        let big = [[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]];
+        let strip = grate_strip(&big, &Grate { at: [3.0, -0.2], length: 2.0 }, 0.5);
+        assert_eq!(strip.len(), 5);
+        // Полоса вдоль верхнего края, внутри площадки, ровно от x 2 до 4: прорези поперёк края.
+        assert!(near(strip[0].0, [2.0, GRATE_IN.0]) && near(strip[0].1, [2.0, GRATE_IN.1]), "{strip:?}");
+        assert!(near(strip[4].0, [4.0, GRATE_IN.0]) && near(strip[4].1, [4.0, GRATE_IN.1]), "{strip:?}");
+        // У угла решётка заворачивает за него, а не вылезает наружу.
+        let corner = grate_strip(&big, &Grate { at: [6.0, 0.0], length: 2.0 }, 0.25);
+        assert!(corner.iter().all(|(a, b)| contains(&big, *a) && contains(&big, *b)), "{corner:?}");
+        // Овал вписан в свою рамку.
+        assert!(ellipse([0.0, 0.0], 3.0, 1.0).iter().all(|q| q[1].abs() <= 1.0 + 1e-4 && q[0].abs() <= 3.0 + 1e-4));
     }
 }

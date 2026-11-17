@@ -7,7 +7,7 @@ import json, math, os, sys
 sys.stdout.reconfigure(encoding="utf-8")
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.py"), encoding="utf-8").read())
 
-_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls", "room_walls", "visible"], limit=3000)
+_, t = call("describe", include=["objects", "roofs", "doors", "labels", "walls", "room_walls", "visible", "platforms"], limit=3000)
 d = json.loads(t)
 # Стены по краю закрашенных комнат (Картограф 0.2.39+): у станции и подземелья без крыш
 # по ним видно, что внутри. У старого Картографа на их месте строка-пояснение.
@@ -519,13 +519,36 @@ def p_obj(o):
     rc = 0.3 * min(hw, hh)
     reach = math.hypot(hw, hh) + RO
     cells = set()
-    for j in p_span(y - reach, y + reach, PH):
-        dy = (j + 0.5) * PS - PAD - y
-        for i in p_span(x - reach, x + reach, PW):
-            dx = (i + 0.5) * PS - PAD - x
-            lx, ly = abs(dx * ca + dy * sa) - (hw - rc), abs(dy * ca - dx * sa) - (hh - rc)
-            if math.hypot(max(lx, 0.0), max(ly, 0.0)) < RO + rc:
-                cells.add(j * PW + i)
+    if o.get("mask") and o.get("vis"):
+        # Маска видимой части 16×16 (Картограф 0.2.42+): занятые клетки маски, раздутые на RO.
+        # Круглое, подкова, колбы по углам обходятся по рисунку, а не по рамке.
+        l, t, r, b = o["vis"]
+        a = math.radians(o["rotation"] or 0)
+        oca, osa = math.cos(a), math.sin(a)
+        cw, ch = (r - l) / 16, (b - t) / 16
+        hx, hy = cw / 2, ch / 2
+        ext = math.hypot(hx, hy) + RO
+        for v, row in enumerate(o["mask"]):
+            for u in range(16):
+                if not row >> u & 1:
+                    continue
+                mx, my = l + (u + 0.5) * cw, t + (v + 0.5) * ch
+                wx, wy = o["x"] + mx * oca - my * osa, o["y"] + mx * osa + my * oca
+                for j in p_span(wy - ext, wy + ext, PH):
+                    dy = (j + 0.5) * PS - PAD - wy
+                    for i in p_span(wx - ext, wx + ext, PW):
+                        dx = (i + 0.5) * PS - PAD - wx
+                        lx, ly = abs(dx * oca + dy * osa) - hx, abs(dy * oca - dx * osa) - hy
+                        if math.hypot(max(lx, 0.0), max(ly, 0.0)) < RO:
+                            cells.add(j * PW + i)
+    else:
+        for j in p_span(y - reach, y + reach, PH):
+            dy = (j + 0.5) * PS - PAD - y
+            for i in p_span(x - reach, x + reach, PW):
+                dx = (i + 0.5) * PS - PAD - x
+                lx, ly = abs(dx * ca + dy * sa) - (hw - rc), abs(dy * ca - dx * sa) - (hh - rc)
+                if math.hypot(max(lx, 0.0), max(ly, 0.0)) < RO + rc:
+                    cells.add(j * PW + i)
     c0 = p_cell(x, y)
     if c0 not in cells or pline[c0]:
         return sorted(cells)       # середина на самой стене: предмет стоит поперёк неё
@@ -554,6 +577,11 @@ for w in walls:
         p_wall(x1, y1, x2, y2)
 for (x1, y1), (x2, y2) in ROOM_WALLS:
     p_wall(x1, y1, x2, y2)
+# Перила помоста (Картограф 0.2.42+) — как стена: на помост и с него — только по лестнице.
+for pl in d.get("platforms", []) if isinstance(d.get("platforms"), list) else []:
+    for line in pl.get("rail_lines", []):
+        for (x1, y1), (x2, y2) in zip(line, line[1:]):
+            p_seg(x1, y1, x2, y2, RW, p_wall_mark)
 for dd in P_OPEN:
     p_seg(*dd["a"], *dd["b"], 0.45, lambda c, d2: pdoor.add(c))
 pcells, pobj = {}, {}

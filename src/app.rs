@@ -210,6 +210,8 @@ pub enum Sel {
     Outline(usize, usize),
     /// Стена комнаты: ключ отрезка и весь ли контур.
     Edge((i32, i32), bool),
+    /// Помост (инструмент «Крыша» в режиме помоста).
+    Platform(usize),
 }
 
 /// Как видны крыши в редакторе.
@@ -609,6 +611,12 @@ pub struct App {
     water_tones: std::collections::HashMap<String, [u8; 3]>,
     /// Инструмент «Крыша» ставит рамкой не крышу, а помост.
     pub platform_mode: bool,
+    /// Новый помост из рамки — овал, вписанный в неё.
+    pub platform_oval: bool,
+    /// Что поставит следующий щелчок у края выбранного помоста.
+    pub platform_put: Option<platform_edit::PlatformPut>,
+    /// Что из помоста тянут мышью.
+    platform_grab: Option<platform_edit::PlatformGrab>,
     /// Где в верхней строке кнопка «Биом» — для самопроверки.
     pub biome_button: Rect,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
@@ -799,6 +807,9 @@ impl App {
             glow_hold: false,
             water_tones: std::collections::HashMap::new(),
             platform_mode: false,
+            platform_oval: false,
+            platform_put: None,
+            platform_grab: None,
             biome_button: Rect::NOTHING,
             window_glass: std::collections::HashMap::new(),
             used_only: false,
@@ -875,6 +886,8 @@ mod input;
 mod draw;
 mod draw_ground;
 mod draw_platform;
+mod platform_edit;
+pub use platform_edit::PlatformPut;
 mod draw_scene;
 mod exporting;
 

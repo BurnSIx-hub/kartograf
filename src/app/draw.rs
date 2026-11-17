@@ -492,6 +492,12 @@ impl App {
                 cam.to_screen(canvas, [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0]),
             );
             painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90)), egui::StrokeKind::Inside);
+            if self.platform_mode && self.platform_oval {
+                painter.add(Shape::ellipse_stroke(r.center(), r.size() / 2.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90))));
+            }
+        }
+        if !exporting && ui && self.tool == Tool::Roof && self.platform_mode {
+            self.draw_platform_marks(painter, canvas);
         }
 
         // Крышное — поверх крыш и тает вместе с ними: скрытые крыши — нет и его;

@@ -552,6 +552,16 @@ pub fn dimensions(sources: &Sources, key: &str) -> Option<[u32; 2]> {
 /// У FA у стола вокруг прозрачные поля, и стулья, придвинутые к краю холста,
 /// висели в стороне от столешницы.
 pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
+    visible_shape(sources, key).map(|v| v.0)
+}
+
+/// Сторона маски видимой части, клеток маски.
+pub const MASK: u32 = 16;
+
+/// Видимая часть картинки и её маска: рамка `MASK`×`MASK` поверх видимой рамки, строка —
+/// число, бит `i` — столбец `i` слева; клетка занята, если непрозрачна хотя бы на четверть.
+/// По маске обходят предмет точнее, чем по рамке: круглый реактор, стол-подкова, колбы по углам.
+pub fn visible_shape(sources: &Sources, key: &str) -> Option<([f32; 4], Vec<u16>)> {
     let bytes = read_source(key, sources).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
@@ -561,7 +571,28 @@ pub fn visible_box(sources: &Sources, key: &str) -> Option<[f32; 4]> {
             (l, t, r, b) = (l.min(x), t.min(y), r.max(x + 1), b.max(y + 1));
         }
     }
-    (r > l && b > t).then(|| [l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5])
+    if r <= l || b <= t {
+        return None;
+    }
+    Some(([l as f32 / w as f32 - 0.5, t as f32 / h as f32 - 0.5, r as f32 / w as f32 - 0.5, b as f32 / h as f32 - 0.5], solid_mask(&img, [l, t, r, b])))
+}
+
+fn solid_mask(img: &image::RgbaImage, [l, t, r, b]: [u32; 4]) -> Vec<u16> {
+    let (bw, bh) = ((r - l) as usize, (b - t) as usize);
+    let n = MASK as usize;
+    let mut solid = vec![0u32; n * n];
+    let mut all = vec![0u32; n * n];
+    for y in t..b {
+        let v = ((y - t) as usize * n / bh).min(n - 1);
+        for x in l..r {
+            let u = ((x - l) as usize * n / bw).min(n - 1);
+            all[v * n + u] += 1;
+            if img.get_pixel(x, y)[3] > 40 {
+                solid[v * n + u] += 1;
+            }
+        }
+    }
+    (0..n).map(|v| (0..n).filter(|&u| all[v * n + u] > 0 && solid[v * n + u] * 4 >= all[v * n + u]).fold(0u16, |m, u| m | 1 << u)).collect()
 }
 
 /// Картинка ассета целиком, RGBA, в цвете ключа (`tint:`).
