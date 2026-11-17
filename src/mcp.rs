@@ -32,7 +32,7 @@ fn tools() -> Value {
     let point = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2});
     let area = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in cells; x1 and y1 are the far edges (a room [4, 3, 14, 11] gets walls on x=4, x=14, y=3, y=11)"});
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}});
-    let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow)"});
+    let light = json!({"type": "string", "enum": ["auto", "off", "campfire", "fireplace", "brazier", "candle", "lamp", "arcane", "alarm", "neon"], "description": "How it lights the scene in Foundry; auto — by its name (lamps, fires, braziers glow); alarm — a soft steady red emergency light close to the wall; neon — a steady cold white electric light (station, lab, future city): never by name, only when chosen"});
     let layer = json!({"type": "string", "enum": ["auto", "floor", "low", "normal", "high", "above_walls", "on_roof", "above_roofs"], "description": "What covers what: floor (rugs), low, normal, high (trees, wardrobes), above_walls, on_roof (chimneys, vents, hatches: part of the roof, gone with it when players enter), above_roofs (airships, birds flying over everything); auto — by its name"});
     let roofs = json!({"type": "string", "enum": ["solid", "ghost", "hidden"], "description": "Roofs: solid as players see them (default), ghost — see-through to check inside, hidden"});
     let canopy = json!({"type": ["boolean", "string"], "description": "A tree crown in Foundry: its own tile above tokens that fades when a token walks under it and sways in the wind (Wild Canvas). Auto (default) — Forgotten Adventures tree tops and the built-in tree; give true for your own tree pictures, false to keep a crown on the ground"});
@@ -48,7 +48,7 @@ fn tools() -> Value {
     json!([
         tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
-            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs"]}, "description": "Sections to list; default all"},
+            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "room_walls"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name)"},
             "area": area, "limit": int("Max items per section, default 200")
         }), &[]),
         tool("find_assets", "Search the asset library (built-in pictures plus the user's Dungeondraft packs and folder) by words, best matches first: the exact file name, then whole words of the name in order; 'table' does not rank 'tablet'; broken, damaged, fallen, desert, arctic, cyberpunk and similar branches sink unless named. Height, normal and roughness maps are not in the library. Returns keys to use in add_object / paint / add_door.", json!({
@@ -113,7 +113,8 @@ fn tools() -> Value {
             "points": points,
             "target": {"type": "string", "enum": ["terrain", "room"], "description": "Default terrain"},
             "feather": num("Terrain only, 0..1, default 0: soft edge — the share of the way from the edge to the middle over which the paint fades. About 0.35 for lawns, mud and shores"),
-            "angle": num("Turn the floor pattern, degrees clockwise (45 for parquet along a diagonal wall). Without it a library key lies straight and a material index keeps its own angle (map_info shows it)")
+            "angle": num("Turn the floor pattern, degrees clockwise (45 for parquet along a diagonal wall). Without it a library key lies straight and a material index keeps its own angle (map_info shows it)"),
+            "live": {"type": "string", "enum": ["auto", "off", "water", "lava", "swamp", "neon"], "description": "What this paint comes alive as in Foundry (Wild Canvas); default auto — by the picture's name (water, lava, swamp, cyberpunk grid floor → neon). off keeps a floor still: a sci-fi grid floor without running neon, a decorative pool"}
         }), &["material"]),
         tool("erase", "Erase floor and rooms over a rectangle, oval or polygon, exact to a quarter cell.", json!({
             "area": area, "shape": {"type": "string", "enum": ["rect", "oval", "poly"]}, "points": points,

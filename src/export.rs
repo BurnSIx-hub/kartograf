@@ -31,6 +31,9 @@ pub struct Layout {
     pub passages: Vec<[f32; 4]>,
 }
 
+/// Стоячая вода в «Wild Canvas»: зыбь, блики на дне, искры и скорость — доли обычных.
+const STILL_WATER: (f64, f64, f64, f64) = (0.15, 0.65, 0.3, 0.5);
+
 pub struct Zone {
     pub effect: &'static str,
     pub loops: Vec<(Vec<[f32; 2]>, bool)>,
@@ -42,6 +45,12 @@ pub struct Zone {
     /// Доля мутной воды, 0..1 ([`crate::map::Material::murky`]): больше половины —
     /// у области нет пены у берега, бликов на дне и рыб.
     pub murky: f32,
+    /// Доля воды без рыб, 0..1 ([`crate::map::Material::fishless`]): больше половины —
+    /// у области рыб нет («Без рыбы»), блики и пена как у обычной воды.
+    pub fishless: f32,
+    /// Доля стоячей воды, 0..1 ([`crate::map::Material::still`]): больше половины и без
+    /// течения — у области нет зыби и пены, свет на дне слабый и медленный.
+    pub still: f32,
     /// Своё течение участка воды ([`crate::map::Flow`]): скорость и куда. Нет — как у
     /// всей карты.
     pub flow: Option<(f32, f32)>,
@@ -155,7 +164,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
     }
     let mut masks: Vec<(&'static str, mask::Mask)> = Vec::new();
     // Сколько воды глубокой и сколько всего — по закрашенному.
-    let (mut deep, mut wet, mut murk) = (0u64, 0u64, 0u64);
+    let (mut deep, mut wet, mut murk, mut cold, mut calm) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for (m, mat) in map.materials.iter().enumerate() {
         let Some(effect) = mat.live().effect() else { continue };
         let mask = map.material_mask(m);
@@ -167,6 +176,12 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
             }
             if mat.murky() {
                 murk += area;
+            }
+            if mat.fishless() {
+                cold += area;
+            }
+            if mat.still() {
+                calm += area;
             }
         }
         match masks.iter_mut().find(|(e, _)| *e == effect) {
@@ -180,6 +195,8 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
     }
     let shallow = if wet == 0 { 1.0 } else { 1.0 - deep as f32 / wet as f32 };
     let murky = if wet == 0 { 0.0 } else { murk as f32 / wet as f32 };
+    let fishless = if wet == 0 { 0.0 } else { cold as f32 / wet as f32 };
+    let still = if wet == 0 { 0.0 } else { calm as f32 / wet as f32 };
     let mut out: Vec<Zone> = Vec::new();
     for (effect, mut mask) in masks {
         // Под настилом (дорожка вдоль линии — мостки, мост) живого нет: по тропе
@@ -290,7 +307,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
                     (l.clone(), depth % 2 == 1)
                 })
                 .collect::<Vec<_>>();
-            out.push(Zone { effect, loops: tagged, place: String::new(), shallow, murky, flow });
+            out.push(Zone { effect, loops: tagged, place: String::new(), shallow, murky, fishless, still, flow });
         }
     }
     out
@@ -337,8 +354,10 @@ pub struct Light {
     pub bright: f32,
     pub dim: f32,
     pub color: &'static str,
-    /// Анимация Foundry: «torch», «flame» и т. п.
+    /// Анимация Foundry: «torch», «flame» и т. п.; пусто — горит ровно.
     pub animation: &'static str,
+    /// Плотность цвета, способ окраски, мягкость края и высветление ([`crate::map::Glow::look`]).
+    pub look: (f32, u8, f32, f32),
 }
 
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
@@ -388,8 +407,9 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
         .iter()
         .filter_map(|p| {
             // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой.
-            let (bright, dim, color, animation) = p.light()?.params()?;
-            Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation })
+            let glow = p.light()?;
+            let (bright, dim, color, animation) = glow.params()?;
+            Some(Light { at: p.pos, bright: bright * p.scale.sqrt(), dim: dim * p.scale.sqrt(), color, animation, look: glow.look() })
         })
         .collect();
     let mut zones = zones(map, room_edges, seen);
@@ -400,7 +420,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let a = i as f32 / 12.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
+        zones.push(Zone { effect: "fire", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, fishless: 0.0, still: 0.0, flow: None });
     }
     // Встроенный фонтан: эффект «Wild Canvas» по его трём чашам — струя, перелив, круги, журчание.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("fountain")) {
@@ -409,11 +429,11 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let a = i as f32 / 24.0 * std::f32::consts::TAU;
             [p.pos[0] + r * a.cos(), p.pos[1] + r * a.sin()]
         }).collect();
-        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
+        zones.push(Zone { effect: "fountain", loops: vec![(round, false)], place: String::new(), shallow: 1.0, murky: 0.0, fishless: 0.0, still: 0.0, flow: None });
     }
     // Мост нарисован в фоне — под ним вырез, чтобы вода и рыба не шли поверх настила.
     for p in map.props.iter().filter(|p| map::bridge_by_name(&p.asset)) {
-        zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
+        zones.push(Zone { effect: "cut", loops: vec![(bridge_cut(p, seen(&p.asset)), false)], place: String::new(), shallow: 1.0, murky: 0.0, fishless: 0.0, still: 0.0, flow: None });
     }
     // Неон бежит по швам пола, а мебель запечена в фон: под каждым предметом на
     // неоновом полу — вырез. Огням и плоскому (люк, решётка, ковёр) не нужен.
@@ -431,7 +451,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             let (c, s) = (p.rot.to_radians().cos(), p.rot.to_radians().sin());
             let corner = |x: f32, y: f32| [p.pos[0] + x * c - y * s, p.pos[1] + x * s + y * c];
             let rect = vec![corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh), corner(-hw, -hh)];
-            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0, flow: None });
+            zones.push(Zone { effect: "cut", loops: vec![(rect, false)], place: String::new(), shallow: 1.0, murky: 0.0, fishless: 0.0, still: 0.0, flow: None });
         }
     }
     // Комнаты — область со звуком внутри: в таверне слышна таверна, во дворе — лес.
@@ -439,7 +459,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&map.rooms)).into_iter().map(|l| simplify(&l, true, 0.05)).filter(|l| l.len() >= 4).collect();
         let tagged: Vec<_> = loops.iter().map(|l| (l.clone(), loops.iter().filter(|o| !std::ptr::eq(*o, l) && inside(l[0], o)).count() % 2 == 1)).collect();
         if !tagged.is_empty() {
-            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0, murky: 0.0, flow: None });
+            zones.push(Zone { effect: "place", loops: tagged, place: map.indoor.clone(), shallow: 1.0, murky: 0.0, fishless: 0.0, still: 0.0, flow: None });
         }
     }
     // Палатки — по прямоугольнику картинки; выгрузка заменит на контур (`tent_walls`).
@@ -1390,6 +1410,22 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 region["flags"][LIVE_MODULE]["caustic"] = json!(0);
                 region["flags"][LIVE_MODULE]["fish"] = json!(false);
             }
+            // Криожидкость, охладитель, кислота: рыб нет, вид «Без рыбы» (номер 3 в Wild Canvas).
+            if z.effect == "water" && z.fishless >= 0.5 {
+                region["flags"][LIVE_MODULE]["fish"] = json!(false);
+                region["flags"][LIVE_MODULE]["fishKind"] = json!(3);
+            }
+            // Стоячая вода (разлив в коридоре, лужа): без зыби и пены у стен, свет на дне
+            // слабый и медленный — зеркало, по которому еле ходят блики. С течением — как обычная.
+            if z.effect == "water" && z.still >= 0.5 && current <= 0.0 {
+                let flags = &mut region["flags"][LIVE_MODULE];
+                let caustic = flags["caustic"].as_f64().unwrap_or(1.0);
+                flags["ripple"] = json!(STILL_WATER.0);
+                flags["foam"] = json!(0);
+                flags["caustic"] = json!((caustic * STILL_WATER.1 * 100.0).round() / 100.0);
+                flags["glint"] = json!(STILL_WATER.2);
+                flags["speed"] = json!(STILL_WATER.3);
+            }
             if z.effect == "water" && current > 0.0 {
                 region["flags"][LIVE_MODULE]["current"] = json!((current as f64 * 10.0).round() / 10.0);
                 region["flags"][LIVE_MODULE]["drift"] = json!(drift.rem_euclid(360.0).round() as i64);
@@ -1569,8 +1605,10 @@ fn level_docs(layout: &Layout, px: u32, leaves: &std::collections::HashMap<Strin
         // Радиус в единицах сетки сцены: футы, 5 на клетку.
         lights_out.push(json!({
             "_id": doc_id('l', lights_out.len()), "x": x, "y": y,
-            "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color, "alpha": 0.35,
-                       "animation": {"type": l.animation, "speed": 3, "intensity": 3}},
+            "config": {"bright": l.bright * 5.0, "dim": l.dim * 5.0, "color": l.color,
+                       "alpha": (l.look.0 as f64 * 100.0).round() / 100.0, "coloration": l.look.1, "attenuation": (l.look.2 as f64 * 100.0).round() / 100.0, "luminosity": (l.look.3 as f64 * 100.0).round() / 100.0,
+                       // Пустая анимация — свет горит ровно (аварийная лампа).
+                       "animation": {"type": if l.animation.is_empty() { Value::Null } else { json!(l.animation) }, "speed": 3, "intensity": 3}},
             // Модуль Картографа ставит у огня кнопку: гасить и зажигать может и игрок.
             "flags": {OWN_MODULE: {"toggle": true}}
         }));
@@ -1875,6 +1913,17 @@ mod tests {
         assert_eq!((murky["foam"].as_f64(), murky["caustic"].as_f64(), murky["fish"].as_bool()), (Some(0.0), Some(0.0), Some(false)));
         let clear = flags("Мелководье");
         assert_eq!((clear.get("foam"), clear["fish"].as_bool()), (None, Some(true)));
+        // Кислота: рыб нет, вид «Без рыбы», а блики на дне и пена как у чистой воды.
+        let acid = flags("Кислота");
+        assert_eq!((acid["fish"].as_bool(), acid["fishKind"].as_i64(), acid.get("foam"), acid.get("caustic"), acid.get("ripple")), (Some(false), Some(3), None, None, None));
+        // Криожидкость — разлив на полу: без рыб и стоячая — ни зыби, ни пены у стен,
+        // блики на дне слабые и медленные.
+        let cryo = flags("Криожидкость");
+        assert_eq!((cryo["fish"].as_bool(), cryo["fishKind"].as_i64()), (Some(false), Some(3)));
+        assert_eq!((cryo["foam"].as_f64(), cryo["ripple"].as_f64(), cryo["caustic"].as_f64(), cryo["glint"].as_f64(), cryo["speed"].as_f64()), (Some(0.0), Some(0.15), Some(0.65), Some(0.3), Some(0.5)));
+        // Лужа чистой воды стоит так же, но рыбы в ней по имени не запрещены.
+        let pool = flags("Лужа");
+        assert_eq!((pool["foam"].as_f64(), pool["ripple"].as_f64(), pool.get("fishKind")), (Some(0.0), Some(0.15), None));
     }
 
     #[test]

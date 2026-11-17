@@ -340,6 +340,13 @@ impl App {
             out.insert("walls".into(), json!(list));
             out.insert("room_walls".into(), json!("walls along painted rooms are automatic and not listed; change them by painting/erasing rooms"));
         }
+        // Стены по краю закрашенных комнат — только по прямой просьбе: на большой карте их много.
+        // Самопроверка карт без крыш (станция, подземелье) узнаёт по ним, что внутри, а что снаружи.
+        let asked = |s: &str| a["include"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str() == Some(s)));
+        if asked("room_walls") {
+            let list: Vec<Value> = m.room_edges().into_iter().filter(|(p, q)| inside(area, *p) || inside(area, *q)).map(|(p, q)| json!([[r2(p[0]), r2(p[1])], [r2(q[0]), r2(q[1])]])).collect();
+            out.insert("room_walls".into(), json!(list));
+        }
         if want("doors") {
             let list: Vec<Value> = m.portals.iter().enumerate().filter(|(_, d)| inside(area, d.center())).take(limit).map(|(i, d)| door_json(i, d)).collect();
             out.insert("doors".into(), json!(list));
@@ -625,7 +632,11 @@ impl App {
             self.edges_dirty = true;
             return Ok(json!({"erased_cells": cells, "feather": feather}));
         }
-        let m = self.material_turned(&a["material"], f(a, "angle"))?;
+        let mut m = self.material_turned(&a["material"], f(a, "angle"))?;
+        // Свой «живой» вид: тот же материал, но с выбранным эффектом (или без) — отдельным.
+        if let Some(live) = live_of(a)? {
+            m = self.map.material_with_live(m, live).ok_or("в карте уже 255 материалов")?;
+        }
         self.checkpoint();
         self.map.paint(if room { Layer::Rooms } else { Layer::Floor }, m, &weights);
         self.edges_dirty = true;
@@ -1475,6 +1486,20 @@ fn color_of(a: &Value, k: &str) -> Result<Option<Option<[u8; 3]>>, String> {
     }
 }
 
+/// Чем оживает закрашенное (`live` у paint): нет поля — как решит имя картинки.
+fn live_of(a: &Value) -> Result<Option<map::Live>, String> {
+    let Some(s) = a["live"].as_str() else { return Ok(None) };
+    Ok(Some(match s {
+        "auto" => map::Live::Auto,
+        "off" => map::Live::Off,
+        "water" => map::Live::Water,
+        "lava" => map::Live::Lava,
+        "swamp" => map::Live::Swamp,
+        "neon" => map::Live::Neon,
+        _ => return Err("live: auto, off, water, lava, swamp или neon".into()),
+    }))
+}
+
 /// Свет из ответа ИИ: нет поля — не трогать; `auto` — по имени; иначе свой.
 fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
     let Some(s) = a["light"].as_str() else { return Ok(None) };
@@ -1487,7 +1512,9 @@ fn glow_of(a: &Value) -> Result<Option<Option<Glow>>, String> {
         "candle" => Some(Glow::Candle),
         "lamp" => Some(Glow::Lamp),
         "arcane" => Some(Glow::Arcane),
-        _ => return Err("light: auto, off, campfire, fireplace, brazier, candle, lamp или arcane".into()),
+        "neon" => Some(Glow::Neon),
+        "alarm" => Some(Glow::Alarm),
+        _ => return Err("light: auto, off, campfire, fireplace, brazier, candle, lamp, arcane, alarm или neon".into()),
     };
     Ok(Some(g))
 }
@@ -1676,6 +1703,14 @@ mod tests {
         let (_, n4) = wall_side(seg, [2.05, 2.05], 0.2, None, |p| p[0] + p[1] < 4.0);
         assert!(n4[0] < 0.0 && n4[1] < 0.0, "из толщи стены — в комнату: {n4:?}");
         assert_eq!(back_extent("right", [-0.3, -0.5, 0.5, 0.5], [1.0, 1.0]), 0.3);
+    }
+
+    #[test]
+    fn paint_live_overrides_the_name() {
+        assert_eq!(live_of(&json!({"live": "off"})), Ok(Some(map::Live::Off)), "пол киберпанка без неона");
+        assert_eq!(live_of(&json!({"live": "water"})), Ok(Some(map::Live::Water)));
+        assert_eq!(live_of(&json!({})), Ok(None), "не названо — по имени картинки");
+        assert!(live_of(&json!({"live": "fire"})).is_err());
     }
 
     #[test]

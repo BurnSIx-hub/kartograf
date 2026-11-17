@@ -314,7 +314,7 @@ mod tests {
     use super::*;
 
     fn light(at: [f32; 2], color: &'static str, animation: &'static str) -> crate::export::Light {
-        crate::export::Light { at, bright: 2.0, dim: 5.0, color, animation }
+        crate::export::Light { at, bright: 2.0, dim: 5.0, color, animation, look: (0.35, 1, 0.5, 0.5) }
     }
 
     fn layout(walls: Vec<Vec<[f32; 2]>>, portals: Vec<PortalOut>, lights: Vec<crate::export::Light>) -> Layout {
