@@ -806,8 +806,21 @@ pub type Sources = Arc<RwLock<HashMap<String, (PathBuf, u64, u64)>>>;
 /// Ключ картинки встроенного набора: `set:cyberpunk/objects/Sofa_Neon_A_2x1.webp`.
 pub const SET: &str = "set:";
 
-/// Набор ассета (`cyberpunk`), если он из встроенного набора. Ассеты набора
-/// идут только в свой генератор, в обычные карты не попадают.
+/// Подписи встроенных наборов на полке. Свои ассеты (мосты, кусты, деревья…) —
+/// из папки OSM-сборки, перенесены в программу 18.11.2026.
+pub const SET_TITLES: [(&str, &str); 8] = [
+    ("cyberpunk", "Киберпанк"),
+    ("bridges", "Мосты"),
+    ("bushes", "Кусты"),
+    ("ground", "Земля"),
+    ("scifi", "Sci-fi"),
+    ("steampunk", "Стимпанк"),
+    ("swamp", "Болото"),
+    ("trees", "Деревья"),
+];
+
+/// Набор ассета (`cyberpunk`), если он из встроенного набора. Киберпанк идёт
+/// только в свой генератор, прочие наборы — как своя папка.
 pub fn set_of(key: &str) -> Option<&str> {
     key.strip_prefix(SET)?.split('/').next()
 }
@@ -1337,8 +1350,9 @@ impl Library {
         // Встроенные наборы — как своя папка: «Киберпанк/objects/…».
         let sets = crate::sets::SET_FILES.iter().filter_map(|(rel, _)| {
             let kind = kind_of(rel, false)?;
-            let shown = rel.strip_prefix("cyberpunk/").map_or_else(|| (*rel).to_owned(), |r| format!("Киберпанк/{r}"));
-            Some(Asset::new(format!("{SET}{rel}"), &shown, kind))
+            let (set, rest) = rel.split_once('/')?;
+            let title = SET_TITLES.iter().find(|t| t.0 == set).map_or(set, |t| t.1);
+            Some(Asset::new(format!("{SET}{rel}"), &format!("{title}/{rest}"), kind))
         });
         let builtin = textures.chain(objects).chain(walls).chain(portals).chain(roofs).chain(sets);
         self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
@@ -1517,6 +1531,26 @@ mod tests {
             let mid = img.height() / 2;
             assert_eq!(img.get_pixel(0, mid)[3], 255, "{id}: середина полосы непрозрачна");
             assert_eq!(super::builtin_wall_width(&format!("{}{id}", super::BUILTIN)), Some(width));
+        }
+    }
+
+    #[test]
+    fn own_sets_are_built_in_with_titles_kinds_and_behaviour() {
+        let lib = super::Library::default();
+        let find = |name: &str| lib.assets.iter().find(|a| a.key.ends_with(name)).unwrap_or_else(|| panic!("нет {name}"));
+        let bridge = find("/Bridge_Boardwalk_Straight_A_3x4.webp");
+        assert_eq!((bridge.kind, super::set_of(&bridge.key)), (super::Kind::Object, Some("bridges")));
+        assert_eq!(bridge.folder, "Мосты/objects");
+        assert!(crate::map::bridge_by_name(&bridge.key));
+        assert!(crate::map::bush_by_name(&find("/Esparto_A1.webp").key), "куст из набора качается");
+        assert!(crate::map::has_trunk(&find("/Olivo_A1.webp").key));
+        assert_eq!(find("/Cobblestone_Scale_Slate.webp").kind, super::Kind::Floor);
+        assert_eq!(find("/Water_Cryo_Fluid_A1.webp").kind, super::Kind::Floor);
+        // Все картинки наборов читаются и у каждого набора есть подпись.
+        for (rel, bytes) in crate::sets::SET_FILES {
+            image::load_from_memory(bytes).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let set = rel.split('/').next().unwrap();
+            assert!(super::SET_TITLES.iter().any(|t| t.0 == set), "нет подписи набора {set}");
         }
     }
 

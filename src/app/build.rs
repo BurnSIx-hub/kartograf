@@ -79,8 +79,8 @@ impl App {
             .assets
             .iter()
             .filter(|a| match library::set_of(&a.key) {
-                Some(set) => cyber && set == "cyberpunk",
-                None => library_mode,
+                Some("cyberpunk") => cyber,
+                _ => library_mode,
             })
             .cloned()
             .collect();
