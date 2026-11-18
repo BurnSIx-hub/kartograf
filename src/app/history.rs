@@ -22,7 +22,7 @@ impl App {
         self.touch();
     }
 
-    pub(super) fn touch(&mut self) {
+    pub(crate) fn touch(&mut self) {
         self.dirty = true;
         self.rev += 1;
         self.edges_dirty = true;
@@ -56,6 +56,8 @@ impl App {
         self.sel = None;
         self.picked.clear();
         self.draft.clear();
+        self.draft_bends.clear();
+        self.wall_join = None;
         self.path_draft.clear();
         self.moving = None;
         self.edges_dirty = true;
@@ -113,6 +115,8 @@ impl App {
         self.sel = self.sel.filter(|s| self.sel_exists(*s));
         self.material = self.material.min(self.map.materials.len().saturating_sub(1));
         self.draft.clear();
+        self.draft_bends.clear();
+        self.wall_join = None;
         self.path_draft.clear();
         self.moving = None;
         self.touch();
@@ -129,6 +133,7 @@ impl App {
             Sel::Roof(i) => i < self.map.roofs.len(),
             Sel::Outline(i, k) => self.map.outline_roofs.get(i).is_some_and(|r| k < r.pieces.len()),
             Sel::Platform(i) => i < self.map.platforms.len(),
+            Sel::PlatformEdge(i, k) => self.map.platforms.get(i).is_some_and(|p| k < crate::platform::tidy(&p.points).len()),
             // Местность после отмены другая: кусок выбирают заново.
             Sel::Ground => false,
         }

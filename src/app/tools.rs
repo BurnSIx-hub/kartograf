@@ -518,7 +518,7 @@ impl App {
         let scale = f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0);
         let (pos, rot, wall) = self.facing(a, &asset, size, scale, [x, y], 0.0)?;
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None, glow, sunk });
+        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None, glow, sunk, flip: a["flip"].as_bool().unwrap_or(false) });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         let p = &self.map.props[i];
@@ -560,6 +560,9 @@ impl App {
         }
         if let Some(s) = sunk {
             p.sunk = s;
+        }
+        if let Some(f) = a.get("flip").and_then(Value::as_bool) {
+            p.flip = f;
         }
         if let Some(s) = shadow {
             p.shadow = s;
@@ -617,7 +620,7 @@ impl App {
     }
 
     /// Контуры крыш этажа: прямоугольные — с выносом, по контуру — внешние кольца.
-    fn roof_outlines(&self) -> Vec<Vec<[f32; 2]>> {
+    pub(super) fn roof_outlines(&self) -> Vec<Vec<[f32; 2]>> {
         let mut out: Vec<Vec<[f32; 2]>> = self
             .map
             .roofs
@@ -676,6 +679,11 @@ impl App {
         let outline = if ["points", "area", "circle", "outside_circle"].iter().any(|k| a.get(*k).is_some()) { Some(platform_outline(a)?) } else { None };
         let (color, side, stairs) = (color_of(a, "color")?, color_of(a, "side")?, stairs_of(a)?);
         let mut decor = self.map.platforms[i].clone();
+        // Новый контур — новые рёбра: открытые края прежнего к нему не относятся.
+        if let Some(points) = &outline {
+            decor.points = points.clone();
+            decor.open.clear();
+        }
         decor_of(a, &mut decor)?;
         self.checkpoint();
         let pl = &mut self.map.platforms[i];
@@ -697,7 +705,7 @@ impl App {
         if let Some(stairs) = stairs {
             pl.stairs = stairs;
         }
-        (pl.rail, pl.lights, pl.grates) = (decor.rail, decor.lights, decor.grates);
+        (pl.rail, pl.lights, pl.grates, pl.open) = (decor.rail, decor.lights, decor.grates, decor.open);
         Ok(platform_row(i, pl))
     }
 
@@ -1707,6 +1715,20 @@ fn stairs_of(a: &Value) -> Result<Option<Vec<crate::platform::Stair>>, String> {
 
 /// Роспись помоста из ответа ИИ: перила, огоньки, решётки. Нет поля — не трогать.
 fn decor_of(a: &Value, pl: &mut crate::platform::Platform) -> Result<(), String> {
+    if let Some(v) = a.get("open") {
+        let edges = crate::platform::tidy(&pl.points).len();
+        let mut open = Vec::new();
+        for k in v.as_array().ok_or("open: список номеров рёбер")? {
+            let k = k.as_u64().ok_or("open: номера рёбер — целые")? as usize;
+            if k >= edges {
+                return Err(format!("open: ребра {k} нет, их {edges}"));
+            }
+            open.push(k);
+        }
+        open.sort_unstable();
+        open.dedup();
+        pl.open = open;
+    }
     if let Some(v) = a.get("rail") {
         pl.rail = v.as_bool().ok_or("rail: true или false")?;
     }
@@ -1735,7 +1757,7 @@ fn platform_row(i: usize, p: &crate::platform::Platform) -> Value {
     let (lo, hi) = p.bounds();
     let stairs: Vec<Value> = p.stairs.iter().map(|s| json!({"at": [r2(s.at[0]), r2(s.at[1])], "width": s.width, "steps": s.steps})).collect();
     let grates: Vec<Value> = p.grates.iter().map(|g| json!({"at": [r2(g.at[0]), r2(g.at[1])], "length": r2(g.length)})).collect();
-    json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs, "rail": p.rail, "lights": p.lights, "grates": grates})
+    json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs, "rail": p.rail, "lights": p.lights, "grates": grates, "open": p.open})
 }
 
 fn points_of(a: &Value) -> Vec<[f32; 2]> {
@@ -1982,7 +2004,7 @@ fn object_row(i: usize, p: &map::Prop) -> Value {
 }
 
 fn object_row_base(i: usize, p: &map::Prop, r2: impl Fn(f32) -> f32) -> Value {
-    json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "canopy": p.is_canopy(), "tint": p.tint, "recolor": library::untint(&p.asset).0})
+    json!({"index": i, "asset": p.asset, "name": library::label(&p.asset), "x": r2(p.pos[0]), "y": r2(p.pos[1]), "w": r2(p.size[0] * p.scale), "h": r2(p.size[1] * p.scale), "rotation": p.rot, "layer": p.layer(), "light": glow_name(p.light()), "shadow": p.casts_shadow(), "canopy": p.is_canopy(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "flip": p.flip})
 }
 
 /// Видимая часть предмета в клетках от его центра, до поворота: лево, верх, право, низ
@@ -2116,7 +2138,7 @@ mod tests {
 
     #[test]
     fn describe_tells_canopies_and_low_walls() {
-        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         assert_eq!(object_row(0, &prop("objects/Sail_Yard_Light_Tan_A1_14x3.webp", Some(true)))["canopy"], json!(true), "парус, отмеченный кроной");
         assert_eq!(object_row(1, &prop("objects/Crate_Wood_Dark_A_1x1.webp", None))["canopy"], json!(false));
         // Видимая часть — в клетках: холст 2×1 в масштабе 1,5, картинка занимает его середину.

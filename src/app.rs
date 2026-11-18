@@ -95,18 +95,20 @@ impl Tool {
         }
     }
 
+    /// Клавиша инструмента. «Выбор» — X, как в Dungeondraft; G, S, L, H, R, C, Z, A и
+    /// цифры заняты его же сочетаниями, у остальных инструментов буквы свободные.
     pub fn key(self) -> Key {
         match self {
-            Tool::Select => Key::V,
+            Tool::Select => Key::X,
             Tool::Dungeon => Key::D,
             Tool::Floor => Key::F,
             Tool::Erase => Key::E,
             Tool::Wall => Key::W,
             Tool::Door => Key::O,
             Tool::Object => Key::P,
-            Tool::Scatter => Key::S,
-            Tool::Path => Key::L,
-            Tool::Shade => Key::H,
+            Tool::Scatter => Key::B,
+            Tool::Path => Key::U,
+            Tool::Shade => Key::N,
             Tool::Relief => Key::M,
             Tool::Text => Key::T,
             Tool::Roof => Key::K,
@@ -212,6 +214,8 @@ pub enum Sel {
     Edge((i32, i32), bool),
     /// Помост (инструмент «Крыша» в режиме помоста или «Выбор»).
     Platform(usize),
+    /// Край помоста: номер помоста и ребра его чистого контура (`platform::tidy`).
+    PlatformEdge(usize, usize),
     /// Кусок местности: сам кусок — в `App::ground`.
     Ground,
 }
@@ -289,9 +293,13 @@ pub struct Settings {
     pub textures_dir: Option<PathBuf>,
     #[serde(default)]
     pub packs: Vec<PathBuf>,
-    /// Объекты встают по сетке; Alt на время меняет на обратное.
+    /// Привязка к сетке (S, как в Dungeondraft): объекты, вершины стен, двери, рамки
+    /// крыш и помостов, подписи, дороги. Alt на время меняет на обратное.
     #[serde(default = "yes")]
     pub snap: bool,
+    /// Сетка видна (G, как в Dungeondraft).
+    #[serde(default = "yes")]
+    pub grid: bool,
     /// Генераторы строят своими ассетами из библиотеки, а не встроенными.
     #[serde(default)]
     pub gen_library: bool,
@@ -309,7 +317,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, gen_library: false, export_canopies: true, roof_view: 0 }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, roof_view: 0 }
     }
 }
 
@@ -639,6 +647,32 @@ pub struct App {
     pub ground: Option<ground_edit::GroundPiece>,
     /// Что из куска местности тянут мышью.
     ground_grab: Option<ground_edit::GroundGrab>,
+    /// Инструмент до «Выбора»: X возвращает к нему, как в Dungeondraft.
+    pub prev_tool: Tool,
+    /// Линейка (R) и её отрезок.
+    pub ruler: bool,
+    pub ruler_line: Option<([f32; 2], [f32; 2])>,
+    /// Предпросмотр света (L) и его расчёт.
+    pub light_view: bool,
+    light: Option<view_tools::LightCache>,
+    /// Слой новых объектов (цифры 1–4, 7, 8, 9); нет — по имени ассета.
+    pub object_layer: Option<i16>,
+    /// Кисть пола или подземелья с Alt стирает (как в Dungeondraft).
+    brush_erase: bool,
+    /// Ctrl на конце стены: новая стена продолжает эту (номер в `map.walls`).
+    wall_join: Option<usize>,
+    /// Ctrl на конце другой стены при начатой: та сливается с этой и убирается.
+    wall_merge: Option<usize>,
+    /// Прогибы отрезков начатой стены (у продолженной — её прежние).
+    draft_bends: Vec<f32>,
+    /// Рамка крыши или помоста без привязки: откуда начали, клетки.
+    roof_from_w: Option<[f32; 2]>,
+    /// Зажата A: объект встанет отражённым.
+    pub mirror_held: bool,
+    /// С какой точки дороги началась протяжка (для ровной линии с Shift).
+    path_from: usize,
+    /// Идёт поворот выбранного колесом: шаг отмены на всю прокрутку один.
+    wheel_turn: bool,
     /// Где в верхней строке кнопка «Биом» — для самопроверки.
     pub biome_button: Rect,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
@@ -858,6 +892,20 @@ impl App {
             wall_low: false,
             ground: None,
             ground_grab: None,
+            prev_tool: Tool::Dungeon,
+            ruler: false,
+            ruler_line: None,
+            light_view: false,
+            light: None,
+            object_layer: None,
+            brush_erase: false,
+            wall_join: None,
+            wall_merge: None,
+            draft_bends: Vec::new(),
+            roof_from_w: None,
+            mirror_held: false,
+            path_from: 0,
+            wheel_turn: false,
             biome_button: Rect::NOTHING,
             window_glass: std::collections::HashMap::new(),
             used_only: false,
@@ -936,7 +984,9 @@ mod draw_ground;
 mod draw_platform;
 mod platform_edit;
 mod ground_edit;
+mod view_tools;
 pub use platform_edit::PlatformPut;
+pub use view_tools::ruler_text;
 mod draw_scene;
 mod exporting;
 mod reference;
@@ -1434,7 +1484,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

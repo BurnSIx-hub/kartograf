@@ -36,17 +36,33 @@ impl App {
                     })
                     .sum::<f32>()
             });
-            // Ctrl с колесом у кисти — её размер, а не масштаб карты.
+            // Колесо как в Dungeondraft: Ctrl — масштаб всегда; без него — дело инструмента:
+            // у кисти размер, у объекта поворот (с Z — медленный), Alt — размер объекта,
+            // Shift — следующая картинка с полки. Где колесу дела нет — масштаб.
             let brush = matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief) && !self.brush.shape.drags();
-            let (ctrl, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.alt));
+            let (ctrl, alt, shift, slow) = ui.input(|i| (i.modifiers.command, i.modifiers.alt, i.modifiers.shift, i.key_down(Key::Z)));
             let prop = matches!(self.tool, Tool::Select | Tool::Object);
+            let turns = self.tool == Tool::Object || (self.tool == Tool::Select && matches!(self.sel, Some(Sel::Prop(_))));
             if !alt {
                 self.alt_wheel = false;
             }
-            if notches != 0.0 && self.tool == Tool::Scatter && ctrl {
+            // Поворот колесом — одна правка, пока не нажали кнопку мыши.
+            if ui.input(|i| i.pointer.any_pressed()) {
+                self.wheel_turn = false;
+            }
+            if notches != 0.0 && ctrl {
+                self.cam.zoom_at(rect, p, WHEEL_STEP.powf(notches));
+            } else if notches != 0.0 && self.tool == Tool::Scatter {
                 self.scatter.radius = (self.scatter.radius * 1.25f32.powf(notches)).clamp(0.25, 10.0);
-            } else if notches != 0.0 && brush && ctrl {
+            } else if notches != 0.0 && brush {
                 self.brush.radius = (self.brush.radius * 1.25f32.powf(notches)).clamp(0.25, 10.0);
+            } else if notches != 0.0 && self.tool == Tool::Object && shift {
+                self.cycle_object(if notches > 0.0 { -1 } else { 1 });
+            } else if notches != 0.0 && turns && !alt {
+                self.turn_by(notches * if slow { 1.0 } else { 15.0 });
+            } else if notches != 0.0 && self.tool == Tool::Roof && !self.platform_mode {
+                // Конёк крыши — поворотом колеса (R теперь линейка).
+                self.rotate();
             } else if notches != 0.0 && prop && alt {
                 // Alt с колесом — размер выбранного объекта, а без выбора — того, что ставится.
                 let k = 1.1f32.powf(notches);
@@ -66,12 +82,18 @@ impl App {
             }
         }
 
+        // A зажата — объект встанет отражённым (пока пишут в поле — нет).
+        self.mirror_held = !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_down(Key::A));
+
         // Сдвиг: средняя кнопка или пробел с левой.
         let space = ui.input(|i| i.key_down(Key::Space));
         let panning = resp.dragged_by(PointerButton::Middle) || (space && resp.dragged_by(PointerButton::Primary));
         if panning {
             self.tap_from = None;
             self.cam.pan += resp.drag_delta();
+        } else if self.ruler {
+            // Линейка меряет и ничего не меняет на карте.
+            self.ruler_input(ui, &resp);
         } else {
             self.handle_tool(ui, &resp);
         }
@@ -235,6 +257,7 @@ impl App {
                 {
                     self.shade_erase = alt;
                     self.relief_alt = alt;
+                    self.brush_erase = alt;
                     self.begin_stroke(self.cam.to_world(rect, p));
                 } else if self.stroke_last.is_some() {
                     match (down, at) {
@@ -246,6 +269,7 @@ impl App {
             Tool::Floor | Tool::Erase | Tool::Dungeon | Tool::Shade | Tool::Relief => {
                 self.shade_erase = alt;
                 self.relief_alt = alt;
+                self.brush_erase = alt;
                 if resp.drag_started_by(PointerButton::Primary) {
                     let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
                     self.drag_from = origin.map(|p| self.cam.cell(rect, p));
@@ -264,10 +288,17 @@ impl App {
             }
             Tool::Wall => {
                 if let Some(p) = tap {
-                    let node = self.cam.node(rect, p);
-                    if self.draft.len() >= 3 && self.draft[0] == node {
+                    // Привязка выключается (S), Alt — на время наоборот; Shift — ровная линия.
+                    let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+                    let node = self.wall_point(p, alt, shift);
+                    let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.05;
+                    let raw = self.cam.to_world(rect, p);
+                    if ctrl && self.wall_end_at(raw).is_some() {
+                        // Ctrl у конца стены — продолжить её или, если стена уже начата, слить с ней.
+                        self.join_wall_at(raw);
+                    } else if self.draft.len() >= 3 && near(self.draft[0], node) {
                         self.finish_wall(true);
-                    } else if self.draft.last() != Some(&node) {
+                    } else if self.draft.last().is_none_or(|&l| !near(l, node)) {
                         self.draft.push(node);
                     }
                 }
@@ -293,24 +324,38 @@ impl App {
                             self.roof_grab = Some((i, w, r.a, r.b));
                             self.sel = Some(Sel::Roof(i));
                         }
-                        None => self.roof_from = Some(self.cam.cell(rect, o)),
+                        None => {
+                            self.roof_from = Some(self.cam.cell(rect, o));
+                            self.roof_from_w = (!self.snap_now(alt)).then_some(w);
+                        }
                     }
                 }
                 if let (Some((i, w0, a, b)), Some(p)) = (self.roof_grab, pointer)
                     && resp.dragged_by(PointerButton::Primary)
                 {
-                    // Крыша двигается целыми клетками — остаётся на стенах.
+                    // С привязкой крыша двигается целыми клетками — остаётся на стенах.
                     let w = self.cam.to_world(rect, p);
-                    let d = [(w[0] - w0[0]).round(), (w[1] - w0[1]).round()];
+                    let d = [w[0] - w0[0], w[1] - w0[1]];
+                    let d = if self.snap_now(alt) { [d[0].round(), d[1].round()] } else { d };
                     let r = &mut self.map.roofs[i];
                     r.a = [a[0] + d[0], a[1] + d[1]];
                     r.b = [b[0] + d[0], b[1] + d[1]];
                 }
                 if resp.drag_stopped_by(PointerButton::Primary) {
                     self.roof_grab = None;
+                    let free = self.roof_from_w.take();
                     if let (Some(a), Some(p)) = (self.roof_from.take(), pointer) {
-                        let b = self.cam.cell(rect, p);
-                        self.place_roof(a, b);
+                        match free {
+                            // Без привязки — рамка где протянули, не по клеткам.
+                            Some(w0) => {
+                                let w = self.cam.to_world(rect, p);
+                                self.place_roof_rect(w0, w);
+                            }
+                            None => {
+                                let b = self.cam.cell(rect, p);
+                                self.place_roof(a, b);
+                            }
+                        }
                     }
                 } else if resp.clicked()
                     && let Some(p) = pointer
@@ -361,20 +406,34 @@ impl App {
                 {
                     // Протяжка — от руки: точки через полклетки, на отпускании дорога готова.
                     self.path_draft.push(self.cam.to_world(rect, o));
+                    self.path_from = self.path_draft.len() - 1;
                     self.path_free = true;
                 }
+                let shift = ui.input(|i| i.modifiers.shift);
                 if self.path_free
                     && resp.dragged_by(PointerButton::Primary)
                     && let (Some(p), Some(last)) = (pointer, self.path_draft.last().copied())
                 {
                     let w = self.cam.to_world(rect, p);
-                    if ((w[0] - last[0]).powi(2) + (w[1] - last[1]).powi(2)).sqrt() >= 0.5 {
+                    if shift {
+                        // С Shift протяжка — ровная линия от начала, как в Paint.
+                        let from = self.path_draft[self.path_from];
+                        self.path_draft.truncate(self.path_from + 1);
+                        self.path_draft.push(view_tools::straight(from, w, false));
+                    } else if ((w[0] - last[0]).powi(2) + (w[1] - last[1]).powi(2)).sqrt() >= 0.5 {
                         self.path_draft.push(w);
                     }
                 }
                 if self.path_free && resp.drag_stopped_by(PointerButton::Primary) {
                     if let Some(p) = pointer {
-                        self.path_draft.push(self.cam.to_world(rect, p));
+                        let w = self.cam.to_world(rect, p);
+                        if shift {
+                            let from = self.path_draft[self.path_from];
+                            self.path_draft.truncate(self.path_from + 1);
+                            self.path_draft.push(view_tools::straight(from, w, false));
+                        } else {
+                            self.path_draft.push(w);
+                        }
                     }
                     self.path_free = false;
                     self.finish_path();
@@ -383,7 +442,7 @@ impl App {
                 } else if resp.clicked()
                     && let Some(p) = pointer
                 {
-                    let w = self.snap_pos(self.cam.to_world(rect, p), alt);
+                    let w = self.path_point(p, alt, shift);
                     if self.path_draft.last() != Some(&w) {
                         self.path_draft.push(w);
                     }
@@ -506,7 +565,7 @@ impl App {
                         return;
                     }
                     // Всё, что на карте: что сверху — то и берётся; под ним помост, ниже — местность.
-                    let hit = self.pick(w).or_else(|| self.platform_at(w).map(Sel::Platform)).or_else(|| if shift { None } else { self.ground_pick(w) });
+                    let hit = self.pick(w).or_else(|| self.platform_hit(w)).or_else(|| if shift { None } else { self.ground_pick(w) });
                     if shift {
                         // Shift — добавить к группе или убрать из неё.
                         if let Some(Sel::Prop(k)) = self.sel.take() {

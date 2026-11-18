@@ -247,6 +247,14 @@ fn light_map(scene: &Scene, time: Time, origin: [f32; 2], cell: f32, lw: usize, 
     map
 }
 
+/// Свет для окна редактора (L): та же карта света, что ляжет на снимок, — множитель
+/// по каналам и сияние, уже размытые. Точка `(i, j)` — в середине своей ячейки `cell`.
+pub fn preview(scene: &Scene, time: Time, origin: [f32; 2], cell: f32, lw: usize, lh: usize) -> Vec<[f32; 6]> {
+    let mut map = light_map(scene, time, origin, cell, lw, lh);
+    blur(&mut map, lw, lh, 1.3);
+    map
+}
+
 /// Размытие Гаусса по строкам и столбцам: мягкие полутени.
 fn blur(map: &mut [Texel], w: usize, h: usize, sigma: f32) {
     let r = (sigma * 2.5).ceil() as isize;

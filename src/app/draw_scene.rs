@@ -41,6 +41,8 @@ impl App {
         let _ = tw;
         let (w, h) = (prop.size[0] * prop.scale, prop.size[1] * prop.scale);
         let (hw, hh) = (w / 2.0 + pad / sw * w, h / 2.0 + pad / sh_h * h);
+        // Отражённый — и тень зеркальная (как в `Prop::corners`).
+        let hw = if prop.flip { -hw } else { hw };
         let (s, c) = prop.rot.to_radians().sin_cos();
         let o = sh.offset();
         let corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [prop.pos[0] + x * c - y * s + o[0], prop.pos[1] + x * s + y * c + o[1]]);

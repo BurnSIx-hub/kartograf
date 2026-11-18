@@ -462,17 +462,47 @@ impl App {
         if typing {
             return;
         }
+        // Сочетания Dungeondraft: X — «Выбор» и обратно к прежнему инструменту, G — сетка,
+        // S — привязка, L — свет, R — линейка, Page Up / Page Down — этажи, цифры — слой.
         for tool in Tool::ALL {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, tool.key())) {
-                self.set_tool(tool);
+                if tool == Tool::Select && self.tool == Tool::Select {
+                    self.set_tool(self.prev_tool);
+                } else {
+                    self.set_tool(tool);
+                }
             }
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
-            self.rotate();
+        // V — прежняя клавиша «Выбора».
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
+            self.set_tool(Tool::Select);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G)) {
+            self.settings.grid = !self.settings.grid;
+            self.save_settings();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
             self.settings.snap = !self.settings.snap;
             self.save_settings();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::L)) {
+            self.light_view = !self.light_view;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
+            self.ruler = !self.ruler;
+            self.ruler_line = None;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp)) && self.level + 1 < self.levels.len() {
+            self.switch_level(self.level + 1);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown)) && self.level > 0 {
+            self.switch_level(self.level - 1);
+        }
+        // Слой: 1–4 — свои слои Dungeondraft, 7 — над стенами, 9 — над крышами; 8 — на крыше.
+        for (key, layer) in [(Key::Num1, 100), (Key::Num2, 200), (Key::Num3, 300), (Key::Num4, 400), (Key::Num7, map::ABOVE_WALLS), (Key::Num8, map::ON_ROOF), (Key::Num9, map::ABOVE_ROOFS)] {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) {
+                self.set_layer(layer);
+            }
         }
         // Стрелки двигают выбранный объект: на полклетки, с Shift — на сотую клетки.
         if let Some(Sel::Prop(i)) = self.sel {
@@ -506,6 +536,10 @@ impl App {
             self.path_draft.clear();
             self.sel = None;
             self.platform_put = None;
+            self.wall_join = None;
+            self.draft_bends.clear();
+            self.ruler = false;
+            self.ruler_line = None;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace)) {
             if !self.path_draft.is_empty() {

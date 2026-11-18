@@ -498,6 +498,7 @@ impl App {
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 let mut tile = export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px);
+                tile.flip = prop.flip;
                 tile.fade = !map::is_bare_tree(&prop.asset);
                 // Навес не качается, но держит дождь; куст и крона — под ветром.
                 tile.shelter = !prop.is_canopy() && map::awning_by_name(&prop.asset);
@@ -542,6 +543,7 @@ impl App {
                 };
                 let src = save(&prop.asset, &mut files)?;
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                tile.flip = prop.flip;
                 tile.fade = false;
                 tile.leaves = false;
                 tile.item = true;

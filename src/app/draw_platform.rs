@@ -130,7 +130,8 @@ impl App {
         let res = mask::RES as f32;
         let rooms = &self.map.rooms;
         let room = |q: [f32; 2]| rooms.get((q[0] * res).floor() as isize, (q[1] * res).floor() as isize) > 127;
-        free_edges(&platform::tidy(&self.map.platforms[i].points), &room)
+        let pl = &self.map.platforms[i];
+        pl.sides(free_edges(&platform::tidy(&pl.points), &room))
     }
 }
 
@@ -155,7 +156,7 @@ fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bo
         return;
     }
     let h = pl.height.clamp(0.02, 1.5);
-    let free = free_edges(&p, room);
+    let free = pl.sides(free_edges(&p, room));
     let inside = room(p[0]) || room(p[p.len() / 2]);
     // Тень не выходит за стену: вершина тени по ту сторону стены гаснет.
     let lit = |q: [f32; 2]| room(q) == inside;

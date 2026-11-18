@@ -116,6 +116,19 @@ impl SelfTest {
         self.frames.push_back((Modifiers::NONE, vec![]));
     }
 
+    /// Щелчок с зажатыми клавишами (Shift, Ctrl).
+    fn click_with(&mut self, p: Pos2, mods: Modifiers) {
+        self.frames.push_back((mods, vec![Event::PointerMoved(p)]));
+        self.frames.push_back((mods, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: mods }]));
+        self.frames.push_back((mods, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: mods }]));
+        self.frames.push_back((Modifiers::NONE, vec![]));
+    }
+
+    /// Нажать или отпустить клавишу (A держат, пока ставят отражённым).
+    fn hold(&mut self, key: Key, pressed: bool) {
+        self.frames.push_back((Modifiers::NONE, vec![Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE }]));
+    }
+
     fn drag(&mut self, from: Pos2, to: Pos2, button: PointerButton) {
         self.drag_with(from, to, button, Modifiers::NONE);
     }
@@ -199,12 +212,13 @@ impl SelfTest {
                 let p = app.canvas.center();
                 self.scale = app.cam.scale;
                 self.world = app.cam.to_world(app.canvas, p);
-                self.wheel(p, 2.0);
+                let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+                self.wheel_with(p, 2.0, ctrl);
             }
             10 => {
                 let after = app.cam.to_world(app.canvas, app.canvas.center());
                 let still = (after[0] - self.world[0]).abs() < 0.01 && (after[1] - self.world[1]).abs() < 0.01;
-                self.check("колесо приблизило карту", app.cam.scale > self.scale * 1.2, &format!("{} → {}", self.scale, app.cam.scale));
+                self.check("Ctrl с колесом приблизил карту", app.cam.scale > self.scale * 1.2, &format!("{} → {}", self.scale, app.cam.scale));
                 self.check("точка под курсором осталась на месте", still, &format!("{:?} → {after:?}", self.world));
                 self.pan = app.cam.pan;
                 let c = app.canvas.center();
@@ -223,11 +237,11 @@ impl SelfTest {
                 app.map = Map::new(5, 5);
                 let opened = app.open_path(&file);
                 self.check("сохранённая карта открылась такой же", opened && app.map == before, &format!("{:?}", app.error));
-                self.key(Key::V, Modifiers::NONE);
+                self.key(Key::X, Modifiers::NONE);
                 self.resume_at = now + 0.2;
             }
             13 => {
-                self.check("клавиша V — инструмент выбора", app.tool == Tool::Select, &format!("{:?}", app.tool));
+                self.check("клавиша X — инструмент выбора", app.tool == Tool::Select, &format!("{:?}", app.tool));
                 let p = at(app, [5.5, 2.05]);
                 self.click(p);
                 self.resume_at = now + CLICK_GAP;
@@ -421,10 +435,12 @@ impl SelfTest {
             31 => {
                 let t = app.map.props.get(1).cloned();
                 self.check("стол 2×1", t.as_ref().is_some_and(|t| t.size == [2.0, 1.0]), &format!("{t:?}"));
-                self.key(Key::R, Modifiers::NONE);
+                // Колесо в «Выборе» поворачивает выбранное, 15° за щелчок (как в Dungeondraft).
+                app.set_tool(Tool::Select);
+                self.wheel(at(app, [15.6, 13.4]), 6.0);
             }
             32 => {
-                self.check("R повернул выбранный стол на 90°", app.map.props[1].rot == 90.0, &format!("{}", app.map.props[1].rot));
+                self.check("колесо повернуло выбранный стол на 90°", app.map.props[1].rot == 90.0, &format!("{}", app.map.props[1].rot));
                 // Выбор и перетаскивание бочки на две клетки вправо.
                 self.key(Key::V, Modifiers::NONE);
                 let (a, b) = (at(app, [14.0, 12.5]), at(app, [16.0, 11.5]));
@@ -608,17 +624,16 @@ impl SelfTest {
                 self.snap(ctx, "изгиб и ручки");
             }
             50 => {
-                // Ctrl с колесом меняет кисть, а не масштаб карты.
+                // Колесо у кисти меняет её размер, а не масштаб карты (как в Dungeondraft).
                 app.set_tool(Tool::Dungeon);
                 app.brush = Brush { shape: Tip::Circle, radius: 2.0, hardness: 0.8, flow: 1.0 };
                 self.area = app.cam.scale;
-                let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
                 let p = at(app, [10.0, 6.0]);
-                self.wheel_with(p, 2.0, ctrl);
+                self.wheel(p, 2.0);
             }
             51 => {
                 let (r, same) = (app.brush.radius, app.cam.scale == self.area);
-                self.check("Ctrl с колесом увеличил кисть, карта на месте", (r - 3.125).abs() < 1e-3 && same, &format!("радиус {r}, масштаб {} → {}", self.area, app.cam.scale));
+                self.check("колесо увеличило кисть, карта на месте", (r - 3.125).abs() < 1e-3 && same, &format!("радиус {r}, масштаб {} → {}", self.area, app.cam.scale));
                 // Alt с колесом — размер выбранной бочки (сейчас 2).
                 app.set_tool(Tool::Select);
                 app.sel = Some(Sel::Prop(0));
@@ -790,8 +805,15 @@ impl SelfTest {
                 app.brush.shape = Tip::Cells;
                 app.paint((10, 5), (16, 9));
                 app.set_tool(Tool::Roof);
+                // Панель «Крыши» другой ширины — холст сдвинется; точки — после кадра.
+                self.resume_at = now + 0.2;
+                self.world = [-1.0, 0.0];
+            }
+            62 if self.world[0] < 0.0 => {
+                self.world = [0.0, 0.0];
                 let (a, b) = (at(app, [10.5, 5.5]), at(app, [16.5, 9.5]));
                 self.drag(a, b, PointerButton::Primary);
+                self.step -= 1;
             }
             62 => {
                 let r = app.map.roofs.first().cloned();
@@ -931,6 +953,7 @@ impl SelfTest {
                     open: None,
                     glow: Some(own),
                     sunk: None,
+                    flip: false,
                 });
                 app.sel = Some(Sel::Prop(app.map.props.len() - 1));
                 self.resume_at = now + 0.3;
@@ -1171,6 +1194,131 @@ impl SelfTest {
                 self.check("«Стена» с галочкой «Бордюр» поставила низкую тонкую стенку", ok, &format!("{:?}", w.map(|w| (w.low, w.style.clone(), w.points.clone()))));
                 app.wall_low = false;
                 self.snap(ctx, "бордюр");
+            }
+            112 => {
+                // Щелчок по стенке помоста (нижний край, y = 8, стенка 0,25 наружу) — выбран край.
+                app.set_tool(Tool::Select);
+                app.sel = None;
+                self.click(at(app, [15.5, 8.12]));
+            }
+            113 => {
+                let i = self.world[0] as usize;
+                let bottom = app.map.platforms.get(i).map(|p| crate::platform::tidy(&p.points)).and_then(|p| (0..p.len()).find(|&k| p[k][1] == 8.0 && p[(k + 1) % p.len()][1] == 8.0));
+                let ok = bottom.is_some_and(|k| app.sel == Some(Sel::PlatformEdge(i, k)));
+                self.check("щелчок по стенке помоста выбрал этот край", ok, &format!("{:?}, нижний край {bottom:?}", app.sel));
+                self.snap(ctx, "край помоста");
+            }
+            114 => self.key(Key::Delete, Modifiers::NONE),
+            115 => {
+                let i = self.world[0] as usize;
+                let open = app.map.platforms.get(i).map(|p| p.open.clone()).unwrap_or_default();
+                let free = if i < app.map.platforms.len() { app.platform_free(i) } else { Vec::new() };
+                let ok = open.len() == 1 && free.get(open[0]) == Some(&false) && free.iter().filter(|&&f| f).count() == 3 && matches!(app.sel, Some(Sel::PlatformEdge(..)));
+                self.check("Delete убрал стенку только у этого края, помост на месте", ok, &format!("open {open:?}, free {free:?}, {:?}", app.sel));
+                self.snap(ctx, "край без стенки");
+            }
+            116 => self.key(Key::Z, CTRL),
+            117 => {
+                let i = self.world[0] as usize;
+                let open = app.map.platforms.get(i).map(|p| p.open.clone()).unwrap_or_default();
+                self.check("Ctrl+Z вернул стенку", open.is_empty(), &format!("{open:?}"));
+                // Стена без привязки и ровная линия с Shift, как в Paint.
+                app.new_map(20, 12);
+                app.set_tool(Tool::Wall);
+                app.settings.snap = false;
+                self.resume_at = now + 0.3;
+            }
+            118 => {
+                self.click(at(app, [2.3, 2.6]));
+                let shift = Modifiers { shift: true, ..Modifiers::NONE };
+                self.click_with(at(app, [6.7, 3.1]), shift);
+                self.key(Key::Enter, Modifiers::NONE);
+            }
+            119 => {
+                let pts = app.map.walls.first().map(|w| w.points.clone()).unwrap_or_default();
+                let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.03 && (a[1] - b[1]).abs() < 0.03;
+                let ok = pts.len() == 2 && near(pts[0], [2.3, 2.6]) && near(pts[1], [6.7, 2.6]) && pts[0][1] == pts[1][1];
+                self.check("без привязки стена встала где щёлкнули, Shift выровнял её по горизонтали", ok, &format!("{pts:?}"));
+                // S — привязка, G — сетка (как в Dungeondraft).
+                self.key(Key::S, Modifiers::NONE);
+                self.key(Key::G, Modifiers::NONE);
+            }
+            120 => {
+                self.check("S включил привязку, G спрятал сетку", app.settings.snap && !app.settings.grid, &format!("привязка {}, сетка {}", app.settings.snap, app.settings.grid));
+                self.key(Key::G, Modifiers::NONE);
+                // Ctrl у конца стены — продолжить её.
+                let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+                let end = app.map.walls.first().map_or([6.7, 2.6], |w| w.points[1]);
+                self.click_with(at(app, end), ctrl);
+                self.click(at(app, [7.0, 5.0]));
+                self.key(Key::Enter, Modifiers::NONE);
+            }
+            121 => {
+                let w = app.map.walls.first().map(|w| w.points.clone()).unwrap_or_default();
+                let ok = app.settings.grid && app.map.walls.len() == 1 && w.len() == 3 && w[2] == [7.0, 5.0];
+                self.check("Ctrl у конца продолжил ту же стену, новая вершина — на узле", ok, &format!("стен {}, {w:?}", app.map.walls.len()));
+                // R — линейка: протяжка меряет и ничего не ставит.
+                self.key(Key::R, Modifiers::NONE);
+                self.drag(at(app, [2.5, 8.5]), at(app, [6.5, 8.5]), PointerButton::Primary);
+            }
+            122 => {
+                let text = app.ruler_line.map(|(a, b)| crate::app::ruler_text(a, b));
+                let ok = app.ruler && text.as_deref() == Some("4.0 кл. · 20 фт") && app.map.walls.len() == 1;
+                self.check("R — линейка: 4 клетки, 20 футов, карта не тронута", ok, &format!("{text:?}"));
+                self.snap(ctx, "линейка");
+            }
+            123 => {
+                self.key(Key::Escape, Modifiers::NONE);
+                // L — свет поверх вида.
+                app.map.props.push(crate::map::Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [12.0, 6.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                app.touch();
+                self.key(Key::L, Modifiers::NONE);
+                self.resume_at = now + 0.5;
+            }
+            124 => {
+                self.check("Escape убрал линейку, L включил свет", !app.ruler && app.light_view, &format!("линейка {}, свет {}", app.ruler, app.light_view));
+                self.snap(ctx, "свет");
+            }
+            125 => {
+                self.key(Key::L, Modifiers::NONE);
+                // X — «Выбор» и обратно к прежнему инструменту.
+                app.set_tool(Tool::Wall);
+                self.key(Key::X, Modifiers::NONE);
+            }
+            126 => {
+                let first = app.tool;
+                self.key(Key::X, Modifiers::NONE);
+                self.world = [if first == Tool::Select { 1.0 } else { 0.0 }, 0.0];
+            }
+            127 => {
+                let ok = self.world[0] == 1.0 && app.tool == Tool::Wall && !app.light_view;
+                self.check("X — «Выбор», второй X — обратно к стене; L выключил свет", ok, &format!("{:?}", app.tool));
+                // 7 — слой «над стенами» для новых; зажатая A — отражённым.
+                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel test")[0]].key.clone();
+                app.object_asset = Some(barrel);
+                app.set_tool(Tool::Object);
+                self.key(Key::Num7, Modifiers::NONE);
+                self.hold(Key::A, true);
+                self.click(at(app, [10.0, 9.0]));
+                self.hold(Key::A, false);
+            }
+            128 => {
+                let p = app.map.props.last().cloned();
+                let ok = p.as_ref().is_some_and(|p| p.layer == Some(crate::map::ABOVE_WALLS) && p.flip);
+                self.check("7 — слой над стенами, A — отражённый объект", ok, &format!("{:?}", p.map(|p| (p.layer, p.flip))));
+                // Alt с кистью пола стирает этот пол.
+                app.set_tool(Tool::Floor);
+                app.brush.shape = Tip::Cells;
+                app.material = 3;
+                app.paint((2, 9), (5, 10));
+                let alt = Modifiers { alt: true, ..Modifiers::NONE };
+                self.drag_with(at(app, [2.5, 9.5]), at(app, [3.5, 9.5]), PointerButton::Primary, alt);
+            }
+            129 => {
+                let at_cell = |x: i32, y: i32| app.map.floor_at(x, y);
+                let ok = at_cell(2, 9) == 0 && at_cell(3, 9) == 0 && at_cell(4, 9) == 4 && at_cell(2, 10) == 4;
+                self.check("Alt с кистью пола стёр её только под протяжкой", ok, &format!("{} {} {} {}", at_cell(2, 9), at_cell(3, 9), at_cell(4, 9), at_cell(2, 10)));
+                self.snap(ctx, "управление Dungeondraft");
             }
             _ => return false,
         }

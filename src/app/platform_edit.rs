@@ -52,9 +52,58 @@ impl App {
 
     pub(super) fn selected_platform(&self) -> Option<usize> {
         match self.sel {
-            Some(Sel::Platform(i)) if i < self.map.platforms.len() => Some(i),
+            Some(Sel::Platform(i) | Sel::PlatformEdge(i, _)) if i < self.map.platforms.len() => Some(i),
             _ => None,
         }
+    }
+
+    /// Край помоста под точкой: щелчок по боковой стенке (от кромки наружу на её высоту
+    /// и чуть внутрь). Открытый край без стенки берётся только у выбранного помоста —
+    /// по линии контура. Верхний помост — первым.
+    pub fn platform_edge_at(&self, w: [f32; 2]) -> Option<(usize, usize)> {
+        let chosen = self.selected_platform();
+        for i in (0..self.map.platforms.len()).rev() {
+            let pl = &self.map.platforms[i];
+            let p = platform::tidy(&pl.points);
+            if p.len() < 3 {
+                continue;
+            }
+            let (nrm, free, h, n) = (platform::normals(&p), self.platform_free(i), pl.height.clamp(0.02, 1.5), p.len());
+            let mut best: Option<(usize, f32)> = None;
+            for k in 0..n {
+                let (a, b) = (p[k], p[(k + 1) % n]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let len2 = dx * dx + dy * dy;
+                if len2 < 1e-8 {
+                    continue;
+                }
+                let t = ((w[0] - a[0]) * dx + (w[1] - a[1]) * dy) / len2;
+                if !(0.0..=1.0).contains(&t) {
+                    continue;
+                }
+                // Насколько точка снаружи ребра: плюс — по наружной нормали.
+                let d = (w[0] - a[0]) * nrm[k][0] + (w[1] - a[1]) * nrm[k][1];
+                let score = if free[k] && (-0.15..=h + 0.1).contains(&d) {
+                    (d - h / 2.0).abs()
+                } else if pl.open.contains(&k) && chosen == Some(i) && d.abs() <= 0.2 {
+                    d.abs()
+                } else {
+                    continue;
+                };
+                if best.is_none_or(|(_, s)| score < s) {
+                    best = Some((k, score));
+                }
+            }
+            if let Some((k, _)) = best {
+                return Some((i, k));
+            }
+        }
+        None
+    }
+
+    /// Помост или его край под точкой: стенка — край, площадка — весь помост.
+    pub fn platform_hit(&self, w: [f32; 2]) -> Option<Sel> {
+        self.platform_edge_at(w).map(|(i, k)| Sel::PlatformEdge(i, k)).or_else(|| self.platform_at(w).map(Sel::Platform))
     }
 
     /// Мышь в режиме помоста.
@@ -74,6 +123,7 @@ impl App {
                 self.checkpoint();
             } else {
                 self.roof_from = Some(self.cam.cell(rect, o));
+                self.roof_from_w = (!self.settings.snap).then_some(w);
             }
         }
         if let Some(p) = pointer
@@ -83,9 +133,13 @@ impl App {
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.platform_grab = None;
+            let free = self.roof_from_w.take();
             if let (Some(a), Some(p)) = (self.roof_from.take(), pointer) {
-                let b = self.cam.cell(rect, p);
-                let i = self.place_platform(a, b);
+                // Без привязки — рамка где протянули, не по клеткам.
+                let i = match free {
+                    Some(w0) => self.place_platform_rect(w0, self.cam.to_world(rect, p)),
+                    None => self.place_platform(a, self.cam.cell(rect, p)),
+                };
                 self.sel = Some(Sel::Platform(i));
             }
         } else if resp.clicked()
@@ -93,7 +147,7 @@ impl App {
         {
             let w = self.cam.to_world(rect, p);
             if !self.platform_put_click(w) {
-                self.sel = self.platform_at(w).map(Sel::Platform);
+                self.sel = self.platform_hit(w);
             }
         }
     }
@@ -103,8 +157,9 @@ impl App {
         let Some(grab) = self.platform_grab.clone() else { return };
         match grab {
             PlatformGrab::Whole(i, w0, before) => {
-                // Целыми клетками: прямоугольный помост остаётся по сетке.
-                let d = [(w[0] - w0[0]).round(), (w[1] - w0[1]).round()];
+                // С привязкой — целыми клетками: прямоугольный помост остаётся по сетке.
+                let d = [w[0] - w0[0], w[1] - w0[1]];
+                let d = if self.settings.snap { [d[0].round(), d[1].round()] } else { d };
                 let mut pl = before;
                 pl.shift(d);
                 self.map.platforms[i] = pl;
@@ -156,6 +211,18 @@ impl App {
             return;
         }
         line(&p, blue, 2.0);
+        // Края без стенки — пунктиром, выбранный край — толсто.
+        let n = p.len();
+        let orange = Color32::from_rgb(255, 170, 60);
+        for &k in pl.open.iter().filter(|&&k| k < n) {
+            let ends = [cam.to_screen(canvas, p[k]), cam.to_screen(canvas, p[(k + 1) % n])];
+            painter.extend(Shape::dashed_line(&ends, Stroke::new(2.0, orange), 6.0, 4.0));
+        }
+        if let Some(Sel::PlatformEdge(_, k)) = self.sel
+            && k < n
+        {
+            painter.line_segment([cam.to_screen(canvas, p[k]), cam.to_screen(canvas, p[(k + 1) % n])], Stroke::new(4.0, orange));
+        }
         for s in &pl.stairs {
             if let Some(g) = platform::stair_geo(&p, s) {
                 line(&g.outline(), blue, 1.5);
@@ -224,6 +291,26 @@ impl App {
                 drop = true;
             }
         });
+        // Край помоста: стенку можно убрать у одного края, остальные остаются.
+        if let Some(Sel::PlatformEdge(_, k)) = self.sel {
+            let mut walled = !pl.open.contains(&k);
+            ui.horizontal(|ui| {
+                ui.label(format!("Край {}:", k + 1));
+                ui.checkbox(&mut walled, "стенка")
+                    .on_hover_text("Без стенки помост у этого края сходит в пол той же высоты: нет ни стенки, ни кромки, ни тени, ни перил. Delete — убрать стенку");
+            });
+            pl.set_open(k, !walled);
+        } else {
+            ui.weak("Щелчок по стенке помоста выбирает один край.");
+        }
+        if !pl.open.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(format!("Краёв без стенки: {}", pl.open.len()));
+                if ui.small_button("вернуть все").clicked() {
+                    pl.open.clear();
+                }
+            });
+        }
         ui.add(egui::Slider::new(&mut pl.height, 0.05..=1.0).text("высота стенки, кл."));
         ui.horizontal(|ui| {
             ui.color_edit_button_srgb(&mut pl.color);

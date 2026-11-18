@@ -65,6 +65,11 @@ pub struct Platform {
     pub lights: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grates: Vec<Grate>,
+    /// Открытые края — номера рёбер чистого контура (`tidy`), ребро `k` идёт от точки `k`
+    /// к `k + 1`. У открытого края нет ни стенки, ни кромки, ни тени, ни перил: помост
+    /// там сходит в пол той же высоты или край просто не нужен.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open: Vec<usize>,
 }
 
 pub fn light() -> [u8; 3] {
@@ -86,7 +91,26 @@ pub fn cyan() -> [u8; 3] {
 
 impl Platform {
     pub fn new(points: Vec<[f32; 2]>, height: f32) -> Self {
-        Self { points, height, color: light(), strength: tenth(), side: steel(), stairs: Vec::new(), rail: false, lights: None, grates: Vec::new() }
+        Self { points, height, color: light(), strength: tenth(), side: steel(), stairs: Vec::new(), rail: false, lights: None, grates: Vec::new(), open: Vec::new() }
+    }
+
+    /// Края со стенкой: из свободных (`free`, не вдоль стен комнат) убраны открытые.
+    pub fn sides(&self, mut free: Vec<bool>) -> Vec<bool> {
+        for &k in &self.open {
+            if let Some(f) = free.get_mut(k) {
+                *f = false;
+            }
+        }
+        free
+    }
+
+    /// Открыть край `k` или вернуть ему стенку.
+    pub fn set_open(&mut self, k: usize, open: bool) {
+        self.open.retain(|&x| x != k);
+        if open {
+            self.open.push(k);
+            self.open.sort_unstable();
+        }
     }
 
     /// Рамка контура: левый верхний и правый нижний углы.
@@ -592,6 +616,21 @@ mod tests {
     use super::*;
 
     const SQUARE: [[f32; 2]; 4] = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
+
+    #[test]
+    fn open_edges_lose_their_side() {
+        let mut pl = Platform::new(SQUARE.to_vec(), 0.3);
+        assert_eq!(pl.sides(vec![true; 4]), vec![true; 4]);
+        pl.set_open(2, true);
+        pl.set_open(2, true);
+        assert_eq!(pl.open, vec![2], "дважды — один раз");
+        assert_eq!(pl.sides(vec![true, false, true, true]), vec![true, false, false, true], "у стены комнаты стенки и так нет");
+        pl.set_open(2, false);
+        assert!(pl.open.is_empty());
+        assert!(!serde_json::to_string(&pl).unwrap().contains("open"), "пустой список не пишется в файл");
+        let old: Platform = serde_json::from_str(r#"{"points": [[1, 1], [3, 1], [3, 3]], "height": 0.3}"#).unwrap();
+        assert!(old.open.is_empty(), "старые карты открываются");
+    }
 
     fn near(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4

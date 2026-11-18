@@ -217,7 +217,7 @@ impl App {
 
         // Сетка. На мелком масштабе она сливается в сплошной фон — тогда её нет.
         // В выгрузке сетки нет: её рисует сам VTT.
-        if s >= 10.0 && !exporting && ui {
+        if s >= 10.0 && !exporting && ui && self.settings.grid {
             let grid = Stroke::new(1.0, Color32::from_black_alpha(60));
             for x in x0..=x1 {
                 painter.line_segment([cam.to_screen(canvas, [x as f32, y0 as f32]), cam.to_screen(canvas, [x as f32, y1 as f32])], grid);
@@ -418,7 +418,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: self.object_layer, tint: None, open: None, glow: None, sunk: None, flip: self.mirror_held };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -448,7 +448,8 @@ impl App {
                 }
             }
             (Tool::Wall, Some(h)) => {
-                painter.circle_stroke(cam.to_screen(canvas, cam.node(canvas, h)), 6.0, Stroke::new(1.5, Color32::from_rgb(255, 200, 90)));
+                let (alt, shift) = painter.ctx().input(|i| (i.modifiers.alt, i.modifiers.shift));
+                painter.circle_stroke(cam.to_screen(canvas, self.wall_point(h, alt, shift)), 6.0, Stroke::new(1.5, Color32::from_rgb(255, 200, 90)));
             }
             _ => {}
         }
@@ -499,10 +500,14 @@ impl App {
         }
         if let (Some(a), Some(p)) = (self.roof_from, self.hover.filter(|_| !exporting && ui)) {
             let b = cam.cell(canvas, p);
-            let r = Rect::from_min_max(
-                cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
-                cam.to_screen(canvas, [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0]),
-            );
+            // Без привязки рамка — от точки нажатия до курсора, не по клеткам.
+            let r = match self.roof_from_w {
+                Some(w0) => Rect::from_two_pos(cam.to_screen(canvas, w0), p),
+                None => Rect::from_min_max(
+                    cam.to_screen(canvas, [a.0.min(b.0) as f32, a.1.min(b.1) as f32]),
+                    cam.to_screen(canvas, [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0]),
+                ),
+            };
             painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90)), egui::StrokeKind::Inside);
             if self.platform_mode && self.platform_oval {
                 painter.add(Shape::ellipse_stroke(r.center(), r.size() / 2.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90))));
@@ -521,6 +526,11 @@ impl App {
         if !walls_only {
             self.draw_props(painter, canvas, view, exporting, map::ON_ROOF..map::ABOVE_ROOFS, on_roof);
             self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX, 1.0);
+        }
+
+        // Свет (L) — поверх всего нарисованного, под образцом, подписями и ручками.
+        if self.light_view && !exporting && ui {
+            self.draw_light(painter, canvas, view);
         }
 
         // Образец поверх нарисованного — полупрозрачный, под подписями и ручками.
@@ -558,7 +568,8 @@ impl App {
         if !self.path_draft.is_empty() && ui {
             let mut pts = self.path_draft.clone();
             if let (Some(h), false) = (hover, self.path_free) {
-                pts.push(self.snap_pos(cam.to_world(canvas, h), painter.ctx().input(|i| i.modifiers.alt)));
+                let (alt, shift) = painter.ctx().input(|i| (i.modifiers.alt, i.modifiers.shift));
+                pts.push(self.path_point(h, alt, shift));
             }
             let line: Vec<Pos2> = map::smooth_line(&pts).iter().map(|&q| cam.to_screen(canvas, q)).collect();
             let gold = Color32::from_rgb(255, 200, 90);
@@ -575,12 +586,18 @@ impl App {
         if !self.draft.is_empty() && ui {
             let mut points: Vec<Pos2> = self.draft.iter().map(|&p| cam.to_screen(canvas, p)).collect();
             if let Some(h) = hover {
-                points.push(cam.to_screen(canvas, cam.node(canvas, h)));
+                let (alt, shift) = painter.ctx().input(|i| (i.modifiers.alt, i.modifiers.shift));
+                points.push(cam.to_screen(canvas, self.wall_point(h, alt, shift)));
             }
             painter.add(Shape::line(points.clone(), Stroke::new(outer * 0.6, Color32::from_rgb(255, 200, 90))));
             for p in &points[..self.draft.len()] {
                 painter.circle_filled(*p, 4.0, Color32::from_rgb(255, 200, 90));
             }
+        }
+
+        // Линейка (R) — поверх всего.
+        if self.ruler && ui && !exporting {
+            self.draw_ruler(painter, canvas);
         }
     }
 

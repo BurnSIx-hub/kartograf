@@ -40,6 +40,21 @@ impl App {
             }
             return;
         }
+        if self.brush_erase && matches!(self.tool, Tool::Floor | Tool::Dungeon) {
+            let (w, h) = (probe.rooms.w, probe.rooms.h);
+            let weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
+            if self.tool == Tool::Floor {
+                probe.fade_material(self.material, &weights);
+            } else {
+                probe.erase_rooms(&weights);
+            }
+            probe.prune();
+            if probe != self.map {
+                self.checkpoint();
+                self.map = probe;
+            }
+            return;
+        }
         let (layer, material) = match self.tool {
             Tool::Erase => (Layer::Floor, None),
             Tool::Dungeon => (Layer::Rooms, Some(self.material)),
@@ -117,6 +132,9 @@ impl App {
                 self.map.shade_paint(&raw, self.shade_level);
             }
             Tool::Erase => self.map.erase(&weights),
+            // Alt, как в Dungeondraft: кисть пола стирает свой материал, подземелья — комнаты.
+            Tool::Floor if self.brush_erase => self.map.fade_material(self.material, &weights),
+            Tool::Dungeon if self.brush_erase => self.map.erase_rooms(&weights),
             Tool::Dungeon => self.map.paint(Layer::Rooms, self.material, &weights),
             _ => self.map.paint(Layer::Floor, self.material, &weights),
         }
@@ -282,15 +300,85 @@ impl App {
         map::WallStyle { width: st.width.min(CURB_WIDTH), ..st }
     }
 
-    /// Поставить начатую стену на карту. Из одной точки стены не бывает.
+    /// Поставить начатую стену на карту. Из одной точки стены не бывает. Продолжение
+    /// стены (Ctrl у её конца) заменяет её; слитая с ней другая стена убирается.
     pub fn finish_wall(&mut self, closed: bool) {
         let points = std::mem::take(&mut self.draft);
-        if points.len() >= 2 {
-            self.checkpoint();
-            // Бордюр — низкий и тонкий; вид — как у всех стен, только тоньше.
-            let style = self.wall_low.then(|| self.curb_style(None));
-            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), low: self.wall_low, style });
-            self.sel = Some(Sel::Wall(self.map.walls.len() - 1));
+        let mut bends = std::mem::take(&mut self.draft_bends);
+        let (join, merge) = (self.wall_join.take(), self.wall_merge.take());
+        if points.len() < 2 {
+            return;
         }
+        self.checkpoint();
+        let closed = closed && points.len() >= 3;
+        bends.resize(if closed { points.len() } else { points.len() - 1 }, 0.0);
+        let bends = if bends.iter().all(|&b| b == 0.0) { Vec::new() } else { bends };
+        let mut join = join.filter(|&i| i < self.map.walls.len());
+        if let Some(j) = merge.filter(|&j| j < self.map.walls.len() && Some(j) != join) {
+            self.map.walls.remove(j);
+            join = join.map(|i| if i > j { i - 1 } else { i });
+        }
+        match join {
+            Some(i) => {
+                let w = &mut self.map.walls[i];
+                (w.points, w.closed, w.bends) = (points, closed, bends);
+                self.sel = Some(Sel::Wall(i));
+            }
+            None => {
+                // Бордюр — низкий и тонкий; вид — как у всех стен, только тоньше.
+                let style = self.wall_low.then(|| self.curb_style(None));
+                self.map.walls.push(Wall { closed, points, bends, low: self.wall_low, style });
+                self.sel = Some(Sel::Wall(self.map.walls.len() - 1));
+            }
+        }
+    }
+
+    /// Конец нарисованной (незамкнутой) стены у точки: номер стены и начало ли это.
+    pub(super) fn wall_end_at(&self, p: [f32; 2]) -> Option<(usize, bool)> {
+        let near = |q: [f32; 2]| (q[0] - p[0]).hypot(q[1] - p[1]) <= PICK;
+        self.map.walls.iter().enumerate().filter(|(_, w)| !w.closed && w.points.len() >= 2).find_map(|(i, w)| {
+            if near(w.points[w.points.len() - 1]) {
+                Some((i, false))
+            } else if near(w.points[0]) {
+                Some((i, true))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Ctrl у конца стены, как в Dungeondraft: без начатой стены — продолжить эту
+    /// (её вершины уходят в черновик, щёлкнутый конец — последним); с начатой —
+    /// слить с этой и закончить. Свой же второй конец — замкнуть.
+    pub(super) fn join_wall_at(&mut self, p: [f32; 2]) {
+        let Some((i, at_start)) = self.wall_end_at(p) else { return };
+        // Прогибы по ходу: при обратном ходе порядок обратный и знак другой.
+        let oriented = |w: &Wall, reverse: bool| -> (Vec<[f32; 2]>, Vec<f32>) {
+            let n = w.points.len() - 1;
+            let bends: Vec<f32> = (0..n).map(|k| w.bend(k)).collect();
+            if reverse { (w.points.iter().rev().copied().collect(), bends.iter().rev().map(|b| -b).collect()) } else { (w.points.clone(), bends) }
+        };
+        if self.draft.is_empty() {
+            let (pts, bends) = oriented(&self.map.walls[i], at_start);
+            self.draft = pts;
+            self.draft_bends = bends;
+            self.wall_join = Some(i);
+            return;
+        }
+        if self.wall_join == Some(i) {
+            self.finish_wall(true);
+            return;
+        }
+        let (pts, bends) = oriented(&self.map.walls[i], !at_start);
+        // Последняя вершина начатой уже на этом конце — соединительного отрезка нет.
+        let skip = usize::from(self.draft.last().is_some_and(|l| (l[0] - pts[0][0]).hypot(l[1] - pts[0][1]) < 1e-3));
+        self.draft_bends.resize(self.draft.len() - 1, 0.0);
+        if skip == 0 {
+            self.draft_bends.push(0.0);
+        }
+        self.draft_bends.extend(bends);
+        self.draft.extend(pts.into_iter().skip(skip));
+        self.wall_merge = Some(i);
+        self.finish_wall(false);
     }
 }

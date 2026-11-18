@@ -454,6 +454,9 @@ pub struct Prop {
     /// капсула. Нет — предмет над водой целиком.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sunk: Option<f32>,
+    /// Отражён слева направо (в Dungeondraft — A при постановке). Поворот — уже после.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip: bool,
 }
 
 /// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
@@ -923,9 +926,12 @@ pub fn canopy_by_name(key: &str) -> bool {
 }
 
 impl Prop {
-    /// Углы на карте: левый верхний, правый верхний, правый нижний, левый нижний.
+    /// Углы на карте: левый верхний, правый верхний, правый нижний, левый нижний —
+    /// углы картинки. У отражённого левый край картинки справа: на те же углы она
+    /// ложится зеркально.
     pub fn corners(&self) -> [[f32; 2]; 4] {
         let (hw, hh) = (self.size[0] * self.scale / 2.0, self.size[1] * self.scale / 2.0);
+        let hw = if self.flip { -hw } else { hw };
         let (s, c) = self.rot.to_radians().sin_cos();
         [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [self.pos[0] + x * c - y * s, self.pos[1] + x * s + y * c])
     }
@@ -2006,6 +2012,21 @@ impl Map {
         fade(&mut self.rooms, weights);
     }
 
+    /// Стереть один материал местности (кисть пола с Alt): слабеет только его слой.
+    pub fn fade_material(&mut self, material: usize, weights: &[(usize, f32)]) {
+        if let Some(c) = self.terrain.iter_mut().find(|c| c.material as usize == material) {
+            fade(&mut c.mask, weights);
+        }
+    }
+
+    /// Стереть комнаты (кисть подземелья с Alt): комнаты и их пол, местность цела.
+    pub fn erase_rooms(&mut self, weights: &[(usize, f32)]) {
+        for c in self.room_floor.iter_mut() {
+            fade(&mut c.mask, weights);
+        }
+        fade(&mut self.rooms, weights);
+    }
+
     /// Тень кистью: точка темнеет до `level` × сила отпечатка, но не светлеет —
     /// ступени 20/40/60% ложатся ровно, сколько ни води.
     pub fn shade_paint(&mut self, weights: &[(usize, f32)], level: f32) {
@@ -2447,7 +2468,7 @@ mod tests {
         m.rooms.data[(crate::mask::RES * 1 + 1) * m.rooms.w + crate::mask::RES + 1] = 255;
         m.walls.push(Wall { points: vec![[0.0, 0.0], [4.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         m.portals.push(Portal { a: [1.0, 3.0], b: [2.0, 3.0], kind: PortalKind::Door, asset: None, frame: None });
-        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
+        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
         m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
         m.edge_looks.insert((64, 0), 1);
         let mut deck = m.new_level();
@@ -2594,7 +2615,7 @@ mod tests {
         assert!(afloat_by_name("pack:fa|textures/objects/Paper_Sheet_A_White_1x1.webp") && !afloat_by_name("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
         // Вентилятор в полу плоский, но живой: своим тайлом (иначе «Wild Canvas» нечего
         // крутить), без своей тени. Ковёр — плоский и неживой: остаётся в картинке карты.
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         let fan = prop("set:cyberpunk/objects/Floor_Fan_Industrial_A_2x2.webp");
         assert!(flat_by_name(&fan.asset) && fan.own_tile() && !fan.carries_shadow());
         assert!(!prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp").own_tile());
@@ -2602,7 +2623,7 @@ mod tests {
 
     #[test]
     fn bridges_are_baked_under_walls_not_own_tiles() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         assert!(!prop("C:/a/objects/bridges/Bridge_Boardwalk_Platform_A_5x4.webp").own_tile());
         assert!(!prop("pack:fa|textures/objects/Log_Bridge_Wood_Dark_A1_11x4.webp").own_tile());
         // Мост тень бросает, как раньше.
@@ -2709,7 +2730,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -2837,7 +2858,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();

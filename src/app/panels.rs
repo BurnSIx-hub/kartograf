@@ -10,6 +10,9 @@ impl App {
         if tool != Tool::Path {
             self.finish_path();
         }
+        if tool != self.tool {
+            self.prev_tool = self.tool;
+        }
         self.tool = tool;
         if let Some(k) = Group::ALL.iter().position(|g| g.has(tool)) {
             self.group_last[k] = tool;
@@ -102,8 +105,15 @@ impl App {
                 if item(ui, "Вся карта", "Home") {
                     self.fitted = false;
                 }
-                if ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
+                if ui.checkbox(&mut self.settings.snap, "Привязка к сетке   S").changed() {
                     self.save_settings();
+                }
+                if ui.checkbox(&mut self.settings.grid, "Сетка   G").changed() {
+                    self.save_settings();
+                }
+                ui.checkbox(&mut self.light_view, "Свет   L").on_hover_text("Как ляжет свет огней ночью: стены и окна держат его так же, как в Foundry");
+                if ui.checkbox(&mut self.ruler, "Линейка   R").changed() {
+                    self.ruler_line = None;
                 }
                 ui.separator();
                 ui.label("Крыши");
@@ -129,7 +139,25 @@ impl App {
                     ui.label(format!("{} — {}", tool.key().name(), tool.label()));
                 }
                 ui.separator();
-                for line in ["Колесо — масштаб", "Средняя кнопка или пробел с левой — сдвиг", "R — поворот", "Ctrl+G — объединить выбранное", "Ctrl+Shift с протяжкой — выгнуть стену", "[ и ] или Ctrl с колесом — размер кисти", "Alt с колесом — размер объекта"] {
+                for line in [
+                    "Как в Dungeondraft:",
+                    "Ctrl с колесом — масштаб; колесо — дело инструмента, где его нет — тоже масштаб",
+                    "Средняя кнопка или пробел с левой — сдвиг",
+                    "X — «Выбор» и обратно к прежнему инструменту",
+                    "Ctrl+Z — отменить, Ctrl+Y — вернуть; Delete или Backspace — удалить; Escape — отменить начатое",
+                    "G — сетка, S — привязка к сетке, L — свет, R — линейка",
+                    "Page Up / Page Down — этаж выше / ниже",
+                    "1–4 — свои слои, 7 — над стенами, 9 — над крышами (8 — на крыше)",
+                    "Кисти: колесо или [ и ] — размер, Alt — стирать",
+                    "Объект: колесо — поворот, Z с колесом — медленно, Alt с колесом — размер, Shift с колесом — следующая картинка, зажатая A — отразить",
+                    "Стена и дорога: Delete — последняя точка; Ctrl у конца стены — продолжить или слить",
+                    "Своё:",
+                    "Shift — ровная линия у стены, дороги и линейки",
+                    "Alt — привязка на время наоборот",
+                    "Ctrl+Shift с протяжкой — выгнуть стену",
+                    "Ctrl+G — объединить выбранное",
+                    "V — тоже «Выбор»",
+                ] {
                     ui.label(line);
                 }
             });
@@ -248,21 +276,24 @@ impl App {
 
     /// Подсказка к инструменту — в строке состояния.
     pub(super) fn hint(&self) -> &'static str {
+        if self.ruler {
+            return "Линейка: протяжка меряет расстояние, карта не меняется. Shift — ровно, правая кнопка — убрать отрезок, R или Escape — выйти.";
+        }
         match self.tool {
-            Tool::Select => "Щелчок выбирает всё, что на карте: объект, дверь, стену, дорогу, крышу, помост, кусок местности. Объект можно тащить, за углы — менять размер, за ручку сверху — поворачивать; Alt с колесом — размер; стрелки сдвигают. Местность и помост тащатся, у местности ручки рамки растягивают и сжимают её. Delete удаляет, R поворачивает.",
-            Tool::Dungeon => "Пол комнат: стены встают по краю сами. Ctrl+Shift с протяжкой выгибает стену дугой.",
-            Tool::Floor => "Пол без стен: двор, трава, площадь.",
+            Tool::Select => "Щелчок выбирает всё, что на карте: объект, дверь, стену, дорогу, крышу, помост, кусок местности. Объект можно тащить, за углы — менять размер, за ручку сверху — поворачивать; колесо — поворот, с Z — медленно, Alt с колесом — размер; стрелки сдвигают; цифры — слой. Местность и помост тащатся, у местности ручки рамки растягивают и сжимают её. Delete удаляет, X — к прежнему инструменту.",
+            Tool::Dungeon => "Пол комнат: стены встают по краю сами. Alt — стирать комнаты, колесо — размер кисти. Ctrl+Shift с протяжкой выгибает стену дугой.",
+            Tool::Floor => "Пол без стен: двор, трава, площадь. Alt — стирать этот пол, колесо — размер кисти.",
             Tool::Erase => "Стирает и комнаты, и местность.",
-            Tool::Wall => "Щелчки ставят вершины. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
+            Tool::Wall => "Щелчки ставят вершины: с привязкой (S) — на узлы, без неё — куда угодно; Shift — ровная линия. Щелчок по первой замыкает; двойной щелчок, Enter или правая кнопка — заканчивают; Delete — убрать последнюю. Ctrl у конца стены — продолжить её или слить с ней. Ctrl+Shift с протяжкой выгибает отрезок дугой.",
             Tool::Door => "Щелчок по стене ставит проём. Картинку двери или окна выберите на полке; без картинки — простая плашка.",
             Tool::Roof if self.platform_mode => "Протяжка по пустому месту ставит помост, щелчок по помосту выбирает его, протяжка за выбранный двигает. Лестницу и решётку — кнопкой в строке над картой и щелчком у края; их можно вести вдоль края протяжкой. Delete удаляет помост.",
-            Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. R — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
+            Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. Колесо — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
             Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — в строке над картой.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
             Tool::Relief => "Ярусы по 5 футов. Жёсткая кисть поднимает плато с обрывом — полоса скалы, в Foundry стена; мягкая — пологий склон уступами-гребнями. Нижние ярусы темнее. «Выровнять» тянет к ярусу, с которого начат мазок. Alt — наоборот.",
-            Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
-            Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Ctrl с колесом — размер кисти. Объекты в набор — щелчком на полке.",
-            Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Alt — на время наоборот с привязкой, Alt с колесом — размер, R — поворот.",
+            Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки; Shift — ровная линия. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
+            Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Колесо — размер кисти. Объекты в набор — щелчком на полке.",
+            Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Колесо — поворот, с Z — медленно; Alt с колесом — размер; Shift с колесом — следующая картинка; зажатая A — отразить; цифры 1–4, 7, 8, 9 — слой. Alt — на время наоборот с привязкой.",
         }
     }
 
@@ -552,7 +583,7 @@ impl App {
             st.fit_form();
         }
         ui.horizontal(|ui| {
-            if ui.add_enabled(st.form.turns(), egui::Button::new("Повернуть   R")).clicked() {
+            if ui.add_enabled(st.form.turns(), egui::Button::new("Повернуть")).clicked() {
                 st.turn();
             }
             ui.label(format!("Покрытие: {}", library::label(&st.paint)));
@@ -588,7 +619,7 @@ impl App {
                 }
                 match self.tool {
                     _ if path_sel => self.path_panel(ui),
-                    Tool::Select if matches!(self.sel, Some(Sel::Platform(_))) => self.platform_panel(ui),
+                    Tool::Select if matches!(self.sel, Some(Sel::Platform(_) | Sel::PlatformEdge(..))) => self.platform_panel(ui),
                     Tool::Select if self.ground_sel().is_some() => self.ground_panel(ui),
                     Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief => {
                         if self.tool == Tool::Relief {
@@ -701,7 +732,7 @@ impl App {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("Повернуть   R").clicked() {
+                            if ui.button("Повернуть").on_hover_text("Или колесом над картой").clicked() {
                                 st.turn = (st.turn + 1) % 4;
                             }
                             ui.label(format!("Покрытие: {}", library::label(&st.paint)));
@@ -774,12 +805,20 @@ impl App {
                         ui.checkbox(&mut self.scatter.spin, "Случайный поворот");
                     }
                     Tool::Object => {
-                        ui.add(egui::Slider::new(&mut self.object_rot, 0.0..=345.0).step_by(15.0).text("поворот"));
+                        ui.add(egui::Slider::new(&mut self.object_rot, 0.0..=359.0).text("поворот"));
                         ui.add(egui::Slider::new(&mut self.object_scale, SCALE_RANGE).logarithmic(true).text("размер"));
+                        // Слой новых: цифры 1–4, 7, 8, 9 или здесь.
+                        let shown = self.object_layer.map_or_else(|| "авто по имени".to_owned(), map::layer_label);
+                        egui::ComboBox::from_label("слой новых").selected_text(shown).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.object_layer, None, "авто по имени");
+                            for (l, name) in map::LAYERS {
+                                ui.selectable_value(&mut self.object_layer, Some(l), name);
+                            }
+                        });
                     }
                     _ => {}
                 }
-                if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   G").changed() {
+                if matches!(self.tool, Tool::Object | Tool::Select) && ui.checkbox(&mut self.settings.snap, "Привязка к сетке   S").changed() {
                     self.save_settings();
                 }
                 if self.tool == Tool::Object
@@ -792,7 +831,7 @@ impl App {
                             self.object_prefab = None;
                         }
                     });
-                    ui.weak("Щелчок ставит набор целиком, R поворачивает его.");
+                    ui.weak("Щелчок ставит набор целиком, колесо поворачивает его.");
                 }
                 self.picked.retain(|&k| k < self.map.props.len());
                 if !self.picked.is_empty() {
@@ -955,6 +994,11 @@ impl App {
                         self.map.props[i].layer = layer;
                     }
                     let mut canopy = self.map.props[i].is_canopy();
+                    let mut flip = self.map.props[i].flip;
+                    if ui.checkbox(&mut flip, "Отражён   A").on_hover_text("Слева направо. Новый объект встаёт отражённым, если при щелчке зажата A").changed() {
+                        self.checkpoint();
+                        self.map.props[i].flip = flip;
+                    }
                     if ui.checkbox(&mut canopy, "Крона над токенами").on_hover_text("В Foundry уходит тайлом выше токенов, в картинке карты на его месте пень. Авто — по имени: деревья.").changed() {
                         self.checkpoint();
                         self.map.props[i].canopy = Some(canopy);

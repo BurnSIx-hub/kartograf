@@ -37,12 +37,6 @@ impl Camera {
         (w[0].floor() as i32, w[1].floor() as i32)
     }
 
-    /// Ближайший узел сетки: вершины стен садятся на него.
-    pub fn node(&self, canvas: Rect, p: Pos2) -> [f32; 2] {
-        let w = self.to_world(canvas, p);
-        [w[0].round(), w[1].round()]
-    }
-
     /// Масштаб вокруг точки экрана: то, что было под ней, под ней и остаётся.
     pub fn zoom_at(&mut self, canvas: Rect, p: Pos2, factor: f32) {
         let w = self.to_world(canvas, p);

@@ -858,6 +858,8 @@ pub struct RoofTile {
     pub rect: [i64; 4],
     /// Поворот в градусах вокруг середины.
     pub rotation: f32,
+    /// Картинка отражена слева направо (`texture.scaleX` −1): одна картинка на ассет.
+    pub flip: bool,
     /// Не пускает свет и дождь: у крыши да, у кроны нет.
     pub shelter: bool,
     /// Гаснет над токеном. Голое дерево — нет: сквозь ветки и так видно.
@@ -1340,6 +1342,9 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
             });
+            if r.flip {
+                tile["texture"]["scaleX"] = json!(-1);
+            }
             // Предметы карты, паутина и сундук лежат под токенами и закреплены.
             if r.item || r.living.is_some() || r.web.is_some() || r.chest.is_some() {
                 tile["locked"] = json!(true);
@@ -2032,7 +2037,7 @@ mod tests {
         let hold = Map::new(10, 10);
         let mut deck = hold.new_level();
         let mut hold = hold;
-        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 5.0, 5.0));
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 8.0, 2.0));
         deck.props.push(prop("Trapdoor_Wood_Ashen_A2_Open_1x1.webp", 5.2, 4.6));
@@ -2150,7 +2155,7 @@ mod tests {
     fn bridge_pieces_cut_water_end_to_end() {
         use crate::map::Prop;
         let mut m = Map::new(12, 14);
-        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         m.props.push(piece(4.0, 0.0));
         m.props.push(piece(8.0, 180.0));
         // Кусок нарисован во всю длину холста, по ширине — настил со сваями.
@@ -2180,7 +2185,7 @@ mod tests {
         assert_eq!(m.materials[floor].live(), Live::Neon);
         let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (8, 6));
         m.paint(crate::map::Layer::Rooms, floor, &all);
-        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         m.props.push(prop("pack:cp|textures/objects/Armchair_Neon_A_2x1.webp", [4.0, 4.0]));
         m.props.push(prop("pack:cp|textures/objects/Neon_Lamp_Floor_A_1x1.webp", [6.0, 3.0]));
         m.props.push(prop("pack:cp|textures/objects/Floor_Vent_Grate_A_1x1.webp", [3.0, 3.0]));
@@ -2508,7 +2513,7 @@ mod tests {
     fn alarm_light_blinks_slowly() {
         use crate::map::Prop;
         let mut m = Map::new(6, 6);
-        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         m.props.push(prop("set:scifi/objects/Alarm_Light_Red_A_1x1.webp", [2.0, 2.0]));
         m.props.push(prop("pack:fa|textures/objects/Lantern_Metal_A_1x1.webp", [4.0, 4.0]));
         let lay = layout(&m, &[]);
@@ -2671,9 +2676,9 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
         // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
-        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
@@ -2756,7 +2761,7 @@ mod tests {
         let hull = alpha_hull(&img);
         assert!((3..=8).contains(&hull.len()), "{hull:?}");
         assert!(hull.iter().all(|v| v[0] >= 0.09 && v[0] <= 0.91 && v[1] >= 0.09 && v[1] <= 0.91), "{hull:?}");
-        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2), glow: None, sunk: None };
+        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2), glow: None, sunk: None, flip: false };
         let walls = tent_walls(&p, Some(&hull));
         assert!(!walls.is_empty() && walls.len() < hull.len());
         for (a, b) in &walls {
@@ -2768,7 +2773,7 @@ mod tests {
     }
 
     fn thing(asset: &str, pos: [f32; 2], size: [f32; 2], rot: f32) -> crate::map::Prop {
-        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None }
+        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false }
     }
 
     #[test]

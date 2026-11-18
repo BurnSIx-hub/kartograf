@@ -29,6 +29,7 @@ fn tools() -> Value {
     let num = |d: &str| json!({"type": "number", "description": d});
     let int = |d: &str| json!({"type": "integer", "description": d});
     let text = |d: &str| json!({"type": "string", "description": d});
+    let open_edges = json!({"type": "array", "items": {"type": "integer"}, "description": "Open edges: no side wall, lip, shadow or rail there, the top runs on into ground of the same height. Edge k runs from corner k to corner k + 1 of the outline (repeated points dropped); [] gives every edge its wall back"});
     let point = json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2});
     let area = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in cells; x1 and y1 are the far edges (a room [4, 3, 14, 11] gets walls on x=4, x=14, y=3, y=11)"});
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}});
@@ -78,13 +79,13 @@ fn tools() -> Value {
         }), &["assets"]),
         tool("add_object", "Place an object (furniture, tree, prop) by asset key. Returns its index.", json!({
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
-            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "tint": tint, "recolor": recolor,
+            "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "flip": {"type": "boolean", "description": "Mirror the picture left to right (Dungeondraft: hold A while placing); rotation applies after"},  "tint": tint, "recolor": recolor,
             "light_radius": light_radius.clone(), "light_color": light_color.clone(), "light_animation": light_animation.clone(), "light_speed": light_speed.clone(), "light_intensity": light_intensity.clone(), "sunk": sunk.clone(),
             "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone(), "inset": inset.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
-            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "tint": tint, "recolor": recolor,
+            "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "flip": {"type": "boolean", "description": "Mirror the picture left to right (Dungeondraft: hold A while placing); rotation applies after"},  "tint": tint, "recolor": recolor,
             "light_radius": light_radius, "light_color": light_color, "light_animation": light_animation, "light_speed": light_speed, "light_intensity": light_intensity, "sunk": sunk,
             "front": front, "look_at": look_at, "against_wall": against_wall, "inset": inset
         }), &["index"]),
@@ -134,7 +135,8 @@ fn tools() -> Value {
             "stairs": {"type": "array", "items": {"type": "object"}, "description": "Stairs up the platform: each {at: [x, y] — a point near the edge where they join (the nearest point of the outline is taken, the steps run outward from that edge), width — cells at the top, default 2, steps — how many, default 3; a step is 0.4 cells deep}"},
             "rail": {"type": "boolean", "description": "Railing along the free edges (not along room walls), open at every stair and running down both sides of it; posts every 1.6 cells at most. Tokens cannot cross a railed edge: put stairs where people go up"},
             "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}, "description": "Little lights: short glowing strips along the lip every 2.4 cells, two on every stair tread, a glowing cap on every railing post. true — cold cyan, [r, g, b] — that colour, false or null — none"},
-            "grates": {"type": "array", "items": {"type": "object"}, "description": "Floor grates along the inside of the edge: each {at: [x, y] — a point near the edge (the nearest point of the outline is the middle of the grate), length — cells along the edge, default 3}; a dark slotted strip 0.3–0.68 cells in from the edge, following its curve. The list replaces the old one, [] removes them"}
+            "grates": {"type": "array", "items": {"type": "object"}, "description": "Floor grates along the inside of the edge: each {at: [x, y] — a point near the edge (the nearest point of the outline is the middle of the grate), length — cells along the edge, default 3}; a dark slotted strip 0.3–0.68 cells in from the edge, following its curve. The list replaces the old one, [] removes them"},
+            "open": open_edges.clone()
         }), &[]),
         tool("edit_platform", "Change a platform by index (see describe with platforms): outline (points, area, circle, outside_circle as in add_platform), height, colours, stairs (the list replaces the old one, [] removes them), rail, lights, grates. To move a platform give it the new outline.", json!({
             "index": int("Platform index"),
@@ -142,7 +144,8 @@ fn tools() -> Value {
             "circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "outside_circle": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
             "height": num("Width of the visible side wall, cells"), "color": {"type": ["array", "null"], "items": {"type": "integer"}}, "strength": num("0..1"),
             "side": {"type": ["array", "null"], "items": {"type": "integer"}}, "stairs": {"type": "array", "items": {"type": "object"}},
-            "rail": {"type": "boolean"}, "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}}, "grates": {"type": "array", "items": {"type": "object"}}
+            "rail": {"type": "boolean"}, "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}}, "grates": {"type": "array", "items": {"type": "object"}},
+            "open": open_edges
         }), &["index"]),
         tool("remove", "Remove items by indices: objects, walls, doors, labels, paths, roofs or platforms. Indices of later items shift down.", json!({
             "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms"]},
@@ -342,7 +345,7 @@ mod tests {
             assert!(names.contains(&n), "{n}");
         }
         let props = |tool: &str| list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"].clone();
-        for k in ["shadow", "canopy", "tint", "recolor"] {
+        for k in ["shadow", "canopy", "tint", "recolor", "flip"] {
             assert!(props("add_object").get(k).is_some() && props("edit_object").get(k).is_some(), "{k}");
         }
         for k in ["asset", "frame", "a", "b", "width"] {

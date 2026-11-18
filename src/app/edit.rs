@@ -49,6 +49,11 @@ impl App {
                 self.platform_put = None;
             }
             Sel::Ground => self.delete_ground(),
+            // Край помоста: убрать у него стенку, выбор остаётся — галочкой её можно вернуть.
+            Sel::PlatformEdge(i, k) => {
+                self.map.platforms[i].set_open(k, true);
+                self.sel = Some(s);
+            }
         }
     }
 
@@ -84,6 +89,12 @@ impl App {
     pub fn place_roof(&mut self, a: (i32, i32), b: (i32, i32)) -> usize {
         let lo = [a.0.min(b.0) as f32, a.1.min(b.1) as f32];
         let hi = [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0];
+        self.place_roof_rect(lo, hi)
+    }
+
+    /// Крыша рамкой без привязки: между двумя точками, не меньше четверти клетки.
+    pub fn place_roof_rect(&mut self, p: [f32; 2], q: [f32; 2]) -> usize {
+        let (lo, hi) = free_rect(p, q);
         let roof = map::Roof { a: lo, b: hi, ..self.roof_style.clone() };
         self.checkpoint();
         self.map.roofs.push(roof);
@@ -97,6 +108,12 @@ impl App {
     pub fn place_platform(&mut self, a: (i32, i32), b: (i32, i32)) -> usize {
         let lo = [a.0.min(b.0) as f32, a.1.min(b.1) as f32];
         let hi = [a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0];
+        self.place_platform_rect(lo, hi)
+    }
+
+    /// Помост рамкой без привязки: между двумя точками, не меньше четверти клетки.
+    pub fn place_platform_rect(&mut self, p: [f32; 2], q: [f32; 2]) -> usize {
+        let (lo, hi) = free_rect(p, q);
         let points = if self.platform_oval {
             crate::platform::ellipse([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], (hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
         } else {
@@ -140,8 +157,8 @@ impl App {
         let len = (dx * dx + dy * dy).sqrt();
         let w = self.door_width.min(len);
         let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len;
-        // Проём встаёт на узлы сетки: дверь в клетку — ровно в клетку.
-        let start = (t - w / 2.0).round().clamp(0.0, len - w);
+        // С привязкой проём встаёт на узлы сетки: дверь в клетку — ровно в клетку; без неё — где щёлкнули.
+        let start = if self.settings.snap { (t - w / 2.0).round() } else { t - w / 2.0 }.clamp(0.0, len - w);
         let at = |t: f32| [a[0] + dx * t / len, a[1] + dy * t / len];
         // Концы всегда слева направо и сверху вниз — как бы ни шла стена.
         let (mut a, mut b) = (at(start), at(start + w));
@@ -197,7 +214,9 @@ impl App {
         let size = self.asset_size(&asset);
         let pos = self.snap_pos(p, alt);
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None });
+        // Слой — выбранный цифрой; зажатая A — отражённым, как в Dungeondraft.
+        let (layer, flip) = (self.object_layer, self.mirror_held);
+        self.map.props.push(Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer, tint: None, open: None, glow: None, sunk: None, flip });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         Some(i)
@@ -296,7 +315,7 @@ impl App {
             let t = self.scatter.rand();
             let scale = self.scatter.scale[0] + (self.scatter.scale[1] - self.scatter.scale[0]) * t;
             let rot = if self.scatter.spin { (self.scatter.rand() * 360.0).floor() } else { self.object_rot };
-            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+            let prop = Prop { asset, pos, size, rot, scale, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
             let me = reach(&prop) * self.scatter.spacing;
             // Просвет: не ближе суммы радиусов (с долей) к соседям того же набора.
             let crowded = self.map.props.iter().any(|q| {
@@ -360,7 +379,7 @@ impl App {
             self.map.props.remove(i);
         }
         let key = file.to_string_lossy().into_owned();
-        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None };
+        let prop = Prop { asset: key, pos: [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], size: [cw, ch], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
         self.map.props.insert(at, prop);
         self.picked.clear();
         self.sel = Some(Sel::Prop(at));
@@ -393,6 +412,54 @@ impl App {
         } else {
             self.object_rot = (self.object_rot + 90.0) % 360.0;
         }
+    }
+
+    /// Слой цифрой: у выбранного объекта или группы — их слой, и тем же слоем встанут новые.
+    pub fn set_layer(&mut self, layer: i16) {
+        self.object_layer = Some(layer);
+        let mut idx = self.picked.clone();
+        if let Some(Sel::Prop(i)) = self.sel {
+            idx.push(i);
+        }
+        idx.retain(|&i| i < self.map.props.len());
+        if idx.iter().any(|&i| self.map.props[i].layer != Some(layer)) {
+            self.checkpoint();
+            for i in idx {
+                self.map.props[i].layer = Some(layer);
+            }
+        }
+    }
+
+    /// Поворот колесом, как в Dungeondraft: выбранный объект или тот, что ставится.
+    pub fn turn_by(&mut self, deg: f32) {
+        let wrap = |a: f32| ((a + deg) % 360.0 + 360.0) % 360.0;
+        match self.sel {
+            Some(Sel::Prop(i)) if self.tool == Tool::Select => {
+                // Одна правка в истории на всю прокрутку.
+                if !self.wheel_turn {
+                    self.checkpoint();
+                    self.wheel_turn = true;
+                }
+                self.map.props[i].rot = wrap(self.map.props[i].rot);
+            }
+            _ => self.object_rot = wrap(self.object_rot),
+        }
+    }
+
+    /// Shift с колесом — следующая или прежняя картинка с полки (как в Dungeondraft).
+    pub fn cycle_object(&mut self, step: i32) {
+        let list = self.filtered().to_vec();
+        if list.is_empty() {
+            return;
+        }
+        let now = self.object_asset.as_ref().and_then(|k| list.iter().position(|&i| &self.library.assets[i].key == k));
+        let n = list.len() as i32;
+        let next = match now {
+            Some(k) => (k as i32 + step).rem_euclid(n),
+            None => 0,
+        } as usize;
+        self.object_asset = Some(self.library.assets[list[next]].key.clone());
+        self.object_prefab = None;
     }
 
     /// Картинка из библиотеки становится материалом пола и выбирается.
@@ -473,4 +540,11 @@ impl App {
             }
         }
     }
+}
+
+/// Рамка между двумя точками (клетки): левый верхний и правый нижний углы, сторона не меньше четверти клетки.
+fn free_rect(p: [f32; 2], q: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let lo = [p[0].min(q[0]), p[1].min(q[1])];
+    let hi = [p[0].max(q[0]).max(lo[0] + 0.25), p[1].max(q[1]).max(lo[1] + 0.25)];
+    (lo, hi)
 }

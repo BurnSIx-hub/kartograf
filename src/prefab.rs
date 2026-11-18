@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     fn prop(asset: &str, pos: [f32; 2], rot: f32) -> Prop {
-        Prop { asset: asset.into(), pos, size: [1.0, 1.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None }
+        Prop { asset: asset.into(), pos, size: [1.0, 1.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false }
     }
 
     #[test]
