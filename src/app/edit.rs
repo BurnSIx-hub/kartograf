@@ -48,6 +48,7 @@ impl App {
                 self.map.platforms.remove(i);
                 self.platform_put = None;
             }
+            Sel::Ground => self.delete_ground(),
         }
     }
 

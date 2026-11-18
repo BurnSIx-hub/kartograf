@@ -249,7 +249,7 @@ impl App {
     /// Подсказка к инструменту — в строке состояния.
     pub(super) fn hint(&self) -> &'static str {
         match self.tool {
-            Tool::Select => "Щелчок выбирает объект, дверь или стену. Объект можно тащить, за углы — менять размер, за ручку сверху — поворачивать; Alt с колесом — размер; стрелки сдвигают. Delete удаляет, R поворачивает.",
+            Tool::Select => "Щелчок выбирает всё, что на карте: объект, дверь, стену, дорогу, крышу, помост, кусок местности. Объект можно тащить, за углы — менять размер, за ручку сверху — поворачивать; Alt с колесом — размер; стрелки сдвигают. Местность и помост тащатся, у местности ручки рамки растягивают и сжимают её. Delete удаляет, R поворачивает.",
             Tool::Dungeon => "Пол комнат: стены встают по краю сами. Ctrl+Shift с протяжкой выгибает стену дугой.",
             Tool::Floor => "Пол без стен: двор, трава, площадь.",
             Tool::Erase => "Стирает и комнаты, и местность.",
@@ -588,6 +588,8 @@ impl App {
                 }
                 match self.tool {
                     _ if path_sel => self.path_panel(ui),
+                    Tool::Select if matches!(self.sel, Some(Sel::Platform(_))) => self.platform_panel(ui),
+                    Tool::Select if self.ground_sel().is_some() => self.ground_panel(ui),
                     Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief => {
                         if self.tool == Tool::Relief {
                             ui.horizontal_wrapped(|ui| {
@@ -976,6 +978,30 @@ impl App {
                             self.map.walls[i].style = None;
                         }
                     });
+                    // Бордюр: у выбранной стены — её, без выбора — для новых стен.
+                    const CURB_HINT: &str = "Низкая тонкая стенка: край пруда, клумбы, уступа. В Foundry держит шаг, а взгляд и свет идут поверх.";
+                    match self.sel {
+                        Some(Sel::Wall(i)) => {
+                            let mut low = self.map.walls[i].low;
+                            if ui.checkbox(&mut low, "Бордюр").on_hover_text(CURB_HINT).changed() {
+                                self.checkpoint();
+                                let thin = self.curb_style(self.map.walls[i].style.as_ref());
+                                let wall = &mut self.map.walls[i];
+                                wall.low = low;
+                                if low && wall.style.as_ref().is_none_or(|s| s.width > CURB_WIDTH) {
+                                    wall.style = Some(thin);
+                                }
+                                if self.tool == Tool::Wall {
+                                    self.wall_low = low;
+                                }
+                            }
+                        }
+                        Some(Sel::Edge(..)) => {}
+                        _ if self.tool == Tool::Wall => {
+                            ui.checkbox(&mut self.wall_low, "Бордюр").on_hover_text(CURB_HINT);
+                        }
+                        _ => {}
+                    }
                     if let Some(Sel::Edge(key, whole)) = self.sel {
                             let mut w = whole;
                             ui.selectable_value(&mut w, false, "Участок");

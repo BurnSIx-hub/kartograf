@@ -35,7 +35,7 @@ impl App {
     }
 
     /// Лестница или решётка выбранного помоста под точкой.
-    fn platform_part_at(&self, i: usize, w: [f32; 2]) -> Option<PlatformGrab> {
+    pub(super) fn platform_part_at(&self, i: usize, w: [f32; 2]) -> Option<PlatformGrab> {
         let pl = self.map.platforms.get(i)?;
         let p = platform::tidy(&pl.points);
         if let Some(k) = pl.stairs.iter().position(|s| platform::stair_geo(&p, s).is_some_and(|g| platform::contains(&g.outline(), w))) {
@@ -76,21 +76,10 @@ impl App {
                 self.roof_from = Some(self.cam.cell(rect, o));
             }
         }
-        if let (Some(grab), Some(p)) = (self.platform_grab.clone(), pointer)
+        if let Some(p) = pointer
             && resp.dragged_by(PointerButton::Primary)
         {
-            let w = self.cam.to_world(rect, p);
-            match grab {
-                PlatformGrab::Whole(i, w0, before) => {
-                    // Целыми клетками: прямоугольный помост остаётся по сетке.
-                    let d = [(w[0] - w0[0]).round(), (w[1] - w0[1]).round()];
-                    let mut pl = before;
-                    pl.shift(d);
-                    self.map.platforms[i] = pl;
-                }
-                PlatformGrab::Stair(i, k) => self.map.platforms[i].stairs[k].at = w,
-                PlatformGrab::Grate(i, k) => self.map.platforms[i].grates[k].at = w,
-            }
+            self.platform_drag(self.cam.to_world(rect, p));
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.platform_grab = None;
@@ -103,15 +92,41 @@ impl App {
             && let Some(p) = pointer
         {
             let w = self.cam.to_world(rect, p);
-            // Ставит щелчок у края — не дальше полутора клеток от контура; дальше — просто выбор.
-            let near = |i: usize| {
-                let p = platform::tidy(&self.map.platforms[i].points);
-                platform::stair_frame(&p, w).is_some_and(|(q, _, _)| (q[0] - w[0]).hypot(q[1] - w[1]) <= 1.5)
-            };
-            match (self.platform_put.take(), self.selected_platform()) {
-                (Some(put), Some(i)) if near(i) => self.platform_add(i, put, w),
-                _ => self.sel = self.platform_at(w).map(Sel::Platform),
+            if !self.platform_put_click(w) {
+                self.sel = self.platform_at(w).map(Sel::Platform);
             }
+        }
+    }
+
+    /// Протяжка того, что взято у помоста: весь он, лестница или решётка.
+    pub(super) fn platform_drag(&mut self, w: [f32; 2]) {
+        let Some(grab) = self.platform_grab.clone() else { return };
+        match grab {
+            PlatformGrab::Whole(i, w0, before) => {
+                // Целыми клетками: прямоугольный помост остаётся по сетке.
+                let d = [(w[0] - w0[0]).round(), (w[1] - w0[1]).round()];
+                let mut pl = before;
+                pl.shift(d);
+                self.map.platforms[i] = pl;
+            }
+            PlatformGrab::Stair(i, k) => self.map.platforms[i].stairs[k].at = w,
+            PlatformGrab::Grate(i, k) => self.map.platforms[i].grates[k].at = w,
+        }
+    }
+
+    /// Щелчок с «+ лестница» или «+ решётка»: ставит у края выбранного помоста — не
+    /// дальше полутора клеток от контура. `true` — поставил; дальше — просто выбор.
+    pub(super) fn platform_put_click(&mut self, w: [f32; 2]) -> bool {
+        let near = |i: usize| {
+            let p = platform::tidy(&self.map.platforms[i].points);
+            platform::stair_frame(&p, w).is_some_and(|(q, _, _)| (q[0] - w[0]).hypot(q[1] - w[1]) <= 1.5)
+        };
+        match (self.platform_put.take(), self.selected_platform()) {
+            (Some(put), Some(i)) if near(i) => {
+                self.platform_add(i, put, w);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -177,11 +192,13 @@ impl App {
     /// Панель режима помоста: форма новой рамки; у выбранного — высота, цвета, перила,
     /// огоньки, лестницы и решётки; без выбора — список, чтобы выбрать.
     pub(super) fn platform_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Рамка ставит:");
-            ui.selectable_value(&mut self.platform_oval, false, "прямоугольник");
-            ui.selectable_value(&mut self.platform_oval, true, "овал");
-        });
+        if self.tool == Tool::Roof {
+            ui.horizontal(|ui| {
+                ui.label("Рамка ставит:");
+                ui.selectable_value(&mut self.platform_oval, false, "прямоугольник");
+                ui.selectable_value(&mut self.platform_oval, true, "овал");
+            });
+        }
         let Some(i) = self.selected_platform() else {
             if self.map.platforms.is_empty() {
                 ui.label("Помостов нет: протяните рамку по полу.");

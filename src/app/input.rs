@@ -433,19 +433,33 @@ impl App {
                     && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
                 {
                     let w = self.cam.to_world(rect, o);
-                    match self.pick(w) {
-                        // Взяли объект из группы — едет вся группа.
-                        Some(Sel::Prop(i)) if self.picked.contains(&i) && self.grip_at(o).is_none() => {
-                            self.checkpoint();
-                            self.moving_group = Some((w, self.picked.iter().map(|&k| (k, self.map.props[k].pos)).collect()));
+                    // Выбранный кусок местности или помост — за ручку или за тело.
+                    if !self.select_grab(w, o) {
+                        match self.pick(w) {
+                            // Взяли объект из группы — едет вся группа.
+                            Some(Sel::Prop(i)) if self.picked.contains(&i) && self.grip_at(o).is_none() => {
+                                self.checkpoint();
+                                self.moving_group = Some((w, self.picked.iter().map(|&k| (k, self.map.props[k].pos)).collect()));
+                            }
+                            Some(_) => {}
+                            // Мимо всего — рамка выбора.
+                            None if self.grip_at(o).is_none() => self.band_from = Some(w),
+                            None => {}
                         }
-                        Some(_) => {}
-                        // Мимо всего — рамка выбора.
-                        None if self.grip_at(o).is_none() => self.band_from = Some(w),
-                        None => {}
                     }
                 }
-                if let (Some((from, start)), Some(p)) = (self.moving_group.clone(), pointer)
+                if self.ground_grab.is_some() || self.platform_grab.is_some() {
+                    if let Some(p) = pointer
+                        && resp.dragged_by(PointerButton::Primary)
+                    {
+                        let w = self.cam.to_world(rect, p);
+                        if self.ground_grab.is_some() {
+                            self.ground_drag(w, shift, self.settings.snap != alt);
+                        } else {
+                            self.platform_drag(w);
+                        }
+                    }
+                } else if let (Some((from, start)), Some(p)) = (self.moving_group.clone(), pointer)
                     && resp.dragged_by(PointerButton::Primary)
                 {
                     let w = self.cam.to_world(rect, p);
@@ -461,6 +475,8 @@ impl App {
                 }
                 if resp.drag_stopped_by(PointerButton::Primary) {
                     self.moving_group = None;
+                    self.platform_grab = None;
+                    self.ground_drag_end();
                     if let (Some(a), Some(p)) = (self.band_from.take(), pointer) {
                         let b = self.cam.to_world(rect, p);
                         let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
@@ -484,7 +500,13 @@ impl App {
                 if resp.clicked()
                     && let Some(p) = pointer
                 {
-                    let hit = self.pick(self.cam.to_world(rect, p));
+                    let w = self.cam.to_world(rect, p);
+                    // «+ лестница» у выбранного помоста.
+                    if self.platform_put_click(w) {
+                        return;
+                    }
+                    // Всё, что на карте: что сверху — то и берётся; под ним помост, ниже — местность.
+                    let hit = self.pick(w).or_else(|| self.platform_at(w).map(Sel::Platform)).or_else(|| if shift { None } else { self.ground_pick(w) });
                     if shift {
                         // Shift — добавить к группе или убрать из неё.
                         if let Some(Sel::Prop(k)) = self.sel.take() {

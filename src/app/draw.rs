@@ -508,8 +508,11 @@ impl App {
                 painter.add(Shape::ellipse_stroke(r.center(), r.size() / 2.0, Stroke::new(2.0, Color32::from_rgb(255, 200, 90))));
             }
         }
-        if !exporting && ui && self.tool == Tool::Roof && self.platform_mode {
+        if !exporting && ui && ((self.tool == Tool::Roof && self.platform_mode) || self.tool == Tool::Select) {
             self.draw_platform_marks(painter, canvas);
+        }
+        if !exporting && ui && self.tool == Tool::Select {
+            self.draw_ground_marks(painter, canvas);
         }
 
         // Крышное — поверх крыш и тает вместе с ними: скрытые крыши — нет и его;

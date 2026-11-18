@@ -276,12 +276,20 @@ impl App {
         }
     }
 
+    /// Вид бордюра: вид стены (своей или общий), но не толще [`CURB_WIDTH`].
+    pub(super) fn curb_style(&self, own: Option<&map::WallStyle>) -> map::WallStyle {
+        let st = own.cloned().unwrap_or_else(|| self.map.wall_style.clone());
+        map::WallStyle { width: st.width.min(CURB_WIDTH), ..st }
+    }
+
     /// Поставить начатую стену на карту. Из одной точки стены не бывает.
     pub fn finish_wall(&mut self, closed: bool) {
         let points = std::mem::take(&mut self.draft);
         if points.len() >= 2 {
             self.checkpoint();
-            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), low: false, style: None });
+            // Бордюр — низкий и тонкий; вид — как у всех стен, только тоньше.
+            let style = self.wall_low.then(|| self.curb_style(None));
+            self.map.walls.push(Wall { closed: closed && points.len() >= 3, points, bends: Vec::new(), low: self.wall_low, style });
             self.sel = Some(Sel::Wall(self.map.walls.len() - 1));
         }
     }

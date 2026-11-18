@@ -1110,8 +1110,77 @@ impl SelfTest {
                 app.relief_fill = false;
                 app.set_tool(Tool::Select);
             }
+            103 => {
+                // «Выбор» берёт всё: кусок местности и помост. Трава на всю карту, пруд 2×2.
+                app.new_map(20, 12);
+                app.set_tool(Tool::Select);
+                let (w, h) = (app.map.rooms.w, app.map.rooms.h);
+                app.map.paint(crate::map::Layer::Floor, 3, &crate::mask::cells(w, h, (0, 0), (19, 11)));
+                app.map.paint(crate::map::Layer::Floor, 5, &crate::mask::cells(w, h, (8, 4), (9, 5)));
+                let i = app.place_platform((14, 7), (16, 9));
+                app.sel = None;
+                self.world = [i as f32, 0.0];
+                self.resume_at = now + 0.3;
+            }
+            104 => self.click(at(app, [8.5, 4.5])),
+            105 => {
+                let r = app.ground_sel().map(|g| g.cells());
+                self.check("щелчок по пруду выбрал кусок местности", app.sel == Some(Sel::Ground) && r == Some([8.0, 4.0, 10.0, 6.0]), &format!("{:?} {r:?}", app.sel));
+                self.snap(ctx, "кусок местности");
+                // Правая ручка рамки — вширь на 2 клетки.
+                self.drag(at(app, [10.0, 5.0]), at(app, [12.0, 5.0]), PointerButton::Primary);
+            }
+            106 => {
+                let r = app.ground_sel().map(|g| g.cells());
+                let water = |app: &App, x: f32, y: f32| ground_share(app, 5, x, y);
+                let ok = r == Some([8.0, 4.0, 12.0, 6.0]) && water(app, 11.5, 4.5) == 255 && water(app, 12.5, 4.5) == 0;
+                self.check("ручка растянула пруд до 4×2", ok, &format!("{r:?}, вода {} / {}", water(app, 11.5, 4.5), water(app, 12.5, 4.5)));
+                self.snap(ctx, "пруд растянут");
+                // За тело — вниз на 3 клетки.
+                self.drag(at(app, [9.0, 5.0]), at(app, [9.0, 8.0]), PointerButton::Primary);
+            }
+            107 => {
+                let r = app.ground_sel().map(|g| g.cells());
+                let ok = r == Some([8.0, 7.0, 12.0, 9.0]) && ground_share(app, 5, 9.0, 7.5) == 255 && ground_share(app, 5, 9.0, 4.5) == 0 && ground_share(app, 3, 9.0, 4.5) == 255;
+                self.check("протяжка сдвинула пруд, на старом месте трава", ok, &format!("{r:?}"));
+                self.key(Key::Z, CTRL);
+            }
+            108 => {
+                let ok = ground_share(app, 5, 11.5, 4.5) == 255 && ground_share(app, 5, 9.0, 7.5) == 0 && app.sel.is_none();
+                self.check("Ctrl+Z вернул пруд на место и снял выбор", ok, &format!("{:?}", app.sel));
+                self.click(at(app, [15.5, 8.5]));
+            }
+            109 => {
+                let i = self.world[0] as usize;
+                self.check("щелчок «Выбором» по помосту выбрал его", app.sel == Some(Sel::Platform(i)), &format!("{:?}", app.sel));
+                self.drag(at(app, [15.5, 8.5]), at(app, [15.5, 6.5]), PointerButton::Primary);
+            }
+            110 => {
+                let b = app.map.platforms.first().map(|p| p.bounds());
+                self.check("«Выбор» тащит помост", b == Some(([14.0, 5.0], [17.0, 8.0])), &format!("{b:?}"));
+                // Бордюр: «Стена» с галочкой ставит низкую тонкую стенку.
+                app.set_tool(Tool::Wall);
+                app.wall_low = true;
+                self.click(at(app, [2.0, 2.0]));
+                self.click(at(app, [6.0, 2.0]));
+                self.key(Key::Enter, Modifiers::NONE);
+            }
+            111 => {
+                let w = app.map.walls.last();
+                let ok = w.is_some_and(|w| w.low && w.style.as_ref().is_some_and(|s| s.width <= crate::app::CURB_WIDTH + 1e-6) && w.points == vec![[2.0, 2.0], [6.0, 2.0]]);
+                self.check("«Стена» с галочкой «Бордюр» поставила низкую тонкую стенку", ok, &format!("{:?}", w.map(|w| (w.low, w.style.clone(), w.points.clone()))));
+                app.wall_low = false;
+                self.snap(ctx, "бордюр");
+            }
             _ => return false,
         }
         true
     }
+}
+
+/// Доля слоя материала `material` в точке `x`, `y` (клетки).
+fn ground_share(app: &App, material: u8, x: f32, y: f32) -> u8 {
+    let m = &app.map;
+    let p = (y * mask::RES as f32) as usize * m.rooms.w + (x * mask::RES as f32) as usize;
+    m.terrain.iter().find(|c| c.material == material).map_or(0, |c| c.mask.data[p])
 }

@@ -210,8 +210,10 @@ pub enum Sel {
     Outline(usize, usize),
     /// Стена комнаты: ключ отрезка и весь ли контур.
     Edge((i32, i32), bool),
-    /// Помост (инструмент «Крыша» в режиме помоста).
+    /// Помост (инструмент «Крыша» в режиме помоста или «Выбор»).
     Platform(usize),
+    /// Кусок местности: сам кусок — в `App::ground`.
+    Ground,
 }
 
 /// Как видны крыши в редакторе.
@@ -631,6 +633,12 @@ pub struct App {
     pub platform_put: Option<platform_edit::PlatformPut>,
     /// Что из помоста тянут мышью.
     platform_grab: Option<platform_edit::PlatformGrab>,
+    /// Инструмент «Стена» ставит бордюр: низкую тонкую стенку — шаг держит, взгляд идёт поверх.
+    pub wall_low: bool,
+    /// Кусок местности, выбранный «Выбором» (`Sel::Ground`).
+    pub ground: Option<ground_edit::GroundPiece>,
+    /// Что из куска местности тянут мышью.
+    ground_grab: Option<ground_edit::GroundGrab>,
     /// Где в верхней строке кнопка «Биом» — для самопроверки.
     pub biome_button: Rect,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
@@ -709,6 +717,8 @@ pub fn grips(prop: &Prop, lift: f32) -> ([[f32; 2]; 4], [f32; 2]) {
 }
 
 const GRIP_PX: f32 = 7.0;
+/// Толщина бордюра, клетки: край пруда, клумбы, уступа.
+pub const CURB_WIDTH: f32 = 0.2;
 pub const TURN_LIFT_PX: f32 = 26.0;
 const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=8.0;
 
@@ -845,6 +855,9 @@ impl App {
             platform_oval: false,
             platform_put: None,
             platform_grab: None,
+            wall_low: false,
+            ground: None,
+            ground_grab: None,
             biome_button: Rect::NOTHING,
             window_glass: std::collections::HashMap::new(),
             used_only: false,
@@ -922,6 +935,7 @@ mod draw;
 mod draw_ground;
 mod draw_platform;
 mod platform_edit;
+mod ground_edit;
 pub use platform_edit::PlatformPut;
 mod draw_scene;
 mod exporting;
