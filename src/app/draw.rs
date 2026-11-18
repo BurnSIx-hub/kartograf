@@ -106,6 +106,8 @@ impl App {
         if !below && self.underlay != 2 {
             painter.rect_filled(map_rect, 0.0, void);
         }
+        // Образец под картой — виден там, где ещё ничего не нарисовано.
+        self.draw_trace(painter, canvas, false);
 
         // Рисуется только видимая часть: на большой карте при сильном приближении
         // остальное всё равно за краем окна.
@@ -517,6 +519,9 @@ impl App {
             self.draw_props(painter, canvas, view, exporting, map::ON_ROOF..map::ABOVE_ROOFS, on_roof);
             self.draw_props(painter, canvas, view, exporting, map::ABOVE_ROOFS..i16::MAX, 1.0);
         }
+
+        // Образец поверх нарисованного — полупрозрачный, под подписями и ручками.
+        self.draw_trace(painter, canvas, true);
 
         // Подписи — поверх всего, с тёмной каймой, чтобы читались на любом полу.
         for (i, label) in self.map.labels.clone().iter().enumerate() {

@@ -230,6 +230,11 @@ impl App {
             match self.browse {
                 _ if as_floor => self.use_floor_texture(&key),
                 Kind::Floor => self.use_floor_texture(&key),
+                Kind::Wall if self.tool == Tool::Relief && self.relief_strip.is_some() => {
+                    if let Some(s) = self.relief_strip {
+                        self.set_relief_strip(s, key);
+                    }
+                }
                 Kind::Wall => {
                     // Встроенная полоса нарисована под свою толщину — её и ставим.
                     let mut st = self.wall_style();

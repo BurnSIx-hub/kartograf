@@ -169,9 +169,15 @@ impl App {
         // С фильтром «на карте» пересчёт и при правках карты: их видно по числу вещей.
         let m = &self.map;
         let used = if self.used_only { 1 + m.props.len() + m.portals.len() + m.roofs.len() + m.materials.len() + m.wall_looks.len() + m.walls.len() } else { 0 };
-        let key = (self.browse, self.query.clone(), self.library.assets.len(), used);
+        // Кисть рельефа выбирает полосу кромки — на полке стен только такие полосы.
+        let strip = self.relief_strip.filter(|_| self.tool == Tool::Relief && self.browse == Kind::Wall);
+        let key = (self.browse, self.query.clone(), self.library.assets.len(), used, strip);
         if key != self.filter_key {
             self.filtered = self.library.filter(self.browse, &self.query);
+            if let Some(s) = strip {
+                let assets = &self.library.assets;
+                self.filtered.retain(|&i| s.fits(&assets[i].key));
+            }
             if self.used_only {
                 let on_map = self.map.used_assets();
                 let assets = &self.library.assets;

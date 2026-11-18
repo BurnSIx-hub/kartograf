@@ -21,6 +21,7 @@ impl App {
             Tool::Object | Tool::Scatter => self.browse = Kind::Object,
             Tool::Wall => self.browse = Kind::Wall,
             Tool::Dungeon | Tool::Floor | Tool::Path if self.browse != Kind::Floor => self.browse = Kind::Floor,
+            Tool::Relief if self.relief_strip.is_some() => self.browse = Kind::Wall,
             _ => {}
         }
     }
@@ -121,6 +122,7 @@ impl App {
                 ui.separator();
                 self.shadows_ui(ui);
             });
+            ui.menu_button("Образец", |ui| self.reference_menu(ui));
             ui.menu_button("Сочетания клавиш", |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 for tool in Tool::ALL {
@@ -422,9 +424,25 @@ impl App {
         });
     }
 
+    /// Выбранный пол образцом и именем, без списка: другой берётся щелчком по полу
+    /// в библиотеке, как стены.
+    pub(super) fn material_shown(&mut self, ui: &mut egui::Ui) {
+        let Some(m) = self.map.materials.get(self.material).cloned() else { return };
+        ui.horizontal(|ui| {
+            self.swatch(ui, &m.paint, 18.0);
+            ui.label(&m.name);
+        })
+        .response
+        .on_hover_text("Другой пол — щелчком по нему в библиотеке");
+    }
+
     /// Выбор пола для кисти и дороги.
     pub(super) fn material_picker(&mut self, ui: &mut egui::Ui) {
-        self.material_combo(ui);
+        if self.tool == Tool::Dungeon {
+            self.material_shown(ui);
+        } else {
+            self.material_combo(ui);
+        }
         let materials = self.map.materials.clone();
         if let Some(m) = materials.get(self.material).filter(|m| matches!(m.paint, Paint::Texture(_))) {
             ui.horizontal(|ui| {
@@ -451,6 +469,38 @@ impl App {
             }
         }
 
+    }
+
+    /// Из чего строится обрыв: три полосы кромки. Щелчок по полосе — полка стен
+    /// показывает только подходящие картинки, щелчок по картинке ставит её.
+    fn relief_strips_panel(&mut self, ui: &mut egui::Ui) {
+        let now = match &self.map.relief {
+            Some(r) => [r.face.clone(), r.ridge.clone(), r.under.clone()],
+            None => self.relief_strips.clone(),
+        };
+        ui.label("Кромки:");
+        for s in library::Strip::ALL {
+            let key = &now[s as usize];
+            let name = if key.is_empty() { "встроенная".to_owned() } else { library::label(key) };
+            let title = match s {
+                library::Strip::Face => "стенка обрыва",
+                library::Strip::Ridge => "гребень",
+                library::Strip::Under => "осыпь",
+            };
+            ui.horizontal(|ui| {
+                let on = self.relief_strip == Some(s);
+                if ui.selectable_label(on, format!("{title}: {name}")).on_hover_text("Щелчок — выбрать картинку на полке стен; ещё щелчок — обычная полка").clicked() {
+                    self.relief_strip = if on { None } else { Some(s) };
+                    if !on {
+                        self.browse = Kind::Wall;
+                        self.prefab_shelf = false;
+                    }
+                }
+                if !key.is_empty() && ui.small_button("×").on_hover_text("Вернуть встроенную").clicked() {
+                    self.set_relief_strip(s, String::new());
+                }
+            });
+        }
     }
 
     /// Ползунки правят выбранную дорогу, а без неё — образец для новых.
@@ -553,6 +603,17 @@ impl App {
                                 let lv = r.level_at(self.cam.to_world(self.canvas, h));
                                 ui.weak(format!("Под курсором: ярус {lv} ({} фт)", lv * 5));
                             }
+                            self.relief_strips_panel(ui);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.relief_fill, "Заливать полом")
+                                    .on_hover_text("Поднятое и опущенное кистью покрывается полом. Другой пол — щелчком по нему в библиотеке, раздел «Пол»");
+                                if self.relief_fill
+                                    && let Some(m) = self.map.materials.get(self.material).cloned()
+                                {
+                                    self.swatch(ui, &m.paint, 18.0);
+                                    ui.label(&m.name);
+                                }
+                            });
                         }
                         if self.tool == Tool::Shade {
                             ui.horizontal(|ui| {

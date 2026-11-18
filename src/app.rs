@@ -509,6 +509,18 @@ pub struct App {
     /// Высоты до мазка и высота, к которой ровняет «Выровнять».
     relief_base: Option<crate::relief::Relief>,
     relief_target: f32,
+    /// Полосы кромок для нового рельефа (стенка, гребень, осыпь; пусто — встроенная):
+    /// у ровной карты рельефа нет, и выбор держится тут до первого мазка.
+    pub relief_strips: [String; 3],
+    /// Какую полосу сейчас выбирают на полке: она показывает только такие.
+    pub relief_strip: Option<library::Strip>,
+    /// Заливать поднятое и опущенное кистью выбранным полом.
+    pub relief_fill: bool,
+    /// Картинки образца и эскиза по файлам ([`reference`]).
+    ref_pics: std::collections::HashMap<String, reference::RefPic>,
+    /// Окошко эскиза открыто; приближение и сдвиг картинки в нём.
+    pub sketch_open: bool,
+    sketch_view: (f32, egui::Vec2),
     /// Образец новой подписи; тащат подпись — откуда взяли.
     pub label_style: map::Label,
     label_grab: Option<(usize, [f32; 2])>,
@@ -595,7 +607,7 @@ pub struct App {
     pub browse: Kind,
     pub query: String,
     filtered: Vec<usize>,
-    filter_key: (Kind, String, usize, usize),
+    filter_key: (Kind, String, usize, usize, Option<library::Strip>),
     /// Видимая полоса картинки окна поперёк стены, доля высоты холста.
     window_bands: std::collections::HashMap<String, [f32; 2]>,
     /// Код окна в Windows: развернуть свёрнутое на время снимка.
@@ -763,6 +775,12 @@ impl App {
             relief_alt: false,
             relief_base: None,
             relief_target: 0.0,
+            relief_strips: Default::default(),
+            relief_strip: None,
+            relief_fill: false,
+            ref_pics: Default::default(),
+            sketch_open: true,
+            sketch_view: (1.0, egui::Vec2::ZERO),
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
             roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
@@ -814,7 +832,7 @@ impl App {
             browse: Kind::Floor,
             query: String::new(),
             filtered: Vec::new(),
-            filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0),
+            filter_key: (Kind::Floor, String::from("\u{0}"), 0, 0, None),
             window_bands: std::collections::HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             window_code: 0,
@@ -907,6 +925,7 @@ mod platform_edit;
 pub use platform_edit::PlatformPut;
 mod draw_scene;
 mod exporting;
+mod reference;
 
 /// Команды ИИ (MCP) — отдельным файлом: `app.rs` и так велик.
 #[cfg(not(target_arch = "wasm32"))]

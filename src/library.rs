@@ -282,6 +282,43 @@ pub fn is_cliff(key: &str) -> bool {
     lower.contains("|textures/paths/") && is_cliff_path(&lower)
 }
 
+/// Полоса кромки рельефа — какая это из трёх: стенка обрыва, гребень уступа,
+/// осыпь под обрывом. Встроенные полосы — по ключу, FA — по имени: тегами FA
+/// помечены только плитки скал (`[FA] Cliff Tiles`), а дорожки обрыва — нет.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Strip {
+    Face,
+    Ridge,
+    Under,
+}
+
+impl Strip {
+    pub const ALL: [Strip; 3] = [Strip::Face, Strip::Ridge, Strip::Under];
+
+    pub fn fits(self, key: &str) -> bool {
+        let key = untint(key).1;
+        if let Some(id) = key.strip_prefix(BUILTIN) {
+            return match self {
+                Strip::Face => id == "wall_cliff",
+                Strip::Ridge => id.starts_with("wall_ridge"),
+                Strip::Under => id == "wall_under_cliff",
+            };
+        }
+        let lower = key.to_lowercase();
+        if !lower.contains("|textures/paths/") {
+            return false;
+        }
+        // По имени файла: гребни FA лежат в папке `Cliffs_Paths`.
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let ridge = name.starts_with("grass_ridge_") || name.starts_with("bank_");
+        match self {
+            Strip::Face => name.contains("cliff") && !name.contains("under_cliff") && !ridge,
+            Strip::Ridge => ridge,
+            Strip::Under => name.contains("under_cliff"),
+        }
+    }
+}
+
 /// Толщина скалы в клетках: у FA 256 точек на клетку, скалы бывают в 1–4 клетки.
 pub fn cliff_width(px: [u32; 2]) -> f32 {
     (px[1] as f32 / 256.0).max(0.25)
@@ -1614,6 +1651,14 @@ mod tests {
         assert!(is_cliff("pack:fa.dungeondraft_pack|textures/paths/Cliff_Paths/Cliff_Ice_A1.webp"));
         assert!(!is_cliff("pack:fa.dungeondraft_pack|textures/walls/Walls_Stone/Wall_Stone_A.webp"));
         assert_eq!(cliff_width([768, 512]), 2.0);
+        let fa = |p: &str| format!("pack:fa.dungeondraft_pack|textures/paths/{p}");
+        let only = |key: &str, s: Strip| Strip::ALL.iter().all(|&o| o.fits(key) == (o == s));
+        assert!(only(&fa("Cliff_Paths/Cliff_Stone_Slate_A1.webp"), Strip::Face));
+        assert!(only(&fa("Cliff_Paths/Under_Cliff_Paths/Under_Cliff_A1.webp"), Strip::Under));
+        assert!(only(&fa("Natural_Decor_Paths/Cliffs_Paths/Grass_Ridge_Dirt_01_A1.webp"), Strip::Ridge), "гребень в папке скал — не стенка");
+        assert!(only(&fa("Cliff_Paths/Bank_Stone_Slate_A1.webp"), Strip::Ridge));
+        assert!(only(&format!("{BUILTIN}wall_ridge_snow"), Strip::Ridge) && only(&format!("{BUILTIN}wall_cliff"), Strip::Face));
+        assert!(Strip::ALL.iter().all(|s| !s.fits("pack:fa.dungeondraft_pack|textures/walls/Walls_Stone/Wall_Stone_A.webp")));
         assert_eq!(kind_of("Мои/Объекты/бочка.png", false), Some(Kind::Object));
         assert_eq!(kind_of("плитка.png", false), Some(Kind::Floor));
     }

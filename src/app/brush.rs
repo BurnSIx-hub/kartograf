@@ -10,10 +10,13 @@ impl App {
             let (w, h) = (probe.rooms.w, probe.rooms.h);
             let mut weights = if self.brush.shape == Tip::Oval { mask::oval(w, h, a, b) } else { mask::cells(w, h, a, b) };
             mask::soften(w, h, &mut weights, 1.0 - self.brush.hardness);
-            let base = probe.relief.clone().unwrap_or_else(|| crate::relief::Relief::for_cells(probe.width, probe.height));
+            let base = probe.relief.clone().unwrap_or_else(|| self.new_relief());
             let c = [(a.0.min(b.0) + a.0.max(b.0) + 1) as f32 / 2.0, (a.1.min(b.1) + a.1.max(b.1) + 1) as f32 / 2.0];
             self.relief_target = base.at(c);
             probe.relief = Some(self.sculpt(&base, &weights));
+            if self.relief_fills() {
+                probe.paint(Layer::Floor, self.material, &weights);
+            }
             probe.prune();
             if probe != self.map {
                 self.checkpoint();
@@ -101,6 +104,9 @@ impl App {
                 }
             }
             self.map.relief = Some(relief);
+            if self.relief_fills() {
+                self.map.paint(Layer::Floor, self.material, &weights);
+            }
             return;
         }
         match self.tool {
@@ -115,6 +121,31 @@ impl App {
             _ => self.map.paint(Layer::Floor, self.material, &weights),
         }
         self.edges_dirty = true;
+    }
+
+    /// Ровный рельеф во всю карту с выбранными полосами кромок.
+    pub(super) fn new_relief(&self) -> crate::relief::Relief {
+        let mut r = crate::relief::Relief::for_cells(self.map.width, self.map.height);
+        for s in library::Strip::ALL {
+            *r.strip(s) = self.relief_strips[s as usize].clone();
+        }
+        r
+    }
+
+    /// Заливает ли кисть рельефа полом: «Сгладить» высот не создаёт — не заливает.
+    fn relief_fills(&self) -> bool {
+        self.relief_fill && self.relief_mode != ReliefMode::Smooth && self.material < self.map.materials.len()
+    }
+
+    /// Полоса кромки с полки: в образец нового рельефа и в рельеф карты, если он есть.
+    pub fn set_relief_strip(&mut self, s: library::Strip, key: String) {
+        self.relief_strips[s as usize] = key.clone();
+        if self.map.relief.as_mut().is_some_and(|r| *r.strip(s) != key) {
+            self.checkpoint();
+            if let Some(r) = &mut self.map.relief {
+                *r.strip(s) = key;
+            }
+        }
     }
 
     /// Высоты после мазка по весам `weights` поверх `base` — по режиму кисти.
@@ -149,7 +180,7 @@ impl App {
     pub fn begin_stroke(&mut self, w: [f32; 2]) {
         self.checkpoint();
         if self.tool == Tool::Relief {
-            let base = self.map.relief.clone().unwrap_or_else(|| crate::relief::Relief::for_cells(self.map.width, self.map.height));
+            let base = self.map.relief.clone().unwrap_or_else(|| self.new_relief());
             self.relief_target = base.at(w);
             self.relief_base = Some(base);
         }

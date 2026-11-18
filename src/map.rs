@@ -1812,6 +1812,42 @@ pub struct Map {
     /// Высота земли; нет — карта ровная.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relief: Option<crate::relief::Relief>,
+    /// Образец: картинка, по которой обводят карту своими кистями. Только в
+    /// редакторе — в выгрузку и на снимки не идёт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<Trace>,
+    /// Эскиз: картинка в окошке сбоку, для сверки.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sketch: String,
+}
+
+/// Образец под обводку ([`Map::trace`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trace {
+    /// Файл картинки.
+    pub path: String,
+    /// Левый верхний угол, клетки.
+    pub pos: [f32; 2],
+    /// Ширина, клетки; высота — по сторонам картинки.
+    pub width: f32,
+    /// Непрозрачность, 0–1.
+    pub opacity: f32,
+    /// Поверх нарисованного; иначе — под ним, видно только в пустоте.
+    #[serde(default = "yes")]
+    pub on_top: bool,
+    #[serde(default = "yes")]
+    pub shown: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Trace {
+    /// Новый образец во всю ширину карты.
+    pub fn new(path: String, map_width: u32) -> Self {
+        Self { path, pos: [0.0, 0.0], width: map_width as f32, opacity: 0.5, on_top: true, shown: true }
+    }
 }
 
 /// Ключ отрезка стены комнаты — его середина с шагом 1/64 клетки.
@@ -1931,6 +1967,8 @@ impl Map {
             shadows: Shadows { on: true, ..Shadows::default() },
             shade: None,
             relief: None,
+            trace: None,
+            sketch: String::new(),
             labels: Vec::new(),
             roofs: Vec::new(),
             outline_roofs: Vec::new(),
@@ -2197,6 +2235,9 @@ impl Map {
         }
         if let Some(r) = &mut self.relief {
             *r = r.padded(w, h, left, top);
+        }
+        if let Some(t) = &mut self.trace {
+            mv(&mut t.pos);
         }
         for wall in &mut self.walls {
             wall.points.iter_mut().for_each(mv);
@@ -2839,6 +2880,23 @@ mod tests {
         assert_eq!(arc_points([0.0, 0.0], [4.0, 0.0], 0.0).len(), 2);
         let w = Wall { points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]], closed: false, bends: vec![1.0], low: false, style: None };
         assert!(w.segments().count() > 4 && w.distance([2.0, -1.0]) < 0.02);
+    }
+
+    #[test]
+    fn trace_and_sketch_are_kept_in_the_file_and_move_with_the_map() {
+        let mut m = Map::new(10, 8);
+        let plain = serde_json::to_string(&m).unwrap();
+        assert!(!plain.contains("trace") && !plain.contains("sketch"), "без образца в файле его нет");
+        m.trace = Some(Trace { opacity: 0.3, on_top: false, ..Trace::new("C:/книга/карта.webp".into(), m.width) });
+        m.sketch = "C:/книга/эскиз.png".into();
+        let back: Map = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!((back.trace.clone(), back.sketch.clone()), (m.trace.clone(), m.sketch.clone()));
+        assert_eq!(back.trace.as_ref().map(|t| t.width), Some(10.0), "новый образец — во всю ширину карты");
+        m.grow(2, 3, 0, 0);
+        assert_eq!(m.trace.as_ref().map(|t| t.pos), Some([2.0, 3.0]), "образец сдвинулся с картой");
+        // Файл без «показывать» и «поверх» (вручную) — образец виден и поверх.
+        let t: Trace = serde_json::from_str(r#"{"path":"a.png","pos":[0,0],"width":5,"opacity":0.5}"#).unwrap();
+        assert!(t.shown && t.on_top);
     }
 
     #[test]

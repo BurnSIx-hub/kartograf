@@ -740,6 +740,23 @@ impl SelfTest {
                 app.end_stroke();
                 let low = app.map.relief.as_ref().map_or(0.0, |r| r.at([15.0, 9.0]));
                 self.check("мазок «Опустить» — ложбина не глубже 2 клеток", (-2.05..-1.0).contains(&low), &format!("{low}"));
+                // Кромки с полки уходят в рельеф карты; «Заливать полом» кладёт пол под поднятое.
+                let snow = format!("{}wall_ridge_snow", crate::library::BUILTIN);
+                app.set_relief_strip(crate::library::Strip::Ridge, snow.clone());
+                let strip = app.map.relief.as_ref().is_some_and(|r| r.ridge == snow) && app.relief_strips[1] == snow;
+                app.set_relief_strip(crate::library::Strip::Ridge, String::new());
+                let back = app.map.relief.as_ref().is_some_and(|r| r.ridge.is_empty());
+                self.check("кромка рельефа с полки: гребень сменился и вернулся встроенным", strip && back, &format!("{strip} {back}"));
+                let before = app.map.floor_at(11, 6);
+                app.material = 1.min(app.map.materials.len() - 1);
+                app.relief_fill = true;
+                app.relief_mode = crate::app::ReliefMode::Raise;
+                app.brush.shape = Tip::Cells;
+                app.brush.hardness = 1.0;
+                app.paint((10, 5), (12, 7));
+                let filled = app.map.floor_at(11, 6);
+                app.relief_fill = false;
+                self.check("«Заливать полом»: под поднятым — выбранный пол", filled == app.material as u8 + 1 && filled != before, &format!("было {before}, стало {filled}"));
                 app.set_tool(Tool::Text);
                 app.label_style.text = "Колодец".into();
                 let p = at(app, [15.0, 7.0]);
@@ -1047,6 +1064,51 @@ impl SelfTest {
                 self.check("Ctrl+Z убрал префаб одним шагом", app.map.props.len() == before, &format!("предметов {}", app.map.props.len()));
                 app.object_prefab = None;
                 app.prefab_shelf = false;
+                // Образец поверх карты и эскиз в окошке: пурпурная клетка 4×4 на всю карту.
+                let pic = self.dir.join("образец.png");
+                let img = image::RgbaImage::from_fn(64, 64, |x, y| if (x / 16 + y / 16) % 2 == 0 { image::Rgba([230, 40, 200, 255]) } else { image::Rgba([40, 200, 230, 255]) });
+                let _ = img.save(&pic);
+                let path = pic.to_string_lossy().into_owned();
+                app.map.trace = Some(crate::map::Trace { opacity: 0.4, ..crate::map::Trace::new(path.clone(), app.map.width) });
+                app.map.sketch = path;
+                app.sketch_open = true;
+                self.resume_at = now + 1.0;
+            }
+            96 => {
+                let path = app.map.sketch.clone();
+                app.ref_pic(ctx, &path);
+                self.resume_at = now + 0.5;
+            }
+            97 => {
+                let path = app.map.sketch.clone();
+                self.check("образец и эскиз загрузились", app.ref_pic(ctx, &path).is_some_and(|(_, s)| s == [64, 64]), &path);
+                self.snap(ctx, "образец и эскиз");
+            }
+            98 => {
+                app.map.trace = None;
+                app.map.sketch.clear();
+                app.set_tool(Tool::Dungeon);
+                self.resume_at = now + 0.3;
+            }
+            99 => self.snap(ctx, "кисть подземелья"),
+            100 => {
+                app.set_tool(Tool::Relief);
+                app.relief_strip = Some(crate::library::Strip::Face);
+                app.browse = crate::library::Kind::Wall;
+                app.relief_fill = true;
+                self.resume_at = now + 0.3;
+            }
+            101 => {
+                let found = app.filtered().to_vec();
+                let shelf = found.iter().map(|&i| app.library.assets[i].key.clone()).collect::<Vec<_>>();
+                let ok = !shelf.is_empty() && shelf.iter().all(|k| crate::library::Strip::Face.fits(k));
+                self.check("кромка «стенка обрыва»: на полке стен только стенки", ok, &format!("{shelf:?}"));
+                self.snap(ctx, "рельеф: кромки");
+            }
+            102 => {
+                app.relief_strip = None;
+                app.relief_fill = false;
+                app.set_tool(Tool::Select);
             }
             _ => return false,
         }

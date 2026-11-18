@@ -71,6 +71,15 @@ impl Relief {
         Self { w, h, data: vec![0.0; w * h], face: String::new(), ridge: String::new(), under: String::new(), natural: false }
     }
 
+    /// Ключ полосы кромки; пусто — встроенная.
+    pub fn strip(&mut self, s: crate::library::Strip) -> &mut String {
+        match s {
+            crate::library::Strip::Face => &mut self.face,
+            crate::library::Strip::Ridge => &mut self.ridge,
+            crate::library::Strip::Under => &mut self.under,
+        }
+    }
+
     pub fn face_key(&self) -> String {
         if self.face.is_empty() { format!("{}wall_cliff", crate::library::BUILTIN) } else { self.face.clone() }
     }

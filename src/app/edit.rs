@@ -404,8 +404,12 @@ impl App {
             Some(i) => self.material = i,
             None => self.error = Some("В карте уже 255 материалов — больше не помещается.".into()),
         }
+        // У кисти рельефа пол — заливка поднятого: инструмент тот же, заливка включается.
+        if self.tool == Tool::Relief {
+            self.relief_fill = true;
+        }
         // Выбрана дорога или вода — её и перекрасить, инструмент не трогать.
-        if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path) && !self.editing_path() {
+        if !matches!(self.tool, Tool::Dungeon | Tool::Floor | Tool::Path | Tool::Relief) && !self.editing_path() {
             self.tool = Tool::Dungeon;
         }
         self.recolor_path();
