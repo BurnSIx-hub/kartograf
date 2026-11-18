@@ -27,7 +27,9 @@ pub fn ruler_text(a: [f32; 2], b: [f32; 2]) -> String {
     format!("{:.1} кл. · {:.0} фт", cells, cells * 5.0)
 }
 
-/// Свет в окне: сцена (по правке карты) и посчитанная сетка (по виду).
+/// Свет в окне: сцена (по правке карты) и посчитанная сетка (по виду). Только в
+/// настольной сборке: `lighting` в сборку для браузера не входит.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct LightCache {
     rev: u64,
     roofs: bool,
@@ -111,6 +113,7 @@ impl App {
     /// Свет поверх вида — то же, что ляжет на ночной снимок: огни предметов, стены и
     /// окна. Множитель и сияние — одним слоем: в смеси egui (альфа уже умножена)
     /// цвет точки = свечение + под ней × (1 − альфа).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn draw_light(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect) {
         let roofs = self.roof_alpha() >= 1.0;
         if self.light.as_ref().is_none_or(|c| c.rev != self.rev || c.roofs != roofs) {

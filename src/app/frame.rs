@@ -485,6 +485,8 @@ impl App {
             self.settings.snap = !self.settings.snap;
             self.save_settings();
         }
+        // Свет считает `lighting` — его нет в сборке для браузера.
+        #[cfg(not(target_arch = "wasm32"))]
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::L)) {
             self.light_view = !self.light_view;
         }

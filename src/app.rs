@@ -654,6 +654,7 @@ pub struct App {
     pub ruler_line: Option<([f32; 2], [f32; 2])>,
     /// Предпросмотр света (L) и его расчёт.
     pub light_view: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     light: Option<view_tools::LightCache>,
     /// Слой новых объектов (цифры 1–4, 7, 8, 9); нет — по имени ассета.
     pub object_layer: Option<i16>,
@@ -896,6 +897,7 @@ impl App {
             ruler: false,
             ruler_line: None,
             light_view: false,
+            #[cfg(not(target_arch = "wasm32"))]
             light: None,
             object_layer: None,
             brush_erase: false,

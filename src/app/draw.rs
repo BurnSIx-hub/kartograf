@@ -529,6 +529,7 @@ impl App {
         }
 
         // Свет (L) — поверх всего нарисованного, под образцом, подписями и ручками.
+        #[cfg(not(target_arch = "wasm32"))]
         if self.light_view && !exporting && ui {
             self.draw_light(painter, canvas, view);
         }

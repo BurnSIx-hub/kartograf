@@ -111,6 +111,7 @@ impl App {
                 if ui.checkbox(&mut self.settings.grid, "Сетка   G").changed() {
                     self.save_settings();
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 ui.checkbox(&mut self.light_view, "Свет   L").on_hover_text("Как ляжет свет огней ночью: стены и окна держат его так же, как в Foundry");
                 if ui.checkbox(&mut self.ruler, "Линейка   R").changed() {
                     self.ruler_line = None;
