@@ -596,6 +596,10 @@ impl App {
             }
         }
 
+        // Метки окна «Проверка».
+        if ui && !exporting {
+            self.draw_check_marks(painter, canvas);
+        }
         // Линейка (R) — поверх всего.
         if self.ruler && ui && !exporting {
             self.draw_ruler(painter, canvas);

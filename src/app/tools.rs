@@ -207,6 +207,15 @@ impl App {
                 }
             }
             "describe" => Ok(self.tool_describe(a)),
+            "check_map" => {
+                let (inp, out) = self.check_now();
+                let r2 = |v: f64| (v * 100.0).round() / 100.0;
+                let issues: Vec<Value> = out
+                    .iter()
+                    .map(|i| json!({"kind": i.kind.tag(), "text": i.text, "line": i.line(), "at": [r2(i.at[0]), r2(i.at[1])], "objects": i.objects}))
+                    .collect();
+                Ok(json!({"count": out.len(), "objects": inp.objs.len(), "roofs": inp.houses.len(), "doors": inp.doors.len(), "issues": issues}))
+            }
             "find_assets" => self.tool_find(a),
             "add_object" => self.tool_add_object(a),
             "edit_object" => self.tool_edit_object(a),

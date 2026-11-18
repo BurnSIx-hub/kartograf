@@ -67,6 +67,7 @@ fn tools() -> Value {
             "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "room_walls", "visible"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},
             "area": area, "limit": int("Max items per section, default 200")
         }), &[]),
+        tool("check_map", "Check the current level for what will look or play wrong in Foundry (the same list as the «Проверка» window): roof-only things off roofs and non-roof things on them, anything above roofs over a house (hides the room), vertical things lying flat, pipe ends to nowhere, objects inside each other, blocked doors, objects across house walls, street things indoors and indoor things outside, objects past the map edge, labels on objects, wall lamps off walls, lamp posts not against a wall or in the middle of a passage, objects that block a passage for a one-cell token. Returns count and issues: kind, text, line ('[kind] text'), at [x, y] — where to look, objects — their indices.", json!({}), &[]),
         tool("find_assets", "Search the asset library (built-in pictures plus the user's Dungeondraft packs and folder) by words, best matches first: the exact file name, then whole words of the name in order; 'table' does not rank 'tablet'; broken, damaged, fallen, desert, arctic, cyberpunk and similar branches sink unless named. Height, normal and roughness maps are not in the library. Returns keys to use in add_object / paint / add_door.", json!({
             "query": text("Words to match in the name or folder, e.g. 'barrel', 'oak tree', 'stone floor', or an exact file name 'Chair_Wood_Ashen_A_1x1'"),
             "kind": {"type": "string", "enum": ["floor", "wall", "door", "object", "roof"], "description": "door: door leaves, jambs (Door_Frame), windows and window sills"},
@@ -341,7 +342,7 @@ mod tests {
     fn tools_found_missing_on_a_real_map_are_there() {
         let list = tools();
         let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map", "edit_door", "preview_assets", "batch"] {
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map", "edit_door", "preview_assets", "batch", "check_map"] {
             assert!(names.contains(&n), "{n}");
         }
         let props = |tool: &str| list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"].clone();

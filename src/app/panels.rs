@@ -134,6 +134,11 @@ impl App {
                 self.shadows_ui(ui);
             });
             ui.menu_button("Образец", |ui| self.reference_menu(ui));
+            let n = self.check.issues.len();
+            let label = if self.check.open && n > 0 { format!("Проверка ({n})") } else { "Проверка".to_owned() };
+            if ui.selectable_label(self.check.open, label).on_hover_text("Что в Foundry выйдет не так: предметы не к месту, трубы в никуда, загороженные двери и проходы").clicked() {
+                self.check.open = !self.check.open;
+            }
             ui.menu_button("Сочетания клавиш", |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 for tool in Tool::ALL {

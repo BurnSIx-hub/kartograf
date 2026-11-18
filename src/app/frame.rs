@@ -113,6 +113,7 @@ impl App {
 
     pub(super) fn windows(&mut self, ctx: &egui::Context) {
         self.update_window(ctx);
+        self.check_window(ctx);
         self.place_window(ctx);
         self.sketch_window(ctx);
         if let Some(e) = self.error.clone() {

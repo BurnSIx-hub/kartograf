@@ -1320,6 +1320,40 @@ impl SelfTest {
                 self.check("Alt с кистью пола стёр её только под протяжкой", ok, &format!("{} {} {} {}", at_cell(2, 9), at_cell(3, 9), at_cell(4, 9), at_cell(2, 10)));
                 self.snap(ctx, "управление Dungeondraft");
             }
+            130 => {
+                // «Проверка»: бочка за краем карты попадает в список, щелчок по строке ведёт к ней.
+                let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel test")[0]].key.clone();
+                let w = app.map.width as f32;
+                app.map.props.push(crate::map::Prop { asset: barrel, pos: [w - 0.1, 4.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                app.touch();
+                app.set_tool(Tool::Wall);
+                app.check.open = true;
+                self.resume_at = now + 0.3;
+            }
+            131 => {
+                if app.check_busy() {
+                    self.step -= 1;
+                    self.resume_at = now + 0.2;
+                    return true;
+                }
+                let k = app.map.props.len() - 1;
+                let edge = app.check.issues.iter().position(|i| i.kind == crate::check::Kind::Edge && i.objects == [k]);
+                self.check("«Проверка»: бочка за краем карты в списке", edge.is_some(), &format!("{:?}", app.check.issues.iter().map(|i| i.line()).collect::<Vec<_>>()));
+                if let Some(i) = edge {
+                    app.goto_issue(i);
+                }
+                self.resume_at = now + 0.3;
+            }
+            132 => {
+                let k = app.map.props.len() - 1;
+                let mid = app.cam.to_world(app.canvas, app.canvas.center());
+                let ok = app.tool == Tool::Select && app.sel == Some(Sel::Prop(k)) && (mid[0] - app.map.width as f32).abs() < 0.5;
+                self.check("щелчок по строке: предмет выбран, карта на нём", ok, &format!("{:?} {:?} {mid:?}", app.tool, app.sel));
+                self.snap(ctx, "проверка");
+            }
+            133 => {
+                app.check.open = false;
+            }
             _ => return false,
         }
         true

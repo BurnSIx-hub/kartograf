@@ -652,6 +652,8 @@ pub struct App {
     /// Линейка (R) и её отрезок.
     pub ruler: bool,
     pub ruler_line: Option<([f32; 2], [f32; 2])>,
+    /// Окно «Проверка для Foundry» и его список.
+    pub check: check_view::CheckState,
     /// Предпросмотр света (L) и его расчёт.
     pub light_view: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -896,6 +898,7 @@ impl App {
             prev_tool: Tool::Dungeon,
             ruler: false,
             ruler_line: None,
+            check: Default::default(),
             light_view: false,
             #[cfg(not(target_arch = "wasm32"))]
             light: None,
@@ -987,6 +990,7 @@ mod draw_platform;
 mod platform_edit;
 mod ground_edit;
 mod view_tools;
+mod check_view;
 pub use platform_edit::PlatformPut;
 pub use view_tools::ruler_text;
 mod draw_scene;
