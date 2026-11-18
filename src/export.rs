@@ -1107,6 +1107,43 @@ pub fn opaque_box(img: &image::RgbaImage, min_alpha: u8) -> Option<[u32; 4]> {
     (lo[0] <= hi[0]).then(|| [lo[0], lo[1], hi[0] - lo[0] + 1, hi[1] - lo[1] + 1])
 }
 
+/// Рамка куска этажа: где нарисовано хоть в одном из его слоёв (фон, стены), с запасом
+/// `pad` точек и в границах картинки `size`. Верхний этаж — стена по гребню, обсерватория
+/// над башней — занимает малую долю сцены, а слой во всю сцену держит в видеопамяти
+/// сотни мегабайт у каждого игрока. Рамка одна на фон и стены: уровень Foundry 14
+/// кладёт их по общим `textures`. Пусто во всех слоях — `None`.
+pub fn level_piece_box(boxes: &[Option<[u32; 4]>], size: [u32; 2], pad: u32) -> Option<[u32; 4]> {
+    let (mut lo, mut hi) = ([u32::MAX; 2], [0u32; 2]);
+    for b in boxes.iter().flatten() {
+        lo = [lo[0].min(b[0]), lo[1].min(b[1])];
+        hi = [hi[0].max(b[0] + b[2]), hi[1].max(b[1] + b[3])];
+    }
+    if lo[0] >= hi[0] || lo[1] >= hi[1] {
+        return None;
+    }
+    let (x0, y0) = (lo[0].saturating_sub(pad), lo[1].saturating_sub(pad));
+    let (x1, y1) = ((hi[0] + pad).min(size[0]), (hi[1] + pad).min(size[1]));
+    Some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// `textures` уровня для куска `piece` (x, y, ширина, высота в точках картинки размером
+/// `image`) в сцене размером `scene` точек. Ядро ставит слой уровня от середины сцены и
+/// растягивает его на всю сцену (`fit: fill`), потом умножает на `scaleX`/`scaleY`; с
+/// якорем в левом верхнем углу и сдвигом от середины кусок встаёт на своё место в
+/// натуральную величину.
+pub fn level_piece_textures(scene: [u32; 2], image: [u32; 2], piece: [u32; 4]) -> Value {
+    let (kx, ky) = (scene[0] as f64 / image[0].max(1) as f64, scene[1] as f64 / image[1].max(1) as f64);
+    json!({
+        "anchorX": 0, "anchorY": 0,
+        "offsetX": (piece[0] as f64 * kx - scene[0] as f64 / 2.0).round() as i64,
+        "offsetY": (piece[1] as f64 * ky - scene[1] as f64 / 2.0).round() as i64,
+        "fit": "fill",
+        "scaleX": piece[2] as f64 / image[0].max(1) as f64,
+        "scaleY": piece[3] as f64 / image[1].max(1) as f64,
+        "rotation": 0
+    })
+}
+
 /// Слой поверх картинки: левый верхний угол слоя — в точке `at`.
 pub fn stamp_layer(dst: &mut image::RgbImage, src: &image::RgbaImage, at: [u32; 2]) {
     for (x, y, p) in src.enumerate_pixels() {
@@ -2192,6 +2229,18 @@ mod tests {
         assert_eq!((lv["foreground"]["src"].as_str(), lv["foreground"]["alphaThreshold"].as_f64()), (Some("k/walls.webp"), Some(0.75)));
         assert!(lv.get("visibility").is_none() && lv["background"].get("alphaThreshold").is_none(), "один этаж — фон сплошной");
         assert_eq!(lv["elevation"], json!({"bottom": 0, "top": 20}), "верх задан: стены — под крышами, а не над всем");
+        // Кусок верхнего этажа: рамка по фону и стенам с запасом, в границах картинки;
+        // кусок встаёт на место — левый верхний угол сдвинут от середины сцены, ширина в долях.
+        let b = level_piece_box(&[Some([100, 200, 50, 40]), None, Some([140, 180, 30, 10])], [1000, 600], 4);
+        assert_eq!(b, Some([96, 176, 78, 68]));
+        assert_eq!(level_piece_box(&[None, None], [10, 10], 4), None);
+        assert_eq!(level_piece_box(&[Some([0, 0, 10, 10])], [10, 10], 4), Some([0, 0, 10, 10]), "запас не выходит за картинку");
+        let t = level_piece_textures([1000, 600], [1000, 600], [96, 176, 78, 68]);
+        assert_eq!((t["anchorX"].as_i64(), t["offsetX"].as_i64(), t["offsetY"].as_i64(), t["fit"].as_str()), (Some(0), Some(-404), Some(-124), Some("fill")));
+        assert!((t["scaleX"].as_f64().unwrap() - 0.078).abs() < 1e-9 && (t["scaleY"].as_f64().unwrap() - 68.0 / 600.0).abs() < 1e-9);
+        // Картинка мельче сцены (выгрузка в меньшем масштабе): сдвиг — в точках сцены.
+        let t = level_piece_textures([2000, 1200], [1000, 600], [100, 60, 100, 60]);
+        assert_eq!((t["offsetX"].as_i64(), t["offsetY"].as_i64()), (Some(-800), Some(-480)));
         // Без слоя стен (выгрузка без тайлов) `foreground` нет.
         assert!(foundry_levels(&map, "Дом", &one, 100, &Default::default())["levels"][0].get("foreground").is_none());
         // Два этажа: у каждого свои границы — предметы на низе, крыши на верхе, стены у каждого свои.

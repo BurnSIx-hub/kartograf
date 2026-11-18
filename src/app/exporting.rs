@@ -256,6 +256,7 @@ impl App {
         // Фон верхнего этажа, где на нём есть пустота, — с прозрачностью: в Foundry
         // сквозь неё виден этаж ниже. Закрашенный целиком — сплошной, как у первого.
         let mut open: Vec<Option<image::RgbaImage>> = Vec::new();
+        let mut bg_paths: Vec<PathBuf> = Vec::new();
         for (k, img) in e.done.iter().enumerate() {
             let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
             // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
@@ -272,6 +273,7 @@ impl App {
             open.push(holes);
             let img_path = e.dir.join(format!("{}.{ext}", stem(k)));
             files.push((img_path.clone(), bytes));
+            bg_paths.push(img_path.clone());
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             // Вырез воды под мостом — по нарисованному: рамка картинки, по разу на картинку.
             let sources = &self.textures.sources;
@@ -315,6 +317,7 @@ impl App {
         // Слой стен каждого этажа (он же для Universal VTT) и его файл.
         let mut wall_layers: std::collections::HashMap<usize, image::RgbaImage> = std::collections::HashMap::new();
         let mut foregrounds: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut wall_paths: std::collections::HashMap<usize, PathBuf> = std::collections::HashMap::new();
         for k in 0..n {
             let map = if k == self.level { &self.map } else { &self.levels[k] };
             let light = map.shadows.light();
@@ -581,16 +584,49 @@ impl App {
                     let file = e.dir.join(format!("{}_walls.{ext}", stem(k)));
                     files.push((file.clone(), bytes));
                     foregrounds.insert(k, export::foundry_src(&file));
+                    wall_paths.insert(k, file);
                     wall_layers.insert(k, layer);
                 }
             }
             roof_tiles.push(tiles);
+        }
+        // Верхний этаж с пустотой — куском, где на нём нарисовано, а не во всю сцену: стена по
+        // гребню над замком в 140×110 клеток занимает малую долю сцены, а слой во всю сцену —
+        // сотни мегабайт видеопамяти у каждого игрока. Фон и стены режутся по одной рамке
+        // (у уровня они кладутся по общим `textures`); кусок почти во всю сцену не режется.
+        let mut pieces: std::collections::HashMap<usize, ([u32; 2], [u32; 4])> = std::collections::HashMap::new();
+        for k in 1..n {
+            let Some(bg) = open[k].as_ref() else { continue };
+            let size = [bg.width(), bg.height()];
+            let walls = wall_layers.get(&k);
+            let Some(piece) = export::level_piece_box(&[export::opaque_box(bg, 8), walls.and_then(|l| export::opaque_box(l, 8))], size, 4) else { continue };
+            if piece[2] as u64 * piece[3] as u64 * 4 > size[0] as u64 * size[1] as u64 * 3 {
+                continue;
+            }
+            let cut = |img: &image::RgbaImage| image::imageops::crop_imm(img, piece[0], piece[1], piece[2], piece[3]).to_image();
+            let (bytes, ext) = export::layer_bytes(&cut(bg), 88.0);
+            let path = e.dir.join(format!("{}.{ext}", stem(k)));
+            files.retain(|(p, _)| p != &bg_paths[k]);
+            files.push((path.clone(), bytes));
+            srcs[k] = export::foundry_src(&path);
+            if let (Some(layer), Some(old)) = (walls, wall_paths.get(&k)) {
+                let (bytes, ext) = export::layer_bytes(&cut(layer), 90.0);
+                let path = e.dir.join(format!("{}_walls.{ext}", stem(k)));
+                files.retain(|(p, _)| p != old);
+                files.push((path.clone(), bytes));
+                foregrounds.insert(k, export::foundry_src(&path));
+            }
+            pieces.insert(k, (size, piece));
         }
         let levels: Vec<export::SceneLevel> = (0..n)
             .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
         let layers: Vec<export::LevelLayers> = (0..n).map(|k| export::LevelLayers { foreground: foregrounds.remove(&k), solid: open[k].as_ref().map(export::Solid::of) }).collect();
         let mut scene = export::foundry_layered(&self.map, &e.name, &levels, &layers, e.px, &leaves);
+        let scene_px = [scene["width"].as_u64().unwrap_or(0) as u32, scene["height"].as_u64().unwrap_or(0) as u32];
+        for (k, (size, piece)) in &pieces {
+            scene["levels"][*k]["textures"] = export::level_piece_textures(scene_px, *size, *piece);
+        }
         // Тени предметов рисует «Wild Canvas»: солнце — у сцены.
         if self.map.shadows.on {
             scene["flags"][export::LIVE_MODULE]["shadows"] = export::shadow_flags(&self.map.shadows);
