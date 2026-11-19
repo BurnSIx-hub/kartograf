@@ -180,7 +180,14 @@ impl App {
 
     fn run_tool(&mut self, tool: &str, a: &Value) -> Out {
         let r = match tool {
-            "map_info" => Ok(self.tool_info()),
+            "map_info" => {
+                let mut info = self.tool_info();
+                info["frame"] = self.prof.report();
+                if a["reset_frames"].as_bool() == Some(true) {
+                    self.prof.clear();
+                }
+                Ok(info)
+            }
             "list_prefabs" => Ok(json!({"prefabs": self.prefabs.iter().map(|(_, p)| {
                 let s = p.span();
                 json!({"name": p.name, "objects": p.props.len(), "span": [(s[0] * 10.0).round() / 10.0, (s[1] * 10.0).round() / 10.0]})

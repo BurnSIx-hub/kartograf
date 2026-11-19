@@ -10,6 +10,7 @@ mod check;
 mod control;
 mod export;
 mod generate;
+mod grid;
 mod library;
 mod mappick;
 mod map;

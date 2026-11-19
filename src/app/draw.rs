@@ -14,6 +14,7 @@ pub(super) struct UnderCache {
     tree_shade: Option<(u64, Option<std::rc::Rc<Mask>>)>,
     outline_cache: std::collections::HashMap<u64, (egui::TextureHandle, [f32; 2], [f32; 2])>,
     outline_last: std::collections::HashMap<usize, u64>,
+    props_index: super::prop_index::PropIndex,
 }
 
 impl App {
@@ -60,6 +61,7 @@ impl App {
             std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
             std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
             std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            self.swap_props_index(&mut c.props_index);
             self.edges_dirty = false;
             let keep = (self.map.roofs.clone(), self.map.outline_roofs.clone());
             let mut i = 0;
@@ -75,6 +77,7 @@ impl App {
             std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
             std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
             std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            self.swap_props_index(&mut c.props_index);
             self.under.insert(j, c);
             std::mem::swap(&mut self.map, &mut self.levels[j]);
         }
@@ -102,7 +105,11 @@ impl App {
             Some(false) => Color32::BLACK,
             None => Color32::from_gray(38),
         };
+        let t = crate::plat::Instant::now();
         let below = ui && self.draw_below(painter, canvas);
+        if below {
+            self.prof.add("below", t);
+        }
         if !below && self.underlay != 2 {
             painter.rect_filled(map_rect, 0.0, void);
         }
@@ -117,6 +124,7 @@ impl App {
         let (y0, y1) = ((tl[1].floor() as i32).max(0), (br[1].ceil() as i32).min(mh));
 
         // Пол: местность, затем пол комнат, обрезанный по самим комнатам.
+        let t = crate::plat::Instant::now();
         let terrain = std::mem::take(&mut self.map.terrain);
         let room_floor = std::mem::take(&mut self.map.room_floor);
         for (k, coat) in terrain.iter().enumerate() {
@@ -129,6 +137,7 @@ impl App {
         self.map.terrain = terrain;
         self.map.room_floor = room_floor;
         self.map.rooms = rooms;
+        self.prof.add("ground", t);
 
         let relief = self.relief_look();
 
@@ -246,6 +255,7 @@ impl App {
 
         // Стены комнат и нарисованные вручную — за вычетом проёмов. Тени стен
         // ложатся и на объекты у стены.
+        let t = crate::plat::Instant::now();
         let style = self.map.wall_style.clone();
         let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
         for s in self.room_edges().to_vec() {
@@ -342,6 +352,7 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, portal.a), cam.to_screen(canvas, portal.b)], Stroke::new(3.0, Color32::from_rgb(120, 180, 255)));
             }
         }
+        self.prof.add("walls", t);
 
         // Изгиб: какую стену возьмёт протяжка и куда ляжет дуга стены комнаты.
         let blue = Color32::from_rgb(120, 180, 255);
@@ -469,6 +480,7 @@ impl App {
             None => self.roof_alpha(),
         };
         self.joined_rects.clear();
+        let t = crate::plat::Instant::now();
         // Скрытые крыши — только в редакторе: в выгрузку они идут всегда, с тенями.
         if (self.roof_view != RoofView::Hidden || exporting) && !walls_only {
             let roofs = self.map.roofs.clone();
@@ -498,6 +510,7 @@ impl App {
                 }
             }
         }
+        self.prof.add("roofs", t);
         if let (Some(a), Some(p)) = (self.roof_from, self.hover.filter(|_| !exporting && ui)) {
             let b = cam.cell(canvas, p);
             // Без привязки рамка — от точки нажатия до курсора, не по клеткам.

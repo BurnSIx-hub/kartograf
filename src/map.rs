@@ -925,6 +925,53 @@ pub fn canopy_by_name(key: &str) -> bool {
     key == crate::library::TREE || key.contains("/Tree_Tops/")
 }
 
+/// Что предмет делает по имени своего файла. Имя переводится в нижний регистр и
+/// сверяется с десятками слов — на карте в 10 000 предметов это сотни тысяч строк
+/// за кадр (слой нужен и для порядка рисования). Поэтому один раз на ключ: ответ
+/// зависит только от ключа.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameTraits {
+    pub layer: i16,
+    pub flat: bool,
+    pub canopy: bool,
+    pub bush: bool,
+    pub awning: bool,
+    pub line: bool,
+    pub bridge: bool,
+    pub living: bool,
+    pub hover: bool,
+    pub swing: bool,
+    pub web: bool,
+    pub stairs_shade: bool,
+}
+
+pub fn name_traits(key: &str) -> NameTraits {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static SEEN: RefCell<HashMap<Box<str>, NameTraits>> = RefCell::new(HashMap::new());
+    }
+    if let Some(t) = SEEN.with(|s| s.borrow().get(key).copied()) {
+        return t;
+    }
+    let t = NameTraits {
+        layer: layer_by_name(key),
+        flat: flat_by_name(key),
+        canopy: canopy_by_name(key),
+        bush: bush_by_name(key),
+        awning: awning_by_name(key),
+        line: line_by_name(key),
+        bridge: bridge_by_name(key),
+        living: living_by_name(key).is_some(),
+        hover: hover_by_name(key),
+        swing: swing_by_name(key),
+        web: web_by_name(key),
+        stairs_shade: key.ends_with("stairs_shade"),
+    };
+    SEEN.with(|s| s.borrow_mut().insert(key.into(), t));
+    t
+}
+
 impl Prop {
     /// Углы на карте: левый верхний, правый верхний, правый нижний, левый нижний —
     /// углы картинки. У отражённого левый край картинки справа: на те же углы она
@@ -938,7 +985,7 @@ impl Prop {
 
     pub fn casts_shadow(&self) -> bool {
         // Предмет в воде тени не даёт: низ его под водой, а тень всей картинки легла бы на воду.
-        self.shadow.unwrap_or_else(|| !flat_by_name(&self.asset) && self.sunk() <= 0.0)
+        self.shadow.unwrap_or_else(|| !name_traits(&self.asset).flat && self.sunk() <= 0.0)
     }
 
     /// Какая доля предмета под водой, от низа картинки: 0 — весь над водой, 1 — весь под ней.
@@ -977,7 +1024,7 @@ impl Prop {
 
     /// Крона: в Foundry тайлом над токенами, в картинке пень.
     pub fn is_canopy(&self) -> bool {
-        self.canopy.unwrap_or_else(|| canopy_by_name(&self.asset))
+        self.canopy.unwrap_or_else(|| name_traits(&self.asset).canopy)
     }
 
     /// В Foundry — своим тайлом в родном разрешении картинки, а не в фоне:
@@ -986,16 +1033,17 @@ impl Prop {
     /// (ковры, лужи, готовые тени — их полупрозрачность в фоне не мешает).
     pub fn own_tile(&self) -> bool {
         // Тень спуска лежит поверх ступеней: в фоне её накрыл бы тайл лестницы.
-        let over_stairs = self.asset.ends_with("stairs_shade");
+        let t = name_traits(&self.asset);
+        let over_stairs = t.stairs_shade;
         // Мост и помост — пол над водой: на них стоят хижины, а стены в Foundry
         // впечатаны в фон — тайл моста их бы накрыл.
         // Вентилятор в полу плоский, но крутится, а «Wild Canvas» крутит только тайл:
         // живое плоское — своим тайлом, без тени.
-        let alive = living_by_name(&self.asset).is_some();
+        let alive = t.living;
         // Целиком под водой — лежит на дне, в картинке карты: вода «Wild Canvas» идёт поверх.
         // Наполовину в воде — тайлом идёт сухой верх, низ остаётся в фоне.
         let on_bottom = self.sunk() >= 1.0;
-        !on_bottom && !self.is_canopy() && !bush_by_name(&self.asset) && !awning_by_name(&self.asset) && !line_by_name(&self.asset) && !bridge_by_name(&self.asset) && (!flat_by_name(&self.asset) || over_stairs || alive)
+        !on_bottom && !self.is_canopy() && !t.bush && !t.awning && !t.line && !t.bridge && (!t.flat || over_stairs || alive)
     }
 
     /// Слой «над стенами» — колонны, столбики перил: в Foundry они в тайле стен
@@ -1009,12 +1057,13 @@ impl Prop {
     /// двигает и размечает по долям тайла (парящее, гамак, машины, паутина): у них
     /// тень остаётся в фоне.
     pub fn carries_shadow(&self) -> bool {
-        self.own_tile() && self.casts_shadow() && self.layer() < ABOVE_WALLS && !hover_by_name(&self.asset) && !swing_by_name(&self.asset) && !web_by_name(&self.asset) && living_by_name(&self.asset).is_none()
+        let t = name_traits(&self.asset);
+        self.own_tile() && self.casts_shadow() && self.layer() < ABOVE_WALLS && !t.hover && !t.swing && !t.web && !t.living
     }
 
     pub fn layer(&self) -> i16 {
         // Целиком под водой — на дне, слоем пола: под всем остальным.
-        self.layer.unwrap_or_else(|| if self.sunk() >= 1.0 { 100 } else { layer_by_name(&self.asset) })
+        self.layer.unwrap_or_else(|| if self.sunk() >= 1.0 { 100 } else { name_traits(&self.asset).layer })
     }
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
@@ -2854,6 +2903,39 @@ mod tests {
         assert!(!json.contains("light") && !json.contains("canopy"));
         let back: Prop = serde_json::from_str(&json).unwrap();
         assert_eq!(back, prop("builtin:tree"));
+    }
+
+    #[test]
+    fn remembered_name_traits_match_the_name_rules() {
+        // Запомненное по ключу — то же, что правила имени, и второй раз тоже.
+        let keys = [
+            "builtin:tree",
+            "builtin:chair",
+            "builtin:bush",
+            "builtin:market_stall_red",
+            "pack:fa.dungeondraft_pack|textures/objects/Rug_Round_A.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Nature/Trees/Tree_Tops/Tree_Top_Oak_A_5x5.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Hammock_A_3x2.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Cobweb_Corner_A.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Windsock_A_2x1.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Airship_Small_A_8x4.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Clothes_Line_A.webp",
+            "pack:fa.dungeondraft_pack|textures/objects/Arranged_Tarps/Tarp_A.webp",
+            "C:\\Картограф\\ассеты\\objects\\bridges\\Bridge_Pier_End_A_3x3.webp",
+            "C:\\Картограф\\ассеты\\objects\\bushes\\Bush_Round_A_2x2.webp",
+            "builtin:stairs_shade",
+            "Crane_Harbour_A_6x6.webp",
+        ];
+        for _ in 0..2 {
+            for k in keys {
+                let t = name_traits(k);
+                assert_eq!(
+                    (t.layer, t.flat, t.canopy, t.bush, t.awning, t.line, t.bridge, t.living, t.hover, t.swing, t.web, t.stairs_shade),
+                    (layer_by_name(k), flat_by_name(k), canopy_by_name(k), bush_by_name(k), awning_by_name(k), line_by_name(k), bridge_by_name(k), living_by_name(k).is_some(), hover_by_name(k), swing_by_name(k), web_by_name(k), k.ends_with("stairs_shade")),
+                    "{k}"
+                );
+            }
+        }
     }
 
     #[test]

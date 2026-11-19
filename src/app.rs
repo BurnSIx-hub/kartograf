@@ -654,6 +654,11 @@ pub struct App {
     pub ruler_line: Option<([f32; 2], [f32; 2])>,
     /// Окно «Проверка для Foundry» и его список.
     pub check: check_view::CheckState,
+    /// Слои, рамки и сетка предметов текущего этажа — пересобираются, когда предметы
+    /// поменялись, а не каждый кадр.
+    props_index: prop_index::PropIndex,
+    /// Сколько длятся кадр и его части (MCP `map_info`).
+    pub prof: prof::Prof,
     /// Предпросмотр света (L) и его расчёт.
     pub light_view: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -899,6 +904,8 @@ impl App {
             ruler: false,
             ruler_line: None,
             check: Default::default(),
+            props_index: Default::default(),
+            prof: Default::default(),
             light_view: false,
             #[cfg(not(target_arch = "wasm32"))]
             light: None,
@@ -991,6 +998,8 @@ mod platform_edit;
 mod ground_edit;
 mod view_tools;
 mod check_view;
+mod prop_index;
+mod prof;
 pub use platform_edit::PlatformPut;
 pub use view_tools::ruler_text;
 mod draw_scene;

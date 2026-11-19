@@ -62,7 +62,9 @@ fn tools() -> Value {
         tool("place_prefab", "Place a prefab: its centre at x, y, the whole set turned by rotation (degrees clockwise). Returns the indices of the new objects.", json!({
             "name": text("Prefab name"), "x": num("Centre x"), "y": num("Centre y"), "rotation": num("Degrees clockwise, default 0")
         }), &["name", "x", "y"]),
-        tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map.", json!({}), &[]),
+        tool("map_info", "Size, name, level, counts of objects/walls/doors/labels/roads and the floor materials of the current map. `frame` — how long the window's last 120 frames took (program work per frame, avg/max ms, by part: frame, ground, props, walls, roofs, below).", json!({
+            "reset_frames": {"type": "boolean", "description": "Forget the frame times after this answer: the next map_info shows only frames drawn since"}
+        }), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
             "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "room_walls", "visible"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},
             "area": area, "limit": int("Max items per section, default 200")

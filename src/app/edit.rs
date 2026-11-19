@@ -267,7 +267,7 @@ impl App {
             return Some(s);
         }
         // Щелчок берёт видимый сверху: последний в порядке рисования.
-        if let Some(&i) = self.prop_order().iter().rev().find(|&&i| self.map.props[i].contains(w)) {
+        if let Some(i) = self.prop_under(w) {
             return Some(Sel::Prop(i));
         }
         let near = |d: f32| d <= PICK;

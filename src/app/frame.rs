@@ -5,6 +5,7 @@ use super::*;
 impl App {
     pub(super) fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let started = crate::plat::Instant::now();
         self.frame += 1;
         // Быстрый щелчок сдвигает мышь на 7–25 точек, при родных 6 он терялся.
         // На карте порог ниже: от него начинаются протяжки.
@@ -66,6 +67,8 @@ impl App {
         }
 
         self.screenshots(&ctx);
+        self.prof.add("frame", started);
+        self.prof.end_frame();
         if let Some(mut test) = self.test.take() {
             let more = test.tick(self, &ctx);
             if more {

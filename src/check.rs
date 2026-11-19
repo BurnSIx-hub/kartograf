@@ -335,15 +335,59 @@ fn is_bridge(low: &str) -> bool {
     low.split(|c: char| !c.is_alphanumeric()).any(|w| w == "bridge" || w == "мост")
 }
 
+// --- Сетка: кого сравнивать ---
+//
+// Проверки сравнивают предмет с предметами, домами, дверями. Перебор всех со всеми на
+// 10 000 ящиков шёл почти три минуты, поэтому сначала сетка отбирает соседей — тех,
+// чья рамка рядом, — а точное условие остаётся прежним. Порядок соседей — по номеру,
+// как в переборе, поэтому и строки выходят в том же порядке, что у check.py.
+
+/// Запас рамок в сетке: она в f32, проверки в f64.
+const NEAR_PAD: f64 = 0.01;
+
+fn grid_of(boxes: &[[f64; 4]]) -> crate::grid::Grid {
+    let b: Vec<crate::grid::Rect> = boxes.iter().map(|b| [(b[0] - NEAR_PAD) as f32, (b[1] - NEAR_PAD) as f32, (b[2] + NEAR_PAD) as f32, (b[3] + NEAR_PAD) as f32]).collect();
+    crate::grid::Grid::new(&b, 8.0)
+}
+
+/// Номера рамок сетки возле окна `r`, по возрастанию.
+fn near(g: &crate::grid::Grid, r: [f64; 4]) -> Vec<usize> {
+    g.near([(r[0] - NEAR_PAD) as f32, (r[1] - NEAR_PAD) as f32, (r[2] + NEAR_PAD) as f32, (r[3] + NEAR_PAD) as f32]).into_iter().map(|i| i as usize).collect()
+}
+
+fn poly_box(pts: &[P]) -> [f64; 4] {
+    pts.iter().fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])])
+}
+
+/// Самое большое поле `pad`, с которым проверки спрашивают `roof_at`.
+const ROOF_PAD: f64 = 1.0;
+
 struct Ctx<'a> {
     inp: &'a Input,
     low: Vec<String>,
     /// Дома — по крышам: имя и контур.
     rooms: Vec<(String, Vec<P>)>,
+    rooms_grid: crate::grid::Grid,
+    houses_grid: crate::grid::Grid,
     issues: Vec<Issue>,
 }
 
 impl<'a> Ctx<'a> {
+    fn new(inp: &'a Input, rooms: Vec<(String, Vec<P>)>) -> Self {
+        let rooms_grid = grid_of(&rooms.iter().map(|(_, poly)| poly_box(poly)).collect::<Vec<_>>());
+        let houses: Vec<[f64; 4]> = inp
+            .houses
+            .iter()
+            .map(|r| match (&r.points, r.area) {
+                (pts, _) if !pts.is_empty() => poly_box(pts),
+                (_, Some(a)) => [a[0] - ROOF_PAD, a[1] - ROOF_PAD, a[2] + ROOF_PAD, a[3] + ROOF_PAD],
+                // Ни контура, ни рамки — такой дом ничего не накрывает.
+                _ => [f64::MAX, f64::MAX, f64::MAX, f64::MAX],
+            })
+            .collect();
+        Ctx { inp, low: inp.objs.iter().map(|o| o.name.to_lowercase()).collect(), rooms, rooms_grid, houses_grid: grid_of(&houses), issues: Vec::new() }
+    }
+
     fn o(&self, k: usize) -> &'a Obj {
         &self.inp.objs[k]
     }
@@ -356,16 +400,24 @@ impl<'a> Ctx<'a> {
         is_bridge(&self.low[k])
     }
 
+    /// Дома, которые могут накрыть точку `p` (по номеру).
+    fn houses_near(&self, p: P) -> impl Iterator<Item = &'a House> {
+        let houses = &self.inp.houses;
+        near(&self.houses_grid, [p[0], p[1], p[0], p[1]]).into_iter().map(move |i| &houses[i])
+    }
+
     fn roof_at(&self, p: P, pad: f64) -> bool {
-        self.inp.houses.iter().any(|r| if !r.points.is_empty() { in_poly(p, &r.points) } else { r.area.is_some_and(|a| inside_box(p, a, pad)) })
+        debug_assert!(pad <= ROOF_PAD);
+        self.houses_near(p).any(|r| if !r.points.is_empty() { in_poly(p, &r.points) } else { r.area.is_some_and(|a| inside_box(p, a, pad)) })
     }
 
     fn deck_at(&self, p: P) -> bool {
-        self.inp.houses.iter().filter(|r| r.flat).any(|r| if !r.points.is_empty() { in_poly(p, &r.points) } else { r.area.is_some_and(|a| inside_box(p, a, 0.0)) })
+        self.houses_near(p).filter(|r| r.flat).any(|r| if !r.points.is_empty() { in_poly(p, &r.points) } else { r.area.is_some_and(|a| inside_box(p, a, 0.0)) })
     }
 
+    /// Первый (по номеру) дом, в котором точка.
     fn room_of(&self, p: P) -> Option<usize> {
-        self.rooms.iter().position(|(_, poly)| in_poly(p, poly))
+        near(&self.rooms_grid, [p[0], p[1], p[0], p[1]]).into_iter().find(|&i| in_poly(p, &self.rooms[i].1))
     }
 
     fn say(&mut self, kind: Kind, text: String, at: P, objects: Vec<usize>) {
@@ -388,7 +440,7 @@ pub fn run(inp: &Input) -> Vec<Issue> {
             rooms.push((format!("дом {}", r.index), vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]));
         }
     }
-    let mut c = Ctx { inp, low: inp.objs.iter().map(|o| o.name.to_lowercase()).collect(), rooms, issues: Vec::new() };
+    let mut c = Ctx::new(inp, rooms);
     roofs_and_flight(&mut c);
     for k in 0..inp.objs.len() {
         if c.has(k, VERTICAL) {
@@ -464,6 +516,8 @@ fn pipes(c: &mut Ctx) {
         let v = ((e[0] - q.x) * ay - (e[1] - q.y) * ax).abs();
         u.abs() <= q.h / 2.0 + 0.05 && v < 0.2
     };
+    // К чему трубу можно подключить — один раз, а не на каждый конец.
+    let connect: Vec<usize> = if ends.is_empty() { Vec::new() } else { (0..objs.len()).filter(|&q| c.has(q, CONNECT)).collect() };
     for &(k, e) in &ends {
         if ends.iter().any(|&(q, f)| q != k && dist(e, f) < 0.35) {
             continue;
@@ -471,7 +525,7 @@ fn pipes(c: &mut Ctx) {
         if pipes.iter().any(|&q| q != k && on_pipe(e, &objs[q])) {
             continue;
         }
-        if (0..objs.len()).any(|q| q != k && c.has(q, CONNECT) && inside_box(e, bbox(&objs[q], 1.0, 0.3), 0.0)) {
+        if connect.iter().any(|&q| q != k && inside_box(e, bbox(&objs[q], 1.0, 0.3), 0.0)) {
             continue;
         }
         let text = format!("#{}: конец ({:.1}, {:.1}) ни к чему не подключён", objs[k].index, e[0], e[1]);
@@ -497,10 +551,13 @@ fn beam_run(c: &Ctx, a: usize, b: usize) -> bool {
 fn overlaps(c: &mut Ctx) {
     let objs = &c.inp.objs;
     let cand: Vec<usize> = (0..objs.len()).filter(|&k| !c.has(k, SKIP) && objs[k].w * objs[k].h >= 1.0 && objs[k].layer < 800 && !objs[k].canopy).collect();
+    let boxes: Vec<[f64; 4]> = cand.iter().map(|&k| bbox(&objs[k], 0.8, 0.0)).collect();
+    let grid = grid_of(&boxes);
     let mut found = Vec::new();
     for (i, &a) in cand.iter().enumerate() {
-        let (oa, ba, pa) = (&objs[a], bbox(&objs[a], 0.8, 0.0), corners(&objs[a], 0.8));
-        for &b in &cand[i + 1..] {
+        let (oa, ba, pa) = (&objs[a], boxes[i], corners(&objs[a], 0.8));
+        // Пары без пересечения рамок отсеялись бы ниже — сетка отсевает их сразу.
+        for b in near(&grid, ba).into_iter().filter(|&j| j > i).map(|j| cand[j]) {
             let ob = &objs[b];
             if oa.layer != ob.layer {
                 continue;
@@ -540,12 +597,18 @@ fn overlaps(c: &mut Ctx) {
 // 5. Двери: свободный проход
 fn doors(c: &mut Ctx) {
     let objs = &c.inp.objs;
+    // Предмет мешает двери, если середина его ближе `reach` к створу: сетка — по серединам,
+    // окно у двери — на самый большой `reach`.
+    let centers: Vec<[f64; 4]> = objs.iter().map(|o| [o.x, o.y, o.x, o.y]).collect();
+    let grid = grid_of(&centers);
+    let reach_max = objs.iter().map(|o| 0.5 + 0.4 * o.w.min(o.h)).filter(|r| r.is_finite()).fold(0.5, f64::max);
     for d in &c.inp.doors {
         if d.window {
             continue;
         }
         let mid = [(d.a[0] + d.b[0]) / 2.0, (d.a[1] + d.b[1]) / 2.0];
-        for (k, o) in objs.iter().enumerate() {
+        let window = [d.a[0].min(d.b[0]) - reach_max, d.a[1].min(d.b[1]) - reach_max, d.a[0].max(d.b[0]) + reach_max, d.a[1].max(d.b[1]) + reach_max];
+        for (k, o) in near(&grid, window).into_iter().map(|k| (k, &objs[k])) {
             // Проём без створки, заваленный обломками, — завал: проход закрыт намеренно.
             if d.opening && c.has(k, &["Rubble_"]) {
                 continue;
@@ -699,10 +762,12 @@ fn edge_and_labels(c: &mut Ctx) {
             c.say(Kind::Edge, format!("{} вылезает за карту", c.label(k)), [o.x.clamp(0.0, w), o.y.clamp(0.0, h)], vec![o.index]);
         }
     }
+    // Подпись лежит на предмете, если в её рамке угол видимой части — он внутри рамки предмета.
+    let grid = if c.inp.labels.is_empty() { crate::grid::Grid::default() } else { grid_of(&c.inp.objs.iter().map(|o| bbox(o, 0.8, 0.0)).collect::<Vec<_>>()) };
     for l in &c.inp.labels {
         let (hw, hh) = (l.text.chars().count() as f64 * l.size * 0.29, l.size * 0.6);
         let lb = [l.x - hw, l.y - hh, l.x + hw, l.y + hh];
-        for k in 0..c.inp.objs.len() {
+        for k in near(&grid, lb) {
             let o = c.o(k);
             if o.layer >= 800 || c.has(k, &["Track_", "Steam", "Pipe_Brass"]) {
                 continue;

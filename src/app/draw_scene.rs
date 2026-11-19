@@ -291,29 +291,29 @@ impl App {
     /// поворачивает по биссектрисе — без нахлёстов и швов. Обводка — по двум краям
     /// ленты, текстура идёт вдоль без разрывов; на замкнутой стене её шаг подогнан,
     /// чтобы целое число повторов сошлось на стыке.
-    /// Порядок рисования объектов: по слою, внутри слоя — как поставлены.
-    pub(super) fn prop_order(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.map.props.len()).collect();
-        order.sort_by_key(|&i| self.map.props[i].layer());
-        order
-    }
-
     /// Объекты слоёв из `layers`: сначала все их тени, потом сами.
     /// `fade` — общая прозрачность (крышное тает вместе с крышей); с ней и без тени.
+    /// Перебираются только предметы возле окна (из сетки указателя), в том же порядке,
+    /// что и прежде по всем: по слою, внутри слоя — как поставлены.
     pub(super) fn draw_props(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, exporting: bool, layers: std::ops::Range<i16>, fade: f32) {
         if fade <= 0.0 {
             return;
         }
+        let started = crate::plat::Instant::now();
         let cam = self.cam;
-        let mut order: Vec<usize> = (0..self.map.props.len()).filter(|&i| layers.contains(&self.map.props[i].layer())).collect();
+        let shadows = self.map.shadows.clone();
+        self.refresh_props_index();
+        // Тень предмета видна в окне, если его рамка, раздвинутая на тень, задевает окно.
+        let reach = if shadows.on { shadows.dist + shadows.blur * 2.0 } else { 0.0 };
+        let wide = crate::grid::grow([view.min.x, view.min.y, view.max.x, view.max.y], reach.max(0.0));
+        let order = self.props_index.near_in_order(wide, |l| layers.contains(&l));
         if order.is_empty() {
+            self.prof.add("props", started);
             return;
         }
-        order.sort_by_key(|&i| self.map.props[i].layer());
         // Объекты на время рисования вынуты из карты, а не скопированы: рисованию
         // нужен `&mut self` (картинки грузятся), а карту оно не читает.
         let props = std::mem::take(&mut self.map.props);
-        let shadows = self.map.shadows.clone();
         // Выгрузка с тайлами: тень предмета едет в картинке его тайла, в фоне её нет.
         let tiles = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
         if shadows.on && fade >= 1.0 {
@@ -366,6 +366,7 @@ impl App {
             }
         }
         self.map.props = props;
+        self.prof.add("props", started);
     }
 
     pub(super) fn draw_walls(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, segs: &[Segment]) {
