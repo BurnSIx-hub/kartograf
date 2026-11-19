@@ -933,7 +933,7 @@ pub fn dungeon_look(m: &mut Map) -> usize {
 
 /// Вокруг помещений темно: скала не спорит с комнатами.
 fn dark_outside(m: &mut Map, level: f32) {
-    let dark: Vec<(usize, f32)> = m.rooms.data.iter().enumerate().filter(|(_, v)| **v < 128).map(|(i, _)| (i, 1.0)).collect();
+    let dark: Vec<(usize, f32)> = m.rooms.values().enumerate().filter(|(_, v)| *v < 128).map(|(i, _)| (i, 1.0)).collect();
     m.shade_paint(&dark, level);
 }
 
@@ -1336,7 +1336,7 @@ fn cave(m: &mut Map, p: &Plan, rng: &mut Rng, warn: &mut Vec<String>) -> usize {
             sp.used[i] = true;
         }
     }
-    let inner = |m: &Map, weights: Vec<(usize, f32)>| -> Vec<(usize, f32)> { weights.into_iter().filter(|(i, _)| m.rooms.data[*i] > 200).collect() };
+    let inner = |m: &Map, weights: Vec<(usize, f32)>| -> Vec<(usize, f32)> { weights.into_iter().filter(|(i, _)| m.rooms.at(*i) > 200).collect() };
     for (name, count, radius, flow) in look.patches {
         let g = mat(m, name);
         let mut spots = Vec::new();
@@ -2852,7 +2852,7 @@ fn mood(m: &mut Map, p: &Plan) {
     if p.mood == Mood::Gloomy {
         m.shadows.opacity = 0.75;
         m.shadows.dist = 0.9;
-        let all: Vec<(usize, f32)> = (0..m.rooms.data.len()).map(|i| (i, 1.0)).collect();
+        let all: Vec<(usize, f32)> = (0..m.rooms.len()).map(|i| (i, 1.0)).collect();
         m.shade_paint(&all, 0.3);
     }
 }

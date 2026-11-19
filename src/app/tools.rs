@@ -183,6 +183,12 @@ impl App {
             "map_info" => {
                 let mut info = self.tool_info();
                 info["frame"] = self.prof.report();
+                // Память масок всех этажей: только куски с точками (пустые и залитые — без неё).
+                let masks: usize = std::iter::once(&self.map)
+                    .chain(self.levels.iter().enumerate().filter(|(k, _)| *k != self.level).map(|(_, m)| m))
+                    .map(|m| m.rooms.bytes() + m.shade.as_ref().map_or(0, |s| s.bytes()) + m.terrain.iter().chain(&m.room_floor).map(|c| c.mask.bytes()).sum::<usize>())
+                    .sum();
+                info["mask_mb"] = json!((masks as f64 / 1048576.0 * 10.0).round() / 10.0);
                 if a["reset_frames"].as_bool() == Some(true) {
                     self.prof.clear();
                 }
@@ -1172,14 +1178,14 @@ impl App {
     /// Поля к карте по краям, на всех этажах; нарисованное сдвигается. Отменить
     /// нельзя: история хранит этаж, а размер у этажей общий.
     fn tool_grow_map(&mut self, a: &Value) -> Res {
-        let side = |k: &str| a[k].as_u64().unwrap_or(0).min(400) as u32;
+        let side = |k: &str| a[k].as_u64().unwrap_or(0).min(map::MAX_SIDE as u64) as u32;
         let (l, t, r, b) = (side("left"), side("top"), side("right"), side("bottom"));
         if l + t + r + b == 0 {
             return Err("нужно хоть одно поле: left, top, right или bottom (клетки)".into());
         }
         let (w, h) = (self.map.width + l + r, self.map.height + t + b);
-        if w > 600 || h > 600 {
-            return Err(format!("карта {w}×{h} — больше 600 клеток по стороне"));
+        if w > map::MAX_SIDE || h > map::MAX_SIDE {
+            return Err(format!("карта {w}×{h} — больше {} клеток по стороне", map::MAX_SIDE));
         }
         self.map.grow(l, t, r, b);
         for (k, m) in self.levels.iter_mut().enumerate() {

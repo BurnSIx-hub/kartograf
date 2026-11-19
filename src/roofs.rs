@@ -950,7 +950,7 @@ pub fn tree_shade(m: &map::Map) -> Option<crate::mask::Mask> {
         let (lo, hi) = r.bounds();
         cover(lo, hi, &|q| inside_rings(&base.rings, q));
     }
-    let data = acc
+    let data: Vec<u8> = acc
         .iter()
         .zip(&roofed)
         .enumerate()
@@ -958,14 +958,14 @@ pub fn tree_shade(m: &map::Map) -> Option<crate::mask::Mask> {
             if under || t <= 0.0 {
                 return 0;
             }
-            let s = m.shade.as_ref().map_or(0.0, |s| s.data.get(k).copied().unwrap_or(0) as f32 / 255.0);
+            let s = m.shade.as_ref().map_or(0.0, |s| s.at(k) as f32 / 255.0);
             let t = t.min(0.95);
             // Итог как max(тень, крона): поверх нарисованной — лишь недостающее.
             let add = if t <= s { 0.0 } else { (t - s) / (1.0 - s) };
             (add * 255.0).round() as u8
         })
         .collect();
-    Some(crate::mask::Mask { w, h, data })
+    Some(crate::mask::Mask::from_vec(w, h, &data))
 }
 
 /// Стороны колец по порядку, без нулевых.
@@ -2165,7 +2165,7 @@ mod tests {
         m.outline_roofs.push(OutlineRoof { pieces: vec![RoofPiece { rings: wall, form: RoofForm::Flat, paint: "grey".into(), height: 3.0, eaves: 3.0, down: None, across: false, overhang: None }] });
         let s = tree_shade(&m).expect("тени крон нет");
         let res = crate::mask::RES as f32;
-        let at = |x: f32, y: f32| s.data[(y * res) as usize * s.w + (x * res) as usize];
+        let at = |x: f32, y: f32| s.get((x * res) as isize, (y * res) as isize);
         let dir = { let l = m.shadows.light(); [-l[0], -l[1]] };
         let c = [6.0 + dir[0] * 4.0, 6.0 + dir[1] * 4.0];
         assert!(at(c[0], c[1]) as f32 >= TREE_SHADE * 255.0 - 2.0, "тень кроны не там: {}", at(c[0], c[1]));
@@ -2173,8 +2173,8 @@ mod tests {
         assert_eq!(at(18.0 + dir[0] * 4.0, 6.0 + dir[1] * 4.0), 0, "тень под крышей");
         // Нарисованная тень гуще кроны — крона её не темнит.
         let mut shaded = m.clone();
-        shaded.shade = Some(crate::mask::Mask { data: vec![200; m.rooms.data.len()], ..m.rooms.clone() });
-        assert_eq!(tree_shade(&shaded).map_or(0, |s| s.data.iter().copied().max().unwrap_or(0)), 0);
+        shaded.shade = Some(crate::mask::Mask::filled(m.rooms.w, m.rooms.h, 200));
+        assert_eq!(tree_shade(&shaded).map_or(0, |s| s.values().max().unwrap_or(0)), 0);
         m.shadows.on = false;
         assert!(tree_shade(&m).is_none());
     }

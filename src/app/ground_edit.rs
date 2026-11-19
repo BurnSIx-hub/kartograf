@@ -69,9 +69,9 @@ fn shape(points: &[(usize, u8)], w: usize) -> ([usize; 4], Vec<Segment>) {
         return ([0; 4], Vec::new());
     }
     let (lw, lh) = (r[2] - r[0], r[3] - r[1]);
-    let mut local = Mask { w: lw, h: lh, data: vec![0; lw * lh] };
+    let mut local = Mask::new(lw, lh);
     for &(p, v) in points {
-        local.data[(p / w - r[1]) * lw + (p % w - r[0])] = v;
+        local.set(p % w - r[0], p / w - r[1], v);
     }
     let (ox, oy) = (r[0] as f32 / RES as f32, r[1] as f32 / RES as f32);
     let outline = mask::contour(&local).into_iter().map(|(a, b)| ([a[0] + ox, a[1] + oy], [b[0] + ox, b[1] + oy])).collect();
@@ -90,7 +90,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
     // Слоя больше всех; при равенстве — верхний.
     let mut best: Option<(usize, u8)> = None;
     for (k, c) in map.terrain.iter().enumerate() {
-        let v = c.mask.data.get(at).copied().unwrap_or(0);
+        let v = c.mask.at(at);
         if best.is_none_or(|(_, b)| v >= b) {
             best = Some((k, v));
         }
@@ -99,7 +99,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
     if top < CORE {
         return None;
     }
-    let data = &map.terrain[k].mask.data;
+    let data = &map.terrain[k].mask;
     let mut seen = vec![false; mw * mh];
     let mut points = Vec::new();
     let mut queue = VecDeque::from([at]);
@@ -107,7 +107,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
     while let Some(p) = queue.pop_front() {
         points.push(p);
         for n in neighbours(p, mw, mh) {
-            if !seen[n] && data[n] >= CORE {
+            if !seen[n] && data.at(n) >= CORE {
                 seen[n] = true;
                 queue.push_back(n);
             }
@@ -118,7 +118,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
         let mut next = Vec::new();
         for &p in &ring {
             for n in neighbours(p, mw, mh) {
-                if !seen[n] && data[n] > 0 {
+                if !seen[n] && data.at(n) > 0 {
                     seen[n] = true;
                     next.push(n);
                 }
@@ -139,7 +139,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
                 continue;
             }
             looked[n] = true;
-            if let Some((c, v)) = map.terrain.iter().enumerate().filter(|(c, _)| *c != k).map(|(c, coat)| (c, coat.mask.data[n])).max_by_key(|x| x.1)
+            if let Some((c, v)) = map.terrain.iter().enumerate().filter(|(c, _)| *c != k).map(|(c, coat)| (c, coat.mask.at(n))).max_by_key(|x| x.1)
                 && v >= 64
             {
                 count[c] += 1;
@@ -147,7 +147,7 @@ pub fn piece_at(map: &Map, w: [f32; 2]) -> Option<GroundPiece> {
         }
     }
     let fill = count.iter().enumerate().filter(|x| *x.1 > 0).max_by_key(|x| *x.1).map(|(c, _)| map.terrain[c].material);
-    let points: Vec<(usize, u8)> = points.into_iter().map(|p| (p, data[p])).collect();
+    let points: Vec<(usize, u8)> = points.into_iter().map(|p| (p, data.at(p))).collect();
     let (rect, outline) = shape(&points, mw);
     Some(GroundPiece { material: map.terrain[k].material, points, rect, fill, outline })
 }
@@ -157,11 +157,11 @@ pub fn lift(map: &mut Map, piece: &GroundPiece) {
     let Some(k) = map.terrain.iter().position(|c| c.material == piece.material) else { return };
     let f = piece.fill.and_then(|m| map.terrain.iter().position(|c| c.material == m));
     for &(p, _) in &piece.points {
-        let cur = map.terrain[k].mask.data[p];
-        map.terrain[k].mask.data[p] = 0;
+        let cur = map.terrain[k].mask.at(p);
+        map.terrain[k].mask.put(p, 0);
         if let Some(f) = f {
-            let x = &mut map.terrain[f].mask.data[p];
-            *x = (*x as u16 + cur as u16).min(255) as u8;
+            let x = map.terrain[f].mask.at(p);
+            map.terrain[f].mask.put(p, (x as u16 + cur as u16).min(255) as u8);
         }
     }
 }
@@ -181,15 +181,16 @@ pub fn put(map: &mut Map, before: &[Coat], piece: &GroundPiece, to: [f32; 4], to
         let r = touched.map_or(union(src, target), |t| union(union(src, target), t));
         for (c, b) in map.terrain.iter_mut().zip(before) {
             for j in r[1]..r[3] {
-                let (a, e) = (j * mw + r[0], j * mw + r[2]);
-                c.mask.data[a..e].copy_from_slice(&b.mask.data[a..e]);
+                for i in r[0]..r[2] {
+                    c.mask.set(i, j, b.mask.get(i as isize, j as isize));
+                }
             }
         }
     }
     *touched = Some(union(src, target));
     let Some(k) = map.terrain.iter().position(|c| c.material == piece.material) else { return Vec::new() };
     // Взять кусок с прежнего места (там его доля — у слоя вокруг).
-    let lifted = GroundPiece { points: piece.points.iter().map(|&(p, _)| (p, map.terrain[k].mask.data[p])).collect(), ..piece.clone() };
+    let lifted = GroundPiece { points: piece.points.iter().map(|&(p, _)| (p, map.terrain[k].mask.at(p))).collect(), ..piece.clone() };
     lift(map, &lifted);
     let (sw, sh) = (src[2] - src[0], src[3] - src[1]);
     if sw == 0 || sh == 0 || d[2] - d[0] < 1e-3 || d[3] - d[1] < 1e-3 {
@@ -230,7 +231,7 @@ pub fn put(map: &mut Map, before: &[Coat], piece: &GroundPiece, to: [f32; 4], to
     }
     map.paint(Layer::Floor, piece.material as usize, &weights);
     let k = map.terrain.iter().position(|c| c.material == piece.material).unwrap_or(k);
-    weights.iter().map(|&(p, _)| (p, map.terrain[k].mask.data[p])).collect()
+    weights.iter().map(|&(p, _)| (p, map.terrain[k].mask.at(p))).collect()
 }
 
 /// Новая рамка: ручка `handle` сдвинута на `d` клеток. Края — на шаг `step`;
@@ -325,7 +326,7 @@ impl App {
                 // Доли — как сейчас: после выбора могли рисовать.
                 let k = self.map.terrain.iter().position(|c| c.material == piece.material);
                 let points = match k {
-                    Some(k) => piece.points.iter().map(|&(p, _)| (p, self.map.terrain[k].mask.data[p])).collect(),
+                    Some(k) => piece.points.iter().map(|&(p, _)| (p, self.map.terrain[k].mask.at(p))).collect(),
                     None => Vec::new(),
                 };
                 let piece = GroundPiece { points, ..piece };
@@ -441,7 +442,7 @@ mod tests {
 
     fn share(m: &Map, material: u8, x: f32, y: f32) -> u8 {
         let p = (y * RES as f32) as usize * m.rooms.w + (x * RES as f32) as usize;
-        m.terrain.iter().find(|c| c.material == material).map_or(0, |c| c.mask.data[p])
+        m.terrain.iter().find(|c| c.material == material).map_or(0, |c| c.mask.at(p))
     }
 
     #[test]

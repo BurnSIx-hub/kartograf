@@ -126,7 +126,8 @@ impl App {
                 v.to_bits().hash(&mut h);
             }
         }
-        m.shade.as_ref().map(|s| &s.data).hash(&mut h);
+        // Отпечаток тени, а не все её точки: раньше это 16 миллионов байт за кадр на большой карте.
+        m.shade.as_ref().map(|s| s.stamp()).hash(&mut h);
         let key = h.finish();
         if let Some((k, trees)) = &self.tree_shade
             && *k == key

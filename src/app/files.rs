@@ -28,7 +28,7 @@ impl App {
     }
 
     pub fn new_map(&mut self, width: u32, height: u32) {
-        self.reset_doc(Map::new(width.clamp(4, 400), height.clamp(4, 400)), None);
+        self.reset_doc(Map::new(width.clamp(4, map::MAX_SIDE), height.clamp(4, map::MAX_SIDE)), None);
     }
 
     pub fn save_to(&mut self, path: &Path) -> bool {
@@ -145,7 +145,7 @@ impl App {
     pub fn autosave(&mut self, now: f64, force: bool) {
         if force || self.recovery.due(now, self.dirty, self.rev) {
             let meta = recovery::Meta { name: self.name(), path: self.path.clone(), saved: recovery::now_unix() };
-            self.recovery.snapshot(now, self.rev, &self.project(), &meta);
+            self.recovery.snapshot(now, self.rev, self.project(), &meta);
         }
     }
 

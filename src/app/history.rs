@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Сколько памяти можно отдать шагам отмены, байт.
+const HISTORY_BYTES: usize = 1 << 30;
+
+/// Сколько своего держит шаг отмены: списки копируются целиком, а маски делят куски с
+/// картой — их не считать.
+fn step_weight(m: &Map) -> usize {
+    use std::mem::size_of;
+    m.props.len() * size_of::<Prop>() + m.walls.iter().map(|w| size_of::<Wall>() + w.points.len() * 8).sum::<usize>() + m.portals.len() * size_of::<Portal>() + m.paths.iter().map(|p| p.points.len() * 8 + 64).sum::<usize>()
+}
+
 impl App {
     /// Запомнить карту перед правкой.
     pub fn checkpoint(&mut self) {
@@ -14,8 +24,15 @@ impl App {
             }
             seen.push(self.level);
         }
+        // Сжать правленые куски масок до копии: копия делит с картой все нетронутые
+        // куски, и шаг отмены стоит столько, сколько правили, а не вся карта.
+        self.map.compact();
         self.undo.push((self.level, self.map.clone()));
-        if self.undo.len() > HISTORY {
+        // Предел — и по числу шагов, и по памяти: списки предметов, стен, дверей
+        // копируются в каждый шаг целиком.
+        let mut weight: usize = self.undo.iter().map(|(_, m)| step_weight(m)).sum();
+        while self.undo.len() > HISTORY || (weight > HISTORY_BYTES && self.undo.len() > 1) {
+            weight -= step_weight(&self.undo[0].1);
             self.undo.remove(0);
         }
         self.redo.clear();

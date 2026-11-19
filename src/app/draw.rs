@@ -48,7 +48,8 @@ impl App {
             if c.rev != self.rev || c.edges.is_empty() {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                (self.map.rooms.w, self.map.rooms.h, &self.map.rooms.data).hash(&mut h);
+                // Отпечаток, а не все точки: у копии маски он тот же, у правленой — новый.
+                (self.map.rooms.w, self.map.rooms.h, self.map.rooms.stamp()).hash(&mut h);
                 let rooms = h.finish();
                 if rooms != c.rooms || c.rev == 0 {
                     c.edges = self.map.room_edges();
@@ -130,7 +131,7 @@ impl App {
         for (k, coat) in terrain.iter().enumerate() {
             self.draw_coat(painter, canvas, coat, &terrain[k + 1..], None, view);
         }
-        let rooms = std::mem::replace(&mut self.map.rooms, Mask { w: 0, h: 0, data: Vec::new() });
+        let rooms = std::mem::replace(&mut self.map.rooms, Mask::new(0, 0));
         for (k, coat) in room_floor.iter().enumerate() {
             self.draw_coat(painter, canvas, coat, &room_floor[k + 1..], Some(&rooms), view);
         }

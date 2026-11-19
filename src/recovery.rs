@@ -49,6 +49,10 @@ pub struct Recovery {
     lock: Option<Lock>,
     saved_rev: u64,
     last: f64,
+    /// Копия пишется в своём потоке: правка и номер её версии. Большая карта
+    /// пишется секунду, и раз в 15 секунд окно замирало бы на это время.
+    #[cfg(not(target_arch = "wasm32"))]
+    job: Option<(u64, std::thread::JoinHandle<bool>)>,
 }
 
 pub fn now_unix() -> u64 {
@@ -125,28 +129,67 @@ impl Recovery {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("{}-{}-{n}", crate::plat::pid(), now_unix());
         let lock = take_lock(&dir.join(format!("{id}.lock")), &id);
-        Self { dir, id, lock, saved_rev: 0, last: f64::NEG_INFINITY }
+        Self {
+            dir,
+            id,
+            lock,
+            saved_rev: 0,
+            last: f64::NEG_INFINITY,
+            #[cfg(not(target_arch = "wasm32"))]
+            job: None,
+        }
     }
 
     fn file(&self, id: &str, ext: &str) -> PathBuf {
         self.dir.join(format!("{id}.{ext}"))
     }
 
-    /// Пора ли делать копию: карта изменена, с прошлой копии прошло время и правки новые.
-    pub fn due(&self, now: f64, dirty: bool, rev: u64) -> bool {
+    /// Пора ли делать копию: карта изменена, с прошлой копии прошло время и правки новые,
+    /// прошлая копия дописана.
+    pub fn due(&mut self, now: f64, dirty: bool, rev: u64) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.job.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            self.settle();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.job.is_some() {
+            return false;
+        }
         dirty && rev != self.saved_rev && now - self.last >= INTERVAL && self.lock.is_some()
     }
 
-    pub fn snapshot(&mut self, now: f64, rev: u64, map: &Map, meta: &Meta) {
+    /// Дождаться копии, что пишется сейчас.
+    pub fn settle(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((rev, h)) = self.job.take()
+            && h.join().unwrap_or(false)
+        {
+            self.saved_rev = rev;
+        }
+    }
+
+    /// Копия карты: в своём потоке (в браузере потоков нет — сразу). Карта — своя
+    /// копия: маски делят куски с картой окна, так что она дешёвая.
+    pub fn snapshot(&mut self, now: f64, rev: u64, map: Map, meta: &Meta) {
+        self.settle();
         self.last = now;
         let meta_json = serde_json::to_vec_pretty(meta).unwrap_or_default();
-        if write_whole(&self.file(&self.id, "karta"), map.to_json().as_bytes()).is_ok() && write_whole(&self.file(&self.id, "json"), &meta_json).is_ok() {
+        let (karta, json) = (self.file(&self.id, "karta"), self.file(&self.id, "json"));
+        let write = move || write_whole(&karta, map.to_json().as_bytes()).is_ok() && write_whole(&json, &meta_json).is_ok();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.job = Some((rev, std::thread::spawn(write)));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if write() {
             self.saved_rev = rev;
         }
     }
 
     /// Карта сохранена или от правок отказались: копия больше не нужна.
     pub fn clear(&mut self) {
+        // Недописанная копия иначе легла бы на диск уже после того, как её убрали.
+        self.settle();
         // Пустые пути — ничего не трогать: копии и не было (в модуле удаление — запись).
         if self.has_copy() {
             fs::remove(&self.file(&self.id, "karta"));
@@ -155,7 +198,12 @@ impl Recovery {
         self.saved_rev = 0;
     }
 
+    /// Копия есть или пишется.
     pub fn has_copy(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.job.is_some() {
+            return true;
+        }
         fs::exists(&self.file(&self.id, "karta"))
     }
 
@@ -205,6 +253,7 @@ impl Recovery {
 
     /// Для самопроверки: отпустить замок, как будто программа упала.
     pub fn drop_lock(&mut self) -> String {
+        self.settle();
         self.lock = None;
         #[cfg(target_arch = "wasm32")]
         crate::plat::release(&self.id);

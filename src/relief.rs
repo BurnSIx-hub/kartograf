@@ -262,7 +262,7 @@ fn byte(v: f32) -> u8 {
 /// Граница яруса `k` (высота `k − 0,5`) как маска: порог маски ровно на ней.
 fn level_mask(r: &Relief, k: i32) -> Mask {
     let at = k as f32 - 0.5;
-    Mask { w: r.w, h: r.h, data: r.data.iter().map(|&h| byte(0.5 + (h - at) * 4.0)).collect() }
+    Mask::from_vec(r.w, r.h, &r.data.iter().map(|&h| byte(0.5 + (h - at) * 4.0)).collect::<Vec<u8>>())
 }
 
 /// Точки ломаной не реже чем через `step` клеток.
@@ -598,14 +598,14 @@ pub fn look(r: &Relief, angle: f32, roads: &[(Vec<[f32; 2]>, f32)]) -> Look {
             }
         }
     }
-    let mut dark = Mask { w, h, data: vec![0; w * h] };
+    let mut dark = vec![0u8; w * h];
     for k in 0..w * h {
         let depth = if r.natural { 0.0 } else { ((top - steps.data[k]) * DEPTH).min(DEPTH_MAX) };
         // Тень и глубина складываются как два слоя полупрозрачного чёрного.
         let v = 1.0 - (1.0 - depth) * (1.0 - cast[k] * CAST);
-        dark.data[k] = byte(v);
+        dark[k] = byte(v);
     }
-    Look { dark, edges, fade }
+    Look { dark: Mask::from_vec(w, h, &dark), edges, fade }
 }
 
 /// Прозрачность полос по точкам кромок. У свободного конца полоса гаснет:

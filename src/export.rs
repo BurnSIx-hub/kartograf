@@ -203,7 +203,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
         let Some(effect) = mat.live().effect() else { continue };
         let mask = map.material_mask(m);
         if effect == "water" {
-            let area: u64 = mask.data.iter().map(|&v| v as u64).sum();
+            let area: u64 = mask.sum();
             wet += area;
             if mat.deep() {
                 deep += area;
@@ -219,11 +219,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
             }
         }
         match masks.iter_mut().find(|(e, _)| *e == effect) {
-            Some((_, all)) => {
-                for (a, v) in all.data.iter_mut().zip(&mask.data) {
-                    *a = a.saturating_add(*v);
-                }
-            }
+            Some((_, all)) => all.add_sat(&mask),
             None => masks.push((effect, mask)),
         }
     }
@@ -243,7 +239,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
                 for j in ((lo[1] * res).floor().max(0.0) as usize)..((hi[1] * res).ceil().max(0.0) as usize).min(mask.h) {
                     for i in ((lo[0] * res).floor().max(0.0) as usize)..((hi[0] * res).ceil().max(0.0) as usize).min(mask.w) {
                         if map::segment_distance([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], seg[0], seg[1]) <= hw {
-                            mask.data[j * mask.w + i] = 0;
+                            mask.set(i, j, 0);
                         }
                     }
                 }
@@ -254,7 +250,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
             for j in ((lo[1] * res).floor().max(0.0) as usize)..((hi[1] * res).ceil().max(0.0) as usize).min(mask.h) {
                 for i in ((lo[0] * res).floor().max(0.0) as usize)..((hi[0] * res).ceil().max(0.0) as usize).min(mask.w) {
                     if map::segment_distance([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], *a, *b) <= *hw {
-                        mask.data[j * mask.w + i] = 0;
+                        mask.set(i, j, 0);
                     }
                 }
             }
@@ -267,7 +263,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
                 for i in (((p.pos[0] - r) * res).floor().max(0.0) as usize)..(((p.pos[0] + r) * res).ceil().max(0.0) as usize).min(mask.w) {
                     let (dx, dy) = ((i as f32 + 0.5) / res - p.pos[0], (j as f32 + 0.5) / res - p.pos[1]);
                     if dx * dx + dy * dy <= r * r {
-                        mask.data[j * mask.w + i] = 0;
+                        mask.set(i, j, 0);
                     }
                 }
             }
@@ -292,7 +288,7 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
                         // В оси картинки: поворот назад.
                         let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
                         if (lx / rx).powi(2) + (ly / ry).powi(2) <= 1.0 {
-                            mask.data[j * mask.w + i] = 0;
+                            mask.set(i, j, 0);
                         }
                     }
                 }
@@ -307,22 +303,15 @@ fn zones(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Option<[f32; 
                 ring.push(ring[0]);
                 let mut part = mask.clone();
                 let mut any = false;
-                for (k, v) in part.data.iter_mut().enumerate() {
-                    if *v == 0 {
-                        continue;
-                    }
-                    if inside([((k % mask.w) as f32 + 0.5) / res, ((k / mask.w) as f32 + 0.5) / res], &ring) {
+                mask.for_each_nonzero(|i, j, _| {
+                    if inside([(i as f32 + 0.5) / res, (j as f32 + 0.5) / res], &ring) {
                         any = true;
                     } else {
-                        *v = 0;
+                        part.set(i, j, 0);
                     }
-                }
+                });
                 if any {
-                    for (a, b) in mask.data.iter_mut().zip(&part.data) {
-                        if *b > 0 {
-                            *a = 0;
-                        }
-                    }
+                    part.for_each_nonzero(|i, j, _| mask.set(i, j, 0));
                     parts.push((part, Some((f.current.clamp(0.0, 3.0), f.drift.rem_euclid(360.0)))));
                 }
             }
@@ -1054,7 +1043,7 @@ impl Solid {
     /// люка, шов по кромке борта — отбрасывается: дыра меньше клетки `px`, островок
     /// меньше её четверти.
     pub fn loops(&self, px: u32) -> Vec<(Vec<[f32; 2]>, bool)> {
-        let mask = mask::Mask { w: self.w as usize, h: self.h as usize, data: self.cells.iter().map(|&c| if c { 255 } else { 0 }).collect() };
+        let mask = mask::Mask::from_vec(self.w as usize, self.h as usize, &self.cells.iter().map(|&c| if c { 255 } else { 0 }).collect::<Vec<u8>>());
         // Одна «клетка» контура маски — `RES` отсчётов сетки.
         let k = (mask::RES as u32 * self.step) as f32;
         let loops: Vec<Vec<[f32; 2]>> = mask::join(mask::contour(&mask)).into_iter().map(|l| simplify(&l, true, 0.2)).filter(|l| l.len() >= 4).collect();

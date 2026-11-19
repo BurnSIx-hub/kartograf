@@ -388,9 +388,9 @@ impl App {
             let mut go = false;
             egui::Window::new("Новая карта").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut nm.width).range(4..=400).suffix(" кл."));
+                    ui.add(egui::DragValue::new(&mut nm.width).range(4..=map::MAX_SIDE).suffix(" кл."));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut nm.height).range(4..=400).suffix(" кл."));
+                    ui.add(egui::DragValue::new(&mut nm.height).range(4..=map::MAX_SIDE).suffix(" кл."));
                 });
                 if self.dirty {
                     ui.weak("Несохранённые правки нынешней карты пропадут.");

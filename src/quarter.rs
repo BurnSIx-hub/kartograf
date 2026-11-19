@@ -1422,13 +1422,15 @@ fn emit_fence(m: &mut Map, fence: &Fence, style: &WallStyle) {
 /// Клетки прямоугольников разом — одним мазком.
 fn paint_rects(m: &mut Map, rects: &[Room], material: usize) {
     let (mw, mh) = (m.rooms.w, m.rooms.h);
-    let mut mask = Mask { w: mw, h: mh, data: vec![0; mw * mh] };
+    let mut mask = Mask::new(mw, mh);
     for r in rects.iter().filter(|r| r.w > 0 && r.h > 0) {
         for (i, _) in mask::cells(mw, mh, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1)) {
-            mask.data[i] = 255;
+            mask.put(i, 255);
         }
     }
-    let weights: Vec<(usize, f32)> = mask.data.iter().enumerate().filter(|(_, v)| **v > 0).map(|(i, _)| (i, 1.0)).collect();
+    let mut weights: Vec<(usize, f32)> = Vec::new();
+    mask.for_each_nonzero(|i, j, _| weights.push((j * mw + i, 1.0)));
+    weights.sort_by_key(|w| w.0);
     if !weights.is_empty() {
         m.paint(Layer::Floor, material, &weights);
     }
@@ -1436,12 +1438,13 @@ fn paint_rects(m: &mut Map, rects: &[Room], material: usize) {
 
 fn rect_mask(m: &Map, rects: &[Room]) -> Mask {
     let (mw, mh) = (m.rooms.w, m.rooms.h);
-    let mut mask = Mask { w: mw, h: mh, data: vec![0; mw * mh] };
+    let mut mask = Mask::new(mw, mh);
     for r in rects.iter().filter(|r| r.w > 0 && r.h > 0) {
         for (i, _) in mask::cells(mw, mh, (r.x, r.y), (r.x + r.w - 1, r.y + r.h - 1)) {
-            mask.data[i] = 255;
+            mask.put(i, 255);
         }
     }
+    mask.compact();
     mask
 }
 

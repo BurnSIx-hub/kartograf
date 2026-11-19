@@ -299,7 +299,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         // проверка соседей по клеткам оставляла по краю голую полосу, на карте —
         // белый пунктир по заросшему склону.
         let rock_here: Vec<bool> = match &hint {
-            Some(_) => (0..m.rooms.w * m.rooms.h).map(|k| m.terrain.iter().any(|c| rock_mats.contains(&(c.material as usize)) && c.mask.data[k] > 0)).collect(),
+            Some(_) => (0..m.rooms.w * m.rooms.h).map(|k| m.terrain.iter().any(|c| rock_mats.contains(&(c.material as usize)) && c.mask.at(k) > 0)).collect(),
             None => Vec::new(),
         };
         let mut to_grass = Vec::new();
@@ -314,7 +314,7 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
         let ice_mat = (!on_ice.is_empty()).then(|| floors.get(&mut m, "ice_glacier"));
         let share_of = |mat: usize| -> Vec<f32> {
             match m.terrain.iter().find(|c| c.material as usize == mat) {
-                Some(c) => c.mask.data.iter().map(|&v| v as f32 / 255.0).collect(),
+                Some(c) => c.mask.values().map(|v| v as f32 / 255.0).collect(),
                 None => vec![0.0; mw * mh],
             }
         };

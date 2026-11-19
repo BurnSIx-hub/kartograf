@@ -494,7 +494,7 @@ impl SelfTest {
             }
             40 => {
                 let grass = app.map.terrain.iter().find(|c| c.material == 3);
-                let soft = grass.is_some_and(|c| c.mask.data.iter().any(|&v| v > 20 && v < 230));
+                let soft = grass.is_some_and(|c| c.mask.values().any(|v| v > 20 && v < 230));
                 self.check("спрей лёг травой с мягкими краями", soft, &format!("слоёв местности {}", app.map.terrain.len()));
                 self.check("мазок — одна правка: Ctrl+Z его снимет", { app.undo(); let gone = !app.map.terrain.iter().any(|c| c.material == 3); app.redo(); gone }, "отмена не сняла спрей");
                 // Ластик кругом поперёк капсулы.
@@ -1364,5 +1364,5 @@ impl SelfTest {
 fn ground_share(app: &App, material: u8, x: f32, y: f32) -> u8 {
     let m = &app.map;
     let p = (y * mask::RES as f32) as usize * m.rooms.w + (x * mask::RES as f32) as usize;
-    m.terrain.iter().find(|c| c.material == material).map_or(0, |c| c.mask.data[p])
+    m.terrain.iter().find(|c| c.material == material).map_or(0, |c| c.mask.at(p))
 }

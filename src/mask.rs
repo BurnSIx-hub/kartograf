@@ -9,32 +9,299 @@
 use std::f32::consts::SQRT_2;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const RES: usize = 4;
 /// Порог «внутри комнаты».
 const LEVEL: f32 = 127.5;
 
-#[derive(Clone, Debug, PartialEq)]
+/// Сторона куска маски в точках: 32 клетки. Степень двойки — номер куска сдвигом.
+pub const CHUNK: usize = 32 * RES;
+const SHIFT: u32 = CHUNK.trailing_zeros();
+const AREA: usize = CHUNK * CHUNK;
+
+/// Кусок маски: весь одной силы (пустой, залитый) — без памяти под точки; иначе точки.
+/// Точки — за `Arc`: копия маски (шаг отмены) делит с ней куски, а правка копирует
+/// только свой кусок.
+#[derive(Clone)]
+enum Chunk {
+    Fill(u8),
+    Data(Arc<Vec<u8>>),
+}
+
+/// Отпечатки содержимого: у каждой правки новый, у копии — тот же.
+static STAMPS: AtomicU64 = AtomicU64::new(1);
+
+/// Маска кусками по [`CHUNK`] точек. Карта 1000×1000 клеток — 4000×4000 точек на слой;
+/// сплошным массивом это 16 МБ на слой, на каждом шаге отмены. Кусками — память только
+/// под то, где сила разная; пустое и залитое целиком места не занимают.
 pub struct Mask {
     pub w: usize,
     pub h: usize,
-    pub data: Vec<u8>,
+    nx: usize,
+    chunks: Vec<Chunk>,
+    /// Куски, которые правили после [`Mask::compact`], — по биту на кусок.
+    touched: Vec<u64>,
+    /// Отпечаток содержимого; 0 — правили, новый выдаст [`Mask::stamp`].
+    stamp: AtomicU64,
+}
+
+impl Clone for Mask {
+    fn clone(&self) -> Self {
+        // Отпечаток — до копии: иначе копия и оригинал получили бы разные, хотя одинаковы.
+        Self { w: self.w, h: self.h, nx: self.nx, chunks: self.chunks.clone(), touched: self.touched.clone(), stamp: AtomicU64::new(self.stamp()) }
+    }
+}
+
+impl std::fmt::Debug for Mask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.chunks.iter().filter(|c| matches!(c, Chunk::Data(_))).count();
+        write!(f, "Mask({}×{}, кусков с точками {data} из {})", self.w, self.h, self.chunks.len())
+    }
+}
+
+impl PartialEq for Mask {
+    fn eq(&self, other: &Self) -> bool {
+        if (self.w, self.h) != (other.w, other.h) {
+            return false;
+        }
+        (0..self.chunks.len()).all(|c| match (&self.chunks[c], &other.chunks[c]) {
+            (Chunk::Fill(a), Chunk::Fill(b)) => a == b,
+            (Chunk::Data(a), Chunk::Data(b)) if Arc::ptr_eq(a, b) => true,
+            _ => self.chunk_rows(c).all(|(j, i0, i1)| (i0..i1).all(|i| self.get_u(i, j) == other.get_u(i, j))),
+        })
+    }
 }
 
 impl Mask {
+    /// Маска `w × h` точек одной силы `v`.
+    pub fn filled(w: usize, h: usize, v: u8) -> Self {
+        let nx = w.div_ceil(CHUNK);
+        let ny = h.div_ceil(CHUNK);
+        Self { w, h, nx, chunks: vec![Chunk::Fill(v); nx * ny], touched: vec![0; (nx * ny).div_ceil(64)], stamp: AtomicU64::new(0) }
+    }
+
+    /// Пустая маска `w × h` точек.
+    pub fn new(w: usize, h: usize) -> Self {
+        Self::filled(w, h, 0)
+    }
+
     /// Маска под карту `cells_w × cells_h` клеток.
     pub fn for_cells(cells_w: u32, cells_h: u32) -> Self {
-        let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
-        Self { w, h, data: vec![0; w * h] }
+        Self::new(cells_w as usize * RES, cells_h as usize * RES)
+    }
+
+    /// Пустая маска того же размера.
+    pub fn blank_like(&self) -> Self {
+        Self::new(self.w, self.h)
+    }
+
+    /// Маска из точек подряд, строками (как прежний сплошной массив).
+    pub fn from_vec(w: usize, h: usize, data: &[u8]) -> Self {
+        let mut m = Self::new(w, h);
+        for j in 0..h {
+            for i in 0..w {
+                let v = data.get(j * w + i).copied().unwrap_or(0);
+                if v != 0 {
+                    m.set(i, j, v);
+                }
+            }
+        }
+        m.compact();
+        m
+    }
+
+    /// Точки подряд, строками.
+    #[cfg(test)]
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.values().collect()
+    }
+
+    /// Сколько точек.
+    pub fn len(&self) -> usize {
+        self.w * self.h
+    }
+
+    #[inline]
+    fn locate(&self, i: usize, j: usize) -> (usize, usize) {
+        ((j >> SHIFT) * self.nx + (i >> SHIFT), ((j & (CHUNK - 1)) << SHIFT) | (i & (CHUNK - 1)))
+    }
+
+    /// Значение точки внутри маски.
+    #[inline]
+    fn get_u(&self, i: usize, j: usize) -> u8 {
+        let (c, o) = self.locate(i, j);
+        match &self.chunks[c] {
+            Chunk::Fill(v) => *v,
+            Chunk::Data(d) => d[o],
+        }
     }
 
     /// Значение точки; за краем — 0.
+    #[inline]
     pub fn get(&self, i: isize, j: isize) -> u8 {
-        if i < 0 || j < 0 || i as usize >= self.w || j as usize >= self.h { 0 } else { self.data[j as usize * self.w + i as usize] }
+        if i < 0 || j < 0 || i as usize >= self.w || j as usize >= self.h { 0 } else { self.get_u(i as usize, j as usize) }
+    }
+
+    /// Значение точки по номеру строками (`j * w + i`), как в прежнем массиве.
+    #[inline]
+    pub fn at(&self, k: usize) -> u8 {
+        if k >= self.len() { 0 } else { self.get_u(k % self.w, k / self.w) }
+    }
+
+    /// Поставить силу точки; за краем — ничего.
+    #[inline]
+    pub fn set(&mut self, i: usize, j: usize, v: u8) {
+        if i >= self.w || j >= self.h {
+            return;
+        }
+        let (c, o) = self.locate(i, j);
+        match &mut self.chunks[c] {
+            Chunk::Fill(x) if *x == v => return,
+            Chunk::Fill(x) => {
+                let mut d = vec![*x; AREA];
+                d[o] = v;
+                self.chunks[c] = Chunk::Data(Arc::new(d));
+            }
+            Chunk::Data(d) => {
+                if d[o] == v {
+                    return;
+                }
+                Arc::make_mut(d)[o] = v;
+            }
+        }
+        self.touched[c >> 6] |= 1 << (c & 63);
+        self.stamp.store(0, Ordering::Relaxed);
+    }
+
+    /// Поставить силу точки по номеру строками.
+    #[inline]
+    pub fn put(&mut self, k: usize, v: u8) {
+        if k < self.len() {
+            self.set(k % self.w, k / self.w, v);
+        }
+    }
+
+    /// Точки подряд, строками.
+    pub fn values(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.h).flat_map(move |j| (0..self.w).map(move |i| self.get_u(i, j)))
+    }
+
+    /// Строки куска `c` в пределах маски: `(j, i0, i1)`.
+    fn chunk_rows(&self, c: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+        let (cx, cy) = (c % self.nx, c / self.nx);
+        let (i0, j0) = (cx * CHUNK, cy * CHUNK);
+        let (i1, j1) = ((i0 + CHUNK).min(self.w), (j0 + CHUNK).min(self.h));
+        (j0..j1).map(move |j| (j, i0, i1))
+    }
+
+    /// Сила куска, в котором точка `(i, j)`, если он весь одной силы.
+    pub fn uniform_at(&self, i: usize, j: usize) -> Option<u8> {
+        if i >= self.w || j >= self.h {
+            return Some(0);
+        }
+        match &self.chunks[self.locate(i, j).0] {
+            Chunk::Fill(v) => Some(*v),
+            Chunk::Data(_) => None,
+        }
+    }
+
+    /// Куски, ставшие одной силы, — снова без памяти под точки. Смотрит только те, что
+    /// правили после прошлого раза: на большой карте это доли процента кусков.
+    pub fn compact(&mut self) {
+        let touched = std::mem::replace(&mut self.touched, vec![0; self.chunks.len().div_ceil(64)]);
+        for (word, bits) in touched.into_iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let c = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                self.compact_one(c);
+            }
+        }
+    }
+
+    fn compact_one(&mut self, c: usize) {
+        let Chunk::Data(d) = &self.chunks[c] else { return };
+        let (cx, cy) = (c % self.nx, c / self.nx);
+        let (ew, eh) = ((self.w - cx * CHUNK).min(CHUNK), (self.h - cy * CHUNK).min(CHUNK));
+        let first = d[0];
+        if (0..eh).all(|r| d[r * CHUNK..r * CHUNK + ew].iter().all(|&v| v == first)) {
+            self.chunks[c] = Chunk::Fill(first);
+        }
+    }
+
+    /// Отпечаток содержимого: тот же — содержимое то же (копия или без правок).
+    pub fn stamp(&self) -> u64 {
+        let s = self.stamp.load(Ordering::Relaxed);
+        if s != 0 {
+            return s;
+        }
+        let fresh = STAMPS.fetch_add(1, Ordering::Relaxed);
+        match self.stamp.compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => fresh,
+            Err(now) => now,
+        }
+    }
+
+    /// Каждая точка с силой больше нуля: `(i, j, сила)`, кусками; пустые куски пропускаются.
+    pub fn for_each_nonzero(&self, mut f: impl FnMut(usize, usize, u8)) {
+        for c in 0..self.chunks.len() {
+            match &self.chunks[c] {
+                Chunk::Fill(0) => {}
+                Chunk::Fill(v) => {
+                    for (j, i0, i1) in self.chunk_rows(c) {
+                        for i in i0..i1 {
+                            f(i, j, *v);
+                        }
+                    }
+                }
+                Chunk::Data(d) => {
+                    let (x0, y0) = ((c % self.nx) * CHUNK, (c / self.nx) * CHUNK);
+                    for (j, i0, i1) in self.chunk_rows(c) {
+                        let row = &d[(j - y0) * CHUNK..];
+                        for i in i0..i1 {
+                            let v = row[i - x0];
+                            if v != 0 {
+                                f(i, j, v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Сумма сил всех точек.
+    pub fn sum(&self) -> u64 {
+        let mut s = 0u64;
+        self.for_each_nonzero(|_, _, v| s += v as u64);
+        s
+    }
+
+    /// Сложить с другой маской того же размера (с насыщением на 255).
+    pub fn add_sat(&mut self, other: &Mask) {
+        other.for_each_nonzero(|i, j, v| {
+            let a = self.get_u(i, j);
+            self.set(i, j, a.saturating_add(v));
+        });
+    }
+
+    /// Сколько кусков держат свои точки (для замеров памяти).
+    pub fn data_chunks(&self) -> usize {
+        self.chunks.iter().filter(|c| matches!(c, Chunk::Data(_))).count()
+    }
+
+    /// Сколько байт занимают точки кусков (копии для отмены делят их с картой).
+    pub fn bytes(&self) -> usize {
+        self.data_chunks() * AREA
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.iter().all(|&v| v == 0)
+        (0..self.chunks.len()).all(|c| match &self.chunks[c] {
+            Chunk::Fill(v) => *v == 0,
+            Chunk::Data(_) => self.chunk_rows(c).all(|(j, i0, i1)| (i0..i1).all(|i| self.get_u(i, j) == 0)),
+        })
     }
 
     /// Та же маска на холсте `cells_w × cells_h` клеток, сдвинутая на `dx`, `dy`
@@ -43,16 +310,28 @@ impl Mask {
         let mut out = Self::for_cells(cells_w, cells_h);
         let (ox, oy) = (dx as usize * RES, dy as usize * RES);
         for j in 0..self.h.min(out.h.saturating_sub(oy)) {
-            let n = self.w.min(out.w.saturating_sub(ox));
-            let at = (j + oy) * out.w + ox;
-            out.data[at..at + n].copy_from_slice(&self.data[j * self.w..j * self.w + n]);
+            for i in 0..self.w.min(out.w.saturating_sub(ox)) {
+                if self.uniform_at(i, j) == Some(0) {
+                    continue;
+                }
+                out.set(i + ox, j + oy, self.get_u(i, j));
+            }
         }
+        out.compact();
         out
     }
 
     /// Площадь выше порога, в клетках.
     pub fn area(&self) -> f32 {
-        self.data.iter().filter(|&&v| v as f32 > LEVEL).count() as f32 / (RES * RES) as f32
+        let mut n = 0usize;
+        for c in 0..self.chunks.len() {
+            match &self.chunks[c] {
+                Chunk::Fill(v) if *v as f32 > LEVEL => n += self.chunk_rows(c).map(|(_, i0, i1)| i1 - i0).sum::<usize>(),
+                Chunk::Fill(_) => {}
+                Chunk::Data(_) => n += self.chunk_rows(c).map(|(j, i0, i1)| (i0..i1).filter(|&i| self.get_u(i, j) as f32 > LEVEL).count()).sum::<usize>(),
+            }
+        }
+        n as f32 / (RES * RES) as f32
     }
 }
 
@@ -61,36 +340,107 @@ pub fn sample_pos(i: isize, j: isize) -> [f32; 2] {
 }
 
 // ----- запись в файл: сжатые байты в base64, а не тысячи чисел -----
+//
+// Формат 3 (`t`): куски по порядку, у каждого метка — 0 и сила (весь одной силы) или 1 и
+// его точки в пределах маски строками; всё вместе сжато. Пустая карта 1000×1000 — пара
+// сотен байт, и запись не проходит по 16 миллионам точек каждого слоя.
+// Формат 2 (`z`): все точки подряд строками, сжатые, — читается по-прежнему.
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct Packed {
     w: usize,
     h: usize,
-    z: String,
+    t: String,
+}
+
+#[derive(Deserialize)]
+struct Read {
+    w: usize,
+    h: usize,
+    #[serde(default)]
+    z: Option<String>,
+    #[serde(default)]
+    t: Option<String>,
 }
 
 impl Serialize for Mask {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use std::io::Write;
+        let mut m = self.clone();
+        m.compact();
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        let _ = enc.write_all(&self.data);
+        let mut row = Vec::with_capacity(CHUNK);
+        for c in 0..m.chunks.len() {
+            match &m.chunks[c] {
+                Chunk::Fill(v) => {
+                    let _ = enc.write_all(&[0, *v]);
+                }
+                Chunk::Data(_) => {
+                    let _ = enc.write_all(&[1]);
+                    for (j, i0, i1) in m.chunk_rows(c) {
+                        row.clear();
+                        row.extend((i0..i1).map(|i| m.get_u(i, j)));
+                        let _ = enc.write_all(&row);
+                    }
+                }
+            }
+        }
         let bytes = enc.finish().unwrap_or_default();
-        Packed { w: self.w, h: self.h, z: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes) }.serialize(s)
+        Packed { w: self.w, h: self.h, t: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes) }.serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for Mask {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        use std::io::Read;
-        let p = Packed::deserialize(d)?;
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &p.z).map_err(D::Error::custom)?;
-        let mut data = Vec::with_capacity(p.w * p.h);
-        flate2::read::DeflateDecoder::new(&bytes[..]).read_to_end(&mut data).map_err(D::Error::custom)?;
-        if data.len() != p.w * p.h {
-            return Err(D::Error::custom("маска повреждена"));
+        use std::io::Read as _;
+        let p = Read::deserialize(d)?;
+        let unpack = |text: &str| -> Result<Vec<u8>, D::Error> {
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).map_err(D::Error::custom)?;
+            let mut data = Vec::new();
+            flate2::read::DeflateDecoder::new(&bytes[..]).read_to_end(&mut data).map_err(D::Error::custom)?;
+            Ok(data)
+        };
+        let broken = || D::Error::custom("маска повреждена");
+        match (&p.t, &p.z) {
+            (Some(t), _) => {
+                let data = unpack(t)?;
+                let mut m = Mask::new(p.w, p.h);
+                let mut at = 0;
+                for c in 0..m.chunks.len() {
+                    match data.get(at) {
+                        Some(0) => {
+                            m.chunks[c] = Chunk::Fill(*data.get(at + 1).ok_or_else(broken)?);
+                            at += 2;
+                        }
+                        Some(1) => {
+                            at += 1;
+                            let rows: Vec<(usize, usize, usize)> = m.chunk_rows(c).collect();
+                            let mut d = vec![0u8; AREA];
+                            for (r, &(_, i0, i1)) in rows.iter().enumerate() {
+                                let n = i1 - i0;
+                                d[r * CHUNK..r * CHUNK + n].copy_from_slice(data.get(at..at + n).ok_or_else(broken)?);
+                                at += n;
+                            }
+                            m.chunks[c] = Chunk::Data(Arc::new(d));
+                        }
+                        _ => return Err(broken()),
+                    }
+                }
+                if at != data.len() {
+                    return Err(broken());
+                }
+                Ok(m)
+            }
+            (None, Some(z)) => {
+                let data = unpack(z)?;
+                if data.len() != p.w * p.h {
+                    return Err(broken());
+                }
+                Ok(Mask::from_vec(p.w, p.h, &data))
+            }
+            (None, None) => Err(D::Error::custom("у маски нет точек")),
         }
-        Ok(Mask { w: p.w, h: p.h, data })
     }
 }
 
@@ -457,8 +807,26 @@ fn contour_raw(m: &Mask) -> Vec<Segment> {
         [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
     };
     let mut pieces: Vec<Segment> = Vec::new();
+    let above = |v: u8| v as f32 > LEVEL;
     for j in -1..m.h as isize {
-        for i in -1..m.w as isize {
+        let mut next = -1isize;
+        while next < m.w as isize {
+            let i = next;
+            next += 1;
+            // Квадраты, у которых все четыре точки в двух кусках одной силы по одну
+            // сторону порога, границы не дают: весь ряд таких квадратов в куске — мимо.
+            // Порядок остальных прежний, поэтому и стены выходят те же.
+            if i >= 0 && j >= 0 && j + 1 < m.h as isize && i as usize % CHUNK == 0 {
+                let end = (i as usize + CHUNK - 1).min(m.w - 1);
+                let (top, low) = (m.uniform_at(i as usize, j as usize), m.uniform_at(i as usize, j as usize + 1));
+                if end > i as usize
+                    && let (Some(t), Some(l)) = (top, low)
+                    && above(t) == above(l)
+                {
+                    next = end as isize;
+                    continue;
+                }
+            }
             let (a, b, c, d) = (v(i, j), v(i + 1, j), v(i + 1, j + 1), v(i, j + 1));
             let case = (a > LEVEL) as u8 | ((b > LEVEL) as u8) << 1 | ((c > LEVEL) as u8) << 2 | ((d > LEVEL) as u8) << 3;
             if case == 0 || case == 15 {
@@ -784,7 +1152,8 @@ mod tests {
 
     fn fill(m: &mut Mask, weights: &[(usize, f32)]) {
         for &(i, v) in weights {
-            m.data[i] = (m.data[i] as f32 + v * (255.0 - m.data[i] as f32)).round() as u8;
+            let x = m.at(i) as f32;
+            m.put(i, (x + v * (255.0 - x)).round() as u8);
         }
     }
 
@@ -857,14 +1226,14 @@ mod tests {
         // Как в мазке: точка берёт самую большую силу из отпечатков.
         let mut m = Mask::for_cells(30, 20);
         let b = Brush { shape: Shape::Square, radius: 1.5, hardness: 0.8, flow: 1.0 };
-        let mut most = vec![0f32; m.data.len()];
+        let mut most = vec![0f32; m.len()];
         for x in [22.0, 22.45, 22.9, 23.35, 23.8, 24.0] {
             for (i, v) in dab(m.w, m.h, &b, [x, 14.0], 0) {
                 most[i] = most[i].max(v);
             }
         }
-        for (d, v) in m.data.iter_mut().zip(most) {
-            *d = (v * 255.0).round() as u8;
+        for (k, v) in most.into_iter().enumerate() {
+            m.put(k, (v * 255.0).round() as u8);
         }
         let c = contour(&m);
         assert_eq!(c.len(), 4, "{c:?}");
@@ -932,5 +1301,137 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.len() < 5000, "{} байт", json.len());
         assert_eq!(serde_json::from_str::<Mask>(&json).unwrap(), m);
+    }
+
+    /// Псевдослучайная маска: пустые, залитые и пёстрые куски, края карты не кратны куску.
+    fn speckled(w: usize, h: usize) -> (Mask, Vec<u8>) {
+        let mut dense = vec![0u8; w * h];
+        let mut s = 11u64;
+        for j in 0..h {
+            for i in 0..w {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                dense[j * w + i] = if i < CHUNK && j < CHUNK {
+                    0
+                } else if i >= CHUNK && i < 2 * CHUNK && j < CHUNK {
+                    255
+                } else if (i / 7 + j / 5) % 3 == 0 {
+                    (s >> 56) as u8
+                } else {
+                    0
+                };
+            }
+        }
+        (Mask::from_vec(w, h, &dense), dense)
+    }
+
+    #[test]
+    fn chunks_hold_the_same_points_as_a_flat_array() {
+        let (w, h) = (3 * CHUNK + 37, 2 * CHUNK + 5);
+        let (m, dense) = speckled(w, h);
+        assert_eq!(m.to_vec(), dense);
+        assert_eq!(m.at(w + 3), dense[w + 3]);
+        assert_eq!(m.get(-1, 0), 0);
+        assert_eq!(m.get(w as isize, 0), 0);
+        let n = dense.iter().filter(|&&v| v as f32 > LEVEL).count() as f32 / (RES * RES) as f32;
+        assert_eq!(m.area(), n);
+        // Пустой и залитый куски памяти под точки не держат.
+        assert_eq!(m.uniform_at(0, 0), Some(0));
+        assert_eq!(m.uniform_at(CHUNK + 1, 3), Some(255));
+        assert!(m.data_chunks() < m.chunks.len());
+    }
+
+    #[test]
+    fn both_file_formats_read_back_the_same_mask() {
+        let (w, h) = (2 * CHUNK + 9, CHUNK + 3);
+        let (m, dense) = speckled(w, h);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"t\"") && !json.contains("\"z\""), "пишется новый формат");
+        assert_eq!(serde_json::from_str::<Mask>(&json).unwrap(), m);
+        // Формат 2: все точки подряд, сжатые.
+        use std::io::Write;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&dense).unwrap();
+        let z = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, enc.finish().unwrap());
+        let old: Mask = serde_json::from_str(&format!("{{\"w\":{w},\"h\":{h},\"z\":\"{z}\"}}")).unwrap();
+        assert_eq!(old, m);
+        assert_eq!(old.to_vec(), dense);
+        assert!(serde_json::from_str::<Mask>(&format!("{{\"w\":{w},\"h\":{},\"z\":\"{z}\"}}", h + 1)).is_err(), "размер не сходится");
+        // Пустая большая маска в файле — пара сотен байт.
+        let big = serde_json::to_string(&Mask::for_cells(1000, 1000)).unwrap();
+        assert!(big.len() < 400, "{} байт", big.len());
+    }
+
+    /// Контур прежним обходом: все квадраты подряд, без пропуска кусков.
+    fn contour_raw_full(m: &Mask) -> Vec<Segment> {
+        let v = |i: isize, j: isize| m.get(i, j) as f32;
+        let lerp = |a: [f32; 2], b: [f32; 2], va: f32, vb: f32| {
+            let t = if (vb - va).abs() < 1e-6 { 0.5 } else { ((LEVEL - va) / (vb - va)).clamp(0.0, 1.0) };
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        };
+        let mut pieces = Vec::new();
+        for j in -1..m.h as isize {
+            for i in -1..m.w as isize {
+                let (a, b, c, d) = (v(i, j), v(i + 1, j), v(i + 1, j + 1), v(i, j + 1));
+                let case = (a > LEVEL) as u8 | ((b > LEVEL) as u8) << 1 | ((c > LEVEL) as u8) << 2 | ((d > LEVEL) as u8) << 3;
+                let (pa, pb, pc, pd) = (sample_pos(i, j), sample_pos(i + 1, j), sample_pos(i + 1, j + 1), sample_pos(i, j + 1));
+                let (top, right, bottom, left) = (lerp(pa, pb, a, b), lerp(pb, pc, b, c), lerp(pd, pc, d, c), lerp(pa, pd, a, d));
+                match case {
+                    1 | 14 => pieces.push((left, top)),
+                    2 | 13 => pieces.push((top, right)),
+                    3 | 12 => pieces.push((left, right)),
+                    4 | 11 => pieces.push((right, bottom)),
+                    6 | 9 => pieces.push((top, bottom)),
+                    7 | 8 => pieces.push((left, bottom)),
+                    5 => pieces.extend([(left, top), (right, bottom)]),
+                    10 => pieces.extend([(top, right), (left, bottom)]),
+                    _ => {}
+                }
+            }
+        }
+        pieces
+    }
+
+    #[test]
+    fn contour_skips_flat_chunks_but_finds_the_same_walls_in_the_same_order() {
+        // Комнаты по всей карте, у краёв кусков и карты, круглые и клетками; залитый кусок.
+        let mut m = Mask::for_cells(100, 70);
+        for (a, b) in [((0, 0), (3, 2)), ((30, 30), (33, 34)), ((31, 0), (40, 5)), ((60, 40), (99, 69)), ((10, 50), (10, 50))] {
+            fill_cells(&mut m, a, b);
+        }
+        fill_dab(&mut m, &Brush { shape: Shape::Circle, radius: 5.0, hardness: 0.5, flow: 1.0 }, [64.0, 20.0], 0);
+        m.compact();
+        // Кусок клеток 64–95 × 64–69 (у нижнего края карты) — весь в комнате.
+        assert!(m.uniform_at(70 * RES, 66 * RES) == Some(255), "залитый кусок без точек");
+        assert_eq!(contour_raw(&m), contour_raw_full(&m));
+    }
+
+    #[test]
+    fn a_copy_shares_chunks_and_an_edit_copies_only_its_own() {
+        let (mut m, _) = speckled(3 * CHUNK, 3 * CHUNK);
+        let p = (2 * CHUNK as isize + 1, 2 * CHUNK as isize + 1);
+        // Точка в пёстром куске, со своей силой, не 7.
+        let orig = m.get(p.0, p.1);
+        assert!(m.uniform_at(p.0 as usize, p.1 as usize).is_none() && orig != 7);
+        let before = m.clone();
+        assert_eq!(before.stamp(), m.stamp(), "копия — тот же отпечаток");
+        let shared = |a: &Mask, b: &Mask| (0..a.chunks.len()).filter(|&c| matches!((&a.chunks[c], &b.chunks[c]), (Chunk::Data(x), Chunk::Data(y)) if Arc::ptr_eq(x, y))).count();
+        let all = shared(&m, &before);
+        m.set(2 * CHUNK + 1, 2 * CHUNK + 1, 7);
+        assert_eq!(shared(&m, &before), all - 1, "скопирован только тронутый кусок");
+        assert_ne!(before.stamp(), m.stamp(), "после правки — новый отпечаток");
+        assert_ne!(m, before);
+        assert_eq!((before.get(p.0, p.1), m.get(p.0, p.1)), (orig, 7), "копия не изменилась");
+        // Тот же байт ещё раз — не правка.
+        let s = m.stamp();
+        m.set(2 * CHUNK + 1, 2 * CHUNK + 1, 7);
+        assert_eq!(m.stamp(), s);
+        // Залитое снова целиком — кусок без памяти.
+        let mut f = Mask::new(CHUNK, CHUNK);
+        f.set(3, 3, 9);
+        assert_eq!(f.data_chunks(), 1);
+        f.set(3, 3, 0);
+        f.compact();
+        assert_eq!(f.data_chunks(), 0);
+        assert!(f.is_empty());
     }
 }

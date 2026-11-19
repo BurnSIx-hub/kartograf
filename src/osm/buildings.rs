@@ -118,9 +118,11 @@ pub(super) fn house_shadows(m: &mut Map, areas: &[Area], cell_m: f32) {
         return;
     }
     let template = &m.rooms;
-    let out = m.shade.get_or_insert_with(|| Mask { data: vec![0; template.data.len()], ..template.clone() });
-    for (d, s) in out.data.iter_mut().zip(shade) {
-        *d = (*d).max(s);
+    let out = m.shade.get_or_insert_with(|| template.blank_like());
+    for (k, s) in shade.into_iter().enumerate() {
+        if s > out.at(k) {
+            out.put(k, s);
+        }
     }
 }
 
@@ -132,7 +134,7 @@ pub(super) fn shadow_mask(solids: &[Solid], w: usize, h: usize, light: [f32; 2])
     let tallest = solids.iter().map(|s| s.1).fold(0.0f32, f32::max);
     let pad = (tallest / crate::roofs::SUN_RISE).min(HOUSE_SHADE_REACH).ceil() as usize + 1;
     let (pw, ph) = (w + 2 * pad * mask::RES, h + 2 * pad * mask::RES);
-    let grid = Mask { w: pw, h: ph, data: Vec::new() };
+    let grid = Mask::new(pw, ph);
     let mut top = vec![0.0f32; pw * ph];
     let mut indoor = vec![false; pw * ph];
     let mut under = vec![false; pw * ph];

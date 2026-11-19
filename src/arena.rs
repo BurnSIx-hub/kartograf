@@ -777,7 +777,7 @@ mod tests {
         let walk = |dx: f32, dy: f32| -> Vec<u8> {
             (0..64).map(|k| {
                 let (x, y) = (20.0 + dx * k as f32 * 0.25, 15.0 + dy * k as f32 * 0.25);
-                sh.data[(y * 4.0) as usize * sh.w + (x * 4.0) as usize]
+                sh.at((y * 4.0) as usize * sh.w + (x * 4.0) as usize)
             }).collect()
         };
         let sun = walk(-1.0, -0.75);

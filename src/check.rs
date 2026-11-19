@@ -874,16 +874,25 @@ const BIG: f64 = 3.0;
 /// За краем карты — поле: край карты не стена, у леса и улицы за ним то же самое.
 const PAD: f64 = 2.0;
 
+// Признаки точки сетки прохода — битами в одном байте. На карте 1000×1000 сетка в 1/10
+// клетки — сто миллионов точек, и прежние массивы на каждый признак, метки обхода и номера
+// кусков свободного места брали больше двух гигабайт.
+/// Точку закрывает стена или то, что поставлено загородить.
+const WALL: u8 = 1;
+/// Точку закрывает стена или предмет.
+const BLK: u8 = 2;
+/// Через точку идёт сама линия стены.
+const LINE: u8 = 4;
+const DOOR: u8 = 8;
+/// Свободная точка уже отнесена к куску свободного места (закутку или большому).
+const SEEN: u8 = 16;
+/// Свободная точка в куске не меньше `big_part`.
+const ROOMY: u8 = 32;
+
 struct Pass {
     pw: usize,
     ph: usize,
-    /// Точку закрывает стена или то, что поставлено загородить.
-    wall: Vec<bool>,
-    /// Точку закрывает стена или предмет.
-    blk: Vec<bool>,
-    /// Через точку идёт сама линия стены.
-    line: Vec<bool>,
-    door: Vec<bool>,
+    flag: Vec<u8>,
     /// Точка → предметы (номера в карте), которые её закрывают.
     own: HashMap<usize, Vec<usize>>,
     cells: HashMap<usize, Vec<usize>>,
@@ -893,13 +902,19 @@ struct Pass {
     min_part: usize,
     big_part: usize,
     far: u32,
-    /// Метки обхода: точка пройдена, если `stamp[c] == round`.
-    stamp: Vec<u32>,
-    step: Vec<u32>,
-    round: u32,
 }
 
 impl Pass {
+    #[inline]
+    fn is(&self, c: usize, f: u8) -> bool {
+        self.flag[c] & f != 0
+    }
+
+    #[inline]
+    fn mark(&mut self, c: usize, f: u8) {
+        self.flag[c] |= f;
+    }
+
     fn span(&self, lo: f64, hi: f64, n: usize) -> std::ops::RangeInclusive<usize> {
         let a = trunc((lo + PAD) / PS).max(0) as usize;
         let b = trunc((hi + PAD) / PS).min(n as i64 - 1);
@@ -943,10 +958,9 @@ impl Pass {
 
     fn mark_wall(&mut self, cells: Vec<(usize, f64)>) {
         for (c, d2) in cells {
-            self.wall[c] = true;
-            self.blk[c] = true;
+            self.mark(c, WALL | BLK);
             if d2 < 0.5625 * PS * PS {
-                self.line[c] = true;
+                self.mark(c, LINE);
             }
         }
     }
@@ -999,19 +1013,14 @@ impl Pass {
         k
     }
 
-    fn fresh(&mut self) -> u32 {
-        self.round += 1;
-        self.round
-    }
-
     /// Куда фишка дойдёт от куска свободного места не дальше `far` шагов; `None` — дошла до `stop`.
+    /// Метки обхода — свои у каждого обхода: он ходит рядом, а не по всей карте.
     fn side(&mut self, src: &[usize], stop: Option<(&HashMap<usize, usize>, usize)>) -> Option<Vec<usize>> {
-        let g = self.fresh();
+        let mut step: HashMap<usize, u32> = HashMap::with_capacity(src.len() * 4);
         let mut todo: Vec<usize> = Vec::with_capacity(src.len() * 4);
         for &c in src {
-            if self.stamp[c] != g {
-                self.stamp[c] = g;
-                self.step[c] = 0;
+            if let std::collections::hash_map::Entry::Vacant(e) = step.entry(c) {
+                e.insert(0);
                 todo.push(c);
             }
         }
@@ -1022,15 +1031,13 @@ impl Pass {
             if stop.is_some_and(|(part, s)| part.get(&c) == Some(&s)) {
                 return None;
             }
-            if self.step[c] >= self.far {
+            if step[&c] >= self.far {
                 continue;
             }
-            let next = self.step[c] + 1;
-            let near: Vec<usize> = self.near(c).collect();
-            for q in near {
-                if !self.blk[q] && self.stamp[q] != g {
-                    self.stamp[q] = g;
-                    self.step[q] = next;
+            let next = step[&c] + 1;
+            for q in self.near(c) {
+                if !self.is(q, BLK) && !step.contains_key(&q) {
+                    step.insert(q, next);
                     todo.push(q);
                 }
             }
@@ -1040,24 +1047,21 @@ impl Pass {
 
     /// Касается ли препятствие, в которое входят эти предметы, стены: остров посреди поляны — нет.
     fn walled(&mut self, group: &[usize]) -> bool {
-        let g = self.fresh();
+        let mut seen: HashSet<usize> = HashSet::new();
         let mut todo = Vec::new();
         for k in group {
             for &c in &self.cells[k] {
-                if self.stamp[c] != g {
-                    self.stamp[c] = g;
+                if seen.insert(c) {
                     todo.push(c);
                 }
             }
         }
         while let Some(c) = todo.pop() {
-            if self.wall[c] {
+            if self.is(c, WALL) {
                 return true;
             }
-            let near: Vec<usize> = self.near(c).collect();
-            for q in near {
-                if self.blk[q] && self.stamp[q] != g {
-                    self.stamp[q] = g;
+            for q in self.near(c) {
+                if self.is(q, BLK) && seen.insert(q) {
                     todo.push(q);
                 }
             }
@@ -1066,7 +1070,7 @@ impl Pass {
     }
 
     fn goes(&self, side: &[usize]) -> bool {
-        side.iter().any(|&c| self.door[c]) || side.iter().filter(|&&c| self.on_map(c)).count() >= self.big_part
+        side.iter().any(|&c| self.is(c, DOOR)) || side.iter().filter(|&&c| self.on_map(c)).count() >= self.big_part
     }
 
     /// Перегородили ли эти предметы проход: убери их — и куски свободного места рядом соединятся,
@@ -1075,7 +1079,7 @@ impl Pass {
         let mut own: Vec<usize> = Vec::new();
         for k in group {
             for &c in &self.cells[k] {
-                if !self.wall[c] && self.own.get(&c).is_some_and(|ks| ks.iter().all(|q| group.contains(q))) {
+                if !self.is(c, WALL) && self.own.get(&c).is_some_and(|ks| ks.iter().all(|q| group.contains(q))) {
                     own.push(c);
                 }
             }
@@ -1097,7 +1101,7 @@ impl Pass {
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let c0 = j * pw + i;
-                if self.blk[c0] || part.contains_key(&c0) {
+                if self.is(c0, BLK) || part.contains_key(&c0) {
                     continue;
                 }
                 let n = parts.len();
@@ -1106,7 +1110,7 @@ impl Pass {
                 while let Some(c) = todo.pop() {
                     cells.push(c);
                     for q in self.near(c) {
-                        if inside(q) && !self.blk[q] && !part.contains_key(&q) {
+                        if inside(q) && !self.is(q, BLK) && !part.contains_key(&q) {
                             part.insert(q, n);
                             todo.push(q);
                         }
@@ -1132,7 +1136,7 @@ impl Pass {
                     if seen.contains(&q) || !inside(q) {
                         continue;
                     }
-                    if !self.blk[q] {
+                    if !self.is(q, BLK) {
                         touched.insert(part[&q]);
                     } else if own_set.contains(&q) {
                         seen.insert(q);
@@ -1182,10 +1186,7 @@ fn passage(c: &mut Ctx) {
     let mut p = Pass {
         pw,
         ph,
-        wall: vec![false; n],
-        blk: vec![false; n],
-        line: vec![false; n],
-        door: vec![false; n],
+        flag: vec![0; n],
         own: HashMap::new(),
         cells: HashMap::new(),
         group: HashMap::new(),
@@ -1193,9 +1194,6 @@ fn passage(c: &mut Ctx) {
         min_part: trunc(0.2 / PS / PS) as usize,
         big_part: trunc(BIG / PS / PS) as usize,
         far: trunc(DETOUR / PS) as u32,
-        stamp: vec![0; n],
-        step: vec![0; n],
-        round: 0,
     };
     let open: Vec<&Door> = inp.doors.iter().filter(|d| !d.window).collect();
     for l in &inp.walls {
@@ -1215,7 +1213,7 @@ fn passage(c: &mut Ctx) {
     }
     for d in &open {
         for (q, _) in p.seg(d.a, d.b, 0.45) {
-            p.door[q] = true;
+            p.mark(q, DOOR);
         }
     }
     let mut order = Vec::new(); // предметы прохода в порядке карты
@@ -1228,8 +1226,7 @@ fn passage(c: &mut Ctx) {
         let cells = obj_cells(&p, o);
         if c.has(k, HEAP) || c.has(k, P_BARRIER) {
             for &q in &cells {
-                p.wall[q] = true;
-                p.blk[q] = true;
+                p.mark(q, WALL | BLK);
             }
             continue;
         }
@@ -1238,7 +1235,7 @@ fn passage(c: &mut Ctx) {
         by_index.insert(i, k);
         p.group.insert(i, i);
         for &q in &cells {
-            p.blk[q] = true;
+            p.mark(q, BLK);
             if let Some(first) = p.own.get(&q).map(|v| v[0]) {
                 let (a, b) = (p.top(first), p.top(i));
                 p.group.insert(a, b);
@@ -1249,51 +1246,62 @@ fn passage(c: &mut Ctx) {
         }
         p.cells.insert(i, cells);
     }
-    // Свободное место целиком: куски, между которыми фишке не пройти.
-    let mut glab = vec![usize::MAX; n];
-    let mut gsize = Vec::new();
-    for c0 in 0..n {
-        if p.blk[c0] || glab[c0] != usize::MAX {
-            continue;
-        }
-        let id = gsize.len();
-        glab[c0] = id;
-        let (mut todo, mut cnt) = (vec![c0], 0usize);
-        while let Some(q0) = todo.pop() {
-            cnt += 1;
-            for q in p.near(q0) {
-                if !p.blk[q] && glab[q] == usize::MAX {
-                    glab[q] = id;
-                    todo.push(q);
-                }
-            }
-        }
-        gsize.push(cnt);
-    }
     // Закуток, куда не попасть (щель между опрокинутой капсулой и дроном), — не проход: он закрыт
     // теми предметами, что его окружают, и связывает их в одно препятствие. Закуток с дверью — чулан.
-    let mut nooks: Vec<(usize, Vec<usize>)> = Vec::new();
-    let mut nook_of: HashMap<usize, usize> = HashMap::new();
-    for q in 0..n {
-        if !p.blk[q] && gsize[glab[q]] < p.big_part {
-            let at = *nook_of.entry(glab[q]).or_insert_with(|| {
-                nooks.push((glab[q], Vec::new()));
-                nooks.len() - 1
-            });
-            nooks[at].1.push(q);
+    // Закуток — кусок свободного места меньше `big_part` точек. Всякий кусок, кроме всей сетки
+    // разом, касается закрытой точки, поэтому куски ищутся от свободных соседей закрытых, и поиск
+    // бросается, как только кусок дорос до `big_part` или упёрся в уже известный большой: заливать
+    // всё свободное место карты не нужно.
+    let mut nooks: Vec<Vec<usize>> = Vec::new();
+    for b in 0..n {
+        if !p.is(b, BLK) {
+            continue;
+        }
+        let seeds: Vec<usize> = p.near(b).filter(|&q| !p.is(q, BLK | SEEN)).collect();
+        for s in seeds {
+            if p.is(s, SEEN) {
+                continue;
+            }
+            p.mark(s, SEEN);
+            let (mut part, mut k, mut roomy) = (vec![s], 0, false);
+            while k < part.len() && !roomy {
+                let c = part[k];
+                k += 1;
+                let around: Vec<usize> = p.near(c).filter(|&q| !p.is(q, BLK)).collect();
+                for q in around {
+                    if p.is(q, SEEN) {
+                        // Отмеченная соседняя свободная точка — своя же или из большого куска.
+                        roomy |= p.is(q, ROOMY);
+                    } else {
+                        p.mark(q, SEEN);
+                        part.push(q);
+                    }
+                }
+                roomy |= part.len() >= p.big_part;
+            }
+            if roomy {
+                for &c in &part {
+                    p.mark(c, ROOMY);
+                }
+            } else {
+                part.sort_unstable();
+                nooks.push(part);
+            }
         }
     }
-    for (_, cells) in nooks {
-        if cells.iter().any(|&q| p.door[q]) {
+    // Как прежде, когда заливалось всё: по первой точке куска.
+    nooks.sort_by_key(|cells| cells[0]);
+    for cells in nooks {
+        if cells.iter().any(|&q| p.is(q, DOOR)) {
             continue;
         }
         let mut around: Vec<usize> = cells.iter().flat_map(|&q| p.near(q).collect::<Vec<_>>()).filter_map(|q| p.own.get(&q).cloned()).flatten().collect();
         around.sort_unstable();
         around.dedup();
         for &q in &cells {
-            p.blk[q] = true;
+            p.mark(q, BLK);
             if around.is_empty() {
-                p.wall[q] = true;
+                p.mark(q, WALL);
             } else {
                 p.own.insert(q, around.clone());
             }
@@ -1401,7 +1409,7 @@ fn obj_cells(p: &Pass, o: &Obj) -> Vec<usize> {
         }
     }
     let c0 = p.cell(x, y);
-    if !cells.contains(&c0) || p.line[c0] {
+    if !cells.contains(&c0) || p.is(c0, LINE) {
         let mut v: Vec<usize> = cells.into_iter().collect();
         v.sort_unstable();
         return v; // середина на самой стене: предмет стоит поперёк неё
@@ -1409,7 +1417,7 @@ fn obj_cells(p: &Pass, o: &Obj) -> Vec<usize> {
     let (mut seen, mut todo) = (HashSet::from([c0]), vec![c0]);
     while let Some(q0) = todo.pop() {
         for q in p.near(q0) {
-            if cells.contains(&q) && seen.insert(q) && !p.line[q] {
+            if cells.contains(&q) && seen.insert(q) && !p.is(q, LINE) {
                 todo.push(q);
             }
         }

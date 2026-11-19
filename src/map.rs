@@ -17,7 +17,12 @@ use crate::mask::{self, Mask};
 use serde::{Deserialize, Serialize};
 
 pub const EXT: &str = "karta";
-pub const FORMAT: u32 = 2;
+/// 3 — маски кусками ([`crate::mask`]); 2 и 1 читаются.
+pub const FORMAT: u32 = 3;
+
+/// Наибольшая сторона карты, клеток. Маски кусками держат память по нарисованному, а не
+/// по размеру: пустая карта 1000×1000 — столько же, сколько 40×40.
+pub const MAX_SIDE: u32 = 1000;
 
 /// Чем закрашено: цветом или картинкой с диска.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1956,21 +1961,21 @@ fn lay(coats: &mut Vec<Coat>, material: u8, template: &Mask, weights: &[(usize, 
     let k = match coats.iter().position(|c| c.material == material) {
         Some(k) => k,
         None => {
-            coats.push(Coat { material, mask: Mask { data: vec![0; template.data.len()], ..template.clone() } });
+            coats.push(Coat { material, mask: template.blank_like() });
             coats.len() - 1
         }
     };
     for &(i, v) in weights {
         for (n, c) in coats.iter_mut().enumerate() {
-            let x = c.mask.data[i] as f32;
-            c.mask.data[i] = if n == k { (x + v * (255.0 - x)).round() as u8 } else { (x * (1.0 - v)).round() as u8 };
+            let x = c.mask.at(i) as f32;
+            c.mask.put(i, if n == k { (x + v * (255.0 - x)).round() as u8 } else { (x * (1.0 - v)).round() as u8 });
         }
     }
 }
 
 fn fade(mask: &mut Mask, weights: &[(usize, f32)]) {
     for &(i, v) in weights {
-        mask.data[i] = (mask.data[i] as f32 * (1.0 - v)).round() as u8;
+        mask.put(i, (mask.at(i) as f32 * (1.0 - v)).round() as u8);
     }
 }
 
@@ -2040,14 +2045,14 @@ impl Map {
     /// Мазок: материал `material` кладётся по весам; для комнат растёт и сама комната.
     pub fn paint(&mut self, layer: Layer, material: usize, weights: &[(usize, f32)]) {
         let m = material as u8;
-        let template = self.rooms.clone();
+        let template = self.rooms.blank_like();
         match layer {
             Layer::Floor => lay(&mut self.terrain, m, &template, weights),
             Layer::Rooms => {
                 lay(&mut self.room_floor, m, &template, weights);
                 for &(i, v) in weights {
-                    let x = self.rooms.data[i] as f32;
-                    self.rooms.data[i] = (x + v * (255.0 - x)).round() as u8;
+                    let x = self.rooms.at(i) as f32;
+                    self.rooms.put(i, (x + v * (255.0 - x)).round() as u8);
                 }
             }
         }
@@ -2080,10 +2085,10 @@ impl Map {
     /// ступени 20/40/60% ложатся ровно, сколько ни води.
     pub fn shade_paint(&mut self, weights: &[(usize, f32)], level: f32) {
         let template = &self.rooms;
-        let m = self.shade.get_or_insert_with(|| Mask { data: vec![0; template.data.len()], ..template.clone() });
+        let m = self.shade.get_or_insert_with(|| template.blank_like());
         for &(i, v) in weights {
             let t = (level * v * 255.0).round().clamp(0.0, 255.0) as u8;
-            m.data[i] = m.data[i].max(t);
+            m.put(i, m.at(i).max(t));
         }
     }
 
@@ -2093,8 +2098,10 @@ impl Map {
         }
     }
 
-    /// Выбросить опустевшие слои — после мазка.
+    /// Выбросить опустевшие слои — после мазка. Куски масок, ставшие одной силы
+    /// (залитые целиком, стёртые), — снова без памяти под точки.
     pub fn prune(&mut self) {
+        self.compact();
         if self.shade.as_ref().is_some_and(|m| m.is_empty()) {
             self.shade = None;
         }
@@ -2106,6 +2113,17 @@ impl Map {
         }
         self.terrain.retain(|c| !c.mask.is_empty());
         self.room_floor.retain(|c| !c.mask.is_empty());
+    }
+
+    /// Сжать правленые куски всех масок этажа (см. [`Mask::compact`]).
+    pub fn compact(&mut self) {
+        for c in self.terrain.iter_mut().chain(self.room_floor.iter_mut()) {
+            c.mask.compact();
+        }
+        self.rooms.compact();
+        if let Some(s) = &mut self.shade {
+            s.compact();
+        }
     }
 
     /// Целые клетки прямоугольника. `true` — что-то поменялось.
@@ -2255,16 +2273,29 @@ impl Map {
     }
 
     pub fn material_mask(&self, m: usize) -> Mask {
-        let mut out = Mask { data: vec![0; self.rooms.data.len()], ..self.rooms.clone() };
-        for c in self.terrain.iter().filter(|c| c.material as usize == m) {
-            for (o, v) in out.data.iter_mut().zip(&c.mask.data) {
-                *o = (*o).max(*v);
+        let mut out = self.rooms.blank_like();
+        let (w, h) = (out.w, out.h);
+        let pick = |mask: &Mask, rooms: Option<&Mask>, out: &mut Mask| {
+            for j in 0..h {
+                for i in 0..w {
+                    // Пустой кусок слоя ничего не добавит.
+                    if mask.uniform_at(i, j) == Some(0) {
+                        continue;
+                    }
+                    let v = mask.get(i as isize, j as isize);
+                    let v = rooms.map_or(v, |r| v.min(r.get(i as isize, j as isize)));
+                    let o = out.get(i as isize, j as isize);
+                    if v > o {
+                        out.set(i, j, v);
+                    }
+                }
             }
+        };
+        for c in self.terrain.iter().filter(|c| c.material as usize == m) {
+            pick(&c.mask, None, &mut out);
         }
         for c in self.room_floor.iter().filter(|c| c.material as usize == m) {
-            for ((o, v), r) in out.data.iter_mut().zip(&c.mask.data).zip(&self.rooms.data) {
-                *o = (*o).max((*v).min(*r));
-            }
+            pick(&c.mask, Some(&self.rooms), &mut out);
         }
         let res = mask::RES as f32;
         for p in self.paths.iter().filter(|p| p.material == m) {
@@ -2276,12 +2307,13 @@ impl Map {
                 for j in cl(lo[1], out.h)..cl(hi[1] + 1.0 / res, out.h) {
                     for i in cl(lo[0], out.w)..cl(hi[0] + 1.0 / res, out.w) {
                         if segment_distance(mask::sample_pos(i as isize, j as isize), w[0], w[1]) <= hw {
-                            out.data[j * out.w + i] = 255;
+                            out.set(i, j, 255);
                         }
                     }
                 }
             }
         }
+        out.compact();
         out
     }
 
@@ -2430,7 +2462,13 @@ impl Map {
         if format > FORMAT {
             return Err(format!("карта записана более новой версией (формат {format})"));
         }
-        let map = if format == 1 { Self::from_v1(serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))?)? } else { serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))? };
+        let mut map: Map = if format == 1 { Self::from_v1(serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))?)? } else { serde_json::from_value(value).map_err(|e| format!("файл не читается как карта: {e}"))? };
+        // Прочитанная карта в памяти — уже нынешнего устройства: сохранится она нынешним
+        // форматом, и старая программа скажет, что файл новее, а не споткнётся о маски.
+        map.format = FORMAT;
+        for l in &mut map.levels {
+            l.format = FORMAT;
+        }
         let (w, h) = (map.width as usize * mask::RES, map.height as usize * mask::RES);
         let fits = |m: &Mask| m.w == w && m.h == h;
         if map.width == 0 || map.height == 0 || !fits(&map.rooms) || map.shade.as_ref().is_some_and(|m| !fits(m)) || map.relief.as_ref().is_some_and(|r| r.w != map.rooms.w || r.h != map.rooms.h) || !map.terrain.iter().chain(&map.room_floor).all(|c| fits(&c.mask)) {
@@ -2514,7 +2552,7 @@ mod tests {
         // Палуба 4×3 с комнатой, стеной, дверью, предметом и крышей; поле слева 2, сверху 1.
         let mut m = Map::new(4, 3);
         m.rooms = m.rooms.padded(4, 3, 0, 0);
-        m.rooms.data[(crate::mask::RES * 1 + 1) * m.rooms.w + crate::mask::RES + 1] = 255;
+        m.rooms.set(crate::mask::RES + 1, crate::mask::RES * 1 + 1, 255);
         m.walls.push(Wall { points: vec![[0.0, 0.0], [4.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         m.portals.push(Portal { a: [1.0, 3.0], b: [2.0, 3.0], kind: PortalKind::Door, asset: None, frame: None });
         m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
@@ -2527,7 +2565,7 @@ mod tests {
         assert_eq!((m.width, m.height), (9, 4));
         assert_eq!((m.rooms.w, m.rooms.h), (9 * crate::mask::RES, 4 * crate::mask::RES));
         let r = crate::mask::RES;
-        assert_eq!(m.rooms.data[(r * 2 + 1) * m.rooms.w + r * 3 + 1], 255, "комната на клетку ниже и на две правее");
+        assert_eq!(m.rooms.at((r * 2 + 1) * m.rooms.w + r * 3 + 1), 255, "комната на клетку ниже и на две правее");
         assert_eq!(m.walls[0].points, vec![[2.0, 1.0], [6.0, 1.0]]);
         assert_eq!((m.portals[0].a, m.portals[0].b), ([3.0, 4.0], [4.0, 4.0]));
         assert_eq!(m.props[0].pos, [5.5, 2.5]);
@@ -2608,7 +2646,7 @@ mod tests {
         let w = mask::cells(m.rooms.w, m.rooms.h, (0, 0), (1, 1));
         m.shade_paint(&w, 0.4);
         m.shade_paint(&w, 0.4);
-        assert_eq!(m.shade.as_ref().unwrap().data[0], 102);
+        assert_eq!(m.shade.as_ref().unwrap().at(0), 102);
         m.shade_fade(&w);
         m.prune();
         assert!(m.shade.is_none());
@@ -2732,8 +2770,8 @@ mod tests {
             // Рисование поверх: остаток фона — произведение (1 − прозрачность).
             let mut background = 1.0;
             for (k, c) in m.terrain.iter().enumerate() {
-                let above = m.terrain[k + 1..].iter().map(|c| c.mask.data[i] as u32).sum();
-                background *= 1.0 - coat_alpha(c.mask.data[i], above) as f32 / 255.0;
+                let above = m.terrain[k + 1..].iter().map(|c| c.mask.at(i) as u32).sum();
+                background *= 1.0 - coat_alpha(c.mask.at(i), above) as f32 / 255.0;
             }
             assert!(background < 0.02, "в точке {i} просвечивает фон: {background:.2}");
         }
@@ -2877,7 +2915,7 @@ mod tests {
         for j in 0..m.h {
             for i in 0..m.w {
                 if (i as f32 + 0.5) / crate::mask::RES as f32 >= 4.0 {
-                    m.data[j * m.w + i] = 255;
+                    m.set(i, j, 255);
                 }
             }
         }
@@ -2903,6 +2941,27 @@ mod tests {
         assert!(!json.contains("light") && !json.contains("canopy"));
         let back: Prop = serde_json::from_str(&json).unwrap();
         assert_eq!(back, prop("builtin:tree"));
+    }
+
+    /// Свои карты пользователя: прочитать, записать нынешним форматом, прочитать снова —
+    /// то же самое. Файлы — в `KARTA_FILES` через `;`. Запуск:
+    /// `KARTA_FILES=… cargo test --release real_maps_round_trip -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_maps_round_trip() {
+        let files = std::env::var("KARTA_FILES").expect("KARTA_FILES");
+        for f in files.split(';').filter(|f| !f.is_empty()) {
+            let text = std::fs::read_to_string(f).expect(f);
+            let t0 = std::time::Instant::now();
+            let a = Map::from_json(&text).expect(f);
+            let t1 = std::time::Instant::now();
+            let json = a.to_json();
+            let t2 = std::time::Instant::now();
+            let b = Map::from_json(&json).expect(f);
+            assert_eq!(a, b, "{f}");
+            let chunks: usize = std::iter::once(&a).chain(&a.levels).map(|m| m.rooms.data_chunks() + m.terrain.iter().chain(&m.room_floor).map(|c| c.mask.data_chunks()).sum::<usize>()).sum();
+            println!("{f}: {:.0} → {:.0} КБ, чтение {:.0} мс, запись {:.0} мс, кусков с точками {chunks}", text.len() as f64 / 1024.0, json.len() as f64 / 1024.0, (t1 - t0).as_secs_f64() * 1000.0, (t2 - t1).as_secs_f64() * 1000.0);
+        }
     }
 
     #[test]

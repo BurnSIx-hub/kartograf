@@ -301,7 +301,7 @@ pub(super) struct Blocked {
 
 impl Blocked {
     pub(super) fn new(m: &Map) -> Self {
-        let cells = m.rooms.data.iter().map(|&v| v >= 128).collect();
+        let cells = m.rooms.values().map(|v| v >= 128).collect();
         Self { w: m.rooms.w, h: m.rooms.h, cells }
     }
 

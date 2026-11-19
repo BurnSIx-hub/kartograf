@@ -469,7 +469,7 @@ fn shade_wall(m: &mut Map, wy: i32, towers: &[Tower], gate: Room, y_in: i32) {
             let x = (i as f32 + 0.5) / res;
             let k = j * mw + i;
             let band = y >= wy as f32 && y < (wy + THICK) as f32;
-            let built = m.rooms.data[k] >= 128 && (y >= gate.y as f32 || towers.iter().any(|t| x >= t.x as f32 && x < (t.x + t.width()) as f32));
+            let built = m.rooms.at(k) >= 128 && (y >= gate.y as f32 || towers.iter().any(|t| x >= t.x as f32 && x < (t.x + t.width()) as f32));
             if band || built {
                 height[k] = WALL_H;
             }
@@ -528,12 +528,14 @@ fn shade_wall(m: &mut Map, wy: i32, towers: &[Tower], gate: Room, y_in: i32) {
 /// по своим номерам в `m`.
 fn paste(m: &mut Map, s: &Map, dy: i32) {
     let off = dy as usize * mask::RES * m.rooms.w;
-    let n = s.rooms.data.len().min(m.rooms.data.len() - off);
+    let n = s.rooms.len().min(m.rooms.len() - off);
     let remap: Vec<u8> = s.materials.iter().map(|mt| m.material_index(mt.clone()).unwrap_or(0) as u8).collect();
-    let blank = Mask { data: vec![0; m.rooms.data.len()], ..m.rooms.clone() };
+    let blank = m.rooms.blank_like();
     let copy = |dst: &mut Vec<crate::map::Coat>, src: &[crate::map::Coat]| {
         for c in dst.iter_mut() {
-            c.mask.data[off..off + n].fill(0);
+            for k in off..off + n {
+                c.mask.put(k, 0);
+            }
         }
         for c in src {
             let mat = remap[c.material as usize];
@@ -544,15 +546,21 @@ fn paste(m: &mut Map, s: &Map, dy: i32) {
                     dst.len() - 1
                 }
             };
-            dst[k].mask.data[off..off + n].copy_from_slice(&c.mask.data[..n]);
+            for p in 0..n {
+                dst[k].mask.put(off + p, c.mask.at(p));
+            }
         }
     };
     copy(&mut m.terrain, &s.terrain);
     copy(&mut m.room_floor, &s.room_floor);
-    m.rooms.data[off..off + n].copy_from_slice(&s.rooms.data[..n]);
+    for p in 0..n {
+        m.rooms.put(off + p, s.rooms.at(p));
+    }
     if let Some(ss) = &s.shade {
         let sh = m.shade.get_or_insert_with(|| blank.clone());
-        sh.data[off..off + n].copy_from_slice(&ss.data[..n]);
+        for p in 0..n {
+            sh.put(off + p, ss.at(p));
+        }
     }
     let d = dy as f32;
     let down = |p: [f32; 2]| [p[0], p[1] + d];
