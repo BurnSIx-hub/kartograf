@@ -45,12 +45,16 @@ pub struct Mask {
     touched: Vec<u64>,
     /// Отпечаток содержимого; 0 — правили, новый выдаст [`Mask::stamp`].
     stamp: AtomicU64,
+    /// Отпечатки кусков, как `stamp`, но по куску: отрисовка перестраивает только те
+    /// куски земли, чей отпечаток (или соседей) сменился.
+    gens: Vec<AtomicU64>,
 }
 
 impl Clone for Mask {
     fn clone(&self) -> Self {
         // Отпечаток — до копии: иначе копия и оригинал получили бы разные, хотя одинаковы.
-        Self { w: self.w, h: self.h, nx: self.nx, chunks: self.chunks.clone(), touched: self.touched.clone(), stamp: AtomicU64::new(self.stamp()) }
+        let gens = (0..self.chunks.len()).map(|c| AtomicU64::new(self.chunk_gen(c))).collect();
+        Self { w: self.w, h: self.h, nx: self.nx, chunks: self.chunks.clone(), touched: self.touched.clone(), stamp: AtomicU64::new(self.stamp()), gens }
     }
 }
 
@@ -79,7 +83,7 @@ impl Mask {
     pub fn filled(w: usize, h: usize, v: u8) -> Self {
         let nx = w.div_ceil(CHUNK);
         let ny = h.div_ceil(CHUNK);
-        Self { w, h, nx, chunks: vec![Chunk::Fill(v); nx * ny], touched: vec![0; (nx * ny).div_ceil(64)], stamp: AtomicU64::new(0) }
+        Self { w, h, nx, chunks: vec![Chunk::Fill(v); nx * ny], touched: vec![0; (nx * ny).div_ceil(64)], stamp: AtomicU64::new(0), gens: (0..nx * ny).map(|_| AtomicU64::new(0)).collect() }
     }
 
     /// Пустая маска `w × h` точек.
@@ -173,6 +177,7 @@ impl Mask {
         }
         self.touched[c >> 6] |= 1 << (c & 63);
         self.stamp.store(0, Ordering::Relaxed);
+        self.gens[c].store(0, Ordering::Relaxed);
     }
 
     /// Поставить силу точки по номеру строками.
@@ -285,6 +290,31 @@ impl Mask {
             let a = self.get_u(i, j);
             self.set(i, j, a.saturating_add(v));
         });
+    }
+
+    /// Кусков по горизонтали и по вертикали.
+    pub fn chunks_wh(&self) -> (usize, usize) {
+        (self.nx, self.chunks.len() / self.nx.max(1))
+    }
+
+    /// Отпечаток куска `c`: тот же — содержимое куска то же. У куска одной силы он по
+    /// самой силе: одинаковые залитые куски разных слоёв и шагов отмены совпадают.
+    pub fn chunk_gen(&self, c: usize) -> u64 {
+        match self.chunks.get(c) {
+            None => 0,
+            Some(Chunk::Fill(v)) => (1 << 63) | *v as u64,
+            Some(Chunk::Data(_)) => {
+                let g = self.gens[c].load(Ordering::Relaxed);
+                if g != 0 {
+                    return g;
+                }
+                let fresh = STAMPS.fetch_add(1, Ordering::Relaxed);
+                match self.gens[c].compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => fresh,
+                    Err(now) => now,
+                }
+            }
+        }
     }
 
     /// Сколько кусков держат свои точки (для замеров памяти).

@@ -2,20 +2,69 @@
 
 use super::*;
 
+/// Кусок земли (слоя на кусок маски), собранный в координатах карты: вершины в клетках.
+/// Каждый кадр он только переводится в точки экрана — сила вершин, кривые на краю и узор
+/// считаются заново, лишь когда сменился сам кусок маски, его соседи или слои над ним.
+struct GroundMesh {
+    key: u64,
+    verts: Vec<egui::epaint::Vertex>,
+    idx: Vec<u32>,
+    used: u64,
+}
+
+/// Куски земли всех слоёв, что видны. Ключ — слой (`slot`) и номер куска маски.
+#[derive(Default)]
+pub(super) struct GroundCache {
+    pieces: std::collections::HashMap<(u64, u32), GroundMesh>,
+    bytes: usize,
+}
+
+/// Больше памяти под куски земли не держать: давно не видные выбрасываются.
+const GROUND_BUDGET: usize = 256 << 20;
+
+impl GroundCache {
+    /// Выбросить давно не видные куски, пока память сверх предела.
+    pub(super) fn trim(&mut self, frame: u64) {
+        if self.bytes <= GROUND_BUDGET {
+            return;
+        }
+        let mut old: Vec<((u64, u32), u64, usize)> = self.pieces.iter().filter(|(_, p)| p.used + 2 < frame).map(|(k, p)| (*k, p.used, piece_bytes(p))).collect();
+        old.sort_by_key(|o| o.1);
+        for (k, _, b) in old {
+            if self.bytes <= GROUND_BUDGET * 3 / 4 {
+                break;
+            }
+            self.pieces.remove(&k);
+            self.bytes -= b;
+        }
+    }
+
+    pub(super) fn stats(&self) -> serde_json::Value {
+        serde_json::json!({"pieces": self.pieces.len(), "mb": self.bytes / (1 << 20)})
+    }
+}
+
+fn piece_bytes(p: &GroundMesh) -> usize {
+    p.verts.len() * std::mem::size_of::<egui::epaint::Vertex>() + p.idx.len() * 4
+}
+
 impl App {
     /// Слой материала: сетка четырёхугольников по точкам маски, прозрачность вершины —
     /// сила слоя в ней. Края мягкой кисти так и получаются мягкими. `clip` — маска,
     /// за которую слой не выходит (пол комнат — за саму комнату). `above` — слои,
     /// которые лягут поверх: сила в маске — доля слоя в точке, а рисуются слои
     /// друг на друга, поэтому прозрачность пересчитывается (см. [`map::coat_alpha`]).
-    pub(super) fn draw_coat(&mut self, painter: &egui::Painter, canvas: Rect, coat: &Coat, above: &[Coat], clip: Option<&Mask>, view: Rect) {
+    /// `slot` — какой это слой (вид и номер): под ним кэшируются его куски.
+    pub(super) fn draw_coat(&mut self, painter: &egui::Painter, canvas: Rect, coat: &Coat, above: &[Coat], clip: Option<&Mask>, view: Rect, slot: u64) {
         let Some(material) = self.map.materials.get(coat.material as usize).cloned() else { return };
-        self.draw_mask(painter, canvas, &material, &coat.mask, above, clip, view);
+        self.draw_mask(painter, canvas, &material, &coat.mask, above, clip, view, slot);
     }
 
-    /// Маска, залитая материалом: сила точки — прозрачность.
+    /// Маска, залитая материалом: сила точки — прозрачность. Кусками маски: видимые куски
+    /// берутся из кэша и перестраиваются, только если в них (или у соседей, или в слоях
+    /// над ними) что-то поменялось.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_mask(&mut self, painter: &egui::Painter, canvas: Rect, material: &Material, m: &Mask, above: &[Coat], clip: Option<&Mask>, view: Rect) {
+    pub(super) fn draw_mask(&mut self, painter: &egui::Painter, canvas: Rect, material: &Material, m: &Mask, above: &[Coat], clip: Option<&Mask>, view: Rect, slot: u64) {
         let res = RES as f32;
         // Мельче четырёх точек экрана четырёхугольник не дробится: дальше глаз не различит,
         // а на большой карте издалека это сотни тысяч лишних вершин.
@@ -24,14 +73,17 @@ impl App {
         let clampi = |v: f32, hi: usize| (v.floor() as isize).clamp(-1, hi as isize);
         let (i0, i1) = (clampi(view.min.x * res - 1.0, m.w), clampi(view.max.x * res + 1.0, m.w));
         let (j0, j1) = (clampi(view.min.y * res - 1.0, m.h), clampi(view.max.y * res + 1.0, m.h));
-        // Начало шага кратно шагу: при сдвиге карты сетка не «плывёт».
-        let (i0, j0) = (i0 - i0.rem_euclid(step as isize), j0 - j0.rem_euclid(step as isize));
+        if i0 >= i1 || j0 >= j1 {
+            return;
+        }
         let (tex, tile, tint): (Option<egui::TextureId>, [f32; 2], [u8; 3]) = match &material.paint {
             Paint::Color(c) => (None, [1.0, 1.0], *c),
             Paint::Texture(key) => {
                 let key = if material.vary { format!("{}{key}", library::VARY) } else { key.clone() };
                 let failed = self.textures.failed(&key, false);
-                match self.textures.get(&key, false) {
+                // Плитка — того размера, что не мельче её на экране: точка картинки — столько точек экрана.
+                let k = self.cam.scale * self.canvas_ppp.max(1.0) / PX_PER_CELL;
+                match self.textures.get_scaled(&key, k) {
                     // Плитка — по размеру картинки, 256 точек на клетку, как в Dungeondraft.
                     Some((t, px)) => (Some(t.id()), [(px[0] as f32 / PX_PER_CELL).max(MIN_TILE), (px[1] as f32 / PX_PER_CELL).max(MIN_TILE)], [255, 255, 255]),
                     None if failed => (None, [1.0, 1.0], [160, 40, 40]),
@@ -39,121 +91,88 @@ impl App {
                 }
             }
         };
-        let share = |mask: &Mask, i: isize, j: isize| {
-            let v = mask.get(i, j);
-            clip.map_or(v, |c| v.min(c.get(i, j)))
+        // Вблизи четырёхугольник у края дробится мельче, сила между точками маски —
+        // по кривой Катмулла — Рома через соседние точки. По прямой между четырьмя
+        // углами край ложится ступеньками в шаг маски, по кривой — плавной линией.
+        let detail = if step == 1 { ((px / 6.0).ceil() as usize).clamp(1, 8) } else { 1 };
+        // Общая часть ключа: вид слоя, шаг, дробление, размер маски.
+        let base = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (tex, tile[0].to_bits(), tile[1].to_bits(), tint, material.rot.to_bits(), step, detail, m.w, m.h, above.len(), clip.is_some()).hash(&mut h);
+            h.finish()
         };
-        // За краем карты берётся крайняя точка: иначе слой тает к границе и у неё виден фон.
-        let (last_i, last_j) = (m.w as isize - 1, m.h as isize - 1);
-        let (map_w, map_h) = (m.w as f32 / res, m.h as f32 / res);
-        let value = |i: isize, j: isize| {
-            let (i, j) = (i.clamp(0, last_i), j.clamp(0, last_j));
-            let v = share(m, i, j);
-            if v == 0 {
-                return 0;
+        // Кэшируется кусками: чем мельче дробление вблизи, тем мельче кусок — вершин в куске
+        // не больше нескольких десятков тысяч, а за окном лишнего немного.
+        let tshift = match detail {
+            1 => 0,
+            2 => 1,
+            3 | 4 => 2,
+            _ => 3,
+        };
+        let tsz = mask::CHUNK >> tshift;
+        let (npw, nph) = (m.w.div_ceil(tsz).max(1), m.h.div_ceil(tsz).max(1));
+        let piece_of = |v: isize, n: usize| ((v.max(0) as usize) / tsz).min(n - 1);
+        let (px0, px1) = (piece_of(i0, npw), piece_of(i1 - 1, npw));
+        let (py0, py1) = (piece_of(j0, nph), piece_of(j1 - 1, nph));
+        // Отпечаток куска маски — по самому слою, слоям над ним и маске-ограде; ключ куска
+        // кэша — по отпечаткам своего куска маски и восьми соседей: квадраты у края берут
+        // точки соседа.
+        let mix = |h: u64, v: u64| (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let (nx, ny) = m.chunks_wh();
+        let (cx0, cx1) = ((px0 * tsz / mask::CHUNK).saturating_sub(1), ((px1 * tsz / mask::CHUNK) + 1).min(nx - 1));
+        let (cy0, cy1) = ((py0 * tsz / mask::CHUNK).saturating_sub(1), ((py1 * tsz / mask::CHUNK) + 1).min(ny - 1));
+        let cw = cx1 - cx0 + 1;
+        let mut own = vec![0u64; cw * (cy1 - cy0 + 1)];
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                let c = cy * nx + cx;
+                let mut h = mix(0x9e37_79b9_7f4a_7c15, m.chunk_gen(c));
+                for a in above {
+                    h = mix(h, a.mask.chunk_gen(c));
+                }
+                if let Some(cl) = clip {
+                    h = mix(h, cl.chunk_gen(c));
+                }
+                own[(cy - cy0) * cw + cx - cx0] = h;
             }
-            map::coat_alpha(v, above.iter().map(|c| share(&c.mask, i, j) as u32).sum())
-        };
+        }
+        let frame = self.frame;
+        let under = self.under_level as u64;
         let mut mesh = match tex {
             Some(id) => egui::Mesh::with_texture(id),
             None => egui::Mesh::default(),
         };
         let cam = self.cam;
-        // Узор повёрнут на `rot` по часовой: точка карты берёт плитку повёрнутой назад.
-        let (rs, rc) = material.rot.to_radians().sin_cos();
-        // Вершина в точке маски с дробными номерами (fx, fy) и силой `alpha`.
-        let vertex = |fx: f32, fy: f32, alpha: u8| {
-            let w = [((fx + 0.5) / res).clamp(0.0, map_w), ((fy + 0.5) / res).clamp(0.0, map_h)];
-            let color = match tex {
-                Some(_) => Color32::from_white_alpha(alpha),
-                None => Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], alpha),
-            };
-            // Цветной слой берёт белую точку атласа egui, текстурный — плитку.
-            let uv = if tex.is_some() { pos2((w[0] * rc + w[1] * rs) / tile[0], (w[1] * rc - w[0] * rs) / tile[1]) } else { egui::epaint::WHITE_UV };
-            egui::epaint::Vertex { pos: cam.to_screen(canvas, w), uv, color }
-        };
-        // Вблизи четырёхугольник у края дробится мельче, сила между точками маски —
-        // по кривой Катмулла — Рома через соседние точки. По прямой между четырьмя
-        // углами край ложится ступеньками в шаг маски, по кривой — плавной линией.
-        let detail = if step == 1 { ((px / 6.0).ceil() as usize).clamp(1, 8) } else { 1 };
-        let weights: Vec<[f32; 4]> = (0..=detail)
-            .map(|k| {
-                let t = k as f32 / detail as f32;
-                let (t2, t3) = (t * t, t * t * t);
-                [(-t3 + 2.0 * t2 - t) / 2.0, (3.0 * t3 - 5.0 * t2 + 2.0) / 2.0, (-3.0 * t3 + 4.0 * t2 + t) / 2.0, (t3 - t2) / 2.0]
-            })
-            .collect();
-        let s = step as isize;
-        let mut j = j0;
-        while j < j1 {
-            let mut i = i0;
-            while i < i1 {
-                let corners = [(i, j), (i + s, j), (i + s, j + s), (i, j + s)];
-                let a = corners.map(|(x, y)| value(x, y));
-                if a != [0; 4] {
-                    let mut near = [[0f32; 4]; 4];
-                    if detail > 1 {
-                        for (dy, row) in near.iter_mut().enumerate() {
-                            for (dx, v) in row.iter_mut().enumerate() {
-                                *v = value(i + dx as isize - 1, j + dy as isize - 1) as f32;
-                            }
-                        }
-                    }
-                    // Дробится не только сам край, но и соседи: кривая берёт точки на шаг
-                    // дальше, и стык мелкого с крупным иначе дал бы щель.
-                    let flat = near.iter().flatten().all(|&v| v == near[0][0]);
-                    let base = mesh.vertices.len() as u32;
-                    if detail > 1 && !flat {
-                        let n = detail;
-                        for (ky, wy) in weights.iter().enumerate() {
-                            for (kx, wx) in weights.iter().enumerate() {
-                                let sum: f32 = (0..4).map(|r| wy[r] * (0..4).map(|c| wx[c] * near[r][c]).sum::<f32>()).sum();
-                                let alpha = sum.round().clamp(0.0, 255.0) as u8;
-                                mesh.vertices.push(vertex(i as f32 + kx as f32 / n as f32, j as f32 + ky as f32 / n as f32, alpha));
-                            }
-                        }
-                        let row = (n + 1) as u32;
-                        for ky in 0..n as u32 {
-                            for kx in 0..n as u32 {
-                                let q = base + ky * row + kx;
-                                mesh.add_triangle(q, q + 1, q + row + 1);
-                                mesh.add_triangle(q, q + row + 1, q + row);
-                            }
-                        }
-                    } else if detail > 1 {
-                        // Ровный кусок вблизи — веер с теми же точками по краям, что у
-                        // дроблёного соседа: стык без Т-образных узлов и щелей. Раньше
-                        // сплошной кусок раздувался на полпикселя, и полоса раздува
-                        // ложилась на соседей светлой сеткой по шагу маски (зимний лес
-                        // в Foundry, 2026-11-04).
-                        let n = detail as f32;
-                        let (x0, y0, d) = (i as f32, j as f32, s as f32);
-                        mesh.vertices.push(vertex(x0 + d / 2.0, y0 + d / 2.0, a[0]));
-                        let ring: Vec<(f32, f32)> = (0..detail)
-                            .map(|k| (k as f32 / n, 0.0))
-                            .chain((0..detail).map(|k| (1.0, k as f32 / n)))
-                            .chain((0..detail).map(|k| (1.0 - k as f32 / n, 1.0)))
-                            .chain((0..detail).map(|k| (0.0, 1.0 - k as f32 / n)))
-                            .collect();
-                        for &(u, v) in &ring {
-                            mesh.vertices.push(vertex(x0 + u * d, y0 + v * d, a[0]));
-                        }
-                        let count = ring.len() as u32;
-                        for k in 0..count {
-                            mesh.add_triangle(base, base + 1 + k, base + 1 + (k + 1) % count);
-                        }
-                    } else {
-                        for ((x, y), alpha) in corners.into_iter().zip(a) {
-                            mesh.vertices.push(vertex(x as f32, y as f32, alpha));
-                        }
-                        mesh.add_triangle(base, base + 1, base + 2);
-                        mesh.add_triangle(base, base + 2, base + 3);
+        let started = crate::plat::Instant::now();
+        for pj in py0..=py1 {
+            for pi in px0..=px1 {
+                let (cx, cy) = (pi * tsz / mask::CHUNK, pj * tsz / mask::CHUNK);
+                let mut key = mix(base, (pi as u64) << 32 | pj as u64);
+                for y in cy.saturating_sub(1)..=(cy + 1).min(ny - 1) {
+                    for x in cx.saturating_sub(1)..=(cx + 1).min(nx - 1) {
+                        key = mix(key, own[(y - cy0) * cw + x - cx0]);
                     }
                 }
-                i += s;
+                let id = (slot ^ under.rotate_left(56), (tshift as u32) << 28 | (pj * npw + pi) as u32);
+                let fresh = self.ground_cache.pieces.get(&id).is_some_and(|p| p.key == key);
+                if !fresh {
+                    let (verts, idx) = ground_piece(m, above, clip, step, detail, tex.is_some(), tile, tint, material.rot, pi, pj, tsz);
+                    let piece = GroundMesh { key, verts, idx, used: frame };
+                    self.ground_cache.bytes += piece_bytes(&piece);
+                    if let Some(old) = self.ground_cache.pieces.insert(id, piece) {
+                        self.ground_cache.bytes -= piece_bytes(&old);
+                    }
+                }
+                let Some(piece) = self.ground_cache.pieces.get_mut(&id) else { continue };
+                piece.used = frame;
+                // В точки экрана — только сдвиг и масштаб.
+                let base_v = mesh.vertices.len() as u32;
+                mesh.vertices.extend(piece.verts.iter().map(|v| egui::epaint::Vertex { pos: cam.to_screen(canvas, [v.pos.x, v.pos.y]), ..*v }));
+                mesh.indices.extend(piece.idx.iter().map(|&i| i + base_v));
             }
-            j += s;
         }
+        self.prof.add("ground_pieces", started);
         if mesh.is_empty() {
             return;
         }
@@ -611,4 +630,120 @@ pub(super) fn outline_ppc(want: f32, span: f32, exact: bool) -> f32 {
     }
     const STEPS: [f32; 10] = [8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0];
     STEPS.iter().copied().find(|s| *s >= want * 0.85).unwrap_or(library::PX_PER_CELL).min(4096.0 / span).max(4.0)
+}
+
+/// Сетка куска `(pi, pj)` со стороной `tsz` точек маски в координатах карты: то же, что рисовалось прежде по
+/// всему окну, — те же четырёхугольники, сила, кривые и узор, — но только для квадратов,
+/// что начинаются в этом куске (у первого куска ряда — и с края карты, с шага −`step`).
+#[allow(clippy::too_many_arguments)]
+fn ground_piece(m: &Mask, above: &[Coat], clip: Option<&Mask>, step: usize, detail: usize, textured: bool, tile: [f32; 2], tint: [u8; 3], rot: f32, pi: usize, pj: usize, tsz: usize) -> (Vec<egui::epaint::Vertex>, Vec<u32>) {
+    let res = RES as f32;
+    let s = step as isize;
+    let first = |p: usize| if p == 0 { -s } else { (p * tsz) as isize };
+    let (i0, i1) = (first(pi), ((pi + 1) * tsz).min(m.w) as isize);
+    let (j0, j1) = (first(pj), ((pj + 1) * tsz).min(m.h) as isize);
+    let share = |mask: &Mask, i: isize, j: isize| {
+        let v = mask.get(i, j);
+        clip.map_or(v, |c| v.min(c.get(i, j)))
+    };
+    // За краем карты берётся крайняя точка: иначе слой тает к границе и у неё виден фон.
+    let (last_i, last_j) = (m.w as isize - 1, m.h as isize - 1);
+    let (map_w, map_h) = (m.w as f32 / res, m.h as f32 / res);
+    let value = |i: isize, j: isize| {
+        let (i, j) = (i.clamp(0, last_i), j.clamp(0, last_j));
+        let v = share(m, i, j);
+        if v == 0 {
+            return 0;
+        }
+        map::coat_alpha(v, above.iter().map(|c| share(&c.mask, i, j) as u32).sum())
+    };
+    // Узор повёрнут на `rot` по часовой: точка карты берёт плитку повёрнутой назад.
+    let (rs, rc) = rot.to_radians().sin_cos();
+    // Вершина в точке маски с дробными номерами (fx, fy) и силой `alpha`; место — в клетках.
+    let vertex = |fx: f32, fy: f32, alpha: u8| {
+        let w = [((fx + 0.5) / res).clamp(0.0, map_w), ((fy + 0.5) / res).clamp(0.0, map_h)];
+        let color = if textured { Color32::from_white_alpha(alpha) } else { Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], alpha) };
+        // Цветной слой берёт белую точку атласа egui, текстурный — плитку.
+        let uv = if textured { pos2((w[0] * rc + w[1] * rs) / tile[0], (w[1] * rc - w[0] * rs) / tile[1]) } else { egui::epaint::WHITE_UV };
+        egui::epaint::Vertex { pos: pos2(w[0], w[1]), uv, color }
+    };
+    let weights: Vec<[f32; 4]> = (0..=detail)
+        .map(|k| {
+            let t = k as f32 / detail as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            [(-t3 + 2.0 * t2 - t) / 2.0, (3.0 * t3 - 5.0 * t2 + 2.0) / 2.0, (-3.0 * t3 + 4.0 * t2 + t) / 2.0, (t3 - t2) / 2.0]
+        })
+        .collect();
+    let mut mesh = egui::Mesh::default();
+    let mut j = j0;
+    while j < j1 {
+        let mut i = i0;
+        while i < i1 {
+            let corners = [(i, j), (i + s, j), (i + s, j + s), (i, j + s)];
+            let a = corners.map(|(x, y)| value(x, y));
+            if a != [0; 4] {
+                let mut near = [[0f32; 4]; 4];
+                if detail > 1 {
+                    for (dy, row) in near.iter_mut().enumerate() {
+                        for (dx, v) in row.iter_mut().enumerate() {
+                            *v = value(i + dx as isize - 1, j + dy as isize - 1) as f32;
+                        }
+                    }
+                }
+                // Дробится не только сам край, но и соседи: кривая берёт точки на шаг
+                // дальше, и стык мелкого с крупным иначе дал бы щель.
+                let flat = near.iter().flatten().all(|&v| v == near[0][0]);
+                let base = mesh.vertices.len() as u32;
+                if detail > 1 && !flat {
+                    let n = detail;
+                    for (ky, wy) in weights.iter().enumerate() {
+                        for (kx, wx) in weights.iter().enumerate() {
+                            let sum: f32 = (0..4).map(|r| wy[r] * (0..4).map(|c| wx[c] * near[r][c]).sum::<f32>()).sum();
+                            let alpha = sum.round().clamp(0.0, 255.0) as u8;
+                            mesh.vertices.push(vertex(i as f32 + kx as f32 / n as f32, j as f32 + ky as f32 / n as f32, alpha));
+                        }
+                    }
+                    let row = (n + 1) as u32;
+                    for ky in 0..n as u32 {
+                        for kx in 0..n as u32 {
+                            let q = base + ky * row + kx;
+                            mesh.add_triangle(q, q + 1, q + row + 1);
+                            mesh.add_triangle(q, q + row + 1, q + row);
+                        }
+                    }
+                } else if detail > 1 {
+                    // Ровный кусок вблизи — веер с теми же точками по краям, что у
+                    // дроблёного соседа: стык без Т-образных узлов и щелей. Раньше
+                    // сплошной кусок раздувался на полпикселя, и полоса раздува
+                    // ложилась на соседей светлой сеткой по шагу маски (зимний лес
+                    // в Foundry, 2026-11-04).
+                    let n = detail as f32;
+                    let (x0, y0, d) = (i as f32, j as f32, s as f32);
+                    mesh.vertices.push(vertex(x0 + d / 2.0, y0 + d / 2.0, a[0]));
+                    let ring: Vec<(f32, f32)> = (0..detail)
+                        .map(|k| (k as f32 / n, 0.0))
+                        .chain((0..detail).map(|k| (1.0, k as f32 / n)))
+                        .chain((0..detail).map(|k| (1.0 - k as f32 / n, 1.0)))
+                        .chain((0..detail).map(|k| (0.0, 1.0 - k as f32 / n)))
+                        .collect();
+                    for &(u, v) in &ring {
+                        mesh.vertices.push(vertex(x0 + u * d, y0 + v * d, a[0]));
+                    }
+                    let count = ring.len() as u32;
+                    for k in 0..count {
+                        mesh.add_triangle(base, base + 1 + k, base + 1 + (k + 1) % count);
+                    }
+                } else {
+                    for ((x, y), alpha) in corners.into_iter().zip(a) {
+                        mesh.vertices.push(vertex(x as f32, y as f32, alpha));
+                    }
+                    mesh.add_triangle(base, base + 1, base + 2);
+                    mesh.add_triangle(base, base + 2, base + 3);
+                }
+            }
+            i += s;
+        }
+        j += s;
+    }
+    (mesh.vertices, mesh.indices)
 }

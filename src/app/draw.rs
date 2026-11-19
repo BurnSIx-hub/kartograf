@@ -70,7 +70,9 @@ impl App {
             i = 0;
             self.map.outline_roofs.retain(|_| (!outlines.contains(&i), i += 1).0);
             self.underlay = if j == 0 { 1 } else { 2 };
+            self.under_level = j + 1;
             self.draw(painter, canvas);
+            self.under_level = 0;
             self.underlay = 0;
             (self.map.roofs, self.map.outline_roofs) = keep;
             std::mem::swap(&mut self.edges, &mut c.edges);
@@ -129,30 +131,38 @@ impl App {
         let terrain = std::mem::take(&mut self.map.terrain);
         let room_floor = std::mem::take(&mut self.map.room_floor);
         for (k, coat) in terrain.iter().enumerate() {
-            self.draw_coat(painter, canvas, coat, &terrain[k + 1..], None, view);
+            self.draw_coat(painter, canvas, coat, &terrain[k + 1..], None, view, 0x1000 + k as u64);
         }
         let rooms = std::mem::replace(&mut self.map.rooms, Mask::new(0, 0));
         for (k, coat) in room_floor.iter().enumerate() {
-            self.draw_coat(painter, canvas, coat, &room_floor[k + 1..], Some(&rooms), view);
+            self.draw_coat(painter, canvas, coat, &room_floor[k + 1..], Some(&rooms), view, 0x2000 + k as u64);
         }
         self.map.terrain = terrain;
         self.map.room_floor = room_floor;
         self.map.rooms = rooms;
         self.prof.add("ground", t);
 
+        let t = crate::plat::Instant::now();
         let relief = self.relief_look();
+        self.prof.add("relief", t);
 
         // Дороги и реки — поверх пола.
+        let t = crate::plat::Instant::now();
         let paths = std::mem::take(&mut self.map.paths);
+        // Дороги, которых больше нет, — из кэша вон.
+        let under = self.under_level as u32;
+        self.path_cache.retain(|(level, i), _| *level != under || (*i as usize) < paths.len());
         for (i, path) in paths.iter().enumerate() {
             self.draw_path(painter, canvas, path, i as u32);
         }
         self.map.paths = paths;
+        self.prof.add("paths", t);
+        let t = crate::plat::Instant::now();
 
         // Затемнение ярусов и их тени — поверх пола и дорог.
         if let Some(look) = &relief {
             let black = Material { name: String::new(), paint: Paint::Color([10, 14, 26]), vary: false, live: map::Live::Auto, rot: 0.0 };
-            self.draw_mask(painter, canvas, &black, &look.dark, &[], None, view);
+            self.draw_mask(painter, canvas, &black, &look.dark, &[], None, view, 0x3000);
         }
 
         // По кромкам ярусов полосы — осыпь под обрывом, гребни уступов, стенки
@@ -177,20 +187,25 @@ impl App {
             }
         }
 
+        self.prof.add("relief", t);
         // Помосты — на полу: нарисованная тень и тени крон ложатся и на них.
+        let t = crate::plat::Instant::now();
         self.draw_platforms(painter, canvas);
+        self.prof.add("platforms", t);
 
         // Нарисованная тень — поверх пола и дорог.
+        let t = crate::plat::Instant::now();
         if let Some(shade) = self.map.shade.take() {
             let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto, rot: 0.0 };
-            self.draw_mask(painter, canvas, &black, &shade, &[], None, view);
+            self.draw_mask(painter, canvas, &black, &shade, &[], None, view, 0x4000);
             self.map.shade = Some(shade);
         }
         // Тени крон — там же: на полу, под предметами и стенами.
         if let Some(trees) = self.tree_shade() {
             let black = Material { name: String::new(), paint: Paint::Color([0, 0, 0]), vary: false, live: map::Live::Auto, rot: 0.0 };
-            self.draw_mask(painter, canvas, &black, &trees, &[], None, view);
+            self.draw_mask(painter, canvas, &black, &trees, &[], None, view, 0x5000);
         }
+        self.prof.add("shade", t);
 
         let exporting = self.export.is_some();
         // Проходы выгрузки с тайлами: пол без стен — или одни стены (с их тенью,
@@ -259,7 +274,11 @@ impl App {
         let t = crate::plat::Instant::now();
         let style = self.map.wall_style.clone();
         let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
-        for s in self.room_edges().to_vec() {
+        let te = crate::plat::Instant::now();
+        let room_edges = self.room_edges().to_vec();
+        self.prof.add("walls_edges", te);
+        let te = crate::plat::Instant::now();
+        for s in room_edges {
             let st = self.map.edge_look(map::edge_key(&s));
             match looks.iter_mut().find(|l| l.0 == st) {
                 Some(l) => l.1.push(s),
@@ -269,10 +288,14 @@ impl App {
         for l in &mut looks {
             l.1 = map::cut_portals_wide(&l.1, &self.map.portals, l.0.width / 2.0);
         }
+        self.prof.add("walls_looks", te);
+        let te = crate::plat::Instant::now();
         if shadows.on && !floor_only {
             // Стена под крышей своей тени не даёт: её накрывает тень крыши, а вдвоём они
             // чернили двери и всё у стены на теневой стороне дома.
             let roofs = if self.roof_view == RoofView::Hidden && self.export.is_none() { Vec::new() } else { self.map.roofs.clone() };
+            // Крыши у середины отрезка — из сетки их рамок: стен и крыш в городе тысячи.
+            let roofs_grid = crate::grid::Grid::new(&roofs.iter().map(|r| crate::grid::bounds(&r.outline())).collect::<Vec<_>>(), 8.0);
             let open = |segs: &[Segment]| -> Vec<Segment> {
                 // Середина — чуть в обе стороны от стены: стена на стыке двух крыш
                 // (перегородка) тоже под крышей, хоть ни одна её не накрывает целиком.
@@ -283,30 +306,35 @@ impl App {
                         let (dx, dy) = (s.1[0] - s.0[0], s.1[1] - s.0[1]);
                         let l = (dx * dx + dy * dy).sqrt().max(1e-6);
                         let n = [-dy / l * 0.1, dx / l * 0.1];
-                        !roofs.iter().any(|r| r.contains(m) || r.contains([m[0] + n[0], m[1] + n[1]]) || r.contains([m[0] - n[0], m[1] - n[1]]))
+                        !roofs_grid.near(crate::grid::grow([m[0], m[1], m[0], m[1]], 0.2)).into_iter().map(|k| &roofs[k as usize]).any(|r| r.contains(m) || r.contains([m[0] + n[0], m[1] + n[1]]) || r.contains([m[0] - n[0], m[1] - n[1]]))
                     })
                     .collect()
             };
-            for sh in shadows.layers() {
-                for (st, edges) in &looks {
-                    self.draw_wall_shadow(painter, canvas, &open(edges), st.width, &sh);
-                }
-                for w in self.map.walls.clone() {
+            // Стены, разрезанные проёмами, что не под крышей, и склейка в ломаные — один раз
+            // за кадр: слоёв тени до десяти, и каждый считал всё это заново.
+            let walls_cut: Vec<(f32, Vec<Segment>)> = self
+                .map
+                .walls
+                .iter()
+                .map(|w| {
                     let width = w.style.as_ref().map_or(style.width, |s| s.width);
-                    self.draw_wall_shadow(painter, canvas, &open(&map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0)), width, &sh);
+                    (width, map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0))
+                })
+                .collect();
+            let open_lines: Vec<(f32, Vec<Vec<[f32; 2]>>)> = looks.iter().map(|(st, edges)| (st.width, mask::join(open(edges)))).chain(walls_cut.iter().map(|(width, segs)| (*width, mask::join(open(segs))))).collect();
+            for sh in shadows.layers() {
+                for (width, lines) in &open_lines {
+                    self.draw_wall_shadow_lines(painter, canvas, lines, *width, &sh);
                 }
             }
             // У подножия — с обеих сторон и под крышей тоже: два слоя, узкий
             // потемнее и широкий посветлее, — край тает мягко.
             if shadows.ao > 0.0 {
+                let all_lines: Vec<(f32, Vec<Vec<[f32; 2]>>)> = looks.iter().map(|(st, edges)| (st.width, mask::join(edges.clone()))).chain(walls_cut.iter().map(|(width, segs)| (*width, mask::join(segs.clone())))).collect();
                 for (blur, part) in [(0.45, 0.55), (1.1, 0.45)] {
                     let sh = map::Shadows { dist: 0.0, blur, opacity: shadows.ao * part, fade: 0.0, ..shadows.clone() };
-                    for (st, edges) in &looks {
-                        self.draw_wall_shadow(painter, canvas, edges, st.width, &sh);
-                    }
-                    for w in self.map.walls.clone() {
-                        let width = w.style.as_ref().map_or(style.width, |s| s.width);
-                        self.draw_wall_shadow(painter, canvas, &map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0), width, &sh);
+                    for (width, lines) in &all_lines {
+                        self.draw_wall_shadow_lines(painter, canvas, lines, *width, &sh);
                     }
                 }
             }
@@ -317,6 +345,8 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, a), cam.to_screen(canvas, b)], Stroke::new(width * s + 6.0, Color32::from_rgb(120, 180, 255)));
             }
         }
+        self.prof.add("walls_shadow", te);
+        let te = crate::plat::Instant::now();
         for (st, edges) in looks.iter().filter(|_| !floor_only) {
             self.draw_walls(painter, canvas, st, edges);
         }
@@ -334,17 +364,38 @@ impl App {
             }
         }
 
+        self.prof.add("walls_draw", te);
+        let te = crate::plat::Instant::now();
         let portals = self.map.portals.clone();
         // Проём меряется по своей стене: у городской стены карты камень, а у домов
         // за ней фахверк — по общему виду косяки и подоконники домов раздувало.
         let edges = self.room_edges().to_vec();
+        // Стена и отрезок у проёма — из сетки рамок (первый по номеру, как перебором):
+        // проёмов и отрезков в городе тысячи, и перебор всех со всеми шёл каждый кадр.
+        let (walls_grid, edges_grid) = if portals.is_empty() {
+            Default::default()
+        } else {
+            // Стена без отрезков — без рамки (нечисла): сетку не растягивает, проверяется всегда.
+            let wall_boxes: Vec<crate::grid::Rect> = walls
+                .iter()
+                .map(|w| {
+                    let pts: Vec<[f32; 2]> = w.segments().flat_map(|s| [s.0, s.1]).collect();
+                    if pts.is_empty() { [f32::NAN; 4] } else { crate::grid::bounds(&pts) }
+                })
+                .collect();
+            let edge_boxes: Vec<crate::grid::Rect> = edges.iter().map(|s| crate::grid::bounds(&[s.0, s.1])).collect();
+            (crate::grid::Grid::new(&wall_boxes, 8.0), crate::grid::Grid::new(&edge_boxes, 8.0))
+        };
         for (i, portal) in portals.iter().enumerate() {
             let c = portal.center();
-            let own = walls
-                .iter()
+            let near = crate::grid::grow([c[0], c[1], c[0], c[1]], 0.1);
+            let own = walls_grid
+                .near(near)
+                .into_iter()
+                .map(|k| &walls[k as usize])
                 .find(|w| !w.low && w.distance(c) < 0.06)
                 .map(|w| w.style.clone().unwrap_or_else(|| style.clone()))
-                .or_else(|| edges.iter().find(|s| map::segment_distance(c, s.0, s.1) < 0.06).map(|s| self.map.edge_look(map::edge_key(s))))
+                .or_else(|| edges_grid.near(near).into_iter().map(|k| edges[k as usize]).find(|s| map::segment_distance(c, s.0, s.1) < 0.06).map(|s| self.map.edge_look(map::edge_key(&s))))
                 .unwrap_or_else(|| style.clone());
             if !floor_only {
                 self.draw_portal(painter, canvas, portal, &own);
@@ -353,6 +404,7 @@ impl App {
                 painter.line_segment([cam.to_screen(canvas, portal.a), cam.to_screen(canvas, portal.b)], Stroke::new(3.0, Color32::from_rgb(120, 180, 255)));
             }
         }
+        self.prof.add("walls_portals", te);
         self.prof.add("walls", t);
 
         // Изгиб: какую стену возьмёт протяжка и куда ляжет дуга стены комнаты.
@@ -624,7 +676,9 @@ impl App {
     /// Края картинки — на полтекселя внутрь: текстуры повторяются (полам это нужно),
     /// и на краю спрайта сэмплер подмешивал противоположный край — тонкие полоски.
     pub(super) fn quad(&mut self, painter: &egui::Painter, canvas: Rect, key: &str, corners: [[f32; 2]; 4], uv: [Pos2; 4], tint: Color32) -> bool {
-        let Some((tex, _)) = self.textures.get(key, false) else { return false };
+        // Картинка — того размера, что не мельче её места на экране: вдали — миниатюра.
+        let need = self.screen_need(&corners, &uv);
+        let Some((tex, _)) = self.textures.get_sized(key, need) else { return false };
         let [tw, th] = tex.size().map(|v| v.max(2) as f32);
         let mut mesh = egui::Mesh::with_texture(tex.id());
         for (p, uv) in corners.iter().zip(uv) {
@@ -635,6 +689,18 @@ impl App {
         mesh.add_triangle(0, 2, 3);
         painter.add(Shape::mesh(mesh));
         true
+    }
+
+    /// Сколько точек экрана придётся на всю картинку по большей стороне, если её часть
+    /// `uv` натянута на углы `corners` (клетки).
+    pub(super) fn screen_need(&self, corners: &[[f32; 2]; 4], uv: &[Pos2; 4]) -> f32 {
+        let px = self.cam.scale * self.canvas_ppp.max(1.0);
+        let along = |a: usize, b: usize| {
+            let len = (corners[b][0] - corners[a][0]).hypot(corners[b][1] - corners[a][1]) * px;
+            let span = (uv[b].x - uv[a].x).abs().max((uv[b].y - uv[a].y).abs()).max(1e-3);
+            len / span
+        };
+        along(0, 1).max(along(1, 2))
     }
 
     /// Цвет, в который красится низ предмета под водой: по среднему цвету того, что налито
@@ -685,7 +751,8 @@ impl App {
         let row = |v: f32| (at(c[0], c[3], v), at(c[1], c[2], v));
         let (wet, dark) = (self.wet_tint(prop.pos, tint, if prop.sunk() >= 1.0 { 0.64 } else { 0.78 }), tint.gamma_multiply(1.0));
         let dusk = Color32::from_rgba_unmultiplied((dark.r() as f32 * 0.5) as u8, (dark.g() as f32 * 0.55) as u8, (dark.b() as f32 * 0.6) as u8, dark.a());
-        let Some((tex, _)) = self.textures.get(&prop.asset, false) else { return false };
+        let need = self.screen_need(&c, &[pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)]);
+        let Some((tex, _)) = self.textures.get_sized(&prop.asset, need) else { return false };
         let [tw, th] = tex.size().map(|v| v.max(2) as f32);
         let mut mesh = egui::Mesh::with_texture(tex.id());
         let cam = self.cam;
@@ -782,9 +849,27 @@ impl App {
     }
 
     /// Верх и низ рисунка поперёк холста, доли 0..1.
+    /// Пока картинка раскрывается в фоне — весь холст, без запоминания: раскрытая, она
+    /// принесёт и видимую часть. Раньше её считали прямо в кадре, раскрывая картинку
+    /// второй раз: город 90×90 открывался с кадром в 12 секунд.
     fn band_edges(&mut self, key: &str) -> [f32; 2] {
-        let sources = &self.textures.sources;
-        *self.window_bands.entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key).map_or([0.0, 1.0], |[_, t, _, b]| [t + 0.5, (b + 0.5).max(t + 0.55)]))
+        if let Some(b) = self.window_bands.get(key) {
+            return *b;
+        }
+        let v = match library::known_box(key) {
+            Some(v) => v,
+            None => {
+                // Заказать картинку (если ещё нет) и подождать её.
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.textures.get(key, false).is_none() && !self.textures.failed(key, false) {
+                    return [0.0, 1.0];
+                }
+                library::visible_box(&self.textures.sources, key)
+            }
+        };
+        let b = v.map_or([0.0, 1.0], |[_, t, _, b]| [t + 0.5, (b + 0.5).max(t + 0.55)]);
+        self.window_bands.insert(key.to_owned(), b);
+        b
     }
 
     /// Только рисунок холста (без пустых полей и бледной тени FA вокруг) вдоль
@@ -830,8 +915,11 @@ impl App {
                     self.draw_band(painter, canvas, &f, p.a, p.b, visible);
                 }
                 // Само окно — стекло с переплётом поверх подоконника.
-                let assets = &self.library.assets;
-                let glass = self.window_glass.entry((key.clone(), len >= 1.5)).or_insert_with(|| library::window_glass(assets, &key, len)).clone();
+                if self.glass_pool.0 != self.library.assets.len() {
+                    self.glass_pool = (self.library.assets.len(), std::rc::Rc::new(library::glass_pool(&self.library.assets)));
+                }
+                let pool = self.glass_pool.1.clone();
+                let glass = self.window_glass.entry((key.clone(), len >= 1.5)).or_insert_with(|| library::window_glass_in(&pool, &key, len)).clone();
                 if let Some(g) = glass {
                     // Часть стёкол FA нарисована стоя: такое кладётся вдоль проёма
                     // поворотом, иначе ложилось поперёк стены, ребром.

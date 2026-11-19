@@ -189,6 +189,8 @@ impl App {
                     .map(|m| m.rooms.bytes() + m.shade.as_ref().map_or(0, |s| s.bytes()) + m.terrain.iter().chain(&m.room_floor).map(|c| c.mask.bytes()).sum::<usize>())
                     .sum();
                 info["mask_mb"] = json!((masks as f64 / 1048576.0 * 10.0).round() / 10.0);
+                info["textures"] = self.textures.stats();
+                info["ground_cache"] = self.ground_cache.stats();
                 if a["reset_frames"].as_bool() == Some(true) {
                     self.prof.clear();
                 }

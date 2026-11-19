@@ -659,6 +659,13 @@ pub struct App {
     props_index: prop_index::PropIndex,
     /// Сколько длятся кадр и его части (MCP `map_info`).
     pub prof: prof::Prof,
+    /// Земля кусками: собранные куски слоёв в координатах карты.
+    ground_cache: draw_ground::GroundCache,
+    /// Какой этаж сейчас рисуется: 0 — текущий, `j + 1` — этаж `j` под ним (свои куски земли).
+    under_level: usize,
+    /// Дороги, собранные в координатах карты: (этаж, номер) → (ключ, рамка, вершины, треугольники).
+    #[allow(clippy::type_complexity)]
+    path_cache: std::collections::HashMap<(u32, u32), (u64, [f32; 4], Vec<egui::epaint::Vertex>, Vec<u32>)>,
     /// Предпросмотр света (L) и его расчёт.
     pub light_view: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -685,6 +692,8 @@ pub struct App {
     pub biome_button: Rect,
     /// Стекло к подоконнику FA (ключ подоконника и большое ли окно → окно).
     window_glass: std::collections::HashMap<(String, bool), Option<String>>,
+    /// Окна библиотеки для подбора стекла и при каком числе ассетов отобраны.
+    glass_pool: (usize, std::rc::Rc<Vec<(String, Vec<String>)>>),
     /// Библиотека показывает только то, что уже стоит на карте.
     used_only: bool,
     /// Время года последнего леса: окно генератора открывается с ним.
@@ -906,6 +915,9 @@ impl App {
             check: Default::default(),
             props_index: Default::default(),
             prof: Default::default(),
+            ground_cache: Default::default(),
+            under_level: 0,
+            path_cache: std::collections::HashMap::new(),
             light_view: false,
             #[cfg(not(target_arch = "wasm32"))]
             light: None,
@@ -920,6 +932,7 @@ impl App {
             wheel_turn: false,
             biome_button: Rect::NOTHING,
             window_glass: std::collections::HashMap::new(),
+            glass_pool: (usize::MAX, Default::default()),
             used_only: false,
             gen_season: crate::plan::Season::Summer,
             gen_hills: crate::plan::Hills::Auto,
@@ -1034,6 +1047,11 @@ impl eframe::App for App {
             } else if f.extension().is_some_and(|e| e == "dungeondraft_pack") {
                 self.add_pack(f);
             }
+        }
+        // Всё время прошлого кадра у процессора — с разбивкой фигур на треугольники в egui,
+        // которой не видно в частях `frame`.
+        if let Some(cpu) = _frame.info().cpu_usage {
+            self.prof.add_ms("cpu_prev", cpu * 1000.0);
         }
         self.frame_ui(ui);
     }

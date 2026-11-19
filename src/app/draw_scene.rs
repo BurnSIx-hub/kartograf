@@ -58,7 +58,8 @@ impl App {
     }
 
     /// Тень стен: лента шире стены на размытие, сдвинутая от света; края тают.
-    pub(super) fn draw_wall_shadow(&mut self, painter: &egui::Painter, canvas: Rect, segs: &[Segment], width: f32, sh: &map::Shadows) {
+    /// `lines` — отрезки стен, уже склеенные в ломаные ([`mask::join`]).
+    pub(super) fn draw_wall_shadow_lines(&mut self, painter: &egui::Painter, canvas: Rect, lines: &[Vec<[f32; 2]>], width: f32, sh: &map::Shadows) {
         // Стена нулевой толщины — невидимая (перила пролёта для VTT): и тени нет.
         if width <= 0.0 {
             return;
@@ -68,7 +69,7 @@ impl App {
         let (outer_hw, inner_hw) = (width / 2.0 + sh.blur / 2.0, (width / 2.0 - sh.blur / 2.0).max(0.01));
         let dark = Color32::from_black_alpha((sh.opacity * 255.0).round() as u8);
         let mut mesh = egui::Mesh::default();
-        for line in mask::join(segs.to_vec()) {
+        for line in lines {
             let closed = line.len() > 3 && (line[0][0] - line[line.len() - 1][0]).abs() < 1e-3 && (line[0][1] - line[line.len() - 1][1]).abs() < 1e-3;
             let rows = shadow_rows(&line, closed, outer_hw, inner_hw);
             if rows.len() < 2 {
@@ -221,35 +222,73 @@ impl App {
 
     pub(super) fn draw_path(&mut self, painter: &egui::Painter, canvas: Rect, path: &map::Path, seed: u32) {
         let Some(material) = self.map.materials.get(path.material) else { return };
-        let (rs, rc) = material.rot.to_radians().sin_cos();
         let (tex, tile, tint) = match &material.paint {
             Paint::Color(c) => (None, [1.0, 1.0], rgb(*c)),
             Paint::Texture(key) => {
                 let key = if material.vary && !path.along { format!("{}{key}", library::VARY) } else { key.clone() };
-                match self.textures.get(&key, false) {
+                let k = self.cam.scale * self.canvas_ppp.max(1.0) / PX_PER_CELL;
+                match self.textures.get_scaled(&key, k) {
                     Some((t, px)) => (Some(t.id()), [(px[0] as f32 / PX_PER_CELL).max(MIN_TILE), (px[1] as f32 / PX_PER_CELL).max(MIN_TILE)], Color32::WHITE),
                     None => (None, [1.0, 1.0], Color32::from_gray(60)),
                 }
             }
         };
         let organic = tex.is_some() && material.vary && !path.along;
+        let hw = path.width / 2.0;
+        // Край не тоньше полутора точек экрана, иначе он лесенкой.
+        let fade = (hw * path.soft).max(1.5 / self.cam.scale).min(hw);
+        // Лента собирается в координатах карты и ждёт в кэше, пока дорога та же: на карте
+        // OSM дорог сотни, и каждый кадр они считались заново — 8 мс.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for p in &path.points {
+                (p[0].to_bits(), p[1].to_bits()).hash(&mut h);
+            }
+            (path.width.to_bits(), path.rough.to_bits(), path.soft.to_bits(), path.along, path.material, material.rot.to_bits(), material.vary).hash(&mut h);
+            (tex, tile[0].to_bits(), tile[1].to_bits(), tint, seed, fade.to_bits()).hash(&mut h);
+            h.finish()
+        };
+        let id = (self.under_level as u32, seed);
+        if self.path_cache.get(&id).is_none_or(|c| c.0 != key) {
+            let built = self.build_path(path, material.rot, tex, tile, tint, seed, hw, fade);
+            self.path_cache.insert(id, (key, built.0, built.1, built.2));
+        }
+        let Some((_, bbox, verts, idx)) = self.path_cache.get(&id) else { return };
+        // Вне окна — не рисовать.
+        let (tl, br) = (self.cam.to_world(canvas, canvas.min), self.cam.to_world(canvas, canvas.max));
+        if verts.is_empty() || bbox[2] < tl[0] || bbox[0] > br[0] || bbox[3] < tl[1] || bbox[1] > br[1] {
+            return;
+        }
+        let cam = self.cam;
+        let mut mesh = match tex {
+            Some(id) => egui::Mesh::with_texture(id),
+            None => egui::Mesh::default(),
+        };
+        mesh.vertices = verts.iter().map(|v| egui::epaint::Vertex { pos: cam.to_screen(canvas, [v.pos.x, v.pos.y]), ..*v }).collect();
+        mesh.indices = idx.clone();
+        if organic {
+            self.blend.paint(painter, mesh);
+        } else {
+            painter.add(Shape::mesh(mesh));
+        }
+    }
+
+    /// Лента дороги в координатах карты: вершины, номера треугольников, рамка.
+    #[allow(clippy::too_many_arguments)]
+    fn build_path(&self, path: &map::Path, rot: f32, tex: Option<egui::TextureId>, tile: [f32; 2], tint: Color32, seed: u32, hw: f32, fade: f32) -> ([f32; 4], Vec<egui::epaint::Vertex>, Vec<u32>) {
+        let (rs, rc) = rot.to_radians().sin_cos();
         let line = path.curve();
         if line.len() < 2 {
-            return;
+            return ([0.0; 4], Vec::new(), Vec::new());
         }
         let mut dist = vec![0.0f32; line.len()];
         for k in 1..line.len() {
             dist[k] = dist[k - 1] + ((line[k][0] - line[k - 1][0]).powi(2) + (line[k][1] - line[k - 1][1]).powi(2)).sqrt();
         }
         let total = dist[line.len() - 1].max(1e-4);
-        let hw = path.width / 2.0;
-        // Край не тоньше полутора точек экрана, иначе он лесенкой.
-        let fade = (hw * path.soft).max(1.5 / self.cam.scale).min(hw);
-        let cam = self.cam;
-        let mut mesh = match tex {
-            Some(id) => egui::Mesh::with_texture(id),
-            None => egui::Mesh::default(),
-        };
+        let mut mesh = egui::Mesh::default();
+        let mut bbox = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
         for k in 0..line.len() {
             let (a, b) = (line[k.saturating_sub(1)], line[(k + 1).min(line.len() - 1)]);
             let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -271,7 +310,8 @@ impl App {
                 };
                 let alpha = (a * end * 255.0).round() as u8;
                 let color = if tex.is_some() { Color32::from_white_alpha(alpha) } else { Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), alpha) };
-                mesh.vertices.push(egui::epaint::Vertex { pos: cam.to_screen(canvas, p), uv, color });
+                bbox = [bbox[0].min(p[0]), bbox[1].min(p[1]), bbox[2].max(p[0]), bbox[3].max(p[1])];
+                mesh.vertices.push(egui::epaint::Vertex { pos: pos2(p[0], p[1]), uv, color });
             }
             if k > 0 {
                 let (p, q) = (((k - 1) * 4) as u32, (k * 4) as u32);
@@ -281,11 +321,7 @@ impl App {
                 }
             }
         }
-        if organic {
-            self.blend.paint(painter, mesh);
-        } else {
-            painter.add(Shape::mesh(mesh));
-        }
+        (bbox, mesh.vertices, mesh.indices)
     }
 
     /// Стены лентой: отрезки склеиваются в ломаные, у каждой вершины лента

@@ -22,6 +22,14 @@ const TEX_OPTIONS: TextureOptions = TextureOptions { mipmap_mode: Some(egui::Tex
 const MAX_FILES: usize = 20000;
 const THUMB_SIDE: u32 = 128;
 const FULL_SIDE: u32 = 2048;
+
+/// Размеры, в которых картинка раскрывается: миниатюра и полная.
+pub const THUMB: u8 = 0;
+pub const FULL: u8 = 2;
+
+fn side_of(level: u8) -> u32 {
+    if level == THUMB { THUMB_SIDE } else { FULL_SIDE }
+}
 /// Ключ встроенной текстуры: `builtin:<имя>` (см. [`BUILTIN_TEXTURES`]).
 pub const BUILTIN: &str = "builtin:";
 
@@ -199,7 +207,27 @@ fn key_words(key: &str) -> Vec<String> {
 /// стены, стойки рамы по краям и само окно (`Window_Wood_Ashen_A_1x1`, среди объектов)
 /// поверх. Берётся окно того же материала и цвета; проём от двух клеток — большое
 /// (`Window_Large_*_2x1`). Вариант (A, B, C…) — по ключу подоконника, всегда один.
+#[cfg(test)]
 pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
+    window_glass_in(&glass_pool(assets), sill, len)
+}
+
+/// Окна библиотеки со словами имени — то, из чего [`window_glass_in`] выбирает стекло.
+/// Отбирается один раз: разбирать имена всех двадцати тысяч ассетов на каждый
+/// подоконник — город 90×90 открывался с кадром в 10 секунд.
+pub fn glass_pool(assets: &[Asset]) -> Vec<(String, Vec<String>)> {
+    assets
+        .iter()
+        .filter(|a| a.kind == Kind::Object)
+        .filter_map(|a| {
+            let f = key_words(&a.key);
+            (f.first().map(String::as_str) == Some("window")).then(|| (a.key.clone(), f))
+        })
+        .collect()
+}
+
+/// [`window_glass`] по отобранным окнам.
+pub fn window_glass_in(pool: &[(String, Vec<String>)], sill: &str, len: f32) -> Option<String> {
     let words = key_words(sill);
     if !words.iter().any(|w| w == "sill") {
         return None;
@@ -208,9 +236,8 @@ pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
     // `Small` — форточка посередине проёма, к ней своя узкая рама.
     const SKIP: [&str; 10] = ["sill", "frame", "curtain", "curtains", "broken", "stained", "wired", "shutter", "shutters", "small"];
     let mut best: Vec<(usize, &str)> = Vec::new();
-    for a in assets.iter().filter(|a| a.kind == Kind::Object) {
-        let f = key_words(&a.key);
-        if f.first().map(String::as_str) != Some("window") || f.iter().any(|w| SKIP.contains(&w.as_str())) || f.iter().any(|w| w == "large") != large {
+    for (key, f) in pool {
+        if f.iter().any(|w| SKIP.contains(&w.as_str())) || f.iter().any(|w| w == "large") != large {
             continue;
         }
         // Стекло FA — варианты одной буквой (`_E_`); `_A1_`, `_B1_` у малых окон —
@@ -221,8 +248,8 @@ pub fn window_glass(assets: &[Asset], sill: &str, len: f32) -> Option<String> {
         let score = f.iter().filter(|w| words.contains(w)).count();
         match best.first() {
             Some((s, _)) if score < *s => {}
-            Some((s, _)) if score == *s => best.push((score, &a.key)),
-            _ => best = vec![(score, &a.key)],
+            Some((s, _)) if score == *s => best.push((score, key)),
+            _ => best = vec![(score, key)],
         }
     }
     if best.is_empty() {
@@ -352,6 +379,10 @@ pub const VARY: &str = "vary:";
 /// по ним видно, сколько поля под размытие в долях объекта.
 pub const SHADOW: &str = "shadow:";
 const SHADOW_SIDE: u32 = 256;
+/// Радиус размытия тени в точках её картинки, к которому подгоняется её размер.
+const SHADOW_RADIUS_PX: f32 = 4.0;
+/// Меньше точек на клетку у тени не бывает: края и у резкой тени гладкие.
+const SHADOW_MIN_PPC: f32 = 8.0;
 /// Ключ картинки в чужом цвете: `tint:rrggbb:<ключ картинки>`. Узор и светотень
 /// картинки остаются, средний цвет становится этим. Кирпича в цвет Кремля
 /// (`#ec8859`) в паках FA нет — их кирпич серый и бежевый.
@@ -598,9 +629,54 @@ pub const MASK: u32 = 16;
 /// Видимая часть картинки и её маска: рамка `MASK`×`MASK` поверх видимой рамки, строка —
 /// число, бит `i` — столбец `i` слева; клетка занята, если непрозрачна хотя бы на четверть.
 /// По маске обходят предмет точнее, чем по рамке: круглый реактор, стол-подкова, колбы по углам.
+///
+/// Ответ запоминается на всю программу по ключу без цвета (перекраска прозрачность не
+/// трогает): картинку раскрывать целиком — десятки миллисекунд, а спрашивают одно и то же
+/// отрисовка подоконников, проверка, выгрузка. Картинки, раскрытые для показа в фоне,
+/// кладут ответ сюда сами ([`remember_shape`]) — кадр его не ждёт.
 pub fn visible_shape(sources: &Sources, key: &str) -> Option<([f32; 4], Vec<u16>)> {
-    let bytes = read_source(key, sources).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let key = untint(key).1;
+    if let Some(v) = shapes().lock().ok().and_then(|m| m.get(key).cloned()) {
+        return v;
+    }
+    let v = read_source(key, sources).ok().and_then(|bytes| image::load_from_memory(&bytes).ok()).and_then(|img| shape_of(&img.to_rgba8()));
+    if let Ok(mut m) = shapes().lock() {
+        m.insert(key.to_owned(), v.clone());
+    }
+    v
+}
+
+/// Запомненные видимые части картинок (см. [`visible_shape`]).
+fn shapes() -> &'static std::sync::Mutex<HashMap<String, Option<([f32; 4], Vec<u16>)>>> {
+    static SHAPES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<([f32; 4], Vec<u16>)>>>> = std::sync::OnceLock::new();
+    SHAPES.get_or_init(Default::default)
+}
+
+/// Видимая часть, если уже известна: `None` — ещё не считали.
+pub fn known_box(key: &str) -> Option<Option<[f32; 4]>> {
+    shapes().lock().ok()?.get(untint(key).1).map(|v| v.as_ref().map(|s| s.0))
+}
+
+/// Забыть видимые части: файлы своей папки могли смениться.
+pub fn forget_shapes() {
+    if let Ok(mut m) = shapes().lock() {
+        m.clear();
+    }
+}
+
+/// Запомнить видимую часть по уже раскрытой картинке (той же, что раскрыла бы
+/// [`visible_shape`], — без уменьшения).
+fn remember_shape(key: &str, img: &image::RgbaImage) {
+    let key = untint(key).1;
+    if let Ok(mut m) = shapes().lock()
+        && !m.contains_key(key)
+    {
+        m.insert(key.to_owned(), shape_of(img));
+    }
+}
+
+/// Видимая часть и её маска по пикселям картинки.
+fn shape_of(img: &image::RgbaImage) -> Option<([f32; 4], Vec<u16>)> {
     let (w, h) = img.dimensions();
     let (mut l, mut t, mut r, mut b) = (w, h, 0, 0);
     for (x, y, p) in img.enumerate_pixels() {
@@ -879,12 +955,12 @@ fn read_source(key: &str, sources: &Sources) -> Result<Vec<u8>, String> {
 
 struct Job {
     key: String,
-    thumb: bool,
+    level: u8,
 }
 
 struct Done {
     key: String,
-    thumb: bool,
+    level: u8,
     result: Result<(ColorImage, [u32; 2]), String>,
 }
 
@@ -895,7 +971,10 @@ enum Slot {
 }
 
 pub struct Textures {
-    slots: HashMap<(String, bool), Slot>,
+    /// Ключ и размер ([`THUMB`], [`FULL`]).
+    slots: HashMap<(String, u8), Slot>,
+    /// Брать картинку по размеру на экране; выключено — всегда полную (выгрузка для Foundry).
+    pub lod: bool,
     jobs: Sender<Job>,
     done: Receiver<Done>,
     pub sources: Sources,
@@ -928,12 +1007,26 @@ fn load_job(job: &Job, sources: &Sources) -> Result<(ColorImage, [u32; 2]), Stri
             rgba
         };
         match varied {
-            true if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, FULL_SIDE)).map(|(rgba, size)| (to_color_image(&paint(rgba)), size)),
+            true if inner.strip_prefix(BUILTIN).is_some_and(|id| QUILTED.contains(&id)) => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, side_of(job.level))).map(|(rgba, size)| (to_color_image(&paint(rgba)), size)),
             true => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, VARY_SIDE)).map(|(rgba, size)| {
+                // Раскладка — по полной картинке, затем уменьшение: у всех размеров она одна,
+                // и пол при приближении не перескакивает.
                 let big = paint(vary(&rgba, inner));
+                let cap = side_of(job.level) * VARY_TIMES;
+                let big = if job.level < FULL && big.width().max(big.height()) > cap { image::imageops::thumbnail(&big, cap.min(big.width()), cap.min(big.height())) } else { big };
                 (to_color_image(&big), [size[0] * VARY_TIMES, size[1] * VARY_TIMES])
             }),
-            false => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, if job.thumb { THUMB_SIDE } else { FULL_SIDE })).map(|(rgba, size)| (to_color_image(&paint(rgba)), size)),
+            false => read_source(inner, sources).and_then(|bytes| decode_rgba(&bytes, FULL_SIDE)).map(|(rgba, size)| {
+                // Раскрыта целиком, без уменьшения, — заодно и видимая часть: подоконнику и
+                // косяку она нужна в кадре, и считать её там — раскрывать картинку второй раз.
+                if [rgba.width(), rgba.height()] == size {
+                    remember_shape(inner, &rgba);
+                }
+                // Меньшие размеры — пополам за шаг в линейном свете, как мипмапы видеокарты:
+                // уменьшенная по байтам цвета брусчатка выходила темнее и мягче полной.
+                let rgba = if job.level < FULL { halve_linear(&rgba, side_of(job.level)) } else { rgba };
+                (to_color_image(&paint(rgba)), size)
+            }),
         }
     }
 }
@@ -957,7 +1050,7 @@ impl Textures {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (done_tx, ctx);
-            return Self { slots: HashMap::new(), jobs, done, sources, frame: 0, queue: job_rx, backlog: Default::default() };
+            return Self { slots: HashMap::new(), lod: true, jobs, done, sources, frame: 0, queue: job_rx, backlog: Default::default() };
         }
         #[cfg(not(target_arch = "wasm32"))]
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -974,7 +1067,7 @@ impl Textures {
                         Err(_) => return,
                     };
                     let result = load_job(&job, &sources);
-                    if tx.send(Done { key: job.key, thumb: job.thumb, result }).is_err() {
+                    if tx.send(Done { key: job.key, level: job.level, result }).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -982,7 +1075,7 @@ impl Textures {
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
-        Self { slots: HashMap::new(), jobs, done, sources, frame: 0 }
+        Self { slots: HashMap::new(), lod: true, jobs, done, sources, frame: 0 }
     }
 
     /// Раз в кадр: забрать готовые картинки и выбросить лишние миниатюры.
@@ -997,7 +1090,7 @@ impl Textures {
                 if web_decode(&job, &self.sources) {
                     continue;
                 }
-                if job.thumb { self.backlog.0.push_back(job) } else { self.backlog.1.push_back(job) }
+                if job.level == THUMB { self.backlog.0.push_back(job) } else { self.backlog.1.push_back(job) }
             }
             let mut busy = false;
             if let Ok(v) = crate::plat::web::call("kartografTakeDecoded", &[]) {
@@ -1020,7 +1113,7 @@ impl Textures {
                         }
                         None => Slot::Failed,
                     };
-                    self.slots.insert((key, thumb), slot);
+                    self.slots.insert((key, if thumb { THUMB } else { FULL }), slot);
                 }
             }
             // Не дольше ~12 мс за кадр, остальное — в следующих.
@@ -1029,7 +1122,7 @@ impl Textures {
                 let Some(job) = self.backlog.0.pop_front().or_else(|| self.backlog.1.pop_front()) else { break };
                 busy = true;
                 let result = load_job(&job, &self.sources);
-                self.slots.insert((job.key.clone(), job.thumb), match result {
+                self.slots.insert((job.key.clone(), job.level), match result {
                     Ok((image, size)) => Slot::Ready { tex: ctx.load_texture(&job.key, image, TEX_OPTIONS), size, used: self.frame },
                     Err(_) => Slot::Failed,
                 });
@@ -1044,12 +1137,12 @@ impl Textures {
                 Ok((image, size)) => Slot::Ready { tex: ctx.load_texture(&d.key, image, TEX_OPTIONS), size, used: self.frame },
                 Err(_) => Slot::Failed,
             };
-            self.slots.insert((d.key, d.thumb), slot);
+            self.slots.insert((d.key, d.level), slot);
         }
-        let thumbs = self.slots.keys().filter(|k| k.1).count();
+        let thumbs = self.slots.keys().filter(|k| k.1 == THUMB).count();
         if thumbs > THUMB_BUDGET {
             let cutoff = self.frame.saturating_sub(120);
-            self.slots.retain(|k, s| !k.1 || !matches!(s, Slot::Ready { used, .. } if *used < cutoff));
+            self.slots.retain(|k, s| k.1 != THUMB || !matches!(s, Slot::Ready { used, .. } if *used < cutoff));
         }
         self.evict_full();
     }
@@ -1062,7 +1155,7 @@ impl Textures {
         let mut idle = Vec::new();
         let cutoff = self.frame.saturating_sub(FULL_IDLE);
         for (k, s) in &self.slots {
-            if let (false, Slot::Ready { tex, used, .. }) = (k.1, s) {
+            if let (true, Slot::Ready { tex, used, .. }) = (k.1 != THUMB, s) {
                 total += bytes(tex);
                 if *used < cutoff {
                     idle.push((*used, bytes(tex), k.clone()));
@@ -1084,10 +1177,15 @@ impl Textures {
 
     /// Картинка и её настоящий размер в пикселях. `None` — ещё грузится или не читается.
     pub fn get(&mut self, key: &str, thumb: bool) -> Option<(&TextureHandle, [u32; 2])> {
-        let id = (key.to_owned(), thumb);
+        self.get_level(key, if thumb { THUMB } else { FULL })
+    }
+
+    /// Картинка размера `level` (заказать, если нет).
+    fn get_level(&mut self, key: &str, level: u8) -> Option<(&TextureHandle, [u32; 2])> {
+        let id = (key.to_owned(), level);
         if !self.slots.contains_key(&id) {
             self.slots.insert(id.clone(), Slot::Loading);
-            let _ = self.jobs.send(Job { key: key.to_owned(), thumb });
+            let _ = self.jobs.send(Job { key: key.to_owned(), level });
             return None;
         }
         match self.slots.get_mut(&id) {
@@ -1099,8 +1197,84 @@ impl Textures {
         }
     }
 
+    /// Размер, которого хватит, чтобы вся картинка легла на `need` точек экрана по большей
+    /// стороне (у разнообразного пола плитка втрое больше раскрытой картинки).
+    fn level_for(&self, key: &str, need: f32) -> u8 {
+        if !self.lod {
+            return FULL;
+        }
+        // Разнообразный пол — всегда полный: уменьшенная раскладка выходила заметно мягче
+        // (брусчатка «Порта»), а таких картинок на карте единицы.
+        if key.starts_with(VARY) {
+            return FULL;
+        }
+        // Только вдали и с запасом вдвое: уменьшенная заранее картинка чуть иначе по тону, чем
+        // уменьшенная видеокартой (куст «Затона» светлее, брусчатка «Порта» мягче), — на
+        // предмете в 64 точки экрана этого не видно, крупнее — уже заметно. Ближе — полная.
+        // Средний размер (512 точек) пробовал — на нём разница уже видна.
+        let need = need * 2.0;
+        if need <= THUMB_SIDE as f32 { THUMB } else { FULL }
+    }
+
+    /// Картинка не мельче `need` точек экрана по большей стороне. Пока нужная раскрывается —
+    /// уже готовая другого размера (сперва крупнее): при приближении предмет не пропадает.
+    pub fn get_sized(&mut self, key: &str, need: f32) -> Option<(&TextureHandle, [u32; 2])> {
+        let level = self.level_for(key, need);
+        let ready = |s: &Textures, l: u8| matches!(s.slots.get(&(key.to_owned(), l)), Some(Slot::Ready { .. }));
+        if ready(self, level) {
+            return self.get_level(key, level);
+        }
+        // Заказать нужный размер, а показать пока какой есть.
+        let _ = self.get_level(key, level);
+        let other = [FULL, THUMB].into_iter().find(|&l| l != level && ready(self, l))?;
+        self.get_level(key, other)
+    }
+
+    /// Картинка, у которой точка исходной картинки — `k` точек экрана (плитка пола).
+    /// Исходный размер известен, как только раскрыт любой размер; до того — миниатюра.
+    pub fn get_scaled(&mut self, key: &str, k: f32) -> Option<(&TextureHandle, [u32; 2])> {
+        let size = [THUMB, FULL].into_iter().find_map(|l| match self.slots.get(&(key.to_owned(), l)) {
+            Some(Slot::Ready { size, .. }) => Some(*size),
+            _ => None,
+        });
+        match size {
+            Some(s) => self.get_sized(key, s[0].max(s[1]) as f32 * k),
+            None if !self.lod => self.get_level(key, FULL),
+            None => {
+                let _ = self.get_level(key, THUMB);
+                None
+            }
+        }
+    }
+
+    /// Сколько картинок в памяти: миниатюр, полных и сколько мегабайт полные.
+    pub fn stats(&self) -> serde_json::Value {
+        let (mut thumbs, mut full, mut bytes) = (0usize, 0usize, 0usize);
+        // По видам ключа: откуда столько картинок.
+        let mut kinds: HashMap<String, (usize, usize)> = HashMap::new();
+        for (k, s) in &self.slots {
+            if let Slot::Ready { tex, .. } = s {
+                if k.1 == THUMB {
+                    thumbs += 1;
+                } else {
+                    full += 1;
+                    let b = tex.size()[0] * tex.size()[1] * 4 * 4 / 3;
+                    bytes += b;
+                    let kind = if let Some(rest) = k.0.strip_prefix(BUILTIN) { format!("builtin:{}", rest.split('_').next().unwrap_or("")) } else if k.0.contains(':') && !k.0.starts_with("pack:") && k.0.len() > 2 && k.0.as_bytes()[1] != b':' { k.0.split(':').next().unwrap_or("").to_owned() } else { k.0.rsplit(['/', '\\']).nth(1).unwrap_or("").to_owned() };
+                    let e = kinds.entry(kind).or_default();
+                    e.0 += 1;
+                    e.1 += b;
+                }
+            }
+        }
+        let mut kinds: Vec<(String, (usize, usize))> = kinds.into_iter().collect();
+        kinds.sort_by_key(|k| std::cmp::Reverse(k.1.1));
+        let top: Vec<serde_json::Value> = kinds.into_iter().take(12).map(|(k, (n, b))| serde_json::json!({"kind": k, "count": n, "mb": b / (1 << 20)})).collect();
+        serde_json::json!({"thumbs": thumbs, "full": full, "full_mb": bytes / (1 << 20), "top": top})
+    }
+
     pub fn failed(&self, key: &str, thumb: bool) -> bool {
-        matches!(self.slots.get(&(key.to_owned(), thumb)), Some(Slot::Failed))
+        matches!(self.slots.get(&(key.to_owned(), if thumb { THUMB } else { FULL })), Some(Slot::Failed))
     }
 
     /// Все ли запрошенные картинки уже пришли (для самопроверки).
@@ -1117,7 +1291,7 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
     use wasm_bindgen::JsValue;
     let (inner, side, blur) = match job.key.strip_prefix(SHADOW).and_then(|rest| rest.split_once(':')) {
         Some((blur, inner)) => (inner, SHADOW_SIDE, blur.parse::<f32>().unwrap_or(3.0) / 10.0),
-        None => (job.key.as_str(), if job.thumb { THUMB_SIDE } else { FULL_SIDE }, 0.0),
+        None => (job.key.as_str(), if job.level == THUMB { THUMB_SIDE } else { FULL_SIDE }, 0.0),
     };
     // Своя папка в модуле — файлы из окна браузера: их тоже раскрывает браузер.
     let own = || -> Option<(PathBuf, u64, u64)> {
@@ -1134,7 +1308,7 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
     let Some((file, offset, size)) = found else { return false };
     let args = [
         JsValue::from_str(&job.key),
-        JsValue::from_bool(job.thumb),
+        JsValue::from_bool(job.level == THUMB),
         JsValue::from_str(&file.to_string_lossy()),
         JsValue::from_f64(offset as f64),
         JsValue::from_f64(size as f64),
@@ -1144,6 +1318,44 @@ fn web_decode(job: &Job, sources: &Sources) -> bool {
     ];
     // Браузер без размытия на холсте вернёт `false` — тогда тень считаем сами.
     crate::plat::web::call("kartografDecode", &args).is_ok_and(|v| v.as_bool() != Some(false))
+}
+
+/// Картинка, уменьшенная пополам столько раз, чтобы большая сторона стала не больше
+/// `max_side`: каждый шаг — среднее четырёх точек в линейном свете с учётом прозрачности,
+/// как строит мипмапы видеокарта у sRGB-картинки.
+fn halve_linear(img: &image::RgbaImage, max_side: u32) -> image::RgbaImage {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| std::array::from_fn(|i| {
+        let c = i as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }));
+    let to_srgb = |l: f32| {
+        let c = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+        (c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    let mut cur = img.clone();
+    while cur.width().max(cur.height()) > max_side && cur.width().max(cur.height()) > 1 {
+        let (w, h) = (cur.width(), cur.height());
+        let (nw, nh) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
+        let mut out = image::RgbaImage::new(nw, nh);
+        for y in 0..nh {
+            for x in 0..nw {
+                let (mut sum, mut alpha) = ([0f32; 3], 0f32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = cur.get_pixel((2 * x + dx).min(w - 1), (2 * y + dy).min(h - 1)).0;
+                    let a = p[3] as f32 / 255.0;
+                    for c in 0..3 {
+                        sum[c] += lut[p[c] as usize] * a;
+                    }
+                    alpha += a;
+                }
+                let px = if alpha > 0.0 { [to_srgb(sum[0] / alpha), to_srgb(sum[1] / alpha), to_srgb(sum[2] / alpha), (alpha / 4.0 * 255.0).round() as u8] } else { [0, 0, 0, 0] };
+                out.put_pixel(x, y, image::Rgba(px));
+            }
+        }
+        cur = out;
+    }
+    cur
 }
 
 /// Картинка не крупнее `max_side` и её настоящий размер.
@@ -1159,8 +1371,21 @@ fn decode_rgba(bytes: &[u8], max_side: u32) -> Result<(image::RgbaImage, [u32; 2
 /// подробности ей ни к чему.
 pub fn shadow_image(bytes: &[u8], blur_cells: f32) -> Result<(ColorImage, [u32; 2]), String> {
     let (small, orig) = decode_rgba(bytes, SHADOW_SIDE)?;
+    // Размытой тени мелкие подробности ни к чему: точек на клетку — столько, чтобы радиус
+    // размытия был в несколько точек. Тень с размытием в клетку — 8 точек на клетку, а не
+    // 50: у предмета десять слоёв тени со своим размытием, и на «Иерихоне» 457 предметов
+    // держали 1308 таких картинок — 1,9 ГБ.
+    let cells = (orig[0] as f32 / PX_PER_CELL).max(1e-3);
+    let want = (SHADOW_RADIUS_PX * 2.0 / blur_cells.max(1e-3)).max(SHADOW_MIN_PPC);
+    let small = if (small.width() as f32 / cells) > want * 1.25 {
+        let k = want * cells / small.width() as f32;
+        let (nw, nh) = (((small.width() as f32 * k).round() as u32).max(8), ((small.height() as f32 * k).round() as u32).max(8));
+        image::imageops::resize(&small, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        small
+    };
     let (w, h) = (small.width() as usize, small.height() as usize);
-    let ppc = w as f32 / (orig[0] as f32 / PX_PER_CELL).max(1e-3);
+    let ppc = w as f32 / cells;
     let r = ((blur_cells * ppc / 2.0).round() as usize).clamp(1, 64);
     let pad = 3 * r + 1;
     let (pw, ph) = (w + 2 * pad, h + 2 * pad);
@@ -1297,6 +1522,8 @@ impl Default for Library {
 
 impl Library {
     pub fn set_folder(&mut self, dir: &Path) {
+        // Файлы своей папки могли смениться: их видимые части считать заново.
+        forget_shapes();
         // Свои живые механизмы: `live.json` в корне папки — «начало имени файла → раскладка».
         let live = crate::plat::fs::read(&dir.join("live.json")).ok().and_then(|b| String::from_utf8(b).ok());
         crate::map::set_live_table(live.map(|text| crate::map::parse_live_table(&text)).unwrap_or_default());
@@ -1622,15 +1849,19 @@ mod tests {
         let mut bytes = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
         let (shadow, [pad, w]) = shadow_image(&bytes, 0.3).unwrap();
-        assert_eq!(w, 256);
-        assert_eq!(shadow.size, [256 + 2 * pad as usize, 256 + 2 * pad as usize]);
+        // Размытие 0,3 клетки — 4 точки радиуса: картинка ~27 точек на клетку, а не 128.
+        assert!((50..=56).contains(&w), "{w}");
+        assert_eq!(shadow.size, [w as usize + 2 * pad as usize, w as usize + 2 * pad as usize]);
         let at = |x: usize, y: usize| shadow.pixels[y * shadow.size[0] + x];
         let c = shadow.size[0] / 2;
-        // Середина тёмная и чёрная, угол поля пустой, край силуэта — полутень.
+        // Середина тёмная и чёрная, угол поля пустой, край силуэта (четверть ширины) — полутень.
         assert!(at(c, c).a() > 250 && at(c, c).r() == 0);
         assert_eq!(at(0, 0).a(), 0);
-        let edge = at(pad as usize + 64, c).a();
+        let edge = at(pad as usize + w as usize / 4, c).a();
         assert!((90..170).contains(&edge), "{edge}");
+        // Резкая тень (0,05 клетки) — не мельче прежнего: точек хватает на край.
+        let (_, [_, sharp]) = shadow_image(&bytes, 0.05).unwrap();
+        assert_eq!(sharp, 256);
     }
 
     #[test]

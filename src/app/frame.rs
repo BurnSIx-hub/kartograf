@@ -7,6 +7,8 @@ impl App {
         let ctx = ui.ctx().clone();
         let started = crate::plat::Instant::now();
         self.frame += 1;
+        // Картинки по размеру на экране — везде, кроме выгрузки для Foundry: там полные.
+        self.textures.lod = !self.export.as_ref().is_some_and(|e| !e.picture);
         // Быстрый щелчок сдвигает мышь на 7–25 точек, при родных 6 он терялся.
         // На карте порог ниже: от него начинаются протяжки.
         let on_map = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| self.canvas.contains(p));
@@ -45,12 +47,14 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         self.hide_after_ai(&ctx);
 
+        let t = crate::plat::Instant::now();
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));
         // Как в привычных редакторах карт: слева инструменты и их настройки, справа библиотека.
         egui::Panel::left("tools").exact_size(64.0).resizable(false).frame(egui::Frame::new().fill(PANEL)).show(ui, |ui| self.tool_cells(ui));
         egui::Panel::left("options").default_size(250.0).size_range(200.0..=420.0).resizable(true).show(ui, |ui| self.options_bar(ui));
         egui::Panel::right("library").default_size(330.0).size_range(200.0..=700.0).resizable(true).show(ui, |ui| self.shelf(ui));
+        self.prof.add("panels", t);
         egui::CentralPanel::no_frame().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas_ui(ui));
         // Пока идёт выгрузка, поверх холста ничего: окно, заходящее на холст,
         // впечатывалось краем в каждую плитку картинки.
@@ -67,6 +71,7 @@ impl App {
         }
 
         self.screenshots(&ctx);
+        self.ground_cache.trim(self.frame);
         self.prof.add("frame", started);
         self.prof.end_frame();
         if let Some(mut test) = self.test.take() {

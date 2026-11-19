@@ -15,7 +15,10 @@ pub struct Prof {
 impl Prof {
     /// Прибавить к части кадра `part` время с `since`.
     pub fn add(&mut self, part: &'static str, since: crate::plat::Instant) {
-        let ms = since.elapsed().as_secs_f32() * 1000.0;
+        self.add_ms(part, since.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    pub fn add_ms(&mut self, part: &'static str, ms: f32) {
         match self.now.iter_mut().find(|p| p.0 == part) {
             Some(p) => p.1 += ms,
             None => self.now.push((part, ms)),
