@@ -343,6 +343,7 @@ impl App {
                     }
                     if let Some(e) = &mut self.export {
                         e.fresh = a["fresh"].as_bool().unwrap_or(false);
+                        e.boundless = a["boundless"].as_bool().unwrap_or(false);
                     }
                     return Out::Wait(Waiting::Export { reply: dummy() });
                 }

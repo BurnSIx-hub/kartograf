@@ -5,6 +5,7 @@
 
 mod app;
 mod blend;
+mod boundless;
 mod check;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;

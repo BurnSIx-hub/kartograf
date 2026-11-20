@@ -60,6 +60,7 @@ impl App {
             planning: 0.0,
             prepare,
             fresh: false,
+            boundless: false,
             district: None,
         });
     }
@@ -163,6 +164,7 @@ impl App {
             planning: 0.0,
             prepare: 0.0,
             fresh: false,
+            boundless: false,
             district: None,
         });
     }
@@ -923,6 +925,44 @@ impl App {
                     files.push((e.dir.join(format!("raw_{k}_walls_black.png")), png_bytes(black)));
                     files.push((e.dir.join(format!("raw_{k}_walls_white.png")), png_bytes(white)));
                 }
+            }
+            // Мир для Boundless — из того же: пол со стенами, крыши, сцена со стенами и светом.
+            if e.boundless {
+                if n > 1 {
+                    return Err("Boundless: пока только карта в один этаж".into());
+                }
+                let world = crate::boundless::World::new(e.done[0].width(), e.done[0].height(), e.px);
+                let mut plain = image::RgbaImage::new(world.side, world.side);
+                {
+                    use image::buffer::ConvertBuffer;
+                    let floor: image::RgbaImage = e.done[0].convert();
+                    image::imageops::replace(&mut plain, &floor, 0, 0);
+                }
+                if let Some(layer) = wall_layers.get(&0) {
+                    image::imageops::overlay(&mut plain, layer, 0, 0);
+                }
+                let by_src: std::collections::HashMap<String, &Vec<u8>> = files.iter().map(|(p, b)| (export::foundry_src(p), b)).collect();
+                let roofs: Vec<crate::boundless::BakedRoof> = scene["tiles"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| crate::boundless::is_roof(t))
+                    .filter_map(|t| {
+                        let src = t["texture"]["src"].as_str()?.split('?').next()?;
+                        let image = image::load_from_memory(by_src.get(src)?).ok()?.to_rgba8();
+                        Some(crate::boundless::BakedRoof { image, center: [t["x"].as_f64()?, t["y"].as_f64()?], size: [t["width"].as_f64()?, t["height"].as_f64()?] })
+                    })
+                    .collect();
+                let pyr = e.dir.join(format!("{base}_pyramid"));
+                for (rel, bytes) in crate::boundless::pyramid(plain, &roofs, &world) {
+                    files.push((pyr.join(rel), bytes));
+                }
+                let mpath = e.dir.join(format!("{base}_boundless.json"));
+                let manifest = crate::boundless::manifest(&scene, &world, &export::foundry_src(&pyr));
+                files.push((mpath.clone(), manifest.to_string().into_bytes()));
+                let bscene = crate::boundless::scene(&scene, &world, &export::foundry_src(&mpath));
+                files.push((e.dir.join(format!("{base}_boundless_scene.json")), serde_json::to_string_pretty(&bscene).unwrap_or_default().into_bytes()));
+                laps.lap("boundless");
             }
             std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
             for (path, bytes) in &files {
