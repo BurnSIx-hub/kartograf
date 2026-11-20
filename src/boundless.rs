@@ -88,8 +88,10 @@ impl World {
         // навсегда). Целым числом клеток — тогда куски мира кончаются на границе клеток.
         let target = (need / 32).clamp(128, 1024);
         let tile = ((target as f64 / px as f64).round() as u32).max(1) * px;
+        // Маленькая карта (меньше ~40 клеток) уровня z5 не набрала бы: дома Boundless ставит с z5,
+        // мебель под крышами — тоже, и её не было бы совсем. Такой мир достраивается пустыми плитками.
         let mut max_z = 0;
-        while tile << max_z < need {
+        while tile << max_z < need || max_z < ROOF_Z {
             max_z += 1;
         }
         let side = tile << max_z;
@@ -399,16 +401,12 @@ pub fn merge_down(pyr: &std::path::Path, roofed: &std::path::Path, world: &World
 
 /// Точки сцены во флагах Wild Canvas у тайла — дымоходы, сливы, путь по рельсам — со
 /// сдвигом куска в мир. Рамка крыши (`outline`) и концы гамака — доли тайла, их не трогать.
+/// Только `get_mut`: `v["ключ"]` на запись вставляет пустое значение, и у каждого тайла
+/// появлялись `chimneys: null`, `rail: {path: null}`, `scuppers: null`.
 fn shift_live(v: &mut Value, offset: [f64; 2]) {
-    let live = &mut v["flags"][crate::export::LIVE_MODULE];
-    if !live.is_object() {
-        if live.is_null() {
-            if let Some(f) = v["flags"].as_object_mut() {
-                f.remove(crate::export::LIVE_MODULE);
-            }
-        }
+    let Some(live) = v.get_mut("flags").and_then(|f| f.get_mut(crate::export::LIVE_MODULE)).and_then(Value::as_object_mut) else {
         return;
-    }
+    };
     let mv = |p: &mut Value| {
         if let Some(a) = p.as_array_mut().filter(|a| a.len() >= 2) {
             a[0] = json!(a[0].as_f64().unwrap_or(0.0) + offset[0]);
@@ -416,11 +414,11 @@ fn shift_live(v: &mut Value, offset: [f64; 2]) {
         }
     };
     for key in ["chimneys", "scuppers"] {
-        for p in live[key].as_array_mut().into_iter().flatten() {
+        for p in live.get_mut(key).and_then(Value::as_array_mut).into_iter().flatten() {
             mv(p);
         }
     }
-    for p in live["rail"]["path"].as_array_mut().into_iter().flatten() {
+    for p in live.get_mut("rail").and_then(|r| r.get_mut("path")).and_then(Value::as_array_mut).into_iter().flatten() {
         mv(p);
     }
 }
@@ -496,6 +494,9 @@ mod tests {
         let big = World::new(100_000, 100_000, 100);
         assert_eq!((big.tile, big.max_z, big.side, big.chunk_z, big.chunk_cells()), (1000, 7, 128_000, 4, 80));
         assert!(big.sector * big.sim >= big.side);
+        // 16×12 клеток: плитка в клетку, мир 32 клетки — z5 есть, лишнее — пустые плитки.
+        let small = World::new(1600, 1200, 100);
+        assert_eq!((small.tile, small.max_z, small.side, small.chunk_z), (100, ROOF_Z, 3200, 0));
     }
 
     #[test]
@@ -647,5 +648,8 @@ mod tests {
         let tile = &m["tiles"][0];
         assert_eq!(tile["flags"]["burn-living-map"]["wind"], 1);
         assert_eq!(tile["flags"]["burn-living-map"]["rail"]["path"], json!([[1010.0, 2020.0], [1030.0, 2040.0]]));
+        let keys = |v: &Value| v["flags"]["burn-living-map"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(keys(tile), Some(vec!["rail".to_owned(), "wind".to_owned()]), "пустых пометок не прибавилось");
+        assert_eq!(keys(ov), Some(vec!["chimneys".to_owned(), "outline".to_owned()]));
     }
 }
