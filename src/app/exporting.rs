@@ -60,7 +60,6 @@ impl App {
             planning: 0.0,
             prepare,
             fresh: false,
-            boundless: false,
             district: None,
         });
     }
@@ -164,7 +163,6 @@ impl App {
             planning: 0.0,
             prepare: 0.0,
             fresh: false,
-            boundless: false,
             district: None,
         });
     }
@@ -473,6 +471,10 @@ impl App {
         self.sel = e.sel.take();
         let shot_s = e.began.elapsed().as_secs_f32();
         let result = self.write_export(&e);
+        if self.big.is_some() {
+            self.big_next(result);
+            return;
+        }
         if let Some(t) = &mut self.export_timing {
             let r = |s: f32| (s * 100.0).round() / 100.0;
             t["shots"] = serde_json::json!(e.shots_taken);
@@ -533,9 +535,12 @@ impl App {
         // Фон этажа сжимается в своём потоке, пока рисуются крыши и тайлы: у большой карты
         // это десятки секунд. WebP вышел или JPEG — видно, когда поток закончил.
         let mut bg_jobs: Vec<Pending<Result<(Vec<u8>, &'static str), String>>> = Vec::new();
+        // Кусок мира для Boundless: фон и стены идут в его пирамиду, своих файлов у куска нет.
+        let chunk = self.big.is_some();
         for (k, img) in e.done.iter().enumerate() {
             let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
             let job = match &holes {
+                _ if chunk => Pending::Ready(Ok((Vec::new(), "webp"))),
                 Some(rgba) => {
                     let (rgba, cache) = (rgba.clone(), cache.clone());
                     Pending::spawn(move || encode_cached(cache, "floor-rgba-88", rgba.dimensions().into(), rgba.as_raw(), || Ok(export::layer_bytes(&rgba, 88.0))))
@@ -752,7 +757,9 @@ impl App {
             // окна, косяки и слой «над стенами».
             if let Some([black, white]) = e.walls.get(k) {
                 let layer = export::layer_from_pair(black, white);
-                if export::opaque_box(&layer, 8).is_some() {
+                if chunk {
+                    wall_jobs.push((k, Pending::Ready(Ok((layer, Vec::new(), "webp")))));
+                } else if export::opaque_box(&layer, 8).is_some() {
                     let cache = cache.clone();
                     wall_jobs.push((k, Pending::spawn(move || {
                         let (bytes, ext) = encode_cached(cache, "walls-rgba-90", layer.dimensions().into(), layer.as_raw(), || Ok(export::layer_bytes(&layer, 90.0)))?;
@@ -838,6 +845,20 @@ impl App {
         let scene_path = e.dir.join(format!("{base}.json"));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
         laps.lap("scene");
+        #[cfg(not(target_arch = "wasm32"))]
+        if chunk {
+            let skip: std::collections::HashSet<&PathBuf> = bg_paths.iter().chain(wall_paths.values()).chain(std::iter::once(&files.last().expect("сцена").0)).collect();
+            for (path, bytes) in files.iter().filter(|(p, _)| !skip.contains(p)) {
+                if let Some(d) = path.parent() {
+                    std::fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+                }
+                std::fs::write(path, bytes).map_err(|x| format!("{}: {x}", path.display()))?;
+            }
+            self.big_chunk(e, &scene, wall_layers.get(&0), &files)?;
+            laps.lap("chunk");
+            self.export_timing = Some(laps.json());
+            return Ok(String::new());
+        }
         // Universal VTT — для других VTT; модулю он не нужен, сцена создаётся сразу.
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -925,44 +946,6 @@ impl App {
                     files.push((e.dir.join(format!("raw_{k}_walls_black.png")), png_bytes(black)));
                     files.push((e.dir.join(format!("raw_{k}_walls_white.png")), png_bytes(white)));
                 }
-            }
-            // Мир для Boundless — из того же: пол со стенами, крыши, сцена со стенами и светом.
-            if e.boundless {
-                if n > 1 {
-                    return Err("Boundless: пока только карта в один этаж".into());
-                }
-                let world = crate::boundless::World::new(e.done[0].width(), e.done[0].height(), e.px);
-                let mut plain = image::RgbaImage::new(world.side, world.side);
-                {
-                    use image::buffer::ConvertBuffer;
-                    let floor: image::RgbaImage = e.done[0].convert();
-                    image::imageops::replace(&mut plain, &floor, 0, 0);
-                }
-                if let Some(layer) = wall_layers.get(&0) {
-                    image::imageops::overlay(&mut plain, layer, 0, 0);
-                }
-                let by_src: std::collections::HashMap<String, &Vec<u8>> = files.iter().map(|(p, b)| (export::foundry_src(p), b)).collect();
-                let roofs: Vec<crate::boundless::BakedRoof> = scene["tiles"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|t| crate::boundless::is_roof(t))
-                    .filter_map(|t| {
-                        let src = t["texture"]["src"].as_str()?.split('?').next()?;
-                        let image = image::load_from_memory(by_src.get(src)?).ok()?.to_rgba8();
-                        Some(crate::boundless::BakedRoof { image, center: [t["x"].as_f64()?, t["y"].as_f64()?], size: [t["width"].as_f64()?, t["height"].as_f64()?] })
-                    })
-                    .collect();
-                let pyr = e.dir.join(format!("{base}_pyramid"));
-                for (rel, bytes) in crate::boundless::pyramid(plain, &roofs, &world) {
-                    files.push((pyr.join(rel), bytes));
-                }
-                let mpath = e.dir.join(format!("{base}_boundless.json"));
-                let manifest = crate::boundless::manifest(&scene, &world, &export::foundry_src(&pyr));
-                files.push((mpath.clone(), manifest.to_string().into_bytes()));
-                let bscene = crate::boundless::scene(&scene, &world, &export::foundry_src(&mpath));
-                files.push((e.dir.join(format!("{base}_boundless_scene.json")), serde_json::to_string_pretty(&bscene).unwrap_or_default().into_bytes()));
-                laps.lap("boundless");
             }
             std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
             for (path, bytes) in &files {
@@ -1485,5 +1468,213 @@ impl App {
         }
         out.retain(|_, pic| pic.size[0] > 0);
         Ok(out)
+    }
+}
+
+/// Мир для Boundless кусками: каждый кусок — район выгрузки ([`App::start_district`]);
+/// его плитки сразу ложатся в пирамиду, стены, свет и тайлы — в общий манифест. Всей
+/// карты в памяти нет: у 1000×1000 при 100 точках на клетку она была бы 30 ГБ.
+pub(super) struct BigJob {
+    dir: PathBuf,
+    name: String,
+    px: u32,
+    fresh: bool,
+    world: crate::boundless::World,
+    queue: std::collections::VecDeque<[u32; 4]>,
+    total: usize,
+    done: std::collections::HashSet<(u32, u32)>,
+    gather: crate::boundless::Gather,
+    meta: serde_json::Value,
+    began: crate::plat::Instant,
+}
+
+impl App {
+    /// Начать мир для Boundless: куски — районы по `chunk_cells` клеток.
+    pub fn start_boundless(&mut self, dir: PathBuf, name: String, px: u32, fresh: bool) -> Result<(), String> {
+        if cfg!(target_arch = "wasm32") {
+            return Err("мир для Boundless пишет только программа".into());
+        }
+        if self.levels.len() > 1 {
+            return Err("Boundless: пока только карта в один этаж".into());
+        }
+        let (w, h) = (self.map.width, self.map.height);
+        let mut world = crate::boundless::World::new(w * px, h * px, px);
+        world.baked = crate::boundless::roofs_too_heavy(&self.map, px);
+        let cc = world.chunk_cells();
+        let n = 1u32 << world.chunk_z;
+        let mut queue = std::collections::VecDeque::new();
+        for cy in 0..n {
+            for cx in 0..n {
+                let (x0, y0) = (cx * cc, cy * cc);
+                if x0 < w && y0 < h {
+                    queue.push_back([x0, y0, (x0 + cc).min(w), (y0 + cc).min(h)]);
+                }
+            }
+        }
+        let total = queue.len();
+        self.big = Some(BigJob { dir, name, px, fresh, world, queue, total, done: Default::default(), gather: Default::default(), meta: serde_json::Value::Null, began: crate::plat::Instant::now() });
+        self.big_next(Ok(String::new()));
+        Ok(())
+    }
+
+    /// Кусок снят: дальше следующий, а кончились — нижние уровни, манифест и сцена.
+    pub(super) fn big_next(&mut self, result: Result<String, String>) {
+        if let Err(err) = result {
+            self.big = None;
+            self.error = Some(format!("Мир для Boundless не собрался: {err}"));
+            return;
+        }
+        let Some(job) = &mut self.big else { return };
+        if let Some(area) = job.queue.pop_front() {
+            let (dir, name, px, fresh) = (job.dir.clone(), job.name.clone(), job.px, job.fresh);
+            self.notice = Some(format!("Boundless: кусок {} из {}", job.total - job.queue.len(), job.total));
+            match self.start_district(dir, name, px, area, false) {
+                Ok(()) => {
+                    if let Some(e) = &mut self.export {
+                        e.fresh = fresh;
+                    }
+                }
+                Err(err) => self.big_next(Err(err)),
+            }
+            return;
+        }
+        let Some(job) = self.big.take() else { return };
+        match Self::big_finish(job) {
+            Ok(msg) => self.notice = Some(msg),
+            Err(err) => self.error = Some(format!("Мир для Boundless не собрался: {err}")),
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(store) = &self.shot_store {
+            store.prune(shotcache::DISK_LIMIT);
+        }
+    }
+
+    /// Снятый кусок — в пирамиду (плитки от верхнего уровня до уровня кусков) и в манифест.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn big_chunk(&mut self, e: &Export, scene: &serde_json::Value, walls: Option<&image::RgbaImage>, files: &[(PathBuf, Vec<u8>)]) -> Result<(), String> {
+        use image::buffer::ConvertBuffer;
+        let (map_w, map_h) = (self.map.width, self.map.height);
+        let Some(job) = &mut self.big else { return Ok(()) };
+        let d = e.district.as_ref().ok_or("кусок без района")?;
+        let [x0, y0, x1, y1] = d.area;
+        if e.px != job.px {
+            return Err(format!("кусок снят при {} точках на клетку, а мир — при {}", e.px, job.px));
+        }
+        let world = job.world;
+        let px = job.px;
+        let mut plain = image::RgbaImage::new(world.chunk_px(), world.chunk_px());
+        let floor: image::RgbaImage = e.done[0].convert();
+        image::imageops::replace(&mut plain, &floor, 0, 0);
+        if let Some(layer) = walls {
+            image::imageops::overlay(&mut plain, layer, 0, 0);
+        }
+        // Крыши — все, что задевают кусок (у шва — в обоих): каждая впечатывается целиком.
+        let by_src: std::collections::HashMap<String, &Vec<u8>> = files.iter().map(|(p, b)| (export::foundry_src(p), b)).collect();
+        let roofs: Vec<crate::boundless::BakedRoof> = scene["tiles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| crate::boundless::is_roof(t))
+            .filter_map(|t| {
+                let src = t["texture"]["src"].as_str()?.split('?').next()?;
+                let image = image::load_from_memory(by_src.get(src)?).ok()?.to_rgba8();
+                Some(crate::boundless::BakedRoof { image, center: [t["x"].as_f64()?, t["y"].as_f64()?], size: [t["width"].as_f64()?, t["height"].as_f64()?] })
+            })
+            .collect();
+        let t0 = [x0 * px / world.tile, y0 * px / world.tile];
+        let (tiles, low) = crate::boundless::chunk_tiles(plain, &roofs, &world, t0);
+        let base = export::ascii_name(&job.name);
+        let pyr = job.dir.join(format!("{base}_pyramid"));
+        for (rel, bytes) in tiles {
+            let path = pyr.join(rel);
+            if let Some(d) = path.parent() {
+                std::fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+            }
+            std::fs::write(&path, bytes).map_err(|x| format!("{}: {x}", path.display()))?;
+        }
+        let at = (t0[0] >> (world.max_z - world.chunk_z), t0[1] >> (world.max_z - world.chunk_z));
+        if let Some(bytes) = low {
+            let dir = job.dir.join(format!("{base}_pyramid_roofed")).join(world.chunk_z.to_string());
+            std::fs::create_dir_all(&dir).map_err(|x| format!("{}: {x}", dir.display()))?;
+            std::fs::write(dir.join(format!("{}_{}.webp", at.0, at.1)), bytes).map_err(|x| x.to_string())?;
+        }
+        job.done.insert(at);
+        // Своё — середина в куске; у правого и нижнего края карты — и на самой кромке.
+        let (ox, oy) = ((x0 * px) as f64, (y0 * px) as f64);
+        let far = |v: u32, edge: u32| if v >= edge { f64::INFINITY } else { (v * px) as f64 };
+        job.gather.add(scene, [ox, oy], [ox, oy, far(x1, map_w), far(y1, map_h)]);
+        if job.meta.is_null() {
+            job.meta = serde_json::json!({"name": job.name, "grid": scene["grid"], "environment": scene["environment"]});
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn big_chunk(&mut self, _e: &Export, _scene: &serde_json::Value, _walls: Option<&image::RgbaImage>, _files: &[(PathBuf, Vec<u8>)]) -> Result<(), String> {
+        Err("мир для Boundless пишет только программа".into())
+    }
+
+    /// Пустые куски (за картой), нижние уровни, манифест и сцена.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn big_finish(job: BigJob) -> Result<String, String> {
+        let world = job.world;
+        let base = export::ascii_name(&job.name);
+        let pyr = job.dir.join(format!("{base}_pyramid"));
+        let roofed = job.dir.join(format!("{base}_pyramid_roofed"));
+        // Мир — квадрат 2^z плиток, карта — в его углу: за картой плитки пустые, но
+        // модуль их спросит.
+        let empty = crate::boundless::empty_tile(&world);
+        let n = 1u32 << world.chunk_z;
+        let mut blank = 0;
+        for cy in 0..n {
+            for cx in 0..n {
+                if job.done.contains(&(cx, cy)) {
+                    continue;
+                }
+                for z in world.chunk_z..=world.max_z {
+                    let m = 1u32 << (z - world.chunk_z);
+                    let dir = pyr.join(z.to_string());
+                    std::fs::create_dir_all(&dir).map_err(|x| format!("{}: {x}", dir.display()))?;
+                    for j in 0..m {
+                        for i in 0..m {
+                            std::fs::write(dir.join(format!("{}_{}.webp", cx * m + i, cy * m + j)), &empty).map_err(|x| x.to_string())?;
+                            blank += 1;
+                        }
+                    }
+                }
+            }
+        }
+        crate::boundless::merge_down(&pyr, &roofed, &world)?;
+        if roofed.is_dir() {
+            std::fs::remove_dir_all(&roofed).map_err(|x| format!("{}: {x}", roofed.display()))?;
+        }
+        let mpath = job.dir.join(format!("{base}_boundless.json"));
+        let manifest = crate::boundless::manifest(&job.gather.scene(), &world, &export::foundry_src(&pyr));
+        std::fs::write(&mpath, manifest.to_string()).map_err(|x| format!("{}: {x}", mpath.display()))?;
+        let scene = crate::boundless::scene(&job.meta, &world, &export::foundry_src(&mpath));
+        let spath = job.dir.join(format!("{base}_boundless_scene.json"));
+        std::fs::write(&spath, serde_json::to_string_pretty(&scene).unwrap_or_default()).map_err(|x| format!("{}: {x}", spath.display()))?;
+        let count = |k: &str| manifest["sectors"].as_object().map_or(0, |s| s.values().map(|v| v[k].as_array().map_or(0, |a| a.len())).sum::<usize>());
+        Ok(format!(
+            "Мир для Boundless — в {}: {}×{} точек, плитка {}, уровни z0–z{}, кусков {} (пустых плиток {blank}), стен {}, дверей {}, огней {}, тайлов {}, домов {}{}; {:.0} с",
+            job.dir.display(),
+            world.side,
+            world.side,
+            world.tile,
+            world.max_z,
+            job.total,
+            count("w"),
+            count("d"),
+            count("l"),
+            manifest["tiles"].as_array().map_or(0, |a| a.len()),
+            manifest["overlays"].as_object().map_or(0, |a| a.len()),
+            if world.baked { " (крыши запечены в плитки: картинки домов не влезли бы в видеопамять)" } else { "" },
+            job.began.elapsed().as_secs_f32()
+        ))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn big_finish(_job: BigJob) -> Result<String, String> {
+        Err("мир для Boundless пишет только программа".into())
     }
 }

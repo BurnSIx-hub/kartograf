@@ -15,6 +15,9 @@ use std::time::Duration;
 /// Сколько ждать окно с ответом: сборка места по координатам бывает долгой.
 const REPLY_WAIT: Duration = Duration::from_secs(900);
 
+/// Сколько ждать выгрузку: мир для Boundless снимается кусками.
+const EXPORT_WAIT: Duration = Duration::from_secs(12 * 3600);
+
 /// Команда для окна и куда отдать ответ.
 pub struct Request {
     pub tool: String,
@@ -77,11 +80,13 @@ fn serve(stream: TcpStream, tx: &Sender<Request>, ctx: &eframe::egui::Context, t
         Ok(req) if req["token"].as_str() == Some(token) => {
             let (reply, wait) = channel();
             let tool = req["tool"].as_str().unwrap_or_default().to_owned();
+            // Мир для Boundless у карты 1000×1000 снимается кусками час и больше.
+            let limit = if tool == "export_foundry" { EXPORT_WAIT } else { REPLY_WAIT };
             if tx.send(Request { tool, args: req["args"].clone(), reply }).is_err() {
                 Err("окно Картографа закрывается".to_owned())
             } else {
                 ctx.request_repaint();
-                wait.recv_timeout(REPLY_WAIT).unwrap_or_else(|_| Err("окно Картографа не ответило".to_owned()))
+                wait.recv_timeout(limit).unwrap_or_else(|_| Err("окно Картографа не ответило".to_owned()))
             }
         }
         Ok(_) => Err("неверный пароль управления".to_owned()),

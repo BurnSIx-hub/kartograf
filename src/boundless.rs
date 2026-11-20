@@ -21,8 +21,41 @@ use serde_json::{Value, json};
 /// запечены в плитки.
 pub const ROOF_Z: u32 = 5;
 
-/// Размеры мира: сторона (плитка × 2^maxZoomZ, карта — в левом верхнем углу), плитка,
-/// верхний уровень пирамиды, сетка секторов.
+/// Сколько видеопамяти могут занять картинки крыш-домов. Boundless 1.1.0 для маски крыш
+/// грузит и закрепляет картинки всех домов мира разом (у него их 17 на весь мир); у
+/// Картографа картинка своя у каждого дома, и у King's Cross 4×4 (1624 дома при 64 на
+/// клетку) это 38,7 ГБ — вкладка Foundry падает.
+pub const ROOF_BUDGET: f64 = 1.0e9;
+
+/// Видеопамять картинок всех крыш карты при `px` на клетку, с mip-уровнями.
+pub fn roof_bytes(map: &crate::map::Map, px: u32) -> f64 {
+    let p = px as f64;
+    let area = |lo: [f32; 2], hi: [f32; 2]| ((hi[0] - lo[0]).max(0.0) as f64 * p) * ((hi[1] - lo[1]).max(0.0) as f64 * p);
+    let rects = map.roofs.iter().map(|r| {
+        let o = r.outline();
+        let lo = o.iter().fold([f32::MAX; 2], |a, v| [a[0].min(v[0]), a[1].min(v[1])]);
+        let hi = o.iter().fold([f32::MIN; 2], |a, v| [a[0].max(v[0]), a[1].max(v[1])]);
+        area(lo, hi)
+    });
+    let outlines = map.outline_roofs.iter().map(|r| {
+        let (lo, hi) = r.bounds();
+        area(lo, hi)
+    });
+    rects.chain(outlines).sum::<f64>() * 4.0 * 4.0 / 3.0
+}
+
+/// Крыши не влезут в [`ROOF_BUDGET`]: тогда они запекаются во все уровни пирамиды.
+pub fn roofs_too_heavy(map: &crate::map::Map, px: u32) -> bool {
+    roof_bytes(map, px) > ROOF_BUDGET
+}
+
+/// Наибольшая сторона куска мира, что снимается за раз, в точках: кусок — обычный
+/// район выгрузки, со всеми слоями в памяти (около гигабайта).
+pub const CHUNK_PX: u32 = 8192;
+
+/// Размеры мира: сторона (плитка × 2^maxZoomZ, карта — в левом верхнем углу), плитка
+/// (целое число клеток), верхний уровень пирамиды, сетка секторов и уровень кусков: на
+/// `chunk_z` кусок — одна плитка, выше он режется сам, ниже — плитки собираются с диска.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct World {
     pub side: u32,
@@ -30,24 +63,43 @@ pub struct World {
     pub max_z: u32,
     pub sim: u32,
     pub sector: u32,
+    pub cell_px: u32,
+    pub chunk_z: u32,
+    /// Крыши запечены во все уровни, домов нет ([`roofs_too_heavy`]).
+    pub baked: bool,
 }
 
 impl World {
-    /// Мир под картинку `w`×`h` точек при `grid` точках на клетку. Плитка у небольших
-    /// миров — 512: верхний уровень должен дойти до z5, иначе крыши не откроются никогда.
-    /// Сектор — около 25 клеток.
-    pub fn new(w: u32, h: u32, grid: u32) -> Self {
+    /// Мир под картинку `w`×`h` точек при `px` точках на клетку. Сектор — около 25 клеток.
+    pub fn new(w: u32, h: u32, px: u32) -> Self {
         let need = w.max(h).max(1);
-        // Около 1/32 стороны: тогда верхний уровень — z5, и крыши открываются вблизи
-        // («Иерихон_2», 6000 точек: плитка 512 дала бы z4 — крыши запечены навсегда).
-        let tile = (need / 32).max(1).next_power_of_two().clamp(128, 1024);
+        let px = px.max(1);
+        // Плитка — около 1/32 стороны: тогда верхний уровень — z5, и крыши открываются
+        // вблизи («Иерихон_2», 6000 точек: плитка 512 дала бы z4 — крыши запечены
+        // навсегда). Целым числом клеток — тогда куски мира кончаются на границе клеток.
+        let target = (need / 32).clamp(128, 1024);
+        let tile = ((target as f64 / px as f64).round() as u32).max(1) * px;
         let mut max_z = 0;
         while tile << max_z < need {
             max_z += 1;
         }
         let side = tile << max_z;
-        let sim = side.div_ceil(grid.max(1) * 25).max(1);
-        Self { side, tile, max_z, sim, sector: side.div_ceil(sim) }
+        let sim = side.div_ceil(px * 25).max(1);
+        let mut c = 0;
+        while c < max_z && tile << (c + 1) <= CHUNK_PX {
+            c += 1;
+        }
+        Self { side, tile, max_z, sim, sector: side.div_ceil(sim), cell_px: px, chunk_z: max_z - c, baked: false }
+    }
+
+    /// Сторона куска в точках.
+    pub fn chunk_px(&self) -> u32 {
+        self.tile << (self.max_z - self.chunk_z)
+    }
+
+    /// Сторона куска в клетках.
+    pub fn chunk_cells(&self) -> u32 {
+        self.chunk_px() / self.cell_px
     }
 
     fn sector_of(&self, x: f64, y: f64) -> (u32, u32) {
@@ -146,10 +198,17 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
         let (x, y, w, h) = (num(&t["x"], 0.0), num(&t["y"], 0.0), num(&t["width"], 0.0), num(&t["height"], 0.0));
         let src = t["texture"]["src"].clone();
         let rot = num(&t["rotation"], 0.0);
+        if is_roof(t) && world.baked {
+            continue;
+        }
         if is_roof(t) {
             let id = overlays.len();
             overlays.insert(id.to_string(), json!({"cx": x, "cy": y, "w": w, "h": h, "rot": rot, "roof": src}));
             push(world.sector_of(x, y), "o", json!(id));
+            continue;
+        }
+        // Под запечённой крышей мебели не видно никогда.
+        if world.baked && under_roof(x, y) {
             continue;
         }
         let id = tiles.len();
@@ -217,45 +276,134 @@ pub struct BakedRoof {
     pub size: [f64; 2],
 }
 
-/// Пирамида: файлы `z/x_y.webp` и их байты. `plain` — мир без крыш (`side`×`side`,
-/// карта со стенами в левом верхнем углу); уровни ниже [`ROOF_Z`] — с крышами.
-pub fn pyramid(plain: image::RgbaImage, roofs: &[BakedRoof], world: &World) -> Vec<(String, Vec<u8>)> {
-    let mut roofed = (world.max_z > 0 && !roofs.is_empty()).then(|| plain.clone());
-    if let Some(r) = &mut roofed {
-        for roof in roofs {
-            let (w, h) = (roof.size[0].round().max(1.0) as u32, roof.size[1].round().max(1.0) as u32);
-            let pic = if roof.image.dimensions() == (w, h) { roof.image.clone() } else { image::imageops::resize(&roof.image, w, h, image::imageops::FilterType::Triangle) };
-            image::imageops::overlay(r, &pic, (roof.center[0] - w as f64 / 2.0).round() as i64, (roof.center[1] - h as f64 / 2.0).round() as i64);
-        }
+fn webp(img: &image::RgbaImage) -> Vec<u8> {
+    crate::export::layer_bytes(img, 88.0).0
+}
+
+/// Пустая плитка: там, где карты нет (мир — квадрат 2^z плиток), модуль всё равно её спросит.
+pub fn empty_tile(world: &World) -> Vec<u8> {
+    webp(&image::RgbaImage::new(world.tile, world.tile))
+}
+
+/// Плитки куска мира: уровни от `max_z` до `chunk_z`. `plain` — кусок (`chunk_px` ×
+/// `chunk_px`, лишнее за картой прозрачно) без крыш, `t0` — его левая верхняя плитка на
+/// `max_z`. Уровни ниже [`ROOF_Z`] — с крышами. Если кусок кончается выше них
+/// (`chunk_z >= ROOF_Z`), его плитка `chunk_z` с крышами — вторым: из неё соберутся
+/// нижние уровни.
+pub fn chunk_tiles(plain: image::RgbaImage, roofs: &[BakedRoof], world: &World, t0: [u32; 2]) -> (Vec<(String, Vec<u8>)>, Option<Vec<u8>>) {
+    let mut roofed = plain.clone();
+    for roof in roofs {
+        let (w, h) = (roof.size[0].round().max(1.0) as u32, roof.size[1].round().max(1.0) as u32);
+        let pic = if roof.image.dimensions() == (w, h) { roof.image.clone() } else { image::imageops::resize(&roof.image, w, h, image::imageops::FilterType::Triangle) };
+        image::imageops::overlay(&mut roofed, &pic, (roof.center[0] - w as f64 / 2.0).round() as i64, (roof.center[1] - h as f64 / 2.0).round() as i64);
     }
     let mut out = Vec::new();
-    let cut = |img: &image::RgbaImage, z: u32, out: &mut Vec<(String, Vec<u8>)>| {
-        let n = 1u32 << z;
-        let t = img.width() / n;
-        let cells: Vec<(u32, u32)> = (0..n).flat_map(|y| (0..n).map(move |x| (x, y))).collect();
-        let bytes = crate::export::par_map(&cells, |&(x, y)| {
-            let tile = image::imageops::crop_imm(img, x * t, y * t, t, t).to_image();
-            let tile = if t == world.tile { tile } else { image::imageops::resize(&tile, world.tile, world.tile, image::imageops::FilterType::Triangle) };
-            Some(crate::export::layer_bytes(&tile, 88.0).0)
-        });
-        for ((x, y), b) in cells.into_iter().zip(bytes) {
-            out.push((format!("{z}/{x}_{y}.webp"), b.unwrap_or_default()));
-        }
-    };
     let (mut a, mut b) = (plain, roofed);
-    for z in (0..=world.max_z).rev() {
-        let img = if z < ROOF_Z { b.as_ref().unwrap_or(&a) } else { &a };
-        cut(img, z, &mut out);
-        if z > 0 {
-            if z >= ROOF_Z || b.is_none() {
+    for z in (world.chunk_z..=world.max_z).rev() {
+        let img = if z < ROOF_Z || world.baked { &b } else { &a };
+        let m = 1u32 << (z - world.chunk_z);
+        let shift = world.max_z - z;
+        let cells: Vec<(u32, u32)> = (0..m).flat_map(|y| (0..m).map(move |x| (x, y))).collect();
+        let t = world.tile;
+        let bytes = crate::export::par_map(&cells, |&(x, y)| Some(webp(&image::imageops::crop_imm(img, x * t, y * t, t, t).to_image())));
+        for ((x, y), bytes) in cells.into_iter().zip(bytes) {
+            out.push((format!("{z}/{}_{}.webp", (t0[0] >> shift) + x, (t0[1] >> shift) + y), bytes.unwrap_or_default()));
+        }
+        if z > world.chunk_z {
+            if z > ROOF_Z && !world.baked {
                 a = half(&a);
             }
-            if let Some(r) = &b {
-                b = Some(half(r));
+            b = half(&b);
+        }
+    }
+    let low = (world.chunk_z >= ROOF_Z && !world.baked).then(|| webp(&b));
+    (out, low)
+}
+
+/// Уровни ниже `chunk_z` — из плиток уровня выше на диске, по четыре в одну. `pyr` —
+/// пирамида, `roofed` — плитки с крышами тех уровней, что в пирамиде без них. Нет
+/// плитки — прозрачная.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn merge_down(pyr: &std::path::Path, roofed: &std::path::Path, world: &World) -> Result<(), String> {
+    let t = world.tile;
+    let load = |dir: &std::path::Path, z: u32, x: u32, y: u32| -> image::RgbaImage {
+        std::fs::read(dir.join(z.to_string()).join(format!("{x}_{y}.webp"))).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8()).unwrap_or_else(|| image::RgbaImage::new(t, t))
+    };
+    let merge = |from: &std::path::Path, to: &std::path::Path, z: u32| -> Result<(), String> {
+        let n = 1u32 << z;
+        let dir = to.join(z.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let cells: Vec<(u32, u32)> = (0..n).flat_map(|y| (0..n).map(move |x| (x, y))).collect();
+        let done = crate::export::par_map(&cells, |&(x, y)| {
+            let mut big = image::RgbaImage::new(2 * t, 2 * t);
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                image::imageops::replace(&mut big, &load(from, z + 1, 2 * x + dx, 2 * y + dy), (dx * t) as i64, (dy * t) as i64);
+            }
+            std::fs::write(dir.join(format!("{x}_{y}.webp")), webp(&half(&big))).ok()
+        });
+        if done.iter().any(Option::is_none) { Err(format!("{}: не записалось", dir.display())) } else { Ok(()) }
+    };
+    for z in (0..world.chunk_z).rev() {
+        if world.baked {
+            merge(pyr, pyr, z)?;
+        } else if z >= ROOF_Z {
+            merge(pyr, pyr, z)?;
+            merge(roofed, roofed, z)?;
+        } else {
+            merge(if z + 1 >= ROOF_Z { roofed } else { pyr }, pyr, z)?;
+        }
+    }
+    Ok(())
+}
+
+/// Данные сцен кусков в одну: сдвиг куска в мир и только своё — середина вещи в
+/// `own` = `[x0, y0, x1, y1)` (у шва двух кусков стена, лампа, крыша — одна). Крыши — все
+/// свои: у Картографа крыша — тайл-поверхность ([`is_roof`]).
+#[derive(Default)]
+pub struct Gather {
+    walls: Vec<Value>,
+    lights: Vec<Value>,
+    sounds: Vec<Value>,
+    tiles: Vec<Value>,
+}
+
+impl Gather {
+    pub fn add(&mut self, scene: &Value, offset: [f64; 2], own: [f64; 4]) {
+        let mine = |x: f64, y: f64| x >= own[0] && x < own[2] && y >= own[1] && y < own[3];
+        let shift = |v: &mut Value, kx: &str, ky: &str| {
+            if let Some(x) = v[kx].as_f64() {
+                v[kx] = json!(x + offset[0]);
+            }
+            if let Some(y) = v[ky].as_f64() {
+                v[ky] = json!(y + offset[1]);
+            }
+        };
+        for w in scene["walls"].as_array().into_iter().flatten() {
+            let Some(c) = w["c"].as_array().filter(|c| c.len() == 4) else { continue };
+            let c: Vec<f64> = c.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+            let c = [c[0] + offset[0], c[1] + offset[1], c[2] + offset[0], c[3] + offset[1]];
+            if !mine((c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0) {
+                continue;
+            }
+            let mut w = w.clone();
+            w["c"] = json!(c);
+            self.walls.push(w);
+        }
+        for (list, out) in [(&scene["lights"], &mut self.lights), (&scene["sounds"], &mut self.sounds), (&scene["tiles"], &mut self.tiles)] {
+            for v in list.as_array().into_iter().flatten() {
+                let mut v = v.clone();
+                shift(&mut v, "x", "y");
+                if mine(v["x"].as_f64().unwrap_or(f64::NAN), v["y"].as_f64().unwrap_or(f64::NAN)) {
+                    out.push(v);
+                }
             }
         }
     }
-    out
+
+    /// Собранное — сценой для [`manifest`].
+    pub fn scene(&self) -> Value {
+        json!({"walls": self.walls, "lights": self.lights, "sounds": self.sounds, "tiles": self.tiles})
+    }
 }
 
 #[cfg(test)]
@@ -264,22 +412,22 @@ mod tests {
 
     #[test]
     fn the_world_is_a_whole_number_of_tiles_and_reaches_the_roof_level() {
-        // King's Cross: 16 000 × 16 256 при 64 на клетку.
+        // King's Cross: 16 000 × 16 256 при 64 на клетку — плитка 8 клеток, кусок 128.
         let w = World::new(16000, 16256, 64);
-        assert_eq!((w.tile, w.max_z, w.side), (512, 5, 16384));
+        assert_eq!((w.tile, w.max_z, w.side, w.chunk_z, w.chunk_px(), w.chunk_cells()), (512, 5, 16384, 1, 8192, 128));
         assert!(w.max_z >= ROOF_Z, "крыши должны открываться");
-        // «Иерихон_2»: 6000 × 4400 при 100.
+        // «Иерихон_2»: 6000 × 4400 при 100 — плитка 2 клетки, мир одним куском.
         let j = World::new(6000, 4400, 100);
-        assert_eq!((j.tile, j.max_z, j.side), (256, 5, 8192));
-        // 1000×1000 при 100 на клетку — плитка 1024.
+        assert_eq!((j.tile, j.max_z, j.side, j.chunk_z, j.chunk_cells()), (200, 5, 6400, 0, 64));
+        // 1000×1000 при 100 — плитка 10 клеток, кусок 80 клеток (8000 точек), куски — z4.
         let big = World::new(100_000, 100_000, 100);
-        assert_eq!((big.tile, big.max_z, big.side), (1024, 7, 131_072));
-        assert_eq!(big.sector * big.sim >= big.side, true);
+        assert_eq!((big.tile, big.max_z, big.side, big.chunk_z, big.chunk_cells()), (1000, 7, 128_000, 4, 80));
+        assert!(big.sector * big.sim >= big.side);
     }
 
     #[test]
     fn walls_are_cut_by_sectors_and_tiles_move_to_their_corner() {
-        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500 };
+        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500, cell_px: 100, chunk_z: 0, baked: false };
         let scene = json!({
             "walls": [
                 {"c": [100, 100, 900, 100]},
@@ -312,11 +460,12 @@ mod tests {
 
     #[test]
     fn roofs_are_baked_below_the_roof_level_only() {
-        // Мир 6 уровней по 4 точки: z0..z4 — с крышей, z5 — без.
-        let world = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128 };
+        // Мир одним куском, 6 уровней по 4 точки: z0..z4 — с крышей, z5 — без.
+        let world = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128, cell_px: 4, chunk_z: 0, baked: false };
         let plain = image::RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 255, 255]));
         let roof = BakedRoof { image: image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])), center: [4.0, 4.0], size: [8.0, 8.0] };
-        let files = pyramid(plain, &[roof], &world);
+        let (files, low) = chunk_tiles(plain, &[roof], &world, [0, 0]);
+        assert!(low.is_none(), "кусок дошёл до z0 сам");
         assert_eq!(files.len(), (0..=5).map(|z| 1usize << (2 * z)).sum::<usize>());
         let px = |name: &str| {
             let b = &files.iter().find(|f| f.0 == format!("{name}.webp")).unwrap().1;
@@ -325,5 +474,57 @@ mod tests {
         assert!(px("5/0_0")[2] > 200 && px("5/0_0")[0] < 40, "z5 — без крыши: {:?}", px("5/0_0"));
         assert!(px("4/0_0")[0] > 200, "z4 — с крышей: {:?}", px("4/0_0"));
         assert!(px("0/0_0")[2] > 200, "z0 — весь мир, крыша мелкая");
+    }
+
+    #[test]
+    fn low_levels_are_merged_from_chunks_with_roofs_from_their_own_chain() {
+        // Плитка 8 точек (у меньшей WebP мешает цвет соседей в блоке 2×2), z0..z6, куски —
+        // z5 (по 2×2 плитки z6): 32×32 куска. Крыша — в первом куске: на z5 её нет, на z4 и ниже есть.
+        let world = World { side: 512, tile: 8, max_z: 6, sim: 1, sector: 512, cell_px: 8, chunk_z: 5, baked: false };
+        let dir = std::env::temp_dir().join(format!("kartograf_bl_{}", std::process::id()));
+        let (pyr, roofed) = (dir.join("pyr"), dir.join("roofed"));
+        for cy in 0..32u32 {
+            for cx in 0..32u32 {
+                let plain = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 255, 255]));
+                let roofs = if (cx, cy) == (0, 0) { vec![BakedRoof { image: image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])), center: [8.0, 8.0], size: [16.0, 16.0] }] } else { Vec::new() };
+                let (files, low) = chunk_tiles(plain, &roofs, &world, [cx * 2, cy * 2]);
+                for (rel, b) in files {
+                    let p = pyr.join(rel);
+                    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                    std::fs::write(p, b).unwrap();
+                }
+                let p = roofed.join("5").join(format!("{cx}_{cy}.webp"));
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, low.expect("кусок выше уровня крыш отдаёт свою плитку с крышей")).unwrap();
+            }
+        }
+        merge_down(&pyr, &roofed, &world).unwrap();
+        let px = |z: u32, x: u32, y: u32| image::load_from_memory(&std::fs::read(pyr.join(z.to_string()).join(format!("{x}_{y}.webp"))).unwrap()).unwrap().to_rgba8().get_pixel(0, 0).0;
+        assert!(px(5, 0, 0)[2] > 200 && px(5, 0, 0)[0] < 40, "z5 — без крыши");
+        assert!(px(4, 0, 0)[0] > 100, "z4 — из кусков с крышей: {:?}", px(4, 0, 0));
+        assert!(px(4, 1, 0)[2] > 200, "соседняя плитка z4 — без крыши");
+        assert_eq!((0..=6).filter(|z| pyr.join(z.to_string()).join("0_0.webp").exists()).count(), 7, "все уровни на месте");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn heavy_roofs_are_baked_everywhere_and_give_no_houses() {
+        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500, cell_px: 100, chunk_z: 0, baked: true };
+        let scene = json!({"tiles": [
+            {"x": 250, "y": 750, "width": 100, "height": 50, "texture": {"src": "k/tree.webp"}, "occlusion": {"modes": [1], "alpha": 0}},
+            {"x": 800, "y": 800, "width": 200, "height": 100, "texture": {"src": "k/roof_1.webp"}, "occlusion": {"modes": [2], "alpha": 0}},
+            {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp"}, "occlusion": {"modes": [1], "alpha": 0}}
+        ]});
+        let m = manifest(&scene, &world, "k/pyramid");
+        assert_eq!(m["overlays"], json!({}), "домов нет: крыши в плитках");
+        assert_eq!(m["tiles"].as_array().unwrap().len(), 1, "стол под крышей не нужен, дерево остаётся");
+        assert_eq!(m["tiles"][0]["src"], "k/tree.webp");
+        // Плитки: крыша и на верхнем уровне.
+        let w = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128, cell_px: 4, chunk_z: 0, baked: true };
+        let plain = image::RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 255, 255]));
+        let roof = BakedRoof { image: image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])), center: [4.0, 4.0], size: [8.0, 8.0] };
+        let (files, low) = chunk_tiles(plain, &[roof], &w, [0, 0]);
+        assert!(low.is_none());
+        let b = &files.iter().find(|f| f.0 == "5/0_0.webp").unwrap().1;
+        assert!(image::load_from_memory(b).unwrap().to_rgba8().get_pixel(0, 0).0[0] > 200, "z5 — с крышей");
     }
 }

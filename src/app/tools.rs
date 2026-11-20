@@ -147,7 +147,7 @@ impl App {
                 }
             }
             Some(Waiting::Export { reply }) => {
-                if self.export.is_some() {
+                if self.export.is_some() || self.big.is_some() {
                     self.control_wait = Some(Waiting::Export { reply });
                 } else {
                     let r = self.take_error().map(|_| json!({"done": self.notice.clone().unwrap_or_default(), "timing": self.export_timing.clone()}));
@@ -333,6 +333,12 @@ impl App {
                         let at = |i: usize| v[i].as_f64().unwrap_or(0.0).max(0.0);
                         [at(0).floor() as u32, at(1).floor() as u32, at(2).ceil() as u32, at(3).ceil() as u32]
                     });
+                    if a["boundless"].as_bool().unwrap_or(false) {
+                        if let Err(err) = self.start_boundless(dir, name, px, a["fresh"].as_bool().unwrap_or(false)) {
+                            return Out::Done(Err(err));
+                        }
+                        return Out::Wait(Waiting::Export { reply: dummy() });
+                    }
                     match area {
                         Some(area) => {
                             if let Err(err) = self.start_district(dir, name, px, area, false) {
@@ -343,7 +349,6 @@ impl App {
                     }
                     if let Some(e) = &mut self.export {
                         e.fresh = a["fresh"].as_bool().unwrap_or(false);
-                        e.boundless = a["boundless"].as_bool().unwrap_or(false);
                     }
                     return Out::Wait(Waiting::Export { reply: dummy() });
                 }

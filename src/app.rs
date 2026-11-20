@@ -419,8 +419,6 @@ struct Export {
     prepare: f32,
     /// Снять всё заново, мимо кэша (снятое всё равно ложится в кэш).
     fresh: bool,
-    /// Рядом — мир для модуля Boundless: пирамида плиток, манифест и своя сцена.
-    boundless: bool,
     /// Выгружается только район — отдельной сценой.
     district: Option<District>,
 }
@@ -582,6 +580,8 @@ pub struct App {
     outline_last: std::collections::HashMap<usize, u64>,
     /// Картинки крыш, которые рисуют фоновые потоки, — по отпечатку.
     roof_jobs: std::collections::HashMap<u64, draw_ground::RoofJob>,
+    /// Мир для Boundless, что собирается кусками.
+    big: Option<exporting::BigJob>,
     /// Стены комнат целыми ломаными и отпечаток того, из чего они собраны.
     wall_lines: Option<(u64, std::rc::Rc<draw::WallLines>)>,
     /// Не все крыши по контуру нарисованы под нынешний масштаб: снимок ждёт.
@@ -903,6 +903,7 @@ impl App {
             outline_last: std::collections::HashMap::new(),
             roof_jobs: std::collections::HashMap::new(),
             wall_lines: None,
+            big: None,
             outline_pending: false,
             under: std::collections::HashMap::new(),
             underlay: 0,
