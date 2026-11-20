@@ -652,6 +652,54 @@ pub fn clip_segments(segs: &[Segment], r: [f32; 4], shift: [f32; 2]) -> Vec<Segm
     out
 }
 
+/// Ломаные, обрезанные по прямоугольнику `r`: выход за край рвёт ломаную на куски.
+fn clip_lines(lines: &[Vec<[f32; 2]>], r: [f32; 4]) -> Vec<Vec<[f32; 2]>> {
+    let mut out = Vec::new();
+    for line in lines {
+        let mut cur: Vec<[f32; 2]> = Vec::new();
+        for w in line.windows(2) {
+            match clip_segments(&[(w[0], w[1])], r, [0.0, 0.0]).first() {
+                Some(&(a, b)) if cur.last().is_some_and(|l| (l[0] - a[0]).abs() < 1e-4 && (l[1] - a[1]).abs() < 1e-4) => cur.push(b),
+                Some(&(a, b)) => {
+                    if cur.len() >= 2 {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur = vec![a, b];
+                }
+                None => {
+                    if cur.len() >= 2 {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur.clear();
+                }
+            }
+        }
+        if cur.len() >= 2 {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+impl Layout {
+    /// Раскладка района — в его пределах `w`×`h` клеток. Обрезанная карта берёт стену,
+    /// дверь и палатку, если они задевают край, целиком: без обрезки стена тянулась бы за
+    /// сцену на клетки, а дверь за краем висела бы значком над пустотой. Дверь остаётся,
+    /// если её середина в районе.
+    pub fn clip_to(&mut self, w: f32, h: f32) {
+        let r = [0.0, 0.0, w, h];
+        self.walls = clip_lines(&self.walls, r);
+        self.low = clip_lines(&self.low, r);
+        self.cliffs = clip_lines(&self.cliffs, r);
+        self.tents = clip_segments(&self.tents, r, [0.0, 0.0]);
+        const EPS: f32 = 1e-3;
+        self.portals.retain(|p| {
+            let m = [(p.seg.0[0] + p.seg.1[0]) / 2.0, (p.seg.0[1] + p.seg.1[1]) / 2.0];
+            (-EPS..=w + EPS).contains(&m[0]) && (-EPS..=h + EPS).contains(&m[1])
+        });
+    }
+}
+
 /// Предел формата по стороне: карта больше уходит в JPEG.
 pub const WEBP_MAX_SIDE: u32 = 16383;
 
@@ -2751,6 +2799,29 @@ mod tests {
         assert_eq!(cut[0], ([0.0, 1.0], [5.0, 1.0]), "через район — по краю");
         let ((ax, ay), (bx, by)) = ((cut[1].0[0], cut[1].0[1]), (cut[1].1[0], cut[1].1[1]));
         assert!((ax - 0.0).abs() < 1e-5 && (ay - 6.0).abs() < 1e-5 && (bx - 2.0).abs() < 1e-5 && (by - 8.0).abs() < 1e-5, "косой — до нижнего края: {cut:?}");
+    }
+
+    #[test]
+    fn a_district_layout_keeps_only_what_is_inside() {
+        let door = |a: [f32; 2], b: [f32; 2]| PortalOut { seg: (a, b), kind: PortalKind::Door, leaf: None };
+        let mut lay = Layout {
+            tents: vec![([-2.0, 3.0], [2.0, 3.0])],
+            // Через левый край, вдоль края, вне района и ломаная, дважды выходящая за верх.
+            walls: vec![vec![[-6.0, 9.0], [2.0, 9.0]], vec![[0.0, 2.0], [0.0, 5.0]], vec![[-1.0, 2.0], [0.0, 2.0]], vec![[2.0, 1.0], [2.0, -1.0], [4.0, -1.0], [4.0, 1.0], [6.0, 1.0]]],
+            low: vec![vec![[9.0, 20.0], [9.0, 24.0]]],
+            cliffs: Vec::new(),
+            // За верхним краем, за левым, на краю и через край серединой внутри.
+            portals: vec![door([15.0, -1.0], [15.0, 0.0]), door([-2.0, 21.0], [0.0, 21.0]), door([26.0, 4.0], [26.0, 5.0]), door([-0.4, 7.0], [0.6, 7.0])],
+            lights: Vec::new(),
+            zones: Vec::new(),
+            passages: Vec::new(),
+        };
+        lay.clip_to(26.0, 22.0);
+        assert_eq!(lay.walls, vec![vec![[0.0, 9.0], [2.0, 9.0]], vec![[0.0, 2.0], [0.0, 5.0]], vec![[2.0, 1.0], [2.0, 0.0]], vec![[4.0, 0.0], [4.0, 1.0], [6.0, 1.0]]]);
+        assert_eq!(lay.low, vec![vec![[9.0, 20.0], [9.0, 22.0]]]);
+        assert_eq!(lay.tents, vec![([0.0, 3.0], [2.0, 3.0])], "полог — тем же направлением");
+        let kept: Vec<_> = lay.portals.iter().map(|p| p.seg).collect();
+        assert_eq!(kept, vec![([26.0, 4.0], [26.0, 5.0]), ([-0.4, 7.0], [0.6, 7.0])]);
     }
 
     #[test]

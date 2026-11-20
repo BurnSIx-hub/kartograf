@@ -565,6 +565,9 @@ impl App {
                 tents.extend(export::tent_walls(p, Some(&hulls[&p.asset])));
             }
             lay.tents = tents;
+            if e.district.is_some() {
+                lay.clip_to(map.width as f32, map.height as f32);
+            }
             layouts.push(lay);
             laps.lap("layout");
         }
