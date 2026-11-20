@@ -286,9 +286,9 @@ impl App {
             let found = crate::place::parse_place(&form.text);
             ui.horizontal(|ui| {
                 ui.label("Размер, клеток:");
-                ui.add(egui::DragValue::new(&mut form.cells[0]).range(8..=256));
+                ui.add(egui::DragValue::new(&mut form.cells[0]).range(8..=map::MAX_SIDE));
                 ui.label("×");
-                ui.add(egui::DragValue::new(&mut form.cells[1]).range(8..=256));
+                ui.add(egui::DragValue::new(&mut form.cells[1]).range(8..=map::MAX_SIDE));
             });
             ui.horizontal(|ui| {
                 ui.label("Деревья:");

@@ -199,7 +199,7 @@ impl MapPick {
                 Some(p) if self.resizing => {
                     let d = (p - mid).abs();
                     for (k, half) in [d.x, d.y].into_iter().enumerate() {
-                        self.cells[k] = ((2.0 * half * mpp / CELL_M).round() as u32).clamp(8, 256);
+                        self.cells[k] = ((2.0 * half * mpp / CELL_M).round() as u32).clamp(8, crate::map::MAX_SIDE);
                     }
                 }
                 _ => {

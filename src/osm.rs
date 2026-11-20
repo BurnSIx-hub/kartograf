@@ -35,7 +35,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { cell_m: CELL_M, max_cells: 256, trees: 0.0 }
+        Self { cell_m: CELL_M, max_cells: crate::map::MAX_SIDE, trees: 0.0 }
     }
 }
 
@@ -89,7 +89,8 @@ pub fn import_cover(xml: &str, extra: &[String], cover: Option<&Cover>, opt: Opt
     let (wm, hm) = (((east - west) * mx) as f32, ((north - south) * my) as f32);
     let mut warnings = Vec::new();
     let mut cell = opt.cell_m.max(0.1);
-    if wm.max(hm) / cell > opt.max_cells as f32 {
+    // Допуск — как у округления сторон ниже: 1524 м — это 1000,0003 клетки, а не больше 1000.
+    if wm.max(hm) / cell > opt.max_cells as f32 + 0.1 {
         cell = wm.max(hm) / opt.max_cells as f32;
         warnings.push(format!("участок {:.0}×{:.0} м больше {} клеток по 5 футов: клетка {:.1} м", wm, hm, opt.max_cells, cell));
     }

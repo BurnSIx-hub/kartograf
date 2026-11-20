@@ -1120,10 +1120,26 @@ fn analyse(agent: Option<&net::Agent>, frame: &Frame, files: &Files, step: &dyn 
 /// Выгрузка OSM по рамке — с запасом вокруг: API отдаёт только линии с точкой
 /// внутри запрошенного, и мост через реку у Болтона, чьи концы за рамкой в 60 м,
 /// в карту не попадал. Рамка карты — прежняя (`<bounds>` заменяется).
+/// API OSM отдаёт не больше 50 000 точек: центр города в 256 клеток (390 м, с
+/// запасом — 585) уже около предела. Рамка больше — через Overpass, тем же XML.
 fn osm_url(want: &Frame) -> String {
     let pad = (want.width_m().max(want.height_m()) * 0.25).max(30.0);
     let (plat, plon) = (pad / 110_574.0, pad / (111_320.0 * want.mid_lat().to_radians().cos()));
-    format!("https://api.openstreetmap.org/api/0.6/map?bbox={:.7},{:.7},{:.7},{:.7}", want.west - plon, want.south - plat, want.east + plon, want.north + plat)
+    let (s, w, n, e) = (want.south - plat, want.west - plon, want.north + plat, want.east + plon);
+    if want.width_m().max(want.height_m()) > (API_CELLS as f64 + 0.5) * CELL_M as f64 {
+        // Как у `map` API: точки рамки, линии и отношения с ними, точки этих линий.
+        let q = format!("[out:xml][timeout:180];(node({s:.7},{w:.7},{n:.7},{e:.7});<;)->.a;(way.a;>;)->.b;(.a;.b;);out body;");
+        return format!("https://overpass-api.de/api/interpreter?data={}", query_escape(&q));
+    }
+    format!("https://api.openstreetmap.org/api/0.6/map?bbox={w:.7},{s:.7},{e:.7},{n:.7}")
+}
+
+/// Наибольшая сторона рамки в клетках, которую ещё качает API OSM.
+const API_CELLS: u32 = 256;
+
+/// Строка для адреса: всё, кроме букв, цифр и `-_.~`, — `%XX`.
+fn query_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// Что [`build`] заведомо скачает для места: выгрузку OSM, плитки снимка всех
@@ -1220,6 +1236,21 @@ pub fn compare(osms: &[PathBuf]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Рамка до 256 клеток — API OSM, как прежде (и прежние папки мест те же);
+    /// больше — Overpass: у API предел 50 000 точек.
+    #[test]
+    fn a_big_frame_comes_from_overpass() {
+        let small = osm_url(&Frame::around(51.53, -0.125, [256, 256]));
+        assert!(small.starts_with("https://api.openstreetmap.org/api/0.6/map?bbox="), "{small}");
+        let big = osm_url(&Frame::around(51.53, -0.125, [1000, 600]));
+        assert!(big.starts_with("https://overpass-api.de/api/interpreter?data=%5Bout%3Axml%5D"), "{big}");
+        // Та же рамка с запасом, что у API: четверть длинной стороны.
+        let f = Frame::around(51.53, -0.125, [1000, 600]);
+        let pad = f.width_m() * 0.25 / 110_574.0;
+        assert!(big.contains(&format!("node%28{:.7}%2C", f.south - pad)), "{big}");
+        assert!(!big.contains(' ') && !big.contains(';'), "строка запроса не экранирована");
+    }
 
     /// Модуль качает заранее ровно то, что спросит сборка: та же выгрузка, те же
     /// слои по рамке из `<bounds>` (до седьмого знака), плитки выбранного масштаба.

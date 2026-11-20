@@ -1625,7 +1625,8 @@ impl App {
         if self.place.busy() {
             return Out::Done(Err("место уже собирается".into()));
         }
-        let cells = [a["width"].as_u64().unwrap_or(40).clamp(8, 256) as u32, a["height"].as_u64().unwrap_or(30).clamp(8, 256) as u32];
+        let side = |k: &str, d: u64| a[k].as_u64().unwrap_or(d).clamp(8, map::MAX_SIDE as u64) as u32;
+        let cells = [side("width", 40), side("height", 30)];
         self.place.trees = f(a, "trees").unwrap_or(0.0).clamp(0.0, 1.0);
         self.place.error = None;
         self.place.start = Some((lat, lon, cells));

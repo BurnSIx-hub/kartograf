@@ -201,16 +201,29 @@ impl App {
     /// так не нарисовать. Разрешение картинки — под масштаб окна ([`outline_ppc`]):
     /// раньше оно было не больше 24 точек на клетку, и рядом с прямоугольной
     /// крышей (её рисует видеокарта в полную резкость) такая выходила мылом.
-    /// Новых за кадр — несколько, остальные в следующих; пока новая не готова,
-    /// видна прежняя.
+    /// Рисуют их фоновые потоки ([`RoofJob`]), кадр только забирает готовые: прежде
+    /// крыши рисовались в кадре, и смена масштаба над городом давала кадры по
+    /// 150–300 мс. Пока новая не готова, видна прежняя.
     pub(super) fn draw_outline_roofs(&mut self, painter: &egui::Painter, canvas: Rect, view: Rect, alpha: f32, light: [f32; 2]) {
         use std::hash::{Hash, Hasher};
-        const NEW_PER_FRAME: usize = 6;
-        /// Новых точек картинок за кадр: больше — окно замирает.
-        const PX_PER_FRAME: f32 = 3.0e6;
+        // Готовые картинки — в кэш.
+        let mut arrived = Vec::new();
+        self.roof_jobs.retain(|_, job| match job.rx.try_recv() {
+            Ok(out) => {
+                arrived.push((std::mem::take(&mut job.targets), out));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (targets, out) in arrived {
+            for (t, (ci, origin, size)) in targets.into_iter().zip(out) {
+                let handle = painter.ctx().load_texture(format!("roof-{t}"), ci, egui::TextureOptions::LINEAR);
+                self.outline_cache.insert(t, (handle, origin, size));
+            }
+        }
+        let max_jobs = export::threads();
         let roofs = std::mem::take(&mut self.map.outline_roofs);
-        let mut fresh = 0;
-        let mut fresh_px = 0.0;
         let mut pending = false;
         let exact = self.export.is_some();
         let want = (self.cam.scale * self.canvas_ppp).max(1.0);
@@ -256,10 +269,8 @@ impl App {
             let ppc = outline_ppc(want, w.max(h), exact);
             ppc.to_bits().hash(&mut hs);
             let key = hs.finish();
-            let cost = w * h * ppc * ppc;
-            if !self.outline_cache.contains_key(&key) && fresh > 0 && (fresh >= NEW_PER_FRAME || fresh_px + cost > PX_PER_FRAME) {
-                pending = true;
-            } else if !self.outline_cache.contains_key(&key) {
+            let ready = self.outline_cache.contains_key(&key);
+            if !ready && !self.roof_jobs.contains_key(&key) && self.roof_jobs.len() < max_jobs {
                 let mut covers: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>> = std::collections::HashMap::new();
                 for piece in &r.pieces {
                     if let Some(img) = self.cover_rgba(&piece.paint) {
@@ -269,14 +280,14 @@ impl App {
                 if covers.len() < r.pieces.iter().map(|k| &k.paint).collect::<std::collections::BTreeSet<_>>().len() {
                     continue;
                 }
-                fresh += 1;
-                fresh_px += cost;
-                let (img, origin) = roofs::render_outline(r, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]), &near);
-                let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
-                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-                let handle = painter.ctx().load_texture(format!("outline-roof-{key}"), ci, egui::TextureOptions::LINEAR);
-                self.outline_cache.insert(key, (handle, origin, size));
+                let (roof, clip) = (r.clone(), ([0.0, 0.0], [self.map.width as f32, self.map.height as f32]));
+                let rx = spawn_roof(move || {
+                    let (img, origin) = roofs::render_outline(&roof, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, clip, &near);
+                    vec![roof_picture(img, origin, ppc)]
+                });
+                self.roof_jobs.insert(key, RoofJob { targets: vec![key], rx });
             }
+            pending |= !ready;
             let shown = if self.outline_cache.contains_key(&key) {
                 self.outline_last.insert(idx, key);
                 Some(key)
@@ -324,24 +335,33 @@ impl App {
             (light[0].to_bits(), light[1].to_bits(), ppc.to_bits(), snow).hash(&mut hs);
             let key = hs.finish();
             let slot = |k: usize| key.wrapping_add(k as u64 + 1);
-            let cost = w * h * ppc * ppc;
             let ready = self.outline_cache.contains_key(&slot(0));
-            if !ready && fresh > 0 && (fresh >= NEW_PER_FRAME || fresh_px + cost > PX_PER_FRAME) {
-                pending = true;
-            } else if !ready {
+            if !ready && !self.roof_jobs.contains_key(&key) && self.roof_jobs.len() < max_jobs {
                 let covers: std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>> = paints.iter().filter_map(|k| Some((k.clone(), self.cover_rgba(k)?))).collect();
                 if covers.len() == paints.len() {
-                    fresh += 1;
-                    fresh_px += cost;
-                    let out = roofs::render_joined(&rects, &roofs, group, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], map_size), snow);
-                    for (k, (img, origin)) in out.into_iter().enumerate() {
-                        let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
-                        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-                        let handle = painter.ctx().load_texture(format!("joined-roof-{key}-{k}"), ci, egui::TextureOptions::LINEAR);
-                        self.outline_cache.insert(slot(k), (handle, origin, size));
-                    }
+                    // Потоку — только крыши группы, с номерами по своим спискам.
+                    let n = rects.len();
+                    let sub_rects: Vec<map::Roof> = group.iter().filter(|&&id| id < n).map(|&id| rects[id].clone()).collect();
+                    let sub_outline: Vec<map::OutlineRoof> = group.iter().filter(|&&id| id >= n).map(|&id| roofs[id - n].clone()).collect();
+                    let (mut ri, mut oi) = (0, sub_rects.len());
+                    let sub_group: Vec<usize> = group
+                        .iter()
+                        .map(|&id| {
+                            let at = if id < n { &mut ri } else { &mut oi };
+                            *at += 1;
+                            *at - 1
+                        })
+                        .collect();
+                    let rx = spawn_roof(move || {
+                        roofs::render_joined(&sub_rects, &sub_outline, &sub_group, &|k: &str| covers.get(k).map(|a| a.as_ref()), ppc, light, ([0.0, 0.0], map_size), snow)
+                            .into_iter()
+                            .map(|(img, origin)| roof_picture(img, origin, ppc))
+                            .collect()
+                    });
+                    self.roof_jobs.insert(key, RoofJob { targets: (0..group.len()).map(slot).collect(), rx });
                 }
             }
+            pending |= !ready;
             for (k, &id) in group.iter().enumerate() {
                 let shown = if self.outline_cache.contains_key(&slot(k)) {
                     self.outline_last.insert(GROUP + id, slot(k));
@@ -616,6 +636,33 @@ pub(super) fn climb_rects(props: &[map::Prop], sources: &library::Sources, seen:
             map::prop_rect(p, v)
         })
         .collect()
+}
+
+/// Картинка крыши, которую рисует фоновый поток: куда в кэш крыш её положить (у группы
+/// врезки — по месту на крышу) и откуда её взять.
+pub(super) struct RoofJob {
+    targets: Vec<u64>,
+    rx: std::sync::mpsc::Receiver<Vec<RoofPicture>>,
+}
+
+/// Готовая для видеокарты картинка крыши, левый верхний угол и размер в клетках.
+type RoofPicture = (egui::ColorImage, [f32; 2], [f32; 2]);
+
+fn roof_picture(img: image::RgbaImage, origin: [f32; 2], ppc: f32) -> RoofPicture {
+    let size = [img.width() as f32 / ppc, img.height() as f32 / ppc];
+    (egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()), origin, size)
+}
+
+/// Отрисовка крыши в своём потоке; в браузере потоков нет — сразу.
+fn spawn_roof(f: impl FnOnce() -> Vec<RoofPicture> + Send + 'static) -> std::sync::mpsc::Receiver<Vec<RoofPicture>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    #[cfg(target_arch = "wasm32")]
+    let _ = tx.send(f());
+    rx
 }
 
 /// Точек на клетку у картинки крыши по контуру: `want` — точек экрана на клетку,

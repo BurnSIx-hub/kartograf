@@ -228,7 +228,7 @@ fn tools() -> Value {
         }), &["kind"]),
         tool("build_plan", "Build the map from a JSON plan: rooms, corridors, doors, furniture, terrain. Format: plans/README.md in the Kartograf repository.", json!({"plan": {"type": "object", "description": "The plan"}}), &["plan"]),
         tool("terrain_from_place", "Build real terrain from OpenStreetMap and satellite imagery around a point: buildings with roofs, roads, water, trees. Takes from seconds to a minute.", json!({
-            "lat": num("Latitude"), "lon": num("Longitude"), "width": int("Cells, 8..256, default 40"), "height": int("Cells, 8..256, default 30"),
+            "lat": num("Latitude"), "lon": num("Longitude"), "width": int("Cells, 8..1000, default 40"), "height": int("Cells, 8..1000, default 30"),
             "trees": num("0..1, extra groves on top of what the photo shows")
         }), &["lat", "lon"]),
         tool("new_map", "Start an empty map, up to 1000×1000 cells.", json!({"width": int("Cells"), "height": int("Cells")}), &["width", "height"]),

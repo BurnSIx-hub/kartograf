@@ -221,6 +221,15 @@ impl App {
     }
 
     pub(super) fn draw_path(&mut self, painter: &egui::Painter, canvas: Rect, path: &map::Path, seed: u32) {
+        // Вне окна — сразу, по рамке точек с запасом на ширину и изгиб: на карте OSM
+        // 1000×1000 дорог 7000, и отпечаток каждой по всем точкам шёл каждый кадр —
+        // 100–200 мс.
+        let (tl, br) = (self.cam.to_world(canvas, canvas.min), self.cam.to_world(canvas, canvas.max));
+        let pad = path.width.abs() + 1.0;
+        let (lo, hi) = path.points.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), p| ([l[0].min(p[0]), l[1].min(p[1])], [h[0].max(p[0]), h[1].max(p[1])]));
+        if hi[0] + pad < tl[0] || lo[0] - pad > br[0] || hi[1] + pad < tl[1] || lo[1] - pad > br[1] {
+            return;
+        }
         let Some(material) = self.map.materials.get(path.material) else { return };
         let (tex, tile, tint) = match &material.paint {
             Paint::Color(c) => (None, [1.0, 1.0], rgb(*c)),
@@ -255,8 +264,6 @@ impl App {
             self.path_cache.insert(id, (key, built.0, built.1, built.2));
         }
         let Some((_, bbox, verts, idx)) = self.path_cache.get(&id) else { return };
-        // Вне окна — не рисовать.
-        let (tl, br) = (self.cam.to_world(canvas, canvas.min), self.cam.to_world(canvas, canvas.max));
         if verts.is_empty() || bbox[2] < tl[0] || bbox[0] > br[0] || bbox[3] < tl[1] || bbox[1] > br[1] {
             return;
         }
@@ -407,6 +414,14 @@ impl App {
     }
 
     pub(super) fn draw_walls(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, segs: &[Segment]) {
+        self.draw_wall_lines(painter, canvas, style, &mask::join(segs.to_vec()));
+    }
+
+    /// Стены готовыми ломаными. Рисунок отсчитывается от начала ломаной (у замкнутой
+    /// ещё и подгоняется под её длину), поэтому ломаные — целые, склеенные по всей
+    /// карте, а не по окну: иначе кирпич сдвигался бы при прокрутке и на стыках
+    /// плиток выгрузки.
+    pub(super) fn draw_wall_lines(&mut self, painter: &egui::Painter, canvas: Rect, style: &map::WallStyle, lines: &[Vec<[f32; 2]>]) {
         if style.width <= 0.0 {
             return;
         }
@@ -422,7 +437,7 @@ impl App {
         };
         if let (Some(id), Paint::Texture(key)) = (tex, &style.paint) {
             if let Some(n) = library::builtin_wall_stamps(key) {
-                self.draw_stamped(painter, canvas, style.width, id, n, segs);
+                self.draw_stamped(painter, canvas, style.width, id, n, lines);
                 return;
             }
         }
@@ -432,7 +447,7 @@ impl App {
         };
         // Заливка ляжет под обводку: место под неё занято заранее.
         let slot = painter.add(Shape::Noop);
-        for line in mask::join(segs.to_vec()) {
+        for line in lines {
             let closed = line.len() > 3 && (line[0][0] - line[line.len() - 1][0]).abs() < 1e-3 && (line[0][1] - line[line.len() - 1][1]).abs() < 1e-3;
             let rows = ribbon(&line, closed, hw);
             if rows.len() < 2 {
@@ -490,12 +505,12 @@ impl App {
     /// сжимается и режет брёвна, поэтому каждое бревно — свой квадрат: шаг вдоль
     /// стены ровный, в каждом остром углу стоит бревно. Под ними тёмная лента,
     /// чтобы между кругами не просвечивал пол.
-    pub(super) fn draw_stamped(&mut self, painter: &egui::Painter, canvas: Rect, width: f32, id: egui::TextureId, n: u32, segs: &[Segment]) {
+    pub(super) fn draw_stamped(&mut self, painter: &egui::Painter, canvas: Rect, width: f32, id: egui::TextureId, n: u32, lines: &[Vec<[f32; 2]>]) {
         let cam = self.cam;
         let mut under = egui::Mesh::default();
         let mut logs = egui::Mesh::with_texture(id);
         let bark = Color32::from_rgb(30, 21, 14);
-        for line in mask::join(segs.to_vec()) {
+        for line in lines {
             let closed = line.len() > 3 && (line[0][0] - line[line.len() - 1][0]).abs() < 1e-3 && (line[0][1] - line[line.len() - 1][1]).abs() < 1e-3;
             let rows = ribbon(&line, closed, width * 0.28);
             for k in 0..rows.len().saturating_sub(1) {

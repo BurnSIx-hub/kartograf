@@ -14,8 +14,13 @@ pub(super) struct UnderCache {
     tree_shade: Option<(u64, Option<std::rc::Rc<Mask>>)>,
     outline_cache: std::collections::HashMap<u64, (egui::TextureHandle, [f32; 2], [f32; 2])>,
     outline_last: std::collections::HashMap<usize, u64>,
+    roof_jobs: std::collections::HashMap<u64, super::draw_ground::RoofJob>,
+    wall_lines: Option<(u64, std::rc::Rc<WallLines>)>,
     props_index: super::prop_index::PropIndex,
 }
+
+/// Стены комнат целыми ломаными (за вычетом проёмов) по виду стены, у каждой — рамка.
+pub(super) type WallLines = Vec<(map::WallStyle, Vec<(crate::grid::Rect, Vec<[f32; 2]>)>)>;
 
 impl App {
     /// Этажи ниже — под текущим, как в Foundry: сквозь пустоту верхнего этажа и дыры
@@ -62,6 +67,8 @@ impl App {
             std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
             std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
             std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            std::mem::swap(&mut self.roof_jobs, &mut c.roof_jobs);
+            std::mem::swap(&mut self.wall_lines, &mut c.wall_lines);
             self.swap_props_index(&mut c.props_index);
             self.edges_dirty = false;
             let keep = (self.map.roofs.clone(), self.map.outline_roofs.clone());
@@ -80,6 +87,8 @@ impl App {
             std::mem::swap(&mut self.tree_shade, &mut c.tree_shade);
             std::mem::swap(&mut self.outline_cache, &mut c.outline_cache);
             std::mem::swap(&mut self.outline_last, &mut c.outline_last);
+            std::mem::swap(&mut self.roof_jobs, &mut c.roof_jobs);
+            std::mem::swap(&mut self.wall_lines, &mut c.wall_lines);
             self.swap_props_index(&mut c.props_index);
             self.under.insert(j, c);
             std::mem::swap(&mut self.map, &mut self.levels[j]);
@@ -88,6 +97,50 @@ impl App {
         self.sel = sel;
         self.picked = picked;
         true
+    }
+
+    /// Стены комнат по всей карте целыми ломаными — раз на правку комнат, проёмов или
+    /// вида стен, а не каждый кадр. Окно берёт из них свои по рамкам.
+    fn full_wall_lines(&mut self) -> std::rc::Rc<WallLines> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.map.rooms.w, self.map.rooms.h, self.map.rooms.stamp()).hash(&mut h);
+        for p in &self.map.portals {
+            (p.a.map(f32::to_bits), p.b.map(f32::to_bits), std::mem::discriminant(&p.kind)).hash(&mut h);
+        }
+        self.map.edge_looks.hash(&mut h);
+        for st in self.map.wall_looks.iter().chain(std::iter::once(&self.map.wall_style)) {
+            st.width.to_bits().hash(&mut h);
+            match &st.paint {
+                Paint::Color(c) => (0u8, c).hash(&mut h),
+                Paint::Texture(k) => (1u8, k).hash(&mut h),
+            }
+        }
+        let key = h.finish();
+        if let Some((k, lines)) = &self.wall_lines
+            && *k == key
+        {
+            return lines.clone();
+        }
+        let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
+        for s in self.room_edges().to_vec() {
+            let st = self.map.edge_look(map::edge_key(&s));
+            match looks.iter_mut().find(|l| l.0 == st) {
+                Some(l) => l.1.push(s),
+                None => looks.push((st, vec![s])),
+            }
+        }
+        let out: WallLines = looks
+            .into_iter()
+            .map(|(st, segs)| {
+                let cut = map::cut_portals_wide(&segs, &self.map.portals, st.width / 2.0);
+                let lines = mask::join(cut).into_iter().filter(|l| !l.is_empty()).map(|l| (crate::grid::bounds(&l), l)).collect();
+                (st, lines)
+            })
+            .collect();
+        let rc = std::rc::Rc::new(out);
+        self.wall_lines = Some((key, rc.clone()));
+        rc
     }
 
     pub(super) fn draw(&mut self, painter: &egui::Painter, canvas: Rect) {
@@ -275,10 +328,18 @@ impl App {
         let style = self.map.wall_style.clone();
         let mut looks: Vec<(map::WallStyle, Vec<Segment>)> = Vec::new();
         let te = crate::plat::Instant::now();
-        let room_edges = self.room_edges().to_vec();
+        // Стены и проёмы — только у окна, с запасом на тень (как поле куска в кэше
+        // снимков) и толщину: на карте OSM 1000×1000 все стены города за кадр — 200 мс.
+        let reach = (4.0 + 3.0 * (shadows.dist + shadows.blur)).min(32.0) + style.width.max(1.0);
+        let near_view = |b: crate::grid::Rect| b[2] >= view.min.x - reach && b[0] <= view.max.x + reach && b[3] >= view.min.y - reach && b[1] <= view.max.y + reach;
+        let room_edges: Vec<Segment> = self.room_edges().iter().copied().filter(|s| near_view(crate::grid::bounds(&[s.0, s.1]))).collect();
+        let wall_seen: Vec<bool> = self.map.walls.iter().map(|w| {
+            let pts: Vec<[f32; 2]> = w.segments().flat_map(|s| [s.0, s.1]).collect();
+            !pts.is_empty() && near_view(crate::grid::bounds(&pts))
+        }).collect();
         self.prof.add("walls_edges", te);
         let te = crate::plat::Instant::now();
-        for s in room_edges {
+        for &s in &room_edges {
             let st = self.map.edge_look(map::edge_key(&s));
             match looks.iter_mut().find(|l| l.0 == st) {
                 Some(l) => l.1.push(s),
@@ -316,7 +377,9 @@ impl App {
                 .map
                 .walls
                 .iter()
-                .map(|w| {
+                .zip(&wall_seen)
+                .filter(|(_, seen)| **seen)
+                .map(|(w, _)| {
                     let width = w.style.as_ref().map_or(style.width, |s| s.width);
                     (width, map::cut_portals_wide(&w.segments().collect::<Vec<_>>(), &self.map.portals, width / 2.0))
                 })
@@ -347,11 +410,17 @@ impl App {
         }
         self.prof.add("walls_shadow", te);
         let te = crate::plat::Instant::now();
-        for (st, edges) in looks.iter().filter(|_| !floor_only) {
-            self.draw_walls(painter, canvas, st, edges);
+        if !floor_only {
+            let full = self.full_wall_lines();
+            for (st, lines) in full.iter() {
+                let seen: Vec<Vec<[f32; 2]>> = lines.iter().filter(|(b, _)| near_view(*b)).map(|(_, l)| l.clone()).collect();
+                if !seen.is_empty() {
+                    self.draw_wall_lines(painter, canvas, st, &seen);
+                }
+            }
         }
         let walls = self.map.walls.clone();
-        for (i, wall) in walls.iter().enumerate() {
+        for (i, wall) in walls.iter().enumerate().filter(|(i, _)| wall_seen[*i]) {
             let segs: Vec<Segment> = wall.segments().collect();
             let own = wall.style.as_ref().unwrap_or(&style);
             if self.sel == Some(Sel::Wall(i)) {
@@ -366,10 +435,10 @@ impl App {
 
         self.prof.add("walls_draw", te);
         let te = crate::plat::Instant::now();
-        let portals = self.map.portals.clone();
+        let portals: Vec<(usize, map::Portal)> = self.map.portals.iter().cloned().enumerate().filter(|(_, p)| near_view(crate::grid::bounds(&[p.a, p.b]))).collect();
         // Проём меряется по своей стене: у городской стены карты камень, а у домов
         // за ней фахверк — по общему виду косяки и подоконники домов раздувало.
-        let edges = self.room_edges().to_vec();
+        let edges = room_edges.clone();
         // Стена и отрезок у проёма — из сетки рамок (первый по номеру, как перебором):
         // проёмов и отрезков в городе тысячи, и перебор всех со всеми шёл каждый кадр.
         let (walls_grid, edges_grid) = if portals.is_empty() {
@@ -386,7 +455,7 @@ impl App {
             let edge_boxes: Vec<crate::grid::Rect> = edges.iter().map(|s| crate::grid::bounds(&[s.0, s.1])).collect();
             (crate::grid::Grid::new(&wall_boxes, 8.0), crate::grid::Grid::new(&edge_boxes, 8.0))
         };
-        for (i, portal) in portals.iter().enumerate() {
+        for (i, portal) in portals.iter().map(|(i, p)| (*i, p)) {
             let c = portal.center();
             let near = crate::grid::grow([c[0], c[1], c[0], c[1]], 0.1);
             let own = walls_grid

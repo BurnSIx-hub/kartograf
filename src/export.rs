@@ -733,24 +733,33 @@ pub fn webp_bytes(img: &image::RgbaImage, quality: f32) -> Vec<u8> {
 /// (16 128 точек по стороне, миллион блоков 16×16) переполнялся первый раздел
 /// кадра (`VP8_ENC_ERROR_PARTITION0_OVERFLOW`), и `encode` ронял программу. Влезает
 /// с одним сегментом и `partition_limit` 100: 73 МБ за 14 с против 99 МБ JPEG
-/// (с четырьмя сегментами — то же переполнение). Большую сразу так, без пробы.
+/// (с четырьмя сегментами — то же переполнение). Большую сразу так, без пробы. Фон
+/// King's Cross (16 000 × 16 256) не влезает и так, ни при каком `method`: около
+/// миллиона блоков — предел формата, ему JPEG.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn try_webp(img: &image::RgbaImage, quality: f32) -> Option<Vec<u8>> {
     let enc = webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height());
+    let config = |big: bool| {
+        let mut c = webp::WebPConfig::new().ok()?;
+        c.quality = quality;
+        // Прозрачность — своим потоком рядом с цветом и без предсказания: она без
+        // потерь, и предсказание у слоёв стен (сплошь 0 и 255) давало тот же размер
+        // в полтора раза дольше — 33,5 с против 21 у King's Cross.
+        c.thread_level = 1;
+        c.alpha_compression = 1;
+        c.alpha_filtering = 0;
+        if big {
+            c.segments = 1;
+            c.partition_limit = 100;
+        }
+        Some(c)
+    };
     if img.width().max(img.height()) <= 8192
-        && let Ok(m) = enc.encode_simple(false, quality)
+        && let Ok(m) = enc.encode_advanced(&config(false)?)
     {
         return Some(m.to_vec());
     }
-    let mut config = webp::WebPConfig::new().ok()?;
-    config.quality = quality;
-    // Прозрачность сжимается своим потоком рядом с цветом: у слоя стен 16 000 точек по
-    // стороне это половина времени.
-    config.thread_level = 1;
-    config.alpha_compression = 1;
-    config.segments = 1;
-    config.partition_limit = 100;
-    enc.encode_advanced(&config).ok().map(|m| m.to_vec())
+    enc.encode_advanced(&config(true)?).ok().map(|m| m.to_vec())
 }
 
 #[cfg(target_arch = "wasm32")]

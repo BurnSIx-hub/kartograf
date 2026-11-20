@@ -578,6 +578,10 @@ pub struct App {
     /// Какая картинка у крыши по контуру показана последней: пока новая (под другой
     /// масштаб) не готова, на экране остаётся прежняя.
     outline_last: std::collections::HashMap<usize, u64>,
+    /// Картинки крыш, которые рисуют фоновые потоки, — по отпечатку.
+    roof_jobs: std::collections::HashMap<u64, draw_ground::RoofJob>,
+    /// Стены комнат целыми ломаными и отпечаток того, из чего они собраны.
+    wall_lines: Option<(u64, std::rc::Rc<draw::WallLines>)>,
     /// Не все крыши по контуру нарисованы под нынешний масштаб: снимок ждёт.
     outline_pending: bool,
     /// Этажи ниже текущего, видные сквозь его пустоту и решётки: их кэши отрисовки
@@ -895,6 +899,8 @@ impl App {
             },
             outline_cache: std::collections::HashMap::new(),
             outline_last: std::collections::HashMap::new(),
+            roof_jobs: std::collections::HashMap::new(),
+            wall_lines: None,
             outline_pending: false,
             under: std::collections::HashMap::new(),
             underlay: 0,

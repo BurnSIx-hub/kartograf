@@ -1296,3 +1296,18 @@ fn preview(m: &Map, ppc: u32) -> image::RgbImage {
     }
     img
 }
+
+/// Замер импорта большого участка, без сети:
+/// `KARTOGRAF_OSM_BENCH=участок.osm cargo test --release osm_import_bench -- --ignored --nocapture`.
+/// Карта ложится рядом, `.karta`.
+#[test]
+#[ignore]
+fn osm_import_bench() {
+    let Ok(path) = std::env::var("KARTOGRAF_OSM_BENCH") else { return };
+    let xml = std::fs::read_to_string(&path).unwrap();
+    let t = std::time::Instant::now();
+    let (m, r) = import_cover(&xml, &[], None, Options::default()).unwrap();
+    let secs = t.elapsed().as_secs_f32();
+    println!("{}×{} за {secs:.1} с: домов {}, крыш по контуру {}, предметов {}, дорог {}, стен {}; {:?}", m.width, m.height, r.count, m.outline_roofs.len(), m.props.len(), m.paths.len(), m.walls.len(), r.warnings);
+    std::fs::write(std::path::Path::new(&path).with_extension("karta"), m.to_json()).unwrap();
+}
