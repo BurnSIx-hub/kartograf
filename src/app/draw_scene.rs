@@ -362,7 +362,7 @@ impl App {
         let tiles = exporting && self.export.as_ref().is_some_and(|e| e.canopies);
         if shadows.on && fade >= 1.0 {
             // Тень кроны — своя, сдвинутая на высоту дерева ([`roofs::tree_shade`]).
-            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.casts_shadow() && !p.is_canopy() && !(tiles && p.carries_shadow())) {
+            for prop in order.iter().map(|&i| &props[i]).filter(|p| p.floor_shadow(tiles)) {
                 let c = prop.corners();
                 let bounds = Rect::from_points(&c.map(|p| pos2(p[0], p[1]))).expand(shadows.dist + shadows.blur * 2.0);
                 if bounds.intersects(view) {

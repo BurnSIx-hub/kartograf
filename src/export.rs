@@ -843,6 +843,11 @@ pub struct SceneLevel<'a> {
 }
 
 /// Крона: крыша без ограничения света, с поворотом объекта.
+/// Концы нити `[x0, y0, x1, y1]` (доли картинки от середины) у картинки, отражённой слева направо.
+pub fn mirror_ends(e: [f32; 4]) -> [f32; 4] {
+    [-e[0], e[1], -e[2], e[3]]
+}
+
 pub fn canopy_tile(src: String, center: [f32; 2], size: [f32; 2], rot: f32, px: u32) -> RoofTile {
     let (w, h) = ((size[0] * px as f32).round() as i64, (size[1] * px as f32).round() as i64);
     let (x, y) = ((center[0] * px as f32).round() as i64 - w / 2, (center[1] * px as f32).round() as i64 - h / 2);
@@ -2075,6 +2080,12 @@ mod tests {
         assert_eq!(shared_dir(p("kartograf/Kriogenika/1763")), p("kartograf/assets"));
         assert_eq!(shared_dir(p("C:/Maps/Pulsar/foundry")), p("C:/Maps/Pulsar/assets"));
         assert_eq!(asset_src(p("C:/nowhere-near-foundry/assets/X.webp")), "../assets/X.webp");
+    }
+
+    #[test]
+    fn mirrored_strand_ends_swap_sides() {
+        // Гамак по диагонали: левый верхний крюк становится правым верхним.
+        assert_eq!(mirror_ends([-0.437, -0.42, 0.43, 0.41]), [0.437, -0.42, -0.43, 0.41]);
     }
 
     #[test]

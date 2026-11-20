@@ -648,10 +648,16 @@ impl App {
             laps.lap("roofs");
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
-                // Подкрашенная крона — свой файл: та же картинка в другом цвете.
+                // Подкрашенная крона — свой файл: та же картинка в другом цвете. В мире Boundless
+                // отражённая — тоже свой файл: отражать тайлы он не умеет.
+                let mirror = chunk && prop.flip;
                 let look = prop.tint.map_or_else(|| prop.asset.clone(), |t| format!("{}#{t:?}", prop.asset));
+                let look = if mirror { format!("{look}#fx") } else { look };
                 if !canopies.contains_key(&look) {
                     let mut img = image::DynamicImage::ImageRgba8(self.textures.rgba(&prop.asset)?);
+                    if mirror {
+                        img = img.fliph();
+                    }
                     if let Some(t) = prop.tint {
                         let mut rgba = img.to_rgba8();
                         for p in rgba.pixels_mut() {
@@ -668,12 +674,13 @@ impl App {
                         Some([r, g, b]) => format!("{}_t{r:02x}{g:02x}{b:02x}", export::asset_stem(&prop.asset)),
                         None => export::asset_stem(&prop.asset),
                     };
+                    let name = if mirror { format!("{name}_fx") } else { name };
                     let src = shelf.put(&name, export::webp_bytes(&img.to_rgba8(), 88.0), &mut files);
                     canopies.insert(look.clone(), src);
                 }
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 let mut tile = export::canopy_tile(canopies[&look].clone(), prop.pos, size, prop.rot, e.px);
-                tile.flip = prop.flip;
+                tile.flip = prop.flip && !mirror;
                 tile.fade = !map::is_bare_tree(&prop.asset);
                 // Навес не качается, но держит дождь; куст и крона — под ветром.
                 tile.shelter = !prop.is_canopy() && map::awning_by_name(&prop.asset);
@@ -706,19 +713,25 @@ impl App {
                 // Картинка — одна на ассет и без тени (тень рисует «Wild Canvas» по пометке
                 // плитки); предмет в воде — только сухой верх, своя картинка на ватерлинию.
                 let sunk = prop.sunk();
+                // Мир Boundless: отражать тайлы он не умеет — отражённый предмет кладётся своей
+                // картинкой, точки на ней (концы гамака и паутины, ось крана) отражаются следом.
+                // Механизм, ветроуказатель и колонку «Wild Canvas» рисует по раскладке картинки
+                // из пака — они остаются неотражёнными, иначе раскладка разойдётся с картинкой.
+                let mirror = chunk && prop.flip && map::living_by_name(&prop.asset).is_none();
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
-                    let slot = format!("{key}{}", if sunk > 0.0 { format!("#dry{sunk:.3}") } else { String::new() });
+                    let slot = format!("{key}{}{}", if sunk > 0.0 { format!("#dry{sunk:.3}") } else { String::new() }, if mirror { "#fx" } else { "" });
                     if let Some(src) = canopies.get(&slot) {
                         return Ok(src.clone());
                     }
                     let name = if sunk > 0.0 { format!("{}_dry{:02}", export::asset_stem(key), (sunk * 100.0).round() as u32) } else { export::asset_stem(key) };
-                    let src = shelf.put(&name, self.asset_webp(key, sunk)?, files);
+                    let name = if mirror { format!("{name}_fx") } else { name };
+                    let src = shelf.put(&name, self.asset_webp(key, sunk, mirror)?, files);
                     canopies.insert(slot, src.clone());
                     Ok(src)
                 };
                 let src = save(&prop.asset, &mut files)?;
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
-                tile.flip = prop.flip;
+                tile.flip = prop.flip && !mirror;
                 tile.fade = false;
                 tile.leaves = false;
                 tile.item = true;
@@ -730,6 +743,11 @@ impl App {
                 tile.slew = map::slew_by_name(&prop.asset).and_then(|o| export::slew_arc(map, prop, o).map(|arc| [o[0], o[1], arc]));
                 tile.rail = export::rail_ride(map, prop, e.px);
                 tile.tint = prop.tint;
+                if mirror {
+                    // Стрела крана смотрит вверх по картинке и после отражения — меняется лишь ось.
+                    tile.swing = tile.swing.map(export::mirror_ends);
+                    tile.slew = tile.slew.map(|[ax, ay, arc]| [1.0 - ax, ay, arc]);
+                }
                 if !(map::web_by_name(&prop.asset) || map::chest_variants(&prop.asset).is_some() || map::speaker_by_name(&prop.asset)) {
                     tiles.push(tile);
                     continue;
@@ -747,7 +765,7 @@ impl App {
                         let empty = save(&empty, &mut files).unwrap_or_else(|_| open.clone());
                         tile.chest = Some((open, empty));
                     }
-                    None => tile.web = Some(library::strand_ends(&self.textures.sources, &prop.asset)),
+                    None => tile.web = Some(library::strand_ends(&self.textures.sources, &prop.asset).map(|e| if mirror { export::mirror_ends(e) } else { e })),
                 }
                 tiles.push(tile);
             }
@@ -976,8 +994,9 @@ impl App {
 
     /// Картинка ассета для общей папки: WebP пака как есть, если его не перекрашивали и
     /// он не в воде; иначе — заново (перекраска, сухой верх), не больше 4096 точек.
-    fn asset_webp(&self, key: &str, sunk: f32) -> Result<Vec<u8>, String> {
-        if sunk <= 0.0 && !key.starts_with(library::TINT) {
+    /// `mirror` — отражённая слева направо (мир Boundless: отражать тайлы он не умеет).
+    fn asset_webp(&self, key: &str, sunk: f32, mirror: bool) -> Result<Vec<u8>, String> {
+        if sunk <= 0.0 && !mirror && !key.starts_with(library::TINT) {
             let raw = self.textures.bytes(key)?;
             if raw.len() > 12 && &raw[0..4] == b"RIFF" && &raw[8..12] == b"WEBP" {
                 return Ok(raw);
@@ -989,6 +1008,9 @@ impl App {
         }
         if sunk > 0.0 {
             img = export::dry_part(&img, sunk);
+        }
+        if mirror {
+            image::imageops::flip_horizontal_in_place(&mut img);
         }
         Ok(export::webp_bytes(&img, 90.0))
     }

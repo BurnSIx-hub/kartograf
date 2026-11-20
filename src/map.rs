@@ -1066,6 +1066,13 @@ impl Prop {
         self.own_tile() && self.casts_shadow() && self.layer() < ABOVE_WALLS && !t.hover && !t.swing && !t.web && !t.living
     }
 
+    /// Тень предмета в картинке пола. `tiles` — выгрузка с тайлами: там тень тайла рисует
+    /// «Wild Canvas» по пометке, а крану — сам, вместе со стрелой. Запечённая в пол, тень
+    /// крана стояла бы на месте, пока стрела поворачивается.
+    pub fn floor_shadow(&self, tiles: bool) -> bool {
+        self.casts_shadow() && !self.is_canopy() && !(tiles && (self.carries_shadow() || slew_by_name(&self.asset).is_some()))
+    }
+
     pub fn layer(&self) -> i16 {
         // Целиком под водой — на дне, слоем пола: под всем остальным.
         self.layer.unwrap_or_else(|| if self.sunk() >= 1.0 { 100 } else { name_traits(&self.asset).layer })
@@ -2783,6 +2790,13 @@ mod tests {
         let fan = prop("set:cyberpunk/objects/Floor_Fan_Industrial_A_2x2.webp");
         assert!(flat_by_name(&fan.asset) && fan.own_tile() && !fan.carries_shadow());
         assert!(!prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp").own_tile());
+        // Тень в полу: в окне — у всех; в выгрузке с тайлами бочка несёт её сама, а тень крана
+        // «Wild Canvas» поворачивает со стрелой — в полу её нет.
+        let barrel = prop("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp");
+        let crane = prop("C:/a/objects/steampunk/Crane_Steam_Gnome_Brass_A_4x9.webp");
+        assert_eq!((barrel.floor_shadow(false), barrel.floor_shadow(true)), (true, false));
+        assert_eq!((crane.floor_shadow(false), crane.floor_shadow(true)), (true, false));
+        assert!(!crane.carries_shadow(), "кран над крышами — своей тени в тайле у него нет");
     }
 
     #[test]

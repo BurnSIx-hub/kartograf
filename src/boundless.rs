@@ -230,6 +230,11 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
         if t["flags"].is_object() {
             tile["flags"] = t["flags"].clone();
         }
+        // Подкрашенный предмет: цвет Boundless кладёт сам. Отражения он не знает — отражённое
+        // Картограф для него кладёт своей картинкой (`app::exporting`).
+        if let Some(tint) = t["texture"]["tint"].as_str() {
+            tile["tint"] = json!(tint);
+        }
         // Мебель в доме: ниже уровня крыш крыша запечена в плитки, и тайл лёг бы поверх неё.
         if under_roof(x, y) {
             tile["minZ"] = json!(ROOF_Z);
@@ -512,7 +517,7 @@ mod tests {
             "tiles": [
                 {"x": 250, "y": 750, "width": 100, "height": 50, "rotation": 90, "texture": {"src": "k/tree.webp"}, "occlusion": {"modes": [1], "alpha": 0}},
                 {"x": 800, "y": 800, "width": 200, "height": 100, "texture": {"src": "k/roof_1.webp"}, "occlusion": {"modes": [2], "alpha": 0}},
-                {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp"}, "occlusion": {"modes": [1], "alpha": 0}}
+                {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp", "tint": "#a0c0ff"}, "occlusion": {"modes": [1], "alpha": 0}}
             ]
         });
         let m = manifest(&scene, &world, "k/pyramid");
@@ -530,6 +535,8 @@ mod tests {
         assert_eq!(m["tiles"].as_array().unwrap().len(), 2, "крыша — домом, а не тайлом");
         assert_eq!(m["tiles"][1]["minZ"], json!(ROOF_Z), "стол в доме — только с уровня крыш");
         assert!(m["tiles"][0].get("minZ").is_none(), "дерево не под крышей — видно всегда");
+        assert_eq!(m["tiles"][1]["tint"], "#a0c0ff", "цвет подкрашенного предмета");
+        assert!(m["tiles"][0].get("tint").is_none());
     }
 
     #[test]
