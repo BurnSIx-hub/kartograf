@@ -21,32 +21,43 @@ use serde_json::{Value, json};
 /// запечены в плитки.
 pub const ROOF_Z: u32 = 5;
 
-/// Сколько видеопамяти могут занять картинки крыш-домов. Boundless 1.1.0 для маски крыш
-/// грузит и закрепляет картинки всех домов мира разом (у него их 17 на весь мир); у
-/// Картографа картинка своя у каждого дома, и у King's Cross 4×4 (1624 дома при 64 на
-/// клетку) это 38,7 ГБ — вкладка Foundry падает.
-pub const ROOF_BUDGET: f64 = 1.0e9;
+/// Сторона маски крыш всего мира: Boundless растягивает её на мир и по ней гасит свет
+/// под крышами издалека. Своей у него — по прямоугольникам домов, у Картографа крыши любой формы.
+pub const ROOF_MASK: u32 = 2048;
 
-/// Видеопамять картинок всех крыш карты при `px` на клетку, с mip-уровнями.
-pub fn roof_bytes(map: &crate::map::Map, px: u32) -> f64 {
-    let p = px as f64;
-    let area = |lo: [f32; 2], hi: [f32; 2]| ((hi[0] - lo[0]).max(0.0) as f64 * p) * ((hi[1] - lo[1]).max(0.0) as f64 * p);
-    let rects = map.roofs.iter().map(|r| {
-        let o = r.outline();
-        let lo = o.iter().fold([f32::MAX; 2], |a, v| [a[0].min(v[0]), a[1].min(v[1])]);
-        let hi = o.iter().fold([f32::MIN; 2], |a, v| [a[0].max(v[0]), a[1].max(v[1])]);
-        area(lo, hi)
-    });
-    let outlines = map.outline_roofs.iter().map(|r| {
-        let (lo, hi) = r.bounds();
-        area(lo, hi)
-    });
-    rects.chain(outlines).sum::<f64>() * 4.0 * 4.0 / 3.0
+/// Маска крыш мира: белое там, где крыша, по прозрачности её картинки.
+pub struct RoofMask {
+    img: image::RgbaImage,
+    scale: f64,
+    any: bool,
 }
 
-/// Крыши не влезут в [`ROOF_BUDGET`]: тогда они запекаются во все уровни пирамиды.
-pub fn roofs_too_heavy(map: &crate::map::Map, px: u32) -> bool {
-    roof_bytes(map, px) > ROOF_BUDGET
+impl RoofMask {
+    pub fn new(world: &World) -> Self {
+        Self { img: image::RgbaImage::new(ROOF_MASK, ROOF_MASK), scale: ROOF_MASK as f64 / world.side as f64, any: false }
+    }
+
+    /// Крыша куска: середина — в точках куска, `offset` — начало куска в мире.
+    pub fn add(&mut self, roof: &BakedRoof, offset: [f64; 2]) {
+        let s = self.scale;
+        let (w, h) = ((roof.size[0] * s).round().max(1.0) as u32, (roof.size[1] * s).round().max(1.0) as u32);
+        let pic = image::imageops::resize(&roof.image, w, h, image::imageops::FilterType::Triangle);
+        let (x0, y0) = (((roof.center[0] + offset[0]) * s - w as f64 / 2.0).round() as i64, ((roof.center[1] + offset[1]) * s - h as f64 / 2.0).round() as i64);
+        for (x, y, p) in pic.enumerate_pixels() {
+            let (gx, gy) = (x0 + x as i64, y0 + y as i64);
+            if gx < 0 || gy < 0 || gx >= ROOF_MASK as i64 || gy >= ROOF_MASK as i64 || p[3] == 0 {
+                continue;
+            }
+            let q = self.img.get_pixel_mut(gx as u32, gy as u32);
+            *q = image::Rgba([255, 255, 255, q[3].max(p[3])]);
+            self.any = true;
+        }
+    }
+
+    /// Картинка маски; крыш нет — `None`.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        self.any.then(|| webp(&self.img))
+    }
 }
 
 /// Наибольшая сторона куска мира, что снимается за раз, в точках: кусок — обычный
@@ -65,8 +76,6 @@ pub struct World {
     pub sector: u32,
     pub cell_px: u32,
     pub chunk_z: u32,
-    /// Крыши запечены во все уровни, домов нет ([`roofs_too_heavy`]).
-    pub baked: bool,
 }
 
 impl World {
@@ -89,7 +98,7 @@ impl World {
         while c < max_z && tile << (c + 1) <= CHUNK_PX {
             c += 1;
         }
-        Self { side, tile, max_z, sim, sector: side.div_ceil(sim), cell_px: px, chunk_z: max_z - c, baked: false }
+        Self { side, tile, max_z, sim, sector: side.div_ceil(sim), cell_px: px, chunk_z: max_z - c }
     }
 
     /// Сторона куска в точках.
@@ -198,17 +207,14 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
         let (x, y, w, h) = (num(&t["x"], 0.0), num(&t["y"], 0.0), num(&t["width"], 0.0), num(&t["height"], 0.0));
         let src = t["texture"]["src"].clone();
         let rot = num(&t["rotation"], 0.0);
-        if is_roof(t) && world.baked {
-            continue;
-        }
         if is_roof(t) {
             let id = overlays.len();
-            overlays.insert(id.to_string(), json!({"cx": x, "cy": y, "w": w, "h": h, "rot": rot, "roof": src}));
+            let mut ov = json!({"cx": x, "cy": y, "w": w, "h": h, "rot": rot, "roof": src});
+            if t["flags"].is_object() {
+                ov["flags"] = t["flags"].clone();
+            }
+            overlays.insert(id.to_string(), ov);
             push(world.sector_of(x, y), "o", json!(id));
-            continue;
-        }
-        // Под запечённой крышей мебели не видно никогда.
-        if world.baked && under_roof(x, y) {
             continue;
         }
         let id = tiles.len();
@@ -218,6 +224,10 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
             "occlusionMode": t["occlusion"]["modes"].clone(), "occludedAlpha": num(&t["occlusion"]["alpha"], 0.0),
             "restrictsLight": t["restrictions"]["light"].as_bool().unwrap_or(false), "restrictsWeather": t["restrictions"]["weather"].as_bool().unwrap_or(false)
         });
+        // Флаги Wild Canvas: крона качается, гамак ходит, дирижабль парит.
+        if t["flags"].is_object() {
+            tile["flags"] = t["flags"].clone();
+        }
         // Мебель в доме: ниже уровня крыш крыша запечена в плитки, и тайл лёг бы поверх неё.
         if under_roof(x, y) {
             tile["minZ"] = json!(ROOF_Z);
@@ -237,15 +247,48 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
 
 /// Сцена для Boundless: размер мира, сетка и свет сцены выгрузки, флаг модуля. Стен,
 /// света и тайлов в ней нет — их подгружает модуль из манифеста.
-pub fn scene(scene: &Value, world: &World, manifest: &str) -> Value {
-    json!({
+///
+/// Многоэтажная (`scene["levels"]` — уровни Foundry 14 из выгрузки): у каждого уровня свой
+/// манифест в `flags.boundless.manifestUrl`, картинок уровня нет — их даёт пирамида.
+///
+/// `live` — области (вода, звуки мест, переходы между этажами) и флаги сцены обычной
+/// выгрузки всей карты: Wild Canvas оживляет их и в сцене Boundless.
+pub fn scene(scene: &Value, world: &World, manifests: &[String], live: &Value) -> Value {
+    let mut out = json!({
         "name": format!("{} (Boundless)", scene["name"].as_str().unwrap_or("Картограф")),
         "width": world.side, "height": world.side, "padding": 0,
         "grid": scene["grid"], "tokenVision": true,
         "environment": scene["environment"],
         "backgroundColor": "#000000",
-        "flags": {"boundless": {"enabled": true, "manifestUrl": manifest}}
-    })
+        "flags": {"boundless": {"enabled": true, "manifestUrl": manifests.first()}}
+    });
+    if let Some(flags) = live["flags"].as_object() {
+        for (k, v) in flags.iter().filter(|(k, _)| k.as_str() != "boundless") {
+            out["flags"][k] = v.clone();
+        }
+    }
+    if let Some(regions) = live["regions"].as_array().filter(|r| !r.is_empty()) {
+        out["regions"] = json!(regions);
+    }
+    let levels = scene["levels"].as_array().filter(|l| l.len() > 1 && l.len() == manifests.len());
+    if let Some(levels) = levels {
+        let docs: Vec<Value> = levels
+            .iter()
+            .zip(manifests)
+            .map(|(lv, url)| {
+                let mut doc = json!({"_id": lv["_id"], "name": lv["name"], "elevation": lv["elevation"], "background": {"color": "#000000"}, "flags": {"boundless": {"manifestUrl": url}}});
+                if !lv["visibility"].is_null() {
+                    doc["visibility"] = lv["visibility"].clone();
+                }
+                doc
+            })
+            .collect();
+        out["levels"] = json!(docs);
+        if !scene["initialLevel"].is_null() {
+            out["initialLevel"] = scene["initialLevel"].clone();
+        }
+    }
+    out
 }
 
 /// Вдвое меньше: среднее квадрата 2×2.
@@ -300,7 +343,7 @@ pub fn chunk_tiles(plain: image::RgbaImage, roofs: &[BakedRoof], world: &World, 
     let mut out = Vec::new();
     let (mut a, mut b) = (plain, roofed);
     for z in (world.chunk_z..=world.max_z).rev() {
-        let img = if z < ROOF_Z || world.baked { &b } else { &a };
+        let img = if z < ROOF_Z { &b } else { &a };
         let m = 1u32 << (z - world.chunk_z);
         let shift = world.max_z - z;
         let cells: Vec<(u32, u32)> = (0..m).flat_map(|y| (0..m).map(move |x| (x, y))).collect();
@@ -310,13 +353,13 @@ pub fn chunk_tiles(plain: image::RgbaImage, roofs: &[BakedRoof], world: &World, 
             out.push((format!("{z}/{}_{}.webp", (t0[0] >> shift) + x, (t0[1] >> shift) + y), bytes.unwrap_or_default()));
         }
         if z > world.chunk_z {
-            if z > ROOF_Z && !world.baked {
+            if z > ROOF_Z {
                 a = half(&a);
             }
             b = half(&b);
         }
     }
-    let low = (world.chunk_z >= ROOF_Z && !world.baked).then(|| webp(&b));
+    let low = (world.chunk_z >= ROOF_Z).then(|| webp(&b));
     (out, low)
 }
 
@@ -344,9 +387,7 @@ pub fn merge_down(pyr: &std::path::Path, roofed: &std::path::Path, world: &World
         if done.iter().any(Option::is_none) { Err(format!("{}: не записалось", dir.display())) } else { Ok(()) }
     };
     for z in (0..world.chunk_z).rev() {
-        if world.baked {
-            merge(pyr, pyr, z)?;
-        } else if z >= ROOF_Z {
+        if z >= ROOF_Z {
             merge(pyr, pyr, z)?;
             merge(roofed, roofed, z)?;
         } else {
@@ -354,6 +395,34 @@ pub fn merge_down(pyr: &std::path::Path, roofed: &std::path::Path, world: &World
         }
     }
     Ok(())
+}
+
+/// Точки сцены во флагах Wild Canvas у тайла — дымоходы, сливы, путь по рельсам — со
+/// сдвигом куска в мир. Рамка крыши (`outline`) и концы гамака — доли тайла, их не трогать.
+fn shift_live(v: &mut Value, offset: [f64; 2]) {
+    let live = &mut v["flags"][crate::export::LIVE_MODULE];
+    if !live.is_object() {
+        if live.is_null() {
+            if let Some(f) = v["flags"].as_object_mut() {
+                f.remove(crate::export::LIVE_MODULE);
+            }
+        }
+        return;
+    }
+    let mv = |p: &mut Value| {
+        if let Some(a) = p.as_array_mut().filter(|a| a.len() >= 2) {
+            a[0] = json!(a[0].as_f64().unwrap_or(0.0) + offset[0]);
+            a[1] = json!(a[1].as_f64().unwrap_or(0.0) + offset[1]);
+        }
+    };
+    for key in ["chimneys", "scuppers"] {
+        for p in live[key].as_array_mut().into_iter().flatten() {
+            mv(p);
+        }
+    }
+    for p in live["rail"]["path"].as_array_mut().into_iter().flatten() {
+        mv(p);
+    }
 }
 
 /// Данные сцен кусков в одну: сдвиг куска в мир и только своё — середина вещи в
@@ -368,7 +437,10 @@ pub struct Gather {
 }
 
 impl Gather {
-    pub fn add(&mut self, scene: &Value, offset: [f64; 2], own: [f64; 4]) {
+    /// `level` — id этажа: берётся то, у чего он первым в `levels` (тайл виден и с этажей
+    /// выше, но лежит на своём); у карты в один этаж `levels` нет — `None`.
+    pub fn add(&mut self, scene: &Value, offset: [f64; 2], own: [f64; 4], level: Option<&str>) {
+        let on_level = |v: &Value| level.is_none_or(|id| v["levels"].get(0).and_then(Value::as_str).is_none_or(|first| first == id));
         let mine = |x: f64, y: f64| x >= own[0] && x < own[2] && y >= own[1] && y < own[3];
         let shift = |v: &mut Value, kx: &str, ky: &str| {
             if let Some(x) = v[kx].as_f64() {
@@ -378,7 +450,7 @@ impl Gather {
                 v[ky] = json!(y + offset[1]);
             }
         };
-        for w in scene["walls"].as_array().into_iter().flatten() {
+        for w in scene["walls"].as_array().into_iter().flatten().filter(|v| on_level(v)) {
             let Some(c) = w["c"].as_array().filter(|c| c.len() == 4) else { continue };
             let c: Vec<f64> = c.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
             let c = [c[0] + offset[0], c[1] + offset[1], c[2] + offset[0], c[3] + offset[1]];
@@ -390,9 +462,10 @@ impl Gather {
             self.walls.push(w);
         }
         for (list, out) in [(&scene["lights"], &mut self.lights), (&scene["sounds"], &mut self.sounds), (&scene["tiles"], &mut self.tiles)] {
-            for v in list.as_array().into_iter().flatten() {
+            for v in list.as_array().into_iter().flatten().filter(|v| on_level(v)) {
                 let mut v = v.clone();
                 shift(&mut v, "x", "y");
+                shift_live(&mut v, offset);
                 if mine(v["x"].as_f64().unwrap_or(f64::NAN), v["y"].as_f64().unwrap_or(f64::NAN)) {
                     out.push(v);
                 }
@@ -427,7 +500,7 @@ mod tests {
 
     #[test]
     fn walls_are_cut_by_sectors_and_tiles_move_to_their_corner() {
-        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500, cell_px: 100, chunk_z: 0, baked: false };
+        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500, cell_px: 100, chunk_z: 0 };
         let scene = json!({
             "walls": [
                 {"c": [100, 100, 900, 100]},
@@ -461,7 +534,7 @@ mod tests {
     #[test]
     fn roofs_are_baked_below_the_roof_level_only() {
         // Мир одним куском, 6 уровней по 4 точки: z0..z4 — с крышей, z5 — без.
-        let world = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128, cell_px: 4, chunk_z: 0, baked: false };
+        let world = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128, cell_px: 4, chunk_z: 0 };
         let plain = image::RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 255, 255]));
         let roof = BakedRoof { image: image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])), center: [4.0, 4.0], size: [8.0, 8.0] };
         let (files, low) = chunk_tiles(plain, &[roof], &world, [0, 0]);
@@ -480,7 +553,7 @@ mod tests {
     fn low_levels_are_merged_from_chunks_with_roofs_from_their_own_chain() {
         // Плитка 8 точек (у меньшей WebP мешает цвет соседей в блоке 2×2), z0..z6, куски —
         // z5 (по 2×2 плитки z6): 32×32 куска. Крыша — в первом куске: на z5 её нет, на z4 и ниже есть.
-        let world = World { side: 512, tile: 8, max_z: 6, sim: 1, sector: 512, cell_px: 8, chunk_z: 5, baked: false };
+        let world = World { side: 512, tile: 8, max_z: 6, sim: 1, sector: 512, cell_px: 8, chunk_z: 5 };
         let dir = std::env::temp_dir().join(format!("kartograf_bl_{}", std::process::id()));
         let (pyr, roofed) = (dir.join("pyr"), dir.join("roofed"));
         for cy in 0..32u32 {
@@ -506,25 +579,73 @@ mod tests {
         assert_eq!((0..=6).filter(|z| pyr.join(z.to_string()).join("0_0.webp").exists()).count(), 7, "все уровни на месте");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
     #[test]
-    fn heavy_roofs_are_baked_everywhere_and_give_no_houses() {
-        let world = World { side: 1000, tile: 500, max_z: 1, sim: 2, sector: 500, cell_px: 100, chunk_z: 0, baked: true };
+    fn the_roof_mask_follows_the_roof_picture_in_world_coordinates() {
+        let world = World { side: 4096, tile: 512, max_z: 3, sim: 1, sector: 4096, cell_px: 64, chunk_z: 0 };
+        let mut mask = RoofMask::new(&world);
+        assert!(mask.bytes().is_none(), "крыш нет — маски нет");
+        // Крыша 400×400 в куске со сдвигом 2048: в маске (половина мира) — 200×200 у середины.
+        let mut pic = image::RgbaImage::new(400, 400);
+        for (x, _, p) in pic.enumerate_pixels_mut() {
+            *p = image::Rgba([90, 60, 40, if x < 200 { 255 } else { 0 }]);
+        }
+        mask.add(&BakedRoof { image: pic, center: [200.0, 200.0], size: [400.0, 400.0] }, [2048.0, 2048.0]);
+        let img = image::load_from_memory(&mask.bytes().unwrap()).unwrap().to_rgba8();
+        assert!(img.get_pixel(1030, 1100)[3] > 200, "левая половина крыши — в маске");
+        assert!(img.get_pixel(1170, 1100)[3] < 30, "прозрачная половина — нет");
+        assert!(img.get_pixel(500, 500)[3] < 30);
+    }
+
+    #[test]
+    fn floors_get_their_own_things_and_manifests() {
+        let scene = json!({
+            "name": "Дом",
+            "walls": [{"c": [0, 0, 100, 0], "levels": ["L0"]}, {"c": [0, 50, 100, 50], "levels": ["L1"]}],
+            "lights": [{"x": 10, "y": 10, "levels": ["L1"], "config": {}}],
+            "tiles": [{"x": 20, "y": 20, "width": 10, "height": 10, "levels": ["L0", "L1"], "texture": {"src": "k/t.webp"}}],
+            "levels": [{"_id": "L0", "name": "Низ", "elevation": {"bottom": 0, "top": 9}, "background": {"src": "a.webp"}},
+                       {"_id": "L1", "name": "Верх", "elevation": {"bottom": 10, "top": 19}, "visibility": {"levels": ["L0"]}, "background": {"src": "b.webp"}}],
+            "initialLevel": "L1"
+        });
+        let own = [0.0, 0.0, f64::INFINITY, f64::INFINITY];
+        let (mut low, mut up) = (Gather::default(), Gather::default());
+        low.add(&scene, [0.0, 0.0], own, Some("L0"));
+        up.add(&scene, [0.0, 0.0], own, Some("L1"));
+        let (l, u) = (low.scene(), up.scene());
+        assert_eq!((l["walls"].as_array().unwrap().len(), u["walls"].as_array().unwrap().len()), (1, 1));
+        assert_eq!((l["lights"].as_array().unwrap().len(), u["lights"].as_array().unwrap().len()), (0, 1));
+        assert_eq!((l["tiles"].as_array().unwrap().len(), u["tiles"].as_array().unwrap().len()), (1, 0), "тайл лежит на своём этаже, хоть виден и сверху");
+        let world = World::new(1000, 1000, 100);
+        let live = json!({"flags": {"burn-living-map": {"ambience": "town-1"}}, "regions": [{"name": "Вода"}]});
+        let s = super::scene(&scene, &world, &["k/a.json".into(), "k/b.json".into()], &live);
+        assert_eq!((s["flags"]["burn-living-map"]["ambience"].as_str(), s["regions"][0]["name"].as_str()), (Some("town-1"), Some("Вода")), "живое — в сцене");
+        assert_eq!(s["flags"]["boundless"]["manifestUrl"], "k/a.json");
+        assert_eq!(s["levels"][1]["flags"]["boundless"]["manifestUrl"], "k/b.json");
+        assert_eq!(s["levels"][1]["visibility"]["levels"], json!(["L0"]), "сверху виден низ");
+        assert!(s["levels"][0]["background"].get("src").is_none(), "картинки этажа нет — её даёт пирамида");
+        assert_eq!(s["initialLevel"], "L1");
+        let one = super::scene(&json!({"name": "X"}), &world, &["k/a.json".into()], &Value::Null);
+        assert!(one.get("levels").is_none() && one["flags"]["boundless"]["manifestUrl"] == "k/a.json");
+    }
+
+    #[test]
+    fn live_points_of_a_chunk_move_into_the_world_and_reach_the_manifest() {
         let scene = json!({"tiles": [
-            {"x": 250, "y": 750, "width": 100, "height": 50, "texture": {"src": "k/tree.webp"}, "occlusion": {"modes": [1], "alpha": 0}},
-            {"x": 800, "y": 800, "width": 200, "height": 100, "texture": {"src": "k/roof_1.webp"}, "occlusion": {"modes": [2], "alpha": 0}},
-            {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp"}, "occlusion": {"modes": [1], "alpha": 0}}
+            {"x": 50, "y": 50, "width": 100, "height": 100, "occlusion": {"modes": [2]}, "texture": {"src": "k/r.webp"},
+             "flags": {"burn-living-map": {"chimneys": [[60, 40, 30]], "outline": [{"points": [0.1, 0.2], "hole": false}]}}},
+            {"x": 300, "y": 300, "width": 50, "height": 50, "occlusion": {"modes": [1]}, "texture": {"src": "k/tree.webp"},
+             "flags": {"burn-living-map": {"wind": 1, "rail": {"path": [[10, 20], [30, 40]], "lag": 0}}}}
         ]});
-        let m = manifest(&scene, &world, "k/pyramid");
-        assert_eq!(m["overlays"], json!({}), "домов нет: крыши в плитках");
-        assert_eq!(m["tiles"].as_array().unwrap().len(), 1, "стол под крышей не нужен, дерево остаётся");
-        assert_eq!(m["tiles"][0]["src"], "k/tree.webp");
-        // Плитки: крыша и на верхнем уровне.
-        let w = World { side: 128, tile: 4, max_z: 5, sim: 1, sector: 128, cell_px: 4, chunk_z: 0, baked: true };
-        let plain = image::RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 255, 255]));
-        let roof = BakedRoof { image: image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])), center: [4.0, 4.0], size: [8.0, 8.0] };
-        let (files, low) = chunk_tiles(plain, &[roof], &w, [0, 0]);
-        assert!(low.is_none());
-        let b = &files.iter().find(|f| f.0 == "5/0_0.webp").unwrap().1;
-        assert!(image::load_from_memory(b).unwrap().to_rgba8().get_pixel(0, 0).0[0] > 200, "z5 — с крышей");
+        let mut g = Gather::default();
+        g.add(&scene, [1000.0, 2000.0], [0.0, 0.0, f64::INFINITY, f64::INFINITY], None);
+        let world = World { side: 4096, tile: 512, max_z: 3, sim: 1, sector: 4096, cell_px: 64, chunk_z: 0 };
+        let m = manifest(&g.scene(), &world, "k/p");
+        let ov = &m["overlays"]["0"];
+        assert_eq!(ov["flags"]["burn-living-map"]["chimneys"], json!([[1060.0, 2040.0, 30]]), "труба — в мире");
+        assert_eq!(ov["flags"]["burn-living-map"]["outline"][0]["points"], json!([0.1, 0.2]), "рамка — доли, не сдвигается");
+        let tile = &m["tiles"][0];
+        assert_eq!(tile["flags"]["burn-living-map"]["wind"], 1);
+        assert_eq!(tile["flags"]["burn-living-map"]["rail"]["path"], json!([[1010.0, 2020.0], [1030.0, 2040.0]]));
     }
 }

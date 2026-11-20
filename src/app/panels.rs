@@ -46,7 +46,7 @@ impl App {
                 }
                 ui.separator();
                 if item(ui, "Выгрузить для Foundry…", "") {
-                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false, district: None });
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false, district: None, boundless: false });
                 }
                 ui.separator();
                 if item(ui, "Папка с картинками…", "")
@@ -180,7 +180,7 @@ impl App {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("В Foundry").clicked() {
-                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false, district: None });
+                    self.export_dialog = Some(ExportDialog { px: EXPORT_PX, name: self.scene_name.clone().unwrap_or_else(|| self.name()), update: false, district: None, boundless: false });
                 }
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Вернуть")).clicked() {
                     self.redo();

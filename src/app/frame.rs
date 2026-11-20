@@ -193,9 +193,14 @@ impl App {
                         ui.selectable_value(&mut dlg.px, px, px.to_string());
                     }
                 });
+                // Мир для Boundless: огромная карта одной сценой, модуль подгружает её по частям.
+                // Пишет только программа; район в нём не нужен.
+                if cfg!(not(target_arch = "wasm32")) {
+                    ui.checkbox(&mut dlg.boundless, "Мир для Boundless").on_hover_text("Огромная карта одной сценой для модуля Boundless: пирамида плиток, манифест со стенами, дверями и светом, дома с крышами. Снимается кусками; карта 1000×1000 — около часа.");
+                }
                 // Только район — отдельной сценой: у огромной карты целиком на клетку мало точек.
                 let mut part = dlg.district.is_some();
-                if ui.checkbox(&mut part, "Только район").on_hover_text("Прямоугольник карты отдельной сценой, в полном разрешении. Стены, крыши и предметы у края идут целиком.").changed() {
+                if ui.add_enabled(!dlg.boundless, egui::Checkbox::new(&mut part, "Только район")).on_hover_text("Прямоугольник карты отдельной сценой, в полном разрешении. Стены, крыши и предметы у края идут целиком.").changed() {
                     dlg.district = part.then(|| self.view_cells());
                 }
                 if let Some(a) = &mut dlg.district {
@@ -220,7 +225,12 @@ impl App {
                 };
                 let fit = export::fit_px(cw, ch, dlg.px);
                 let (w, h) = (cw * fit, ch * fit);
-                if fit < dlg.px {
+                if dlg.boundless {
+                    let world = crate::boundless::World::new(self.map.width * dlg.px, self.map.height * dlg.px, dlg.px);
+                    let cc = world.chunk_cells();
+                    let chunks = self.map.width.div_ceil(cc) * self.map.height.div_ceil(cc);
+                    ui.weak(format!("Мир {0}×{0}, плитка {1}, уровни z0–z{2}, кусков {chunks}.", world.side, world.tile, world.max_z));
+                } else if fit < dlg.px {
                     ui.weak(format!("Картинка {w}×{h}: карта большая, больше {} точек Foundry не покажет — будет {fit} на клетку.", export::SCENE_MAX_SIDE + 1));
                 } else {
                     ui.weak(format!("Картинка {w}×{h}."));
@@ -288,6 +298,11 @@ impl App {
                     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
                     let name = self.name();
                     match dlg.district {
+                        _ if dlg.boundless => {
+                            if let Err(err) = self.start_boundless(dir, name, dlg.px, false) {
+                                self.error = Some(err);
+                            }
+                        }
                         Some(area) => {
                             if let Err(err) = self.start_district(dir, name, dlg.px, area, false) {
                                 self.error = Some(err);
