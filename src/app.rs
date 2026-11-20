@@ -398,6 +398,39 @@ struct Export {
     whites: Vec<Option<image::RgbImage>>,
     /// Стены снятых этажей: на чёрном и на белом.
     walls: Vec<[image::RgbImage; 2]>,
+    /// Когда началась и сколько снимков окна сделано: время частей — в ответ MCP.
+    began: crate::plat::Instant,
+    shots_taken: u32,
+    /// Снимать с кэшем ([`crate::shotcache`]): плитки — целым числом кусков, куски с тем же
+    /// отпечатком берутся с диска. Снимок области для ИИ — без кэша.
+    cached: bool,
+    /// Проход разложен на плитки (с кэшем — после сверки кусков с диском).
+    planned: bool,
+    /// Каких кусков прохода не было в кэше — их снимки уходят на диск.
+    missing: Vec<bool>,
+    /// Отпечатки этажа, который снимается, и кусков нынешнего прохода.
+    prints: Option<(usize, crate::shotcache::Prints)>,
+    prints_now: Vec<u128>,
+    /// Сколько кусков всего и сколько нашлось в кэше; сколько секунд ушло на сверку.
+    cells_total: u32,
+    cells_cached: u32,
+    planning: f32,
+    /// Сколько ушло на подготовку до первого кадра (пни из библиотеки), секунды.
+    prepare: f32,
+    /// Снять всё заново, мимо кэша (снятое всё равно ложится в кэш).
+    fresh: bool,
+    /// Выгружается только район — отдельной сценой.
+    district: Option<District>,
+}
+
+/// Район карты, что выгружается отдельной сценой: снимается он с самой карты (что
+/// заходит в район снаружи, видно у края как есть), а сцену дают вырезанные этажи.
+struct District {
+    /// Клетки района `[x0, y0, x1, y1]`.
+    area: [u32; 4],
+    maps: Vec<Map>,
+    /// Стены комнат каждого этажа — из всей карты, обрезанные по району.
+    edges: Vec<Vec<Segment>>,
 }
 
 /// Что снимает проход выгрузки.
@@ -454,6 +487,8 @@ struct ExportDialog {
     px: u32,
     name: String,
     update: bool,
+    /// Только район `[x0, y0, x1, y1]` клеток — отдельной сценой; пусто — вся карта.
+    district: Option<[u32; 4]>,
 }
 
 /// Окно «Новая карта».
@@ -735,6 +770,14 @@ pub struct App {
     scene_name: Option<String>,
     /// Выгрузка из командной строки: куда и с каким разрешением.
     export_args: Option<(PathBuf, u32)>,
+    /// Сколько шла последняя выгрузка по частям, секунды (MCP `export_foundry` → `timing`).
+    export_timing: Option<serde_json::Value>,
+    /// Кэш снимков выгрузки на диске: открывается при первой выгрузке.
+    #[cfg(not(target_arch = "wasm32"))]
+    shot_store: Option<crate::shotcache::Store>,
+    /// Отпечатки плиток кусков масок по номеру куска в памяти: повторная выгрузка не
+    /// перечитывает нетронутые куски.
+    chunk_memo: std::collections::HashMap<u64, std::sync::Arc<Vec<u64>>>,
     /// Сообщение в строке состояния: что сделано.
     pub notice: Option<String>,
     confirm_close: bool,
@@ -969,6 +1012,10 @@ impl App {
             scene_name: None,
             export_args: args.export.map(|d| (d, args.px.unwrap_or(EXPORT_PX))),
             notice: None,
+            export_timing: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            shot_store: None,
+            chunk_memo: Default::default(),
             confirm_close: false,
             allow_close: false,
         };

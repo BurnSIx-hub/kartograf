@@ -18,6 +18,8 @@ const LEVEL: f32 = 127.5;
 
 /// Сторона куска маски в точках: 32 клетки. Степень двойки — номер куска сдвигом.
 pub const CHUNK: usize = 32 * RES;
+/// Сторона плитки отпечатков ([`Mask::chunk_tiles`]) в точках: 2 клетки.
+pub const PRINT_TILE: usize = 2 * RES;
 const SHIFT: u32 = CHUNK.trailing_zeros();
 const AREA: usize = CHUNK * CHUNK;
 
@@ -317,6 +319,45 @@ impl Mask {
         }
     }
 
+    /// Отпечатки плиток куска `c` ([`PRINT_TILE`]×[`PRINT_TILE`] точек) по строкам,
+    /// одинаковые от запуска к запуску (кэш снимков выгрузки лежит на диске): плитка одной
+    /// силы — по силе, где бы она ни лежала, иначе по точкам. Так кэш видит, где маска
+    /// поменялась, с точностью до двух клеток, а не до куска в 32.
+    pub fn chunk_tiles(&self, c: usize) -> Vec<u64> {
+        use std::hash::{Hash, Hasher};
+        const N: usize = CHUNK / PRINT_TILE;
+        let flat = |v: u8| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (1u8, v).hash(&mut h);
+            h.finish()
+        };
+        match self.chunks.get(c) {
+            None => vec![0; N * N],
+            Some(Chunk::Fill(v)) => vec![flat(*v); N * N],
+            Some(Chunk::Data(d)) => (0..N * N)
+                .map(|t| {
+                    let (tx, ty) = (t % N, t / N);
+                    let rows = (0..PRINT_TILE).map(|y| (ty * PRINT_TILE + y) * CHUNK + tx * PRINT_TILE);
+                    let first = d[ty * PRINT_TILE * CHUNK + tx * PRINT_TILE];
+                    if rows.clone().all(|at| d[at..at + PRINT_TILE].iter().all(|&v| v == first)) {
+                        return flat(first);
+                    }
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    2u8.hash(&mut h);
+                    for at in rows {
+                        h.write(&d[at..at + PRINT_TILE]);
+                    }
+                    h.finish()
+                })
+                .collect(),
+        }
+    }
+
+    /// Отпечаток пустой плитки ([`Mask::chunk_tiles`]).
+    pub fn empty_tile() -> u64 {
+        Self::for_cells(1, 1).chunk_tiles(0)[0]
+    }
+
     /// Сколько кусков держат свои точки (для замеров памяти).
     pub fn data_chunks(&self) -> usize {
         self.chunks.iter().filter(|c| matches!(c, Chunk::Data(_))).count()
@@ -345,6 +386,23 @@ impl Mask {
                     continue;
                 }
                 out.set(i + ox, j + oy, self.get_u(i, j));
+            }
+        }
+        out.compact();
+        out
+    }
+
+    /// Кусок маски: `cells_w`×`cells_h` клеток от клетки `x0, y0` (район карты отдельной
+    /// картой). За краем исходной — пусто.
+    pub fn cropped(&self, cells_w: u32, cells_h: u32, x0: u32, y0: u32) -> Self {
+        let mut out = Self::for_cells(cells_w, cells_h);
+        let (ox, oy) = (x0 as usize * RES, y0 as usize * RES);
+        for j in 0..out.h.min(self.h.saturating_sub(oy)) {
+            for i in 0..out.w.min(self.w.saturating_sub(ox)) {
+                if self.uniform_at(i + ox, j + oy) == Some(0) {
+                    continue;
+                }
+                out.set(i, j, self.get_u(i + ox, j + oy));
             }
         }
         out.compact();

@@ -150,7 +150,7 @@ impl App {
                 if self.export.is_some() {
                     self.control_wait = Some(Waiting::Export { reply });
                 } else {
-                    let r = self.take_error().map(|_| json!({"done": self.notice.clone().unwrap_or_default()}));
+                    let r = self.take_error().map(|_| json!({"done": self.notice.clone().unwrap_or_default(), "timing": self.export_timing.clone()}));
                     let _ = reply.send(r);
                 }
             }
@@ -329,7 +329,21 @@ impl App {
                 } else {
                     let px = a["px"].as_u64().unwrap_or(EXPORT_PX as u64).clamp(50, 400) as u32;
                     let name = self.name();
-                    self.start_export(dir, name, px, false);
+                    let area = a["area"].as_array().filter(|v| v.len() == 4).map(|v| {
+                        let at = |i: usize| v[i].as_f64().unwrap_or(0.0).max(0.0);
+                        [at(0).floor() as u32, at(1).floor() as u32, at(2).ceil() as u32, at(3).ceil() as u32]
+                    });
+                    match area {
+                        Some(area) => {
+                            if let Err(err) = self.start_district(dir, name, px, area, false) {
+                                return Out::Done(Err(err));
+                            }
+                        }
+                        None => self.start_export(dir, name, px, false),
+                    }
+                    if let Some(e) = &mut self.export {
+                        e.fresh = a["fresh"].as_bool().unwrap_or(false);
+                    }
                     return Out::Wait(Waiting::Export { reply: dummy() });
                 }
             }

@@ -33,6 +33,7 @@ mod recovery;
 mod relief;
 mod roofs;
 mod selftest;
+mod shotcache;
 mod skeleton;
 mod sets;
 #[cfg(not(target_arch = "wasm32"))]

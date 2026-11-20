@@ -111,7 +111,6 @@ pub fn bounds(points: &[[f32; 2]]) -> Rect {
 }
 
 /// Пересекаются ли прямоугольники (касание — тоже), как `egui::Rect::intersects`.
-#[cfg(test)]
 pub fn touch(a: &Rect, b: &Rect) -> bool {
     a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
 }

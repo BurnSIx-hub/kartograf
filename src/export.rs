@@ -618,6 +618,40 @@ pub fn tent_walls(p: &map::Prop, hull: Option<&[[f32; 2]]>) -> Vec<([f32; 2], [f
     out
 }
 
+/// Отрезки, обрезанные по прямоугольнику `r` (клетки) и сдвинутые на `shift` (Лианг —
+/// Барски). Стены комнат района — из всей карты: своя маска района обрывается по краю, и
+/// по её контуру у края встали бы стены, которых на карте нет.
+pub fn clip_segments(segs: &[Segment], r: [f32; 4], shift: [f32; 2]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    for s in segs {
+        let (p, q) = (s.0, s.1);
+        let d = [q[0] - p[0], q[1] - p[1]];
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        let mut keep = true;
+        for (num, den) in [(p[0] - r[0], -d[0]), (r[2] - p[0], d[0]), (p[1] - r[1], -d[1]), (r[3] - p[1], d[1])] {
+            if den.abs() < 1e-9 {
+                if num < 0.0 {
+                    keep = false;
+                    break;
+                }
+            } else {
+                let t = num / den;
+                if den < 0.0 {
+                    t0 = t0.max(t);
+                } else {
+                    t1 = t1.min(t);
+                }
+            }
+        }
+        if !keep || t0 > t1 || (t1 - t0) * (d[0].abs() + d[1].abs()) < 1e-6 {
+            continue;
+        }
+        let at = |t: f32| [p[0] + d[0] * t + shift[0], p[1] + d[1] * t + shift[1]];
+        out.push((at(t0), at(t1)));
+    }
+    out
+}
+
 /// Предел формата по стороне: карта больше уходит в JPEG.
 pub const WEBP_MAX_SIDE: u32 = 16383;
 
@@ -662,6 +696,9 @@ pub fn try_webp(img: &image::RgbaImage, quality: f32) -> Option<Vec<u8>> {
     }
     let mut config = webp::WebPConfig::new().ok()?;
     config.quality = quality;
+    // Прозрачность сжимается своим потоком рядом с цветом: у слоя стен 16 000 точек по
+    // стороне это половина времени.
+    config.thread_level = 1;
     config.alpha_compression = 1;
     config.segments = 1;
     config.partition_limit = 100;
@@ -909,13 +946,66 @@ pub struct RoofTile {
     pub outline: Vec<(Vec<[f32; 2]>, bool)>,
 }
 
-/// Впечатать предмет в картинку (для Universal VTT, где тайлов нет): середина
-/// и размер в точках картинки, поворот по часовой, подкраска умножением.
-pub fn stamp(dst: &mut image::RgbImage, src: &image::RgbaImage, center: [f32; 2], size: [f32; 2], rot: f32, tint: Option<[u8; 3]>) {
+/// Сколько потоков брать на картинку: у программы — по ядрам (не больше восьми), в
+/// браузере потоков нет.
+pub fn threads() -> usize {
+    if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) }
+}
+
+/// Строки картинки полосами по потокам: `f(первая строка полосы, её точки)`; `row` —
+/// байт в строке.
+pub fn par_bands(buf: &mut [u8], row: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    let rows = buf.len() / row.max(1);
+    let n = threads();
+    if n <= 1 || rows < 64 {
+        f(0, buf);
+        return;
+    }
+    let band = rows.div_ceil(n);
+    std::thread::scope(|s| {
+        for (i, chunk) in buf.chunks_mut(band * row).enumerate() {
+            let f = &f;
+            s.spawn(move || f(i * band, chunk));
+        }
+    });
+}
+
+/// `f` над каждым из `items` потоками, ответы — по порядку.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let n = threads().min(items.len());
+    if n <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = (0..n)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        mine.push((i, f(item)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+    });
+    out.sort_by_key(|o| o.0);
+    out.into_iter().map(|o| o.1).collect()
+}
+
+/// Впечатать предмет в полосу картинки шириной `width` (для Universal VTT, где тайлов нет):
+/// строки `rows`, полоса — точки RGB этих строк; середина и размер в точках картинки,
+/// поворот по часовой, подкраска умножением. Полосами картинку делят потоки.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_rows(dst: &mut [u8], width: u32, rows: std::ops::Range<u32>, src: &image::RgbaImage, center: [f32; 2], size: [f32; 2], rot: f32, tint: Option<[u8; 3]>) {
     let (s, c) = rot.to_radians().sin_cos();
     let r = (size[0].hypot(size[1]) / 2.0).ceil() + 1.0;
-    let (x0, y0) = ((center[0] - r).floor().max(0.0) as u32, (center[1] - r).floor().max(0.0) as u32);
-    let (x1, y1) = (((center[0] + r).ceil() as u32).min(dst.width()), ((center[1] + r).ceil() as u32).min(dst.height()));
+    let (x0, y0) = ((center[0] - r).floor().max(0.0) as u32, ((center[1] - r).floor().max(0.0) as u32).max(rows.start));
+    let (x1, y1) = (((center[0] + r).ceil() as u32).min(width), ((center[1] + r).ceil().max(0.0) as u32).min(rows.end));
     let (sw, sh) = (src.width() as f32, src.height() as f32);
     let t = tint.map_or([1.0; 3], |t| t.map(|v| v as f32 / 255.0));
     for y in y0..y1 {
@@ -936,7 +1026,8 @@ pub fn stamp(dst: &mut image::RgbImage, src: &image::RgbaImage, center: [f32; 2]
             if a <= 0.0 {
                 continue;
             }
-            let d = dst.get_pixel_mut(x, y);
+            let at = (((y - rows.start) * width + x) * 3) as usize;
+            let d = &mut dst[at..at + 3];
             for k in 0..3 {
                 d[k] = (px[k] * t[k] * a + d[k] as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
             }
@@ -948,17 +1039,23 @@ pub fn stamp(dst: &mut image::RgbImage, src: &image::RgbaImage, center: [f32; 2]
 /// прозрачность точки — по разнице снимков, цвет — с чёрного. Так стены с их
 /// мягкой тенью снимаются с холста отдельно от пола.
 pub fn layer_from_pair(black: &image::RgbImage, white: &image::RgbImage) -> image::RgbaImage {
+    let w = black.width() as usize;
     let mut out = image::RgbaImage::new(black.width(), black.height());
-    for ((o, b), w) in out.pixels_mut().zip(black.pixels()).zip(white.pixels()) {
-        let d = (0..3).map(|k| w[k] as i32 - b[k] as i32).sum::<i32>() as f32 / 3.0;
-        let a = (255.0 - d).clamp(0.0, 255.0);
-        // Единица-другая — шум округления снимка, а не тень.
-        if a < 2.5 {
-            continue;
+    let (bs, ws) = (black.as_raw(), white.as_raw());
+    par_bands(&mut out, w * 4, |y0, band| {
+        let n = band.len() / 4;
+        let (b, wh) = (&bs[y0 * w * 3..(y0 * w + n) * 3], &ws[y0 * w * 3..(y0 * w + n) * 3]);
+        for ((o, b), wv) in band.chunks_exact_mut(4).zip(b.chunks_exact(3)).zip(wh.chunks_exact(3)) {
+            let d = (0..3).map(|k| wv[k] as i32 - b[k] as i32).sum::<i32>() as f32 / 3.0;
+            let a = (255.0 - d).clamp(0.0, 255.0);
+            // Единица-другая — шум округления снимка, а не тень.
+            if a < 2.5 {
+                continue;
+            }
+            let c = |k: usize| (b[k] as f32 * 255.0 / a).round().clamp(0.0, 255.0) as u8;
+            o.copy_from_slice(&[c(0), c(1), c(2), a.round() as u8]);
         }
-        let c = |k: usize| (b[k] as f32 * 255.0 / a).round().clamp(0.0, 255.0) as u8;
-        *o = image::Rgba([c(0), c(1), c(2), a.round() as u8]);
-    }
+    });
     out
 }
 
@@ -2644,6 +2741,16 @@ mod tests {
         assert_eq!(sf(by("Песок")), Some('a'));
         assert_eq!(sf(by("Лава")), None);
         assert_eq!(sf(by("Болото")), Some('m'));
+    }
+
+    #[test]
+    fn segments_are_cut_by_the_district_and_moved_into_it() {
+        let segs = vec![([0.0, 5.0], [20.0, 5.0]), ([12.0, 0.0], [12.0, 3.0]), ([30.0, 30.0], [40.0, 30.0]), ([10.0, 10.0], [14.0, 14.0])];
+        let cut = clip_segments(&segs, [10.0, 4.0, 15.0, 12.0], [-10.0, -4.0]);
+        assert_eq!(cut.len(), 2, "вне района — не берётся: {cut:?}");
+        assert_eq!(cut[0], ([0.0, 1.0], [5.0, 1.0]), "через район — по краю");
+        let ((ax, ay), (bx, by)) = ((cut[1].0[0], cut[1].0[1]), (cut[1].1[0], cut[1].1[1]));
+        assert!((ax - 0.0).abs() < 1e-5 && (ay - 6.0).abs() < 1e-5 && (bx - 2.0).abs() < 1e-5 && (by - 8.0).abs() < 1e-5, "косой — до нижнего края: {cut:?}");
     }
 
     #[test]

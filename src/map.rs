@@ -2386,6 +2386,83 @@ impl Map {
         }
     }
 
+    /// Район карты отдельной картой: `w`×`h` клеток от клетки `x0, y0`, всё нарисованное
+    /// сдвинуто на `-x0, -y0`. Что целиком вне района, не берётся; что задевает край, —
+    /// целиком, как стоит: стена, крыша, дерево у края не режутся. Этажей у района нет —
+    /// каждый этаж режется сам. Для выгрузки района отдельной сценой.
+    pub fn crop(&self, x0: u32, y0: u32, w: u32, h: u32) -> Map {
+        use crate::grid;
+        let d = [-(x0 as f32), -(y0 as f32)];
+        let mv = move |p: &mut [f32; 2]| {
+            p[0] += d[0];
+            p[1] += d[1];
+        };
+        let area = [0.0, 0.0, w as f32, h as f32];
+        let near = |b: grid::Rect| grid::touch(&b, &area);
+        let mut m = self.clone();
+        m.levels = Vec::new();
+        m.rooms = self.rooms.cropped(w, h, x0, y0);
+        for c in m.terrain.iter_mut().chain(m.room_floor.iter_mut()) {
+            c.mask = c.mask.cropped(w, h, x0, y0);
+        }
+        m.shade = self.shade.as_ref().map(|s| s.cropped(w, h, x0, y0));
+        m.relief = self.relief.as_ref().map(|r| r.cropped(w, h, x0, y0));
+        if let Some(t) = &mut m.trace {
+            mv(&mut t.pos);
+        }
+        m.walls.retain_mut(|wall| {
+            wall.points.iter_mut().for_each(mv);
+            near(grid::grow(grid::bounds(&wall.points), 1.0))
+        });
+        m.portals.retain_mut(|p| {
+            mv(&mut p.a);
+            mv(&mut p.b);
+            near(grid::bounds(&[p.a, p.b]))
+        });
+        m.props.retain_mut(|p| {
+            mv(&mut p.pos);
+            near(grid::bounds(&p.corners()))
+        });
+        m.paths.retain_mut(|p| {
+            p.points.iter_mut().for_each(mv);
+            near(grid::grow(grid::bounds(&p.points), p.width.abs()))
+        });
+        for f in &mut m.flows {
+            f.points.iter_mut().for_each(mv);
+        }
+        m.rails.iter_mut().flatten().for_each(mv);
+        m.labels.retain_mut(|l| {
+            mv(&mut l.pos);
+            near([l.pos[0], l.pos[1], l.pos[0], l.pos[1]])
+        });
+        m.roofs.retain_mut(|r| {
+            mv(&mut r.a);
+            mv(&mut r.b);
+            near(grid::bounds(&r.outline()))
+        });
+        m.outline_roofs.retain_mut(|r| {
+            for piece in &mut r.pieces {
+                piece.rings.iter_mut().flatten().for_each(mv);
+            }
+            let (lo, hi) = r.bounds();
+            near([lo[0], lo[1], hi[0], hi[1]])
+        });
+        m.platforms.retain_mut(|p| {
+            p.points.iter_mut().for_each(mv);
+            p.stairs.iter_mut().for_each(|s| mv(&mut s.at));
+            let (lo, hi) = p.bounds();
+            near([lo[0], lo[1], hi[0], hi[1]])
+        });
+        // Ключ отрезка — середина с шагом 1/64 клетки.
+        let (kx, ky) = (64 * x0 as i32, 64 * y0 as i32);
+        let (kw, kh) = (64 * w as i32, 64 * h as i32);
+        m.edge_looks = self.edge_looks.iter().map(|(&(x, y), &v)| ((x - kx, y - ky), v)).filter(|((x, y), _)| (-64..=kw + 64).contains(x) && (-64..=kh + 64).contains(y)).collect();
+        m.width = w;
+        m.height = h;
+        m.origin = [self.origin[0] - x0 as i32, self.origin[1] - y0 as i32];
+        m
+    }
+
     pub fn new_level(&self) -> Map {
         let mut m = Map::new(self.width, self.height);
         m.materials = self.materials.clone();

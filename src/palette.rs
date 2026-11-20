@@ -794,6 +794,35 @@ impl Palette {
         Self { slots, measure, sizes: RefCell::default(), visible: None, boxes: RefCell::default(), ends: None, opacity: None, alphas: RefCell::default(), rngs: RefCell::default(), base: RefCell::default(), frames }
     }
 
+    /// Ключи одного слота из библиотеки — то же, что `from_library(..).keys(slot)`, без
+    /// разбора всех слотов: пни под кронами берёт каждая выгрузка, а разбор всей
+    /// библиотеки из 20 000 ассетов — около 13 секунд.
+    pub fn library_keys(assets: &[Asset], slot: &str) -> Vec<String> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for a in assets.iter().filter(|a| !a.is_builtin()) {
+            let Some((_, alternatives, none)) = table_of(a.kind).iter().find(|s| s.0 == slot) else { continue };
+            let file = file_words(&a.name);
+            let head = file.iter().find(|w| !MODIFIERS.contains(&w.as_str())).map_or("", |w| w.as_str());
+            let in_file = |w: &str| file.iter().any(|f| f == w);
+            if !alternatives.iter().any(|alt| alt[0] == head && alt[1..].iter().all(|w| in_file(w))) {
+                continue;
+            }
+            let part = a.kind == Kind::Object && PARTS.iter().any(|w| in_file(w)) && !alternatives.iter().any(|alt| alt.iter().any(|w| PARTS.contains(w)));
+            let words = a.words();
+            if !part && !NEVER.iter().any(|w| in_file(w) && !(["stairs_down", "stair_rail"].contains(&slot) && *w == "path")) && !none.iter().any(|w| in_file(w) || words.contains(w)) && fits_size(slot, &a.name) {
+                found.push((a.key.clone(), a.name.clone()));
+            }
+        }
+        for (s, word) in PREFER {
+            if *s == slot && found.iter().any(|(_, name)| file_words(name).iter().any(|w| w == word)) {
+                found.retain(|(_, name)| file_words(name).iter().any(|w| w == word));
+            }
+        }
+        found.sort();
+        found.dedup();
+        found.into_iter().map(|(k, _)| k).collect()
+    }
+
     /// Рама под подоконник FA: того же размера (`1x1`, `2x1`, «large»), ближе всех
     /// по материалу и цвету. У FA окно — подоконник и рама, без рамы стоек нет.
     pub fn window_frame(&self, sill: &str) -> Option<String> {
@@ -947,6 +976,27 @@ mod tests {
 
     fn asset(path: &str, kind: Kind) -> Asset {
         Asset::new(format!("pack:fa.dungeondraft_pack|textures/x/{path}"), &format!("FA/{path}"), kind)
+    }
+
+    #[test]
+    fn one_slot_from_the_library_is_the_same_as_from_the_whole_palette() {
+        let assets: Vec<Asset> = [
+            ("Stump_Oak_A1_1x1.webp", Kind::Object),
+            ("Tree_Stump_Moss_B2_2x2.webp", Kind::Object),
+            ("Stump_Shadow_A_1x1.webp", Kind::Object),
+            ("Tree_Green_A1_6x6.webp", Kind::Object),
+            ("Bed_Arranged_Wood_A1_2x2.webp", Kind::Object),
+            ("Bed_Wood_A2_2x2.webp", Kind::Object),
+            ("Stump_Floor_A.webp", Kind::Floor),
+        ]
+        .iter()
+        .map(|(p, k)| asset(p, *k))
+        .collect();
+        let whole = Palette::from_library(&assets, Box::new(|_| None));
+        for slot in ["stump", "bed", "tree"] {
+            assert_eq!(Palette::library_keys(&assets, slot), whole.keys(slot), "слот {slot}");
+        }
+        assert!(!Palette::library_keys(&assets, "stump").is_empty());
     }
 
     /// Самопроверка своего набора: в какие слоты попадает каждый файл папки, кто в двух

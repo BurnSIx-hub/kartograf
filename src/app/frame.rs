@@ -193,8 +193,33 @@ impl App {
                         ui.selectable_value(&mut dlg.px, px, px.to_string());
                     }
                 });
-                let fit = export::fit_px(self.map.width, self.map.height, dlg.px);
-                let (w, h) = (self.map.width * fit, self.map.height * fit);
+                // Только район — отдельной сценой: у огромной карты целиком на клетку мало точек.
+                let mut part = dlg.district.is_some();
+                if ui.checkbox(&mut part, "Только район").on_hover_text("Прямоугольник карты отдельной сценой, в полном разрешении. Стены, крыши и предметы у края идут целиком.").changed() {
+                    dlg.district = part.then(|| self.view_cells());
+                }
+                if let Some(a) = &mut dlg.district {
+                    let (mw, mh) = (self.map.width, self.map.height);
+                    ui.horizontal(|ui| {
+                        ui.label("x");
+                        ui.add(egui::DragValue::new(&mut a[0]).range(0..=mw.saturating_sub(1)));
+                        ui.label("–");
+                        ui.add(egui::DragValue::new(&mut a[2]).range(1..=mw));
+                        ui.label("y");
+                        ui.add(egui::DragValue::new(&mut a[1]).range(0..=mh.saturating_sub(1)));
+                        ui.label("–");
+                        ui.add(egui::DragValue::new(&mut a[3]).range(1..=mh));
+                        if ui.button("По окну").on_hover_text("Район — то, что сейчас видно в окне.").clicked() {
+                            *a = self.view_cells();
+                        }
+                    });
+                }
+                let (cw, ch) = match dlg.district {
+                    Some(a) => (a[2].saturating_sub(a[0]).max(1), a[3].saturating_sub(a[1]).max(1)),
+                    None => (self.map.width, self.map.height),
+                };
+                let fit = export::fit_px(cw, ch, dlg.px);
+                let (w, h) = (cw * fit, ch * fit);
                 if fit < dlg.px {
                     ui.weak(format!("Картинка {w}×{h}: карта большая, больше {} точек Foundry не покажет — будет {fit} на клетку.", export::SCENE_MAX_SIDE + 1));
                 } else {
@@ -234,9 +259,18 @@ impl App {
                 // а обновлённая не берёт старую картинку из кэша браузера.
                 let name: String = dlg.name.trim().chars().map(|c| if "/\\:*?\"<>|".contains(c) { '-' } else { c }).collect();
                 let stamp = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                self.start_export(PathBuf::from("kartograf").join(export::ascii_name(&name)).join(stamp.to_string()), name.clone(), dlg.px, false);
+                let dir = PathBuf::from("kartograf").join(export::ascii_name(&name)).join(stamp.to_string());
+                match dlg.district {
+                    Some(area) => {
+                        if let Err(err) = self.start_district(dir, name.clone(), dlg.px, area, false) {
+                            self.error = Some(err);
+                        }
+                    }
+                    None => self.start_export(dir, name.clone(), dlg.px, false),
+                }
+                // Район — своя сцена: последнюю (всю карту) он не заменяет.
                 if let Some(e) = &mut self.export {
-                    e.update = dlg.update;
+                    e.update = dlg.update && dlg.district.is_none();
                 }
                 self.scene_name = Some(name);
             } else if go {
@@ -253,7 +287,14 @@ impl App {
                     let stem = file.file_stem().map(|s| export::ascii_name(&s.to_string_lossy()));
                     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
                     let name = self.name();
-                    self.start_export(dir, name, dlg.px, false);
+                    match dlg.district {
+                        Some(area) => {
+                            if let Err(err) = self.start_district(dir, name, dlg.px, area, false) {
+                                self.error = Some(err);
+                            }
+                        }
+                        None => self.start_export(dir, name, dlg.px, false),
+                    }
                     if let (Some(e), Some(stem)) = (&mut self.export, stem) {
                         e.stem = stem;
                     }

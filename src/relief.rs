@@ -66,6 +66,19 @@ impl Relief {
         Self { w, h, data, ..self.clone() }
     }
 
+    /// Кусок рельефа от клетки `x0, y0` (как [`Mask::cropped`]): за краем — на нуле.
+    pub fn cropped(&self, cells_w: u32, cells_h: u32, x0: u32, y0: u32) -> Self {
+        let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
+        let (ox, oy) = (x0 as usize * RES, y0 as usize * RES);
+        let mut data = vec![0.0; w * h];
+        for j in 0..h.min(self.h.saturating_sub(oy)) {
+            let n = w.min(self.w.saturating_sub(ox));
+            let at = (j + oy) * self.w + ox;
+            data[j * w..j * w + n].copy_from_slice(&self.data[at..at + n]);
+        }
+        Self { w, h, data, ..self.clone() }
+    }
+
     pub fn for_cells(cells_w: u32, cells_h: u32) -> Self {
         let (w, h) = (cells_w as usize * RES, cells_h as usize * RES);
         Self { w, h, data: vec![0.0; w * h], face: String::new(), ridge: String::new(), under: String::new(), natural: false }

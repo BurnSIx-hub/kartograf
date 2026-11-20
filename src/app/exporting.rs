@@ -1,10 +1,12 @@
 //! Выгрузка: снимки холста плитками, запись файлов, снимки окна.
 
 use super::*;
+use crate::shotcache;
 
 impl App {
     /// Начать выгрузку: плитки по размеру холста, камера и выбор запоминаются.
     pub fn start_export(&mut self, dir: PathBuf, name: String, px: u32, quit: bool) {
+        let began = crate::plat::Instant::now();
         // Большая карта — мельче: иначе Foundry картинку не покажет.
         let px = export::fit_px(self.map.width, self.map.height, px);
         let (w, h) = (self.map.width * px, self.map.height * px);
@@ -12,7 +14,10 @@ impl App {
         let start_level = self.level;
         let sel = self.sel.take();
         self.switch_level(0);
-        let stumps = if self.settings.gen_library { Palette::from_library(&self.library.assets, Box::new(|_| None)).keys("stump") } else { Vec::new() };
+        // Пни под кронами из библиотеки — только если крон в выгрузке есть.
+        let crowns = self.settings.export_canopies && (0..self.levels.len()).any(|k| if k == self.level { &self.map } else { &self.levels[k] }.props.iter().any(|p| p.is_canopy()));
+        let stumps = if self.settings.gen_library && crowns { Palette::library_keys(&self.library.assets, "stump") } else { Vec::new() };
+        let prepare = began.elapsed().as_secs_f32();
         self.export = Some(Export {
             dir,
             stem: export::ascii_name(&name),
@@ -43,7 +48,69 @@ impl App {
             wall_shot: None,
             whites: Vec::new(),
             walls: Vec::new(),
+            began,
+            shots_taken: 0,
+            cached: false,
+            planned: false,
+            missing: Vec::new(),
+            prints: None,
+            prints_now: Vec::new(),
+            cells_total: 0,
+            cells_cached: 0,
+            planning: 0.0,
+            prepare,
+            fresh: false,
+            district: None,
         });
+    }
+
+    /// Выгрузить только район `area` = `[x0, y0, x1, y1]` клеток — отдельной сценой, в полном
+    /// разрешении: у огромной карты целиком Foundry покажет лишь 16 точек на клетку.
+    /// Снимается район с самой карты; стены, крыши и предметы, что задевают край, идут в
+    /// сцену целиком. Сцена и файлы — с клетками района в имени.
+    pub fn start_district(&mut self, dir: PathBuf, name: String, px: u32, area: [u32; 4], quit: bool) -> Result<(), String> {
+        let (x0, y0) = (area[0].min(self.map.width), area[1].min(self.map.height));
+        let (x1, y1) = (area[2].min(self.map.width), area[3].min(self.map.height));
+        if x1 <= x0 || y1 <= y0 {
+            return Err(format!("район {x0},{y0}–{x1},{y1} пустой: карта {}×{}", self.map.width, self.map.height));
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut maps = Vec::new();
+        let mut edges = Vec::new();
+        for k in 0..self.levels.len() {
+            let src = if k == self.level { &self.map } else { &self.levels[k] };
+            maps.push(src.crop(x0, y0, w, h));
+            edges.push(export::clip_segments(&src.room_edges(), [x0 as f32, y0 as f32, x1 as f32, y1 as f32], [-(x0 as f32), -(y0 as f32)]));
+        }
+        self.start_export(dir, format!("{name} {x0},{y0}–{x1},{y1}"), px, quit);
+        let px = export::fit_px(w, h, px);
+        if let Some(e) = &mut self.export {
+            e.px = px;
+            e.origin = [x0 as f32, y0 as f32];
+            e.image = image::RgbImage::new(w * px, h * px);
+            e.district = Some(District { area: [x0, y0, x1, y1], maps, edges });
+        }
+        Ok(())
+    }
+
+    /// Видимая в окне часть карты, целыми клетками: `[x0, y0, x1, y1]`.
+    pub(super) fn view_cells(&self) -> [u32; 4] {
+        let (a, b) = (self.cam.to_world(self.canvas, self.canvas.min), self.cam.to_world(self.canvas, self.canvas.max));
+        let (mw, mh) = (self.map.width as f32, self.map.height as f32);
+        let x0 = a[0].floor().clamp(0.0, mw - 1.0) as u32;
+        let y0 = a[1].floor().clamp(0.0, mh - 1.0) as u32;
+        let x1 = (b[0].ceil().clamp(1.0, mw) as u32).max(x0 + 1);
+        let y1 = (b[1].ceil().clamp(1.0, mh) as u32).max(y0 + 1);
+        [x0, y0, x1, y1]
+    }
+
+    /// Этаж `k` для файлов выгрузки: вся карта или вырезанный район.
+    fn export_level<'a>(&'a self, e: &'a Export, k: usize) -> &'a Map {
+        match &e.district {
+            Some(d) => &d.maps[k],
+            None if k == self.level => &self.map,
+            None => &self.levels[k],
+        }
     }
 
     /// Снять область карты одной картинкой, как её рисует редактор, но без окон,
@@ -84,6 +151,19 @@ impl App {
             wall_shot: None,
             whites: Vec::new(),
             walls: Vec::new(),
+            began: crate::plat::Instant::now(),
+            shots_taken: 0,
+            cached: false,
+            planned: false,
+            missing: Vec::new(),
+            prints: None,
+            prints_now: Vec::new(),
+            cells_total: 0,
+            cells_cached: 0,
+            planning: 0.0,
+            prepare: 0.0,
+            fresh: false,
+            district: None,
         });
     }
 
@@ -120,29 +200,153 @@ impl App {
         if e.asked {
             return;
         }
-        if e.tiles.is_empty() {
+        if e.tile == [0, 0] {
             // Окно только что развернули для снимка: дать ему принять размер.
             e.wait += 1;
             if e.wait < 3 {
                 return;
             }
-            // Плитки — по холсту развёрнутого окна.
+            // Плитки — по холсту развёрнутого окна. Кэш — если в окно влезает кусок.
             e.tile = [((canvas.width() * ppp).floor() as u32).saturating_sub(2).max(64), ((canvas.height() * ppp).floor() as u32).saturating_sub(2).max(64)];
-            let (w, h) = (e.image.width(), e.image.height());
-            e.tiles = (0..h.div_ceil(e.tile[1])).flat_map(|ty| (0..w.div_ceil(e.tile[0])).map(move |tx| [tx, ty])).collect();
+            e.cached = !e.picture && cfg!(not(target_arch = "wasm32")) && e.tile[0] >= shotcache::CELL && e.tile[1] >= shotcache::CELL;
         }
+        if !e.planned {
+            self.plan_pass(ppp);
+            if self.export.as_ref().is_some_and(|e| e.tiles.is_empty()) {
+                // Весь проход нашёлся в кэше: снимать нечего.
+                self.pass_done();
+                return;
+            }
+        }
+        let Some(e) = &mut self.export else { return };
         let [tx, ty] = e.tiles[e.next];
         // Начало плитки ложится на целый пиксель экрана: плитки стыкуются без шва.
         let origin = [(canvas.min.x * ppp).ceil(), (canvas.min.y * ppp).ceil()];
         let scale = e.px as f32 / ppp;
-        let world = [e.origin[0] + (tx * e.tile[0]) as f32 / e.px as f32, e.origin[1] + (ty * e.tile[1]) as f32 / e.px as f32];
+        let world = [e.origin[0] + tx as f32 / e.px as f32, e.origin[1] + ty as f32 / e.px as f32];
         self.cam.scale = scale;
         self.cam.pan = vec2(origin[0] / ppp - canvas.min.x - world[0] * scale, origin[1] / ppp - canvas.min.y - world[1] * scale);
         e.settle += 1;
         if e.settle >= 3 && idle {
             e.asked = true;
+            e.shots_taken += 1;
             ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
         }
+    }
+
+    /// Кэш снимков на диске (у программы, не в браузере): открывается при первой выгрузке.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shot_store(&mut self) -> &shotcache::Store {
+        let dir = self.data_dir.join("cache").join("shots");
+        self.shot_store.get_or_insert_with(|| shotcache::Store::open(dir))
+    }
+
+    /// Что общего у всех кусков прохода, кроме карты: программа, картинки, проход снимка,
+    /// точки на клетку, масштаб окна.
+    fn shot_salt(&self, e: &Export, ppp: f32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let used = self.map.used_assets();
+        let keys = used.iter().map(String::as_str).chain(e.stumps.iter().map(String::as_str));
+        (shotcache::program_stamp(), shotcache::assets_stamp(keys, &self.textures.sources)).hash(&mut h);
+        (e.shot() as u8, e.pass(), e.void(), e.px, ppp.to_bits(), shotcache::CELL, e.canopies, &e.stumps).hash(&mut h);
+        // Стёкла подоконников и пни берутся из библиотеки: другая библиотека — другие.
+        self.library.assets.len().hash(&mut h);
+        for a in &self.library.assets {
+            a.key.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Разложить проход на плитки. С кэшем: отпечаток каждого куска картинки, найденные на
+    /// диске куски — сразу в картинку, плитки — только там, где куска нет.
+    fn plan_pass(&mut self, ppp: f32) {
+        let Some(mut e) = self.export.take() else { return };
+        e.planned = true;
+        let (w, h) = (e.image.width(), e.image.height());
+        let tile = e.tile;
+        // Плитки окна — их левые верхние точки в картинке.
+        let grid: Vec<[u32; 2]> = (0..h.div_ceil(tile[1])).flat_map(|ty| (0..w.div_ceil(tile[0])).map(move |tx| [tx * tile[0], ty * tile[1]])).collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        if e.cached {
+            use shotcache::CELL;
+            let started = crate::plat::Instant::now();
+            let (nx, ny) = (w.div_ceil(CELL), h.div_ceil(CELL));
+            if e.prints.as_ref().map(|p| p.0) != Some(e.doing) {
+                e.prints = Some((e.doing, shotcache::Prints::new(&self.map, &mut self.chunk_memo)));
+            }
+            let salt = self.shot_salt(&e, ppp);
+            let px = e.px as f32;
+            let o = e.origin;
+            let prints = &e.prints.as_ref().expect("отпечатки этажа").1;
+            e.prints_now = (0..ny * nx)
+                .map(|c| {
+                    let (i, j) = (c % nx, c / nx);
+                    let (x0, y0, x1, y1) = (i * CELL, j * CELL, ((i + 1) * CELL).min(w), ((j + 1) * CELL).min(h));
+                    prints.cell([o[0] + x0 as f32 / px, o[1] + y0 as f32 / px, o[0] + x1 as f32 / px, o[1] + y1 as f32 / px], salt)
+                })
+                .collect();
+            // Куски с диска — сразу в картинку, полосами по потокам: полоса кусков —
+            // свои строки картинки, потоки друг другу не мешают.
+            let fps = std::mem::take(&mut e.prints_now);
+            let store = self.shot_store();
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+            let row = (w * 3) as usize;
+            let raw: &mut [u8] = &mut e.image;
+            let mut per: Vec<Vec<(u32, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+            for (j, band) in raw.chunks_mut(row * CELL as usize).enumerate() {
+                per[j % threads].push((j as u32, band));
+            }
+            let fps_ref = &fps;
+            let fresh = e.fresh;
+            let missing: Vec<u32> = std::thread::scope(|s| {
+                let jobs: Vec<_> = per
+                    .into_iter()
+                    .map(|list| {
+                        s.spawn(move || {
+                            let mut miss = Vec::new();
+                            for (j, band) in list {
+                                let ch = (CELL).min(h - j * CELL);
+                                for i in 0..nx {
+                                    let c = j * nx + i;
+                                    let cw = CELL.min(w - i * CELL);
+                                    match (!fresh).then(|| store.load(fps_ref[c as usize], cw, ch)).flatten() {
+                                        Some(rgb) => {
+                                            let line = (cw * 3) as usize;
+                                            for y in 0..ch as usize {
+                                                let at = y * row + (i * CELL * 3) as usize;
+                                                band[at..at + line].copy_from_slice(&rgb[y * line..(y + 1) * line]);
+                                            }
+                                        }
+                                        None => miss.push(c),
+                                    }
+                                }
+                            }
+                            miss
+                        })
+                    })
+                    .collect();
+                jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+            });
+            e.prints_now = fps;
+            e.missing = vec![false; (nx * ny) as usize];
+            for &c in &missing {
+                e.missing[c as usize] = true;
+            }
+            // Недостающее — плитками от недостающих кусков; если так выходит не меньше
+            // плиток, чем сеткой окна (первая выгрузка), — сеткой.
+            let spots = shotcache::cover(&e.missing, [nx, ny], [w, h], tile);
+            let miss = &e.missing;
+            e.tiles = if spots.len() < grid.len() { spots } else { grid.into_iter().filter(|o| shotcache::touches_missing(miss, [nx, ny], [w, h], *o, tile)).collect() };
+            e.cells_total += nx * ny;
+            e.cells_cached += nx * ny - missing.len() as u32;
+            e.planning += started.elapsed().as_secs_f32();
+            self.export = Some(e);
+            return;
+        }
+        e.tiles = grid;
+        e.missing.clear();
+        self.export = Some(e);
     }
 
     /// Снимок пришёл: вырезать плитку в большую картинку; последняя — записать файлы.
@@ -150,27 +354,72 @@ impl App {
         let ppp = ctx.pixels_per_point();
         let canvas = self.canvas;
         let Some(e) = &mut self.export else { return };
-        let [tx, ty] = e.tiles[e.next];
+        let [x0, y0] = e.tiles[e.next];
         let (ox, oy) = ((canvas.min.x * ppp).ceil() as usize, (canvas.min.y * ppp).ceil() as usize);
-        let (x0, y0) = (tx * e.tile[0], ty * e.tile[1]);
         let w = e.tile[0].min(e.image.width() - x0);
         let h = e.tile[1].min(e.image.height() - y0);
         let [sw, sh] = shot.size;
+        let iw = e.image.width() as usize;
+        let raw: &mut [u8] = &mut e.image;
         for y in 0..h as usize {
-            for x in 0..w as usize {
-                let (sx, sy) = (ox + x, oy + y);
-                if sx < sw && sy < sh {
-                    let c = shot.pixels[sy * sw + sx];
-                    e.image.put_pixel(x0 + x as u32, y0 + y as u32, image::Rgb([c.r(), c.g(), c.b()]));
-                }
+            let sy = oy + y;
+            if sy >= sh {
+                break;
+            }
+            let at = ((y0 as usize + y) * iw + x0 as usize) * 3;
+            for x in 0..(w as usize).min(sw.saturating_sub(ox)) {
+                let c = shot.pixels[sy * sw + ox + x];
+                raw[at + x * 3..at + x * 3 + 3].copy_from_slice(&[c.r(), c.g(), c.b()]);
             }
         }
+        let Some(e) = &mut self.export else { return };
         e.next += 1;
         e.asked = false;
         e.settle = 0;
         if e.next < e.tiles.len() {
             return;
         }
+        self.pass_done();
+    }
+
+    /// Снятые куски, которых не было в кэше, — на диск. Кусок мог лечь на две плитки,
+    /// поэтому — когда снят весь проход.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_missing(&mut self) {
+        use shotcache::CELL;
+        if !self.export.as_ref().is_some_and(|e| e.cached && e.missing.iter().any(|&m| m)) {
+            return;
+        }
+        // Выгрузка — на время в сторону: куски уходят в очередь записи по одному, а не
+        // копятся все разом (у большой карты — тысячи кусков, сотни мегабайт).
+        let Some(mut e) = self.export.take() else { return };
+        let missing = std::mem::take(&mut e.missing);
+        let prints = std::mem::take(&mut e.prints_now);
+        let (iw, ih) = (e.image.width(), e.image.height());
+        let nx = iw.div_ceil(CELL);
+        let store = self.shot_store();
+        for (c, _) in missing.iter().enumerate().filter(|m| *m.1) {
+            let (cx, cy) = ((c as u32 % nx) * CELL, (c as u32 / nx) * CELL);
+            let (cw, ch) = (CELL.min(iw - cx), CELL.min(ih - cy));
+            let mut rgb = Vec::with_capacity((cw * ch * 3) as usize);
+            for y in cy..cy + ch {
+                let at = ((y * iw + cx) * 3) as usize;
+                rgb.extend_from_slice(&e.image.as_raw()[at..at + (cw * 3) as usize]);
+            }
+            store.save(prints[c], cw, ch, rgb);
+        }
+        self.export = Some(e);
+    }
+
+    /// Проход снят: следующий проход, следующий этаж или запись файлов.
+    fn pass_done(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.save_missing();
+        let Some(e) = &mut self.export else { return };
+        e.next = 0;
+        e.planned = false;
+        e.asked = false;
+        e.settle = 0;
         // Только картинка: вернуть камеру и выбор, файлов не писать.
         if e.picture {
             let Some(e) = self.export.take() else { return };
@@ -191,7 +440,6 @@ impl App {
                 Shot::WallsBlack | Shot::WallsWhite => e.wall_shot = Some(shot),
             }
             e.wall_pass += 1;
-            e.next = 0;
             return;
         }
         // Последний проход: в `image` возвращается первый снимок этажа.
@@ -211,7 +459,6 @@ impl App {
             let fresh = image::RgbImage::new(e.image.width(), e.image.height());
             e.done.push(std::mem::replace(&mut e.image, fresh));
             e.doing += 1;
-            e.next = 0;
             let k = e.doing;
             self.switch_level(k);
             return;
@@ -221,8 +468,23 @@ impl App {
         e.done.push(last);
         self.switch_level(e.start_level);
         self.cam = e.cam;
-        self.sel = e.sel;
+        self.sel = e.sel.take();
+        let shot_s = e.began.elapsed().as_secs_f32();
         let result = self.write_export(&e);
+        if let Some(t) = &mut self.export_timing {
+            let r = |s: f32| (s * 100.0).round() / 100.0;
+            t["shots"] = serde_json::json!(e.shots_taken);
+            t["shooting"] = serde_json::json!(r(shot_s - e.planning));
+            t["planning"] = serde_json::json!(r(e.planning));
+            t["prepare"] = serde_json::json!(r(e.prepare));
+            t["cells"] = serde_json::json!(e.cells_total);
+            t["cells_cached"] = serde_json::json!(e.cells_cached);
+            t["total"] = serde_json::json!(r(e.began.elapsed().as_secs_f32()));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(store) = &self.shot_store {
+            store.prune(shotcache::DISK_LIMIT);
+        }
         match &result {
             Ok(msg) => self.notice = Some(msg.clone()),
             Err(err) => self.error = Some(format!("Выгрузка не удалась: {err}")),
@@ -231,6 +493,10 @@ impl App {
             match result {
                 Ok(msg) => println!("{msg}"),
                 Err(err) => eprintln!("{err}"),
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(store) = &self.shot_store {
+                store.flush(std::time::Duration::from_secs(20));
             }
             self.recovery.close();
             std::process::exit(0);
@@ -242,13 +508,18 @@ impl App {
     pub(super) fn write_export(&mut self, e: &Export) -> Result<String, String> {
         // Файлы копятся здесь: программа пишет их на диск, модуль отдаёт Foundry.
         let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let mut laps = Laps::new();
+        // Кэш — и крышам, и сжатию фона и стен в потоках (им — своя копия ручки).
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache: Option<shotcache::Store> = Some(self.shot_store().clone());
+        #[cfg(target_arch = "wasm32")]
+        let cache: Option<shotcache::Store> = None;
         let n = e.done.len();
         // Имена файлов — латиницей: кириллицу Foundry превращает в длинные `%D0%9A…`.
         let base = if e.stem.is_empty() { export::ascii_name(&e.name) } else { e.stem.clone() };
         let stem = |k: usize| if n == 1 { base.clone() } else { format!("{}_{}", base, k + 1) };
         // Картинки ассетов — по одной на ассет, по его имени, в общей папке, как библиотека FA.
         let mut shelf = Shelf::new(export::shared_dir(&e.dir));
-        let mut jpgs = Vec::new();
         let mut srcs = Vec::new();
         let mut layouts = Vec::new();
         // Контуры палаток по картинке — один раз на картинку.
@@ -257,29 +528,33 @@ impl App {
         // сквозь неё виден этаж ниже. Закрашенный целиком — сплошной, как у первого.
         let mut open: Vec<Option<image::RgbaImage>> = Vec::new();
         let mut bg_paths: Vec<PathBuf> = Vec::new();
+        // Фон этажа сжимается в своём потоке, пока рисуются крыши и тайлы: у большой карты
+        // это десятки секунд. WebP вышел или JPEG — видно, когда поток закончил.
+        let mut bg_jobs: Vec<Pending<Result<(Vec<u8>, &'static str), String>>> = Vec::new();
         for (k, img) in e.done.iter().enumerate() {
             let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
-            // JPEG нужен и для Universal VTT: он лежит внутри .dd2vtt.
-            let mut jpg = Vec::new();
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
-            let (bytes, ext) = match &holes {
-                Some(rgba) => export::layer_bytes(rgba, 88.0),
-                // Не вышел WebP (велика или libwebp не справился) — JPEG.
-                None => match (img.width().max(img.height()) <= export::WEBP_MAX_SIDE).then(|| export::try_webp(&image::DynamicImage::ImageRgb8(img.clone()).to_rgba8(), 88.0)).flatten() {
-                    Some(webp) => (webp, "webp"),
-                    None => (jpg.clone(), "jpg"),
-                },
+            let job = match &holes {
+                Some(rgba) => {
+                    let (rgba, cache) = (rgba.clone(), cache.clone());
+                    Pending::spawn(move || encode_cached(cache, "floor-rgba-88", rgba.dimensions().into(), rgba.as_raw(), || Ok(export::layer_bytes(&rgba, 88.0))))
+                }
+                None => {
+                    let (img, cache) = (img.clone(), cache.clone());
+                    Pending::spawn(move || encode_cached(cache, "floor-rgb-88", img.dimensions().into(), img.as_raw(), || background_bytes(&img)))
+                }
             };
+            bg_jobs.push(job);
             open.push(holes);
-            let img_path = e.dir.join(format!("{}.{ext}", stem(k)));
-            files.push((img_path.clone(), bytes));
-            bg_paths.push(img_path.clone());
-            let map = if k == self.level { &self.map } else { &self.levels[k] };
+            let map = self.export_level(e, k);
             // Вырез воды под мостом — по нарисованному: рамка картинки, по разу на картинку.
             let sources = &self.textures.sources;
             let boxes = std::cell::RefCell::new(std::collections::HashMap::new());
             let seen = |key: &str| *boxes.borrow_mut().entry(key.to_owned()).or_insert_with(|| library::visible_box(sources, key));
-            let mut lay = export::layout_seen(map, &map.room_edges(), &seen);
+            let edges = match &e.district {
+                Some(d) => d.edges[k].clone(),
+                None => map.room_edges(),
+            };
+            let mut lay = export::layout_seen(map, &edges, &seen);
             // Стены палаток — по нарисованному пологу, а не по полям картинки.
             let mut tents = Vec::new();
             for p in map.props.iter().filter(|p| map::awning_by_name(&p.asset)) {
@@ -291,8 +566,7 @@ impl App {
             }
             lay.tents = tents;
             layouts.push(lay);
-            srcs.push(export::foundry_src(&img_path));
-            jpgs.push(jpg);
+            laps.lap("layout");
         }
         // Створки — отдельными картинками рядом со сценой: Foundry их двигает.
         let mut leaves = std::collections::HashMap::new();
@@ -307,153 +581,43 @@ impl App {
             let src = shelf.put(&format!("{}_leaf", export::asset_stem(&key)), export::webp_bytes(&img.to_rgba8(), 90.0), &mut files);
             leaves.insert(key, export::LeafFile { src, width });
         }
+        laps.lap("leaves");
         // Крыши — картинками по одной, рядом со сценой.
-        let mut covers: std::collections::HashMap<String, (image::RgbaImage, [f32; 2])> = std::collections::HashMap::new();
         let mut roof_tiles: Vec<Vec<export::RoofTile>> = Vec::new();
         let mut roof_count = 0;
-        let mut outline_covers: std::collections::HashMap<String, image::RgbaImage> = std::collections::HashMap::new();
         let mut canopies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut seen = std::collections::HashMap::new();
         // Слой стен каждого этажа (он же для Universal VTT) и его файл.
         let mut wall_layers: std::collections::HashMap<usize, image::RgbaImage> = std::collections::HashMap::new();
         let mut foregrounds: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         let mut wall_paths: std::collections::HashMap<usize, PathBuf> = std::collections::HashMap::new();
+        let mut wall_jobs: Vec<(usize, Pending<Result<(image::RgbaImage, Vec<u8>, &'static str), String>>)> = Vec::new();
+        let store = cache.as_ref();
         for k in 0..n {
-            let map = if k == self.level { &self.map } else { &self.levels[k] };
-            let light = map.shadows.light();
-            let climbs = super::draw_ground::climb_rects(&map.props, &self.textures.sources, &mut seen);
+            let map = self.export_level(e, k);
             let mut tiles = Vec::new();
-            // Крыши, что врезаются друг в друга, — одной отрисовкой на группу; картинка
-            // и тайл у каждой свои: в них только то, что у неё видно поверх соседей.
-            // Группа рисуется, когда очередь доходит до первой её крыши, а не все заранее:
-            // у города в сотни крыш картинки всех групп разом — гигабайты памяти.
-            let mut joined: std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)> = std::collections::HashMap::new();
-            let groups = roofs::raster_groups(&map.roofs, &map.outline_roofs);
-            let group_of: std::collections::HashMap<usize, usize> = groups.iter().enumerate().flat_map(|(g, ids)| ids.iter().map(move |&id| (id, g))).collect();
+            let mut pics = self.roof_pictures(map, e.px, store)?;
             let rects = map.roofs.len();
-            let mut spans = Vec::new();
-            for group in &groups {
-                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-                for &id in group {
-                    let (paint, (a, b)) = if id < rects { (&map.roofs[id].paint, (map.roofs[id].outline()[0], map.roofs[id].outline()[2])) } else { (&map.outline_roofs[id - rects].pieces[0].paint, map.outline_roofs[id - rects].bounds()) };
-                    (lo, hi) = ([lo[0].min(a[0]), lo[1].min(a[1])], [hi[0].max(b[0]), hi[1].max(b[1])]);
-                    if !outline_covers.contains_key(paint) {
-                        let bytes = self.textures.bytes(paint)?;
-                        outline_covers.insert(paint.clone(), roofs::solid_cover(library::decode_tinted(paint, &bytes)?));
-                    }
-                }
-                spans.push((hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5);
-            }
-            let mut drawn = std::collections::HashSet::new();
-            let mut draw_group = |id: usize, joined: &mut std::collections::HashMap<usize, (image::RgbaImage, [f32; 2], f32)>, covers: &std::collections::HashMap<String, image::RgbaImage>| {
-                let Some(&g) = group_of.get(&id) else { return };
-                if !drawn.insert(g) {
-                    return;
-                }
-                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / spans[g].max(1.0)));
-                let out = roofs::render_joined(&map.roofs, &map.outline_roofs, &groups[g], &|k: &str| covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), map.weather == "snow");
-                for (id, (img, origin)) in groups[g].iter().zip(out) {
-                    joined.insert(*id, (img, origin, ppc));
-                }
-            };
+            let p = e.px as f32;
             for (ri, r) in map.roofs.iter().enumerate() {
-                if !covers.contains_key(&r.paint) {
-                    let bytes = self.textures.bytes(&r.paint)?;
-                    let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&r.paint)))?.to_rgba8();
-                    let tile = roofs::tile_cells([img.width(), img.height()]);
-                    covers.insert(r.paint.clone(), (img, tile));
-                }
+                let Some(pic) = pics.remove(&ri) else { continue };
                 let fixtures = r.fixtures();
-                // Дымоходы, вытяжки, люки этой крыши (слой «На крыше») — в её картинку:
-                // тает крыша, когда игрок вошёл в дом, — тают и они.
-                let mine: Vec<(String, [f32; 2], f32, [f32; 2])> = map
-                    .props
-                    .iter()
-                    .filter(|p| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && r.contains(p.pos))
-                    .map(|p| (p.asset.clone(), p.pos, p.rot, [p.size[0] * p.scale, p.size[1] * p.scale]))
-                    .collect();
-                for pk in r.parapet().into_iter().chain(fixtures.iter().map(|f| f.0)).map(str::to_owned).chain(mine.iter().map(|m| m.0.clone())) {
-                    if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(pk.clone()) {
-                        let bytes = self.textures.bytes(&pk)?;
-                        slot.insert((library::decode_tinted(&pk, &bytes)?, [roofs::PARAPET_TILE, roofs::PARAPET]));
-                    }
-                }
-                let (tex, tile) = &covers[&r.paint];
-                let parapet = r.parapet().map(|pk| &covers[pk].0);
-                let mut items: Vec<roofs::Fixture> = fixtures.iter().map(|f| (&covers[f.0].0, f.1, f.2, [1.0, 1.0])).collect();
-                items.extend(mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)));
-                let smoke = smoke_spots(&mine, e.px as f32);
-                // Крыша — в родном разрешении покрытия (256 на клетку), не в мелком
-                // масштабе сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек.
-                let span = (r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5;
-                let ppc = (e.px as f32).max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
-                draw_group(ri, &mut joined, &outline_covers);
-                let (img, origin, ppc) = match joined.remove(&ri) {
-                    Some((mut img, origin, ppc)) => {
-                        roofs::paste_fixtures(&mut img, origin, ppc, &items);
-                        (img, origin, ppc)
-                    }
-                    None => {
-                        let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &climbs, &items, map.weather == "snow");
-                        (img, origin, ppc)
-                    }
-                };
+                let smoke = smoke_spots(&on_roof(map, |q| r.contains(q)), p);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
-                files.push((file.clone(), export::webp_bytes(&img, 88.0)));
-                let p = e.px as f32;
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() });
+                files.push((file.clone(), pic.bytes));
+                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() });
             }
-            // Крыши по контуру (из OSM) — тоже по одной, в масштабе сцены: их сотни.
-            let casters = roofs::Casters::new(&map.outline_roofs, &map.props);
+            // Крыши по контуру (из OSM) — тоже по одной. Крышное над ними (свод ангара,
+            // купол, шатёр) — в их картинке: отдельным тайлом оно висело бы над комнатой.
             for (idx, r) in map.outline_roofs.iter().enumerate() {
-                for piece in &r.pieces {
-                    if !outline_covers.contains_key(&piece.paint) {
-                        let bytes = self.textures.bytes(&piece.paint)?;
-                        outline_covers.insert(piece.paint.clone(), roofs::solid_cover(library::decode_tinted(&piece.paint, &bytes)?));
-                    }
-                }
-                // Дома из OSM — в масштабе сцены: их сотни. Крыша, заданная руками, — в
-                // родном разрешении покрытия, как прямоугольная: Foundry растянет тайл сам.
-                let p = e.px as f32;
-                let (lo, hi) = r.bounds();
-                let span = (hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5;
-                let ppc = if r.pieces.iter().any(|k| k.overhang.is_some()) { p.max(library::PX_PER_CELL.min(8192.0 / span.max(1.0))) } else { p };
-                let near = casters.near(idx, r.bounds());
-                draw_group(rects + idx, &mut joined, &outline_covers);
-                let (mut img, origin, ppc) = match joined.remove(&(rects + idx)) {
-                    Some(j) => j,
-                    None => {
-                        let (img, origin) = roofs::render_outline(r, &|k: &str| outline_covers.get(k), ppc, light, ([0.0, 0.0], [map.width as f32, map.height as f32]), &near);
-                        (img, origin, ppc)
-                    }
-                };
-                if img.width() <= 1 {
-                    continue;
-                }
-                // Крышное над крышей по контуру (свод ангара, купол, шатёр) — тоже в её
-                // картинку: отдельным тайлом оно висело бы над комнатой, когда крыша тает.
-                let mine: Vec<(String, [f32; 2], f32, [f32; 2])> = map
-                    .props
-                    .iter()
-                    .filter(|p| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && r.contains(p.pos))
-                    .map(|p| (p.asset.clone(), p.pos, p.rot, [p.size[0] * p.scale, p.size[1] * p.scale]))
-                    .collect();
-                for m in &mine {
-                    if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(m.0.clone()) {
-                        let bytes = self.textures.bytes(&m.0)?;
-                        slot.insert((library::decode_tinted(&m.0, &bytes)?, [roofs::PARAPET_TILE, roofs::PARAPET]));
-                    }
-                }
-                let items: Vec<roofs::Fixture> = mine.iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)).collect();
-                roofs::paste_fixtures(&mut img, origin, ppc, &items);
-                let smoke = smoke_spots(&mine, p);
+                let Some(pic) = pics.remove(&(rects + idx)) else { continue };
+                let smoke = smoke_spots(&on_roof(map, |q| r.contains(q)), p);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
-                files.push((file.clone(), export::webp_bytes(&img, 88.0)));
+                files.push((file.clone(), pic.bytes));
                 tiles.push(export::RoofTile {
                     src: export::foundry_src(&file),
-                    rect: [(origin[0] * p).round() as i64, (origin[1] * p).round() as i64, (img.width() as f32 * p / ppc).round() as i64, (img.height() as f32 * p / ppc).round() as i64],
+                    rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64],
                     rotation: 0.0,
                     shelter: true,
                     fade: true,
@@ -471,6 +635,7 @@ impl App {
                     ..Default::default()
                 });
             }
+            laps.lap("roofs");
             // Кроны — один файл на вид дерева, выше токенов, как крыши.
             for prop in map.props.iter().filter(|p| e.canopies && (p.is_canopy() || map::bush_by_name(&p.asset) || map::awning_by_name(&p.asset) || map::line_by_name(&p.asset))) {
                 // Подкрашенная крона — свой файл: та же картинка в другом цвете.
@@ -576,22 +741,41 @@ impl App {
                 }
                 tiles.push(tile);
             }
+            laps.lap("tiles");
             // Стены этажа — слоем во всю сцену, в `foreground` уровня: ядро держит его на
             // верхе этажа, над мебелью и токенами и под крышами. В нём же тень стен,
             // окна, косяки и слой «над стенами».
             if let Some([black, white]) = e.walls.get(k) {
                 let layer = export::layer_from_pair(black, white);
                 if export::opaque_box(&layer, 8).is_some() {
-                    let (bytes, ext) = export::layer_bytes(&layer, 90.0);
-                    let file = e.dir.join(format!("{}_walls.{ext}", stem(k)));
-                    files.push((file.clone(), bytes));
-                    foregrounds.insert(k, export::foundry_src(&file));
-                    wall_paths.insert(k, file);
-                    wall_layers.insert(k, layer);
+                    let cache = cache.clone();
+                    wall_jobs.push((k, Pending::spawn(move || {
+                        let (bytes, ext) = encode_cached(cache, "walls-rgba-90", layer.dimensions().into(), layer.as_raw(), || Ok(export::layer_bytes(&layer, 90.0)))?;
+                        Ok((layer, bytes, ext))
+                    })));
                 }
             }
             roof_tiles.push(tiles);
+            laps.lap("walls");
         }
+        // Сжатое в потоках — в файлы.
+        for (k, job) in wall_jobs {
+            let (layer, bytes, ext) = job.join()??;
+            let file = e.dir.join(format!("{}_walls.{ext}", stem(k)));
+            files.push((file.clone(), bytes));
+            foregrounds.insert(k, export::foundry_src(&file));
+            wall_paths.insert(k, file);
+            wall_layers.insert(k, layer);
+        }
+        laps.lap("walls_wait");
+        for (k, job) in bg_jobs.into_iter().enumerate() {
+            let (bytes, ext) = job.join()??;
+            let img_path = e.dir.join(format!("{}.{ext}", stem(k)));
+            files.push((img_path.clone(), bytes));
+            bg_paths.push(img_path.clone());
+            srcs.push(export::foundry_src(&img_path));
+        }
+        laps.lap("background_wait");
         // Верхний этаж с пустотой — куском, где на нём нарисовано, а не во всю сцену: стена по
         // гребню над замком в 140×110 клеток занимает малую долю сцены, а слой во всю сцену —
         // сотни мегабайт видеопамяти у каждого игрока. Фон и стены режутся по одной рамке
@@ -624,35 +808,41 @@ impl App {
             .map(|k| export::SceneLevel { name: if n == 1 { e.name.clone() } else { self.level_name(k) }, image_src: srcs[k].clone(), layout: &layouts[k], roofs: std::mem::take(&mut roof_tiles[k]) })
             .collect();
         let layers: Vec<export::LevelLayers> = (0..n).map(|k| export::LevelLayers { foreground: foregrounds.remove(&k), solid: open[k].as_ref().map(export::Solid::of) }).collect();
-        let mut scene = export::foundry_layered(&self.map, &e.name, &levels, &layers, e.px, &leaves);
+        let mut scene = export::foundry_layered(self.export_level(e, self.level), &e.name, &levels, &layers, e.px, &leaves);
         let scene_px = [scene["width"].as_u64().unwrap_or(0) as u32, scene["height"].as_u64().unwrap_or(0) as u32];
         for (k, (size, piece)) in &pieces {
             scene["levels"][*k]["textures"] = export::level_piece_textures(scene_px, *size, *piece);
         }
         // Тени предметов рисует «Wild Canvas»: солнце — у сцены.
-        if self.map.shadows.on {
-            scene["flags"][export::LIVE_MODULE]["shadows"] = export::shadow_flags(&self.map.shadows);
+        let shadows = &self.export_level(e, self.level).shadows;
+        if shadows.on {
+            scene["flags"][export::LIVE_MODULE]["shadows"] = export::shadow_flags(shadows);
         }
         // Пути картинок — с меткой содержимого: Foundry не покажет прежнюю под тем же именем.
         let mut tags: std::collections::HashMap<String, String> = files.iter().map(|(p, b)| (export::foundry_src(p), export::content_tag(b))).collect();
         tags.extend(shelf.tags.clone());
         export::tag_sources(&mut scene, &tags);
+        // Район: модуль Foundry видит, какой кусок карты в сцене.
+        if let Some(d) = &e.district {
+            scene["flags"][export::OWN_MODULE]["district"] = serde_json::json!(d.area);
+        }
         // Сцена открывается на том этаже, что открыт в редакторе: у корабля — палуба, а не трюм.
         if n > 1 {
             scene["initialLevel"] = serde_json::json!(export::level_id(self.level));
         }
         let scene_path = e.dir.join(format!("{base}.json"));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
+        laps.lap("scene");
         // Universal VTT — для других VTT; модулю он не нужен, сцена создаётся сразу.
         #[cfg(not(target_arch = "wasm32"))]
         {
             use base64::Engine;
             // В Universal VTT тайлов нет: предметы, ушедшие в тайлы, впечатываются
             // в его картинку.
-            let mut pics: std::collections::HashMap<String, Option<(image::RgbaImage, [f32; 2])>> = std::collections::HashMap::new();
             let mut flats: Vec<image::RgbImage> = Vec::new();
+            let sources = &self.textures.sources;
             for k in 0..n {
-                let map = if k == self.level { &self.map } else { &self.levels[k] };
+                let map = self.export_level(e, k);
                 // Прозрачности в нём нет: в пустоте и дырах верхнего этажа — картинка этажа
                 // ниже, как его видно в Foundry (у самого нижнего — серая пустота).
                 let mut flat = match (&open[k], k.checked_sub(1).and_then(|b| flats.get(b))) {
@@ -664,22 +854,50 @@ impl App {
                 let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !p.with_walls() && !(map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer())).collect();
                 items.sort_by_key(|p| p.layer());
                 let p = e.px as f32;
-                for prop in items {
-                    let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
-                    // Тень предмета в фоне больше не лежит — впечатывается вместе с ним.
-                    let shade = map.shadows.on && prop.carries_shadow();
-                    let slot = if shade { format!("{}#тень{k}|{:.0}|{:.3}", prop.asset, prop.rot.rem_euclid(360.0), prop.scale) } else { prop.asset.clone() };
-                    // У города тысячи предметов со своим поворотом: помнить картинку каждого — гигабайты.
-                    if pics.len() >= 64 && !pics.contains_key(&slot) {
-                        pics.clear();
+                // Тень предмета в фоне больше не лежит — впечатывается вместе с ним.
+                let shade = |prop: &Prop| map.shadows.on && prop.carries_shadow();
+                let size_of = |prop: &Prop| [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
+                let slot_of = |prop: &Prop| if shade(prop) { format!("{}#тень{k}|{:.0}|{:.3}", prop.asset, prop.rot.rem_euclid(360.0), prop.scale) } else { prop.asset.clone() };
+                // Партиями: картинки партии (тень — размытием) считают потоки, потом потоки же
+                // впечатывают их полосами картинки, по порядку слоёв. У города тысячи предметов
+                // со своим поворотом: помнить картинку каждого — гигабайты.
+                let mut i = 0;
+                while i < items.len() {
+                    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    let mut reps: Vec<&Prop> = Vec::new();
+                    let mut ids = Vec::new();
+                    let mut j = i;
+                    while j < items.len() {
+                        let s = slot_of(items[j]);
+                        let id = match index.get(&s) {
+                            Some(&id) => id,
+                            None if reps.len() >= 96 => break,
+                            None => {
+                                index.insert(s, reps.len());
+                                reps.push(items[j]);
+                                reps.len() - 1
+                            }
+                        };
+                        ids.push(id);
+                        j += 1;
                     }
-                    let pic = pics.entry(slot).or_insert_with(|| {
-                        let raw = self.textures.rgba(&prop.asset).ok()?;
-                        Some(if shade { export::with_shadow(&raw, size, prop.rot, &map.shadows) } else { (raw, [1.0, 1.0]) })
+                    let pics = export::par_map(&reps, |prop: &&Prop| {
+                        let raw = library::load_rgba(sources, &prop.asset)?;
+                        Some(if shade(prop) { export::with_shadow(&raw, size_of(prop), prop.rot, &map.shadows) } else { (raw, [1.0, 1.0]) })
                     });
-                    if let Some((pic, grow)) = pic {
-                        export::stamp(&mut flat, pic, [prop.pos[0] * p, prop.pos[1] * p], [size[0] * grow[0] * p, size[1] * grow[1] * p], prop.rot, prop.tint);
-                    }
+                    let batch = &items[i..j];
+                    let w = flat.width();
+                    let raw: &mut [u8] = &mut flat;
+                    export::par_bands(raw, w as usize * 3, |y0, band| {
+                        let rows = y0 as u32..y0 as u32 + (band.len() / (w as usize * 3)) as u32;
+                        for (prop, &id) in batch.iter().zip(&ids) {
+                            if let Some((pic, grow)) = &pics[id] {
+                                let size = size_of(prop);
+                                export::stamp_rows(band, w, rows.clone(), pic, [prop.pos[0] * p, prop.pos[1] * p], [size[0] * grow[0] * p, size[1] * grow[1] * p], prop.rot, prop.tint);
+                            }
+                        }
+                    });
+                    i = j;
                 }
                 // Стены — поверх предметов, как в редакторе.
                 if let Some(layer) = wall_layers.get(&k) {
@@ -691,6 +909,18 @@ impl App {
                 let uv = export::dd2vtt(map, e.px, &base64::engine::general_purpose::STANDARD.encode(&jpg), &layouts[k]);
                 files.push((e.dir.join(format!("{}.dd2vtt", stem(k))), uv.to_string().into_bytes()));
             }
+            laps.lap("uvtt");
+            // Для сверки кэша снимков: снятое без сжатия (WebP с потерями шумит по всей
+            // картинке от малейшей разницы во входе). Только по переменной окружения.
+            if std::env::var_os("KARTOGRAF_EXPORT_RAW").is_some() {
+                for (k, img) in e.done.iter().enumerate() {
+                    files.push((e.dir.join(format!("raw_{k}.png")), png_bytes(img)));
+                }
+                for (k, [black, white]) in e.walls.iter().enumerate() {
+                    files.push((e.dir.join(format!("raw_{k}_walls_black.png")), png_bytes(black)));
+                    files.push((e.dir.join(format!("raw_{k}_walls_white.png")), png_bytes(white)));
+                }
+            }
             std::fs::create_dir_all(&e.dir).map_err(|x| x.to_string())?;
             for (path, bytes) in &files {
                 if let Some(d) = path.parent() {
@@ -701,15 +931,17 @@ impl App {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = &jpgs;
             crate::plat::to_scene(&files, e.update)?;
         }
+        laps.lap("write");
+        self.export_timing = Some(laps.json());
         let walls: usize = layouts.iter().flat_map(|l| l.walls.iter()).map(|l| l.len().saturating_sub(1)).sum();
         let (w, h) = (e.done[0].width(), e.done[0].height());
         Ok(format!(
-            "{} {}: {}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
+            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
             if cfg!(target_arch = "wasm32") { "На сцену —" } else { "Выгружено в" },
             e.dir.display(),
+            e.district.as_ref().map_or_else(String::new, |d| format!("район {},{}–{},{}, ", d.area[0], d.area[1], d.area[2], d.area[3])),
             if n > 1 { format!("этажей {n}, ") } else { String::new() },
             layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
             layouts.iter().map(|l| l.lights.len()).sum::<usize>()
@@ -774,6 +1006,100 @@ impl App {
     }
 }
 
+/// Работа в своём потоке (у программы) или сразу (в браузере потоков нет).
+enum Pending<T> {
+    Ready(T),
+    Thread(std::thread::JoinHandle<T>),
+}
+
+impl<T: Send + 'static> Pending<T> {
+    fn spawn(f: impl FnOnce() -> T + Send + 'static) -> Self {
+        if cfg!(target_arch = "wasm32") { Self::Ready(f()) } else { Self::Thread(std::thread::spawn(f)) }
+    }
+
+    fn join(self) -> Result<T, String> {
+        match self {
+            Self::Ready(v) => Ok(v),
+            Self::Thread(h) => h.join().map_err(|_| "поток выгрузки упал".to_owned()),
+        }
+    }
+}
+
+/// PNG без потерь (сверка кэша снимков).
+#[cfg(not(target_arch = "wasm32"))]
+fn png_bytes(img: &image::RgbImage) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let _ = img.write_to(&mut out, image::ImageFormat::Png);
+    out.into_inner()
+}
+
+/// Сжатая картинка по отпечатку её точек: та же картинка (правка не задела этот слой —
+/// мебель и деревья в Foundry тайлы, фон и стены от них не меняются) — те же байты с
+/// диска. Сжатие слоя стен большой карты — десятки секунд.
+fn encode_cached(cache: Option<shotcache::Store>, kind: &str, size: [u32; 2], raw: &[u8], encode: impl FnOnce() -> Result<(Vec<u8>, &'static str), String>) -> Result<(Vec<u8>, &'static str), String> {
+    let key = cache.as_ref().map(|_| shotcache::content_key(kind, size, raw));
+    if let (Some(c), Some(k)) = (&cache, key)
+        && let Some(blob) = c.load_blob(k)
+        && let Some((&code, bytes)) = blob.split_first()
+    {
+        return Ok((bytes.to_vec(), match code {
+            0 => "webp",
+            1 => "jpg",
+            _ => "png",
+        }));
+    }
+    let (bytes, ext) = encode()?;
+    if let (Some(c), Some(k)) = (&cache, key) {
+        let mut blob = Vec::with_capacity(bytes.len() + 1);
+        blob.push(match ext {
+            "webp" => 0,
+            "jpg" => 1,
+            _ => 2,
+        });
+        blob.extend_from_slice(&bytes);
+        c.save_blob(k, &blob);
+    }
+    Ok((bytes, ext))
+}
+
+/// Фон этажа без пустоты: WebP, а не вышел (велик или libwebp не справился) — JPEG.
+fn background_bytes(img: &image::RgbImage) -> Result<(Vec<u8>, &'static str), String> {
+    use image::buffer::ConvertBuffer;
+    if img.width().max(img.height()) <= export::WEBP_MAX_SIDE
+        && let Some(webp) = export::try_webp(&img.convert(), 88.0)
+    {
+        return Ok((webp, "webp"));
+    }
+    let mut jpg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode_image(img).map_err(|x| x.to_string())?;
+    Ok((jpg, "jpg"))
+}
+
+/// Время частей выгрузки: каждая отметка прибавляет к своей части время с прошлой.
+struct Laps {
+    at: crate::plat::Instant,
+    parts: Vec<(&'static str, f32)>,
+}
+
+impl Laps {
+    fn new() -> Self {
+        Self { at: crate::plat::Instant::now(), parts: Vec::new() }
+    }
+
+    fn lap(&mut self, part: &'static str) {
+        let s = self.at.elapsed().as_secs_f32();
+        self.at = crate::plat::Instant::now();
+        match self.parts.iter_mut().find(|p| p.0 == part) {
+            Some(p) => p.1 += s,
+            None => self.parts.push((part, s)),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.parts.iter().map(|(k, s)| (k.to_string(), serde_json::json!((s * 100.0).round() / 100.0))).collect())
+    }
+}
+
 /// Дымоходы среди крышного (ключ, середина в клетках, поворот, размер): середина
 /// и большая сторона в точках сцены — «Wild Canvas» пускает над ними дым.
 fn smoke_spots(mine: &[(String, [f32; 2], f32, [f32; 2])], px: f32) -> Vec<[f32; 3]> {
@@ -824,5 +1150,297 @@ impl Shelf {
         self.tags.insert(src.clone(), tag);
         self.placed.insert(key, src.clone());
         src
+    }
+}
+
+/// Картинка крыши для Foundry: WebP, левый верхний угол в клетках, точек на клетку, размер.
+/// Размер 0 — у крыши картинки нет (контур целиком за краем карты).
+struct RoofPic {
+    bytes: Vec<u8>,
+    origin: [f32; 2],
+    ppc: f32,
+    size: [u32; 2],
+}
+
+impl RoofPic {
+    fn to_blob(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bytes.len() + 20);
+        for v in [self.origin[0], self.origin[1], self.ppc] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&self.size[0].to_le_bytes());
+        out.extend_from_slice(&self.size[1].to_le_bytes());
+        out.extend_from_slice(&self.bytes);
+        out
+    }
+
+    fn from_blob(b: &[u8]) -> Option<Self> {
+        let f = |i: usize| b.get(i..i + 4).and_then(|s| s.try_into().ok());
+        Some(Self {
+            origin: [f32::from_le_bytes(f(0)?), f32::from_le_bytes(f(4)?)],
+            ppc: f32::from_le_bytes(f(8)?),
+            size: [u32::from_le_bytes(f(12)?), u32::from_le_bytes(f(16)?)],
+            bytes: b.get(20..)?.to_vec(),
+        })
+    }
+}
+
+/// Что рисует работа над крышами: группу врезанных друг в друга, одну прямоугольную или
+/// одну по контуру.
+enum RoofJob {
+    Group(usize),
+    Rect(usize),
+    Outline(usize),
+}
+
+/// Что крыша несёт на себе (слой «На крыше»): ключ, середина, поворот, размер.
+type OnRoof = Vec<(String, [f32; 2], f32, [f32; 2])>;
+
+fn on_roof(map: &Map, contains: impl Fn([f32; 2]) -> bool) -> OnRoof {
+    map.props.iter().filter(|p| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && contains(p.pos)).map(|p| (p.asset.clone(), p.pos, p.rot, [p.size[0] * p.scale, p.size[1] * p.scale])).collect()
+}
+
+impl App {
+    /// Картинки крыш этажа по номеру крыши (прямоугольные, затем по контуру со сдвигом на
+    /// число прямоугольных). Крыши, что врезаются друг в друга, рисуются одной группой;
+    /// картинка у каждой своя — только то, что у неё видно поверх соседей. Рисуют и
+    /// сжимают потоки; работа с тем же отпечатком (крыша, её соседи по тени, вклеенное,
+    /// покрытия, свет) берётся из кэша на диске.
+    fn roof_pictures(&self, map: &Map, px: u32, store: Option<&shotcache::Store>) -> Result<std::collections::HashMap<usize, RoofPic>, String> {
+        use std::collections::{HashMap, HashSet};
+        use std::hash::Hash;
+        let light = map.shadows.light();
+        let snow = map.weather == "snow";
+        let clip = ([0.0, 0.0], [map.width as f32, map.height as f32]);
+        let p = px as f32;
+        let mut seen = HashMap::new();
+        let climbs = super::draw_ground::climb_rects(&map.props, &self.textures.sources, &mut seen);
+        let groups = roofs::raster_groups(&map.roofs, &map.outline_roofs);
+        let grouped: HashSet<usize> = groups.iter().flatten().copied().collect();
+        let rects = map.roofs.len();
+        let mine_rect: Vec<OnRoof> = map.roofs.iter().map(|r| on_roof(map, |q| r.contains(q))).collect();
+        let mine_outline: Vec<OnRoof> = map.outline_roofs.iter().map(|r| on_roof(map, |q| r.contains(q))).collect();
+
+        // Покрытия и всё, что вклеивается, — заранее, по разу: дальше крыши рисуют потоки.
+        let mut covers: HashMap<String, (image::RgbaImage, [f32; 2])> = HashMap::new();
+        let mut solids: HashMap<String, image::RgbaImage> = HashMap::new();
+        let solid = |key: &str, solids: &mut HashMap<String, image::RgbaImage>| -> Result<(), String> {
+            if !solids.contains_key(key) {
+                let bytes = self.textures.bytes(key)?;
+                solids.insert(key.to_owned(), roofs::solid_cover(library::decode_tinted(key, &bytes)?));
+            }
+            Ok(())
+        };
+        let item = |key: &str, covers: &mut HashMap<String, (image::RgbaImage, [f32; 2])>| -> Result<(), String> {
+            if !covers.contains_key(key) {
+                let bytes = self.textures.bytes(key)?;
+                covers.insert(key.to_owned(), (library::decode_tinted(key, &bytes)?, [roofs::PARAPET_TILE, roofs::PARAPET]));
+            }
+            Ok(())
+        };
+        for &id in groups.iter().flatten() {
+            solid(if id < rects { &map.roofs[id].paint } else { &map.outline_roofs[id - rects].pieces[0].paint }, &mut solids)?;
+        }
+        for (ri, r) in map.roofs.iter().enumerate() {
+            if !covers.contains_key(&r.paint) {
+                let bytes = self.textures.bytes(&r.paint)?;
+                let img = image::load_from_memory(&bytes).map_err(|x| format!("{}: {x}", library::label(&r.paint)))?.to_rgba8();
+                let tile = roofs::tile_cells([img.width(), img.height()]);
+                covers.insert(r.paint.clone(), (img, tile));
+            }
+            for pk in r.parapet().into_iter().map(str::to_owned).chain(r.fixtures().iter().map(|f| f.0.to_owned())).chain(mine_rect[ri].iter().map(|m| m.0.clone())) {
+                item(&pk, &mut covers)?;
+            }
+        }
+        for (idx, r) in map.outline_roofs.iter().enumerate() {
+            for piece in &r.pieces {
+                solid(&piece.paint, &mut solids)?;
+            }
+            for m in &mine_outline[idx] {
+                item(&m.0, &mut covers)?;
+            }
+        }
+        let casters = roofs::Casters::new(&map.outline_roofs, &map.props);
+
+        // Крыша — в родном разрешении покрытия (256 на клетку), не в мелком масштабе
+        // сцены: Foundry растянет тайл сам. Огромная — не больше 8192 точек. Дома из OSM —
+        // в масштабе сцены (их сотни); заданная руками крыша по контуру — как прямоугольная.
+        let fine = |span: f32| p.max(library::PX_PER_CELL.min(8192.0 / span.max(1.0)));
+        let rect_ppc = |r: &map::Roof| fine((r.b[0] - r.a[0]).max(r.b[1] - r.a[1]) + 2.0 * r.overhang + 1.5);
+        let outline_ppc = |r: &map::OutlineRoof| {
+            let (lo, hi) = r.bounds();
+            if r.pieces.iter().any(|k| k.overhang.is_some()) { fine((hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5) } else { p }
+        };
+        let group_ppc: Vec<f32> = groups
+            .iter()
+            .map(|group| {
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for &id in group {
+                    let (a, b) = if id < rects { (map.roofs[id].outline()[0], map.roofs[id].outline()[2]) } else { map.outline_roofs[id - rects].bounds() };
+                    (lo, hi) = ([lo[0].min(a[0]), lo[1].min(a[1])], [hi[0].max(b[0]), hi[1].max(b[1])]);
+                }
+                fine((hi[0] - lo[0]).max(hi[1] - lo[1]) + 1.5)
+            })
+            .collect();
+        let items_of = |id: usize| -> Vec<roofs::Fixture> {
+            if id < rects {
+                let mut items: Vec<roofs::Fixture> = map.roofs[id].fixtures().iter().map(|f| (&covers[f.0].0, f.1, f.2, [1.0, 1.0])).collect();
+                items.extend(mine_rect[id].iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)));
+                items
+            } else {
+                mine_outline[id - rects].iter().map(|m| (&covers[&m.0].0, m.1, m.2, m.3)).collect()
+            }
+        };
+
+        // Отпечатки работ: всё, от чего зависит картинка.
+        let sources = &self.textures.sources;
+        let fp = |job: &RoofJob| -> u128 {
+            let mut h = shotcache::Twin::new();
+            (shotcache::program_stamp(), px, light.map(f32::to_bits), snow, map.width, map.height).hash(&mut h);
+            let mut keys: Vec<String> = Vec::new();
+            let mut member = |id: usize, h: &mut shotcache::Twin| {
+                if id < rects {
+                    let r = &map.roofs[id];
+                    serde_json::to_vec(r).unwrap_or_default().hash(h);
+                    keys.push(r.paint.clone());
+                    keys.extend(r.parapet().map(str::to_owned));
+                    keys.extend(r.fixtures().iter().map(|f| f.0.to_owned()));
+                    for m in &mine_rect[id] {
+                        (&m.0, m.1.map(f32::to_bits), m.2.to_bits(), m.3.map(f32::to_bits)).hash(h);
+                        keys.push(m.0.clone());
+                    }
+                } else {
+                    let r = &map.outline_roofs[id - rects];
+                    serde_json::to_vec(r).unwrap_or_default().hash(h);
+                    keys.extend(r.pieces.iter().map(|k| k.paint.clone()));
+                    for m in &mine_outline[id - rects] {
+                        (&m.0, m.1.map(f32::to_bits), m.2.to_bits(), m.3.map(f32::to_bits)).hash(h);
+                        keys.push(m.0.clone());
+                    }
+                }
+            };
+            match *job {
+                RoofJob::Group(g) => {
+                    (1u8, group_ppc[g].to_bits()).hash(&mut h);
+                    for &id in &groups[g] {
+                        member(id, &mut h);
+                    }
+                }
+                RoofJob::Rect(ri) => {
+                    (2u8, rect_ppc(&map.roofs[ri]).to_bits()).hash(&mut h);
+                    member(ri, &mut h);
+                    for c in &climbs {
+                        c.map(f32::to_bits).hash(&mut h);
+                    }
+                }
+                RoofJob::Outline(idx) => {
+                    let r = &map.outline_roofs[idx];
+                    (3u8, outline_ppc(r).to_bits()).hash(&mut h);
+                    member(rects + idx, &mut h);
+                    let near = casters.near(idx, r.bounds());
+                    for (rings, z) in &near.houses {
+                        z.to_bits().hash(&mut h);
+                        for q in rings.iter().flatten() {
+                            q.map(f32::to_bits).hash(&mut h);
+                        }
+                    }
+                    for c in &near.crowns {
+                        (c.pos.map(f32::to_bits), c.d.to_bits(), c.bare).hash(&mut h);
+                    }
+                }
+            }
+            shotcache::assets_stamp(keys.iter().map(String::as_str), sources).hash(&mut h);
+            h.finish128()
+        };
+        let mut jobs: Vec<(RoofJob, Vec<usize>)> = (0..groups.len()).map(|g| (RoofJob::Group(g), groups[g].clone())).collect();
+        jobs.extend((0..rects).filter(|i| !grouped.contains(i)).map(|i| (RoofJob::Rect(i), vec![i])));
+        jobs.extend((0..map.outline_roofs.len()).filter(|i| !grouped.contains(&(rects + i))).map(|i| (RoofJob::Outline(i), vec![rects + i])));
+
+        let mut out: HashMap<usize, RoofPic> = HashMap::new();
+        let mut todo: Vec<(RoofJob, Vec<usize>, u128)> = Vec::new();
+        let slot = |f: u128, j: usize| -> u128 { f ^ (j as u128 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835) };
+        for (job, ids) in jobs {
+            let f = fp(&job);
+            let cached: Option<Vec<RoofPic>> = store.and_then(|s| ids.iter().enumerate().map(|(j, _)| s.load_blob(slot(f, j)).and_then(|b| RoofPic::from_blob(&b))).collect());
+            match cached {
+                Some(pics) => out.extend(ids.into_iter().zip(pics)),
+                None => todo.push((job, ids, f)),
+            }
+        }
+
+        let encode = |img: &image::RgbaImage, origin: [f32; 2], ppc: f32| RoofPic { bytes: export::webp_bytes(img, 88.0), origin, ppc, size: [img.width(), img.height()] };
+        let none = || RoofPic { bytes: Vec::new(), origin: [0.0, 0.0], ppc: 1.0, size: [0, 0] };
+        let run = |job: &RoofJob| -> Vec<RoofPic> {
+            match *job {
+                RoofJob::Group(g) => {
+                    let ppc = group_ppc[g];
+                    let imgs = roofs::render_joined(&map.roofs, &map.outline_roofs, &groups[g], &|k: &str| solids.get(k), ppc, light, clip, snow);
+                    groups[g]
+                        .iter()
+                        .zip(imgs)
+                        .map(|(&id, (mut img, origin))| {
+                            if id >= rects && img.width() <= 1 {
+                                return none();
+                            }
+                            roofs::paste_fixtures(&mut img, origin, ppc, &items_of(id));
+                            encode(&img, origin, ppc)
+                        })
+                        .collect()
+                }
+                RoofJob::Rect(ri) => {
+                    let r = &map.roofs[ri];
+                    let (tex, tile) = &covers[&r.paint];
+                    let parapet = r.parapet().map(|k| &covers[k].0);
+                    let ppc = rect_ppc(r);
+                    let (img, origin) = roofs::render(r, tex, *tile, ppc, light, parapet, &climbs, &items_of(ri), snow);
+                    vec![encode(&img, origin, ppc)]
+                }
+                RoofJob::Outline(idx) => {
+                    let r = &map.outline_roofs[idx];
+                    let ppc = outline_ppc(r);
+                    let near = casters.near(idx, r.bounds());
+                    let (mut img, origin) = roofs::render_outline(r, &|k: &str| solids.get(k), ppc, light, clip, &near);
+                    if img.width() <= 1 {
+                        return vec![none()];
+                    }
+                    roofs::paste_fixtures(&mut img, origin, ppc, &items_of(rects + idx));
+                    vec![encode(&img, origin, ppc)]
+                }
+            }
+        };
+        // Потоки берут работы по одной: группа врезки бывает в разы дольше одиночной крыши.
+        let done = std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6).min(todo.len().max(1));
+        if cfg!(target_arch = "wasm32") || threads <= 1 {
+            for (job, ids, f) in &todo {
+                done.lock().map_err(|_| "поток крыш упал".to_owned())?.push((ids.clone(), *f, run(job)));
+            }
+        } else {
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((job, ids, f)) = todo.get(i) else { break };
+                            let pics = run(job);
+                            if let Ok(mut d) = done.lock() {
+                                d.push((ids.clone(), *f, pics));
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        for (ids, f, pics) in done.into_inner().map_err(|_| "поток крыш упал".to_owned())? {
+            for (j, (id, pic)) in ids.into_iter().zip(pics).enumerate() {
+                if let Some(s) = store {
+                    s.save_blob(slot(f, j), &pic.to_blob());
+                }
+                out.insert(id, pic);
+            }
+        }
+        out.retain(|_, pic| pic.size[0] > 0);
+        Ok(out)
     }
 }
