@@ -231,9 +231,13 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
             tile["flags"] = t["flags"].clone();
         }
         // Подкрашенный предмет: цвет Boundless кладёт сам. Отражения он не знает — отражённое
-        // Картограф для него кладёт своей картинкой (`app::exporting`).
+        // Картограф для него кладёт своей картинкой (`app::exporting`), а механизм,
+        // ветроуказатель и колонку — с `scaleX` −1: их меш отражает «Wild Canvas».
         if let Some(tint) = t["texture"]["tint"].as_str() {
             tile["tint"] = json!(tint);
+        }
+        if num(&t["texture"]["scaleX"], 1.0) < 0.0 {
+            tile["scaleX"] = json!(-1);
         }
         // Мебель в доме: ниже уровня крыш крыша запечена в плитки, и тайл лёг бы поверх неё.
         if under_roof(x, y) {
@@ -517,7 +521,8 @@ mod tests {
             "tiles": [
                 {"x": 250, "y": 750, "width": 100, "height": 50, "rotation": 90, "texture": {"src": "k/tree.webp"}, "occlusion": {"modes": [1], "alpha": 0}},
                 {"x": 800, "y": 800, "width": 200, "height": 100, "texture": {"src": "k/roof_1.webp"}, "occlusion": {"modes": [2], "alpha": 0}},
-                {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp", "tint": "#a0c0ff"}, "occlusion": {"modes": [1], "alpha": 0}}
+                {"x": 780, "y": 790, "width": 50, "height": 50, "texture": {"src": "k/table.webp", "tint": "#a0c0ff"}, "occlusion": {"modes": [1], "alpha": 0}},
+                {"x": 150, "y": 150, "width": 100, "height": 100, "texture": {"src": "k/fan.webp", "scaleX": -1}, "occlusion": {"modes": [], "alpha": 0}}
             ]
         });
         let m = manifest(&scene, &world, "k/pyramid");
@@ -532,11 +537,13 @@ mod tests {
         assert_eq!(s["0_1"]["t"], json!([0]));
         assert_eq!(m["overlays"]["0"], json!({"cx": 800.0, "cy": 800.0, "w": 200.0, "h": 100.0, "rot": 0.0, "roof": "k/roof_1.webp"}));
         assert_eq!(s["1_1"]["o"], json!([0]));
-        assert_eq!(m["tiles"].as_array().unwrap().len(), 2, "крыша — домом, а не тайлом");
+        assert_eq!(m["tiles"].as_array().unwrap().len(), 3, "крыша — домом, а не тайлом");
         assert_eq!(m["tiles"][1]["minZ"], json!(ROOF_Z), "стол в доме — только с уровня крыш");
         assert!(m["tiles"][0].get("minZ").is_none(), "дерево не под крышей — видно всегда");
         assert_eq!(m["tiles"][1]["tint"], "#a0c0ff", "цвет подкрашенного предмета");
         assert!(m["tiles"][0].get("tint").is_none());
+        assert_eq!(m["tiles"][2]["scaleX"], json!(-1), "отражённый механизм: меш отражает «Wild Canvas»");
+        assert!(m["tiles"][0].get("scaleX").is_none() && m["tiles"][1].get("scaleX").is_none());
     }
 
     #[test]

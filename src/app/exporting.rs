@@ -716,7 +716,8 @@ impl App {
                 // Мир Boundless: отражать тайлы он не умеет — отражённый предмет кладётся своей
                 // картинкой, точки на ней (концы гамака и паутины, ось крана) отражаются следом.
                 // Механизм, ветроуказатель и колонку «Wild Canvas» рисует по раскладке картинки
-                // из пака — они остаются неотражёнными, иначе раскладка разойдётся с картинкой.
+                // из пака: их картинка прежняя, в манифест идёт `scaleX` −1, и меш Boundless
+                // отражает сам «Wild Canvas» — раскладка отражается вместе с ним.
                 let mirror = chunk && prop.flip && map::living_by_name(&prop.asset).is_none();
                 let mut save = |key: &str, files: &mut Vec<(PathBuf, Vec<u8>)>| -> Result<String, String> {
                     let slot = format!("{key}{}{}", if sunk > 0.0 { format!("#dry{sunk:.3}") } else { String::new() }, if mirror { "#fx" } else { "" });

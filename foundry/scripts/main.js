@@ -398,8 +398,10 @@ function webEnds(tile) {
   const [c, sn] = [Math.cos(rad), Math.sin(rad)];
   const flag = d.flags[MODULE_ID].web;
   let e = Array.isArray(flag) ? flag : (d.width >= d.height ? [-0.5, 0, 0.5, 0] : [0, -0.5, 0, 0.5]);
+  // Отражённый тайл: концы найдены на картинке, а она отражена — отражаются и они.
+  const sx = Math.sign(d.texture?.scaleX ?? 1) || 1, sy = Math.sign(d.texture?.scaleY ?? 1) || 1;
   const at = (fx, fy) => {
-    const [lx, ly] = [fx * d.width, fy * d.height];
+    const [lx, ly] = [fx * sx * d.width, fy * sy * d.height];
     return { x: s.x + lx * c - ly * sn, y: s.y + lx * sn + ly * c };
   };
   const [p, q] = [at(e[0], e[1]), at(e[2], e[3])];
