@@ -187,7 +187,21 @@ pub fn manifest(scene: &Value, world: &World, pyramid: &str) -> Value {
     for l in scene["lights"].as_array().into_iter().flatten() {
         let c = &l["config"];
         let (x, y) = (num(&l["x"], 0.0), num(&l["y"], 0.0));
-        push(world.sector_of(x, y), "l", json!([x, y, num(&c["dim"], 0.0), num(&c["bright"], 0.0), c["color"], num(&c["alpha"], 0.5), c["animation"]["type"].as_str().unwrap_or("")]));
+        let mut tuple = vec![json!(x), json!(y), json!(num(&c["dim"], 0.0)), json!(num(&c["bright"], 0.0)), c["color"].clone(), json!(num(&c["alpha"], 0.5)), json!(c["animation"]["type"].as_str().unwrap_or(""))];
+        // Скорость и сила анимации, окраска, затухание, яркость: Boundless 1.1.0 из записи берёт только
+        // вид анимации (скорость и сила у него всегда 3). Девятое поле — объект, как у его собственной
+        // запекалки (высота восьмым, `null` — по умолчанию); живые огни по нему доводит «Wild Canvas».
+        let mut extra = serde_json::Map::new();
+        for (k, v) in [("speed", &c["animation"]["speed"]), ("intensity", &c["animation"]["intensity"]), ("coloration", &c["coloration"]), ("attenuation", &c["attenuation"]), ("luminosity", &c["luminosity"])] {
+            if v.is_number() {
+                extra.insert(k.into(), v.clone());
+            }
+        }
+        if !extra.is_empty() {
+            tuple.push(Value::Null);
+            tuple.push(Value::Object(extra));
+        }
+        push(world.sector_of(x, y), "l", Value::Array(tuple));
     }
     for s in scene["sounds"].as_array().into_iter().flatten() {
         let (x, y) = (num(&s["x"], 0.0), num(&s["y"], 0.0));
@@ -517,7 +531,10 @@ mod tests {
                 {"c": [400, 400, 450, 450], "door": 1, "ds": 0},
                 {"c": [600, 600, 700, 600], "move": 20, "sight": 0, "light": 0, "sound": 10}
             ],
-            "lights": [{"x": 700, "y": 200, "config": {"dim": 30, "bright": 15, "color": "#ffc870", "alpha": 0.35, "animation": {"type": "torch"}}}],
+            "lights": [
+                {"x": 700, "y": 200, "config": {"dim": 30, "bright": 15, "color": "#ffc870", "alpha": 0.35, "animation": {"type": "torch"}}},
+                {"x": 300, "y": 200, "config": {"dim": 120, "bright": 60, "color": "#ffd890", "alpha": 0.5, "coloration": 2, "attenuation": 0.7, "luminosity": 0, "animation": {"type": "revolving", "speed": 3, "intensity": 6}}}
+            ],
             "tiles": [
                 {"x": 250, "y": 750, "width": 100, "height": 50, "rotation": 90, "texture": {"src": "k/tree.webp"}, "occlusion": {"modes": [1], "alpha": 0}},
                 {"x": 800, "y": 800, "width": 200, "height": 100, "texture": {"src": "k/roof_1.webp"}, "occlusion": {"modes": [2], "alpha": 0}},
@@ -532,6 +549,11 @@ mod tests {
         assert_eq!(s["0_0"]["d"][0], json!([400.0, 400.0, 450.0, 450.0, 1, 0]));
         assert_eq!(s["1_1"]["w"][0], json!([600.0, 600.0, 700.0, 600.0, 20.0, 0.0, 0.0, 10.0, 0.0]), "низкая стена — со своими свойствами");
         assert_eq!(s["1_0"]["l"][0], json!([700.0, 200.0, 30.0, 15.0, "#ffc870", 0.35, "torch"]));
+        // маяк: скорость, сила и окраска — девятым полем, высота восьмым остаётся по умолчанию
+        assert_eq!(
+            s["0_0"]["l"][0],
+            json!([300.0, 200.0, 120.0, 60.0, "#ffd890", 0.5, "revolving", null, {"speed": 3, "intensity": 6, "coloration": 2, "attenuation": 0.7, "luminosity": 0}])
+        );
         assert_eq!(m["tiles"][0]["x"], 200.0);
         assert_eq!(m["tiles"][0]["y"], 725.0);
         assert_eq!(s["0_1"]["t"], json!([0]));
