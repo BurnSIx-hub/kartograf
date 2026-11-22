@@ -1535,6 +1535,14 @@ impl App {
             }
         }
         let total = queue.len();
+        // Плитки стен пишутся только непрозрачные: прежние от прошлой выгрузки остались бы.
+        #[cfg(not(target_arch = "wasm32"))]
+        for k in 0..self.levels.len().max(1) {
+            let fg = dir.join(wall_pyramid_name(&export::ascii_name(&name), k));
+            if fg.is_dir() {
+                std::fs::remove_dir_all(&fg).map_err(|x| format!("{}: {x}", fg.display()))?;
+            }
+        }
         // Живое Wild Canvas — по всей карте сразу: вода и звуки мест (области), флаги сцены.
         let live = {
             let sources = &self.textures.sources;
@@ -1626,6 +1634,17 @@ impl App {
             }
             if let Some(layer) = walls.get(&k) {
                 image::imageops::overlay(&mut plain, layer, 0, 0);
+                // Стены — ещё и второй пирамидой: Boundless кладёт её поверх фишек, под крыши.
+                let mut only = image::RgbaImage::new(world.chunk_px(), world.chunk_px());
+                image::imageops::replace(&mut only, layer, 0, 0);
+                let fg = job.dir.join(wall_pyramid_name(&base, k));
+                for (rel, bytes) in crate::boundless::chunk_wall_tiles(only, &world, t0) {
+                    let path = fg.join(rel);
+                    if let Some(d) = path.parent() {
+                        std::fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+                    }
+                    std::fs::write(&path, bytes).map_err(|x| format!("{}: {x}", path.display()))?;
+                }
             }
             // Крыши этажа — все, что задевают кусок (у шва — в обоих): каждая впечатывается целиком.
             let roofs: Vec<crate::boundless::BakedRoof> = scene["tiles"]
@@ -1712,6 +1731,16 @@ impl App {
             let suffix = if k == 0 { String::new() } else { format!("_{}", k + 1) };
             let mpath = job.dir.join(format!("{base}_boundless{suffix}.json"));
             let mut manifest = crate::boundless::manifest(&job.gather[k].scene(), &world, &export::foundry_src(&pyr));
+            // Стены поверх фишек (Boundless 1.1.2): только непрозрачные плитки, с уровня крыш.
+            let fg = job.dir.join(wall_pyramid_name(&base, k));
+            if fg.is_dir() {
+                crate::boundless::merge_walls(&fg, &world)?;
+                if let Some(index) = crate::boundless::wall_index(&fg, &world) {
+                    manifest["foregroundPyramidBaseUrl"] = serde_json::json!(export::foundry_src(&fg));
+                    manifest["foregroundMaxZoomZ"] = serde_json::json!(world.max_z);
+                    manifest["foregroundTiles"] = index;
+                }
+            }
             // Маска крыш — одной картинкой: иначе Boundless строит её по прямоугольникам домов.
             if let Some(bytes) = job.mask[k].bytes() {
                 let path = job.dir.join(format!("{base}_roofmask{suffix}.webp"));
@@ -1755,4 +1784,10 @@ impl App {
 #[cfg(not(target_arch = "wasm32"))]
 fn pyramid_name(base: &str, k: usize) -> String {
     if k == 0 { format!("{base}_pyramid") } else { format!("{base}_pyramid_{}", k + 1) }
+}
+
+/// Папка пирамиды стен этажа `k` (поверх фишек): `<имя>_walls`, у остальных этажей — с номером.
+#[cfg(not(target_arch = "wasm32"))]
+fn wall_pyramid_name(base: &str, k: usize) -> String {
+    if k == 0 { format!("{base}_walls") } else { format!("{base}_walls_{}", k + 1) }
 }
