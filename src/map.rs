@@ -397,6 +397,67 @@ impl PortalKind {
     }
 }
 
+/// Отрезок `p`–`q` внутри прямоугольника `r` (Лианг — Барски); нет — `None`.
+fn clip_segment(p: [f32; 2], q: [f32; 2], r: [f32; 4]) -> Option<([f32; 2], [f32; 2])> {
+    let d = [q[0] - p[0], q[1] - p[1]];
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (pk, qk) in [(-d[0], p[0] - r[0]), (d[0], r[2] - p[0]), (-d[1], p[1] - r[1]), (d[1], r[3] - p[1])] {
+        if pk == 0.0 {
+            if qk < 0.0 {
+                return None;
+            }
+        } else {
+            let t = qk / pk;
+            if pk < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    let snap = |v: f32| (v * 1024.0).round() / 1024.0;
+    let at = |t: f32| if t == 0.0 { p } else if t == 1.0 { q } else { [snap(p[0] + t * d[0]), snap(p[1] + t * d[1])] };
+    (t0 < t1).then(|| (at(t0), at(t1)))
+}
+
+/// Стена, обрезанная прямоугольником: что внутри, — кусками, со своим видом и высотой. Замкнутая,
+/// вышедшая за край, размыкается; изгиб остаётся только у отрезков, не тронутых краем.
+fn clip_wall(wall: Wall, r: [f32; 4]) -> Vec<Wall> {
+    let inside = |p: &[f32; 2]| p[0] >= r[0] && p[1] >= r[1] && p[0] <= r[2] && p[1] <= r[3];
+    if wall.points.iter().all(inside) {
+        return vec![wall];
+    }
+    let mut pts = wall.points.clone();
+    if wall.closed {
+        pts.push(pts[0]);
+    }
+    let mut out = Vec::new();
+    let mut run: (Vec<[f32; 2]>, Vec<f32>) = (Vec::new(), Vec::new());
+    let mut flush = |run: &mut (Vec<[f32; 2]>, Vec<f32>)| {
+        let (points, bends) = std::mem::take(run);
+        if points.len() >= 2 {
+            let bends = if bends.iter().all(|b| *b == 0.0) { Vec::new() } else { bends };
+            out.push(Wall { points, closed: false, bends, low: wall.low, style: wall.style.clone() });
+        }
+    };
+    for (k, s) in pts.windows(2).enumerate() {
+        match clip_segment(s[0], s[1], r) {
+            Some((a, b)) => {
+                if run.0.last() != Some(&a) {
+                    flush(&mut run);
+                    run.0.push(a);
+                }
+                let whole = a == s[0] && b == s[1];
+                run.0.push(b);
+                run.1.push(if whole { wall.bends.get(k).copied().unwrap_or(0.0) } else { 0.0 });
+            }
+            None => flush(&mut run),
+        }
+    }
+    flush(&mut run);
+    out
+}
+
 /// Дверь или окно: кусок стены от `a` до `b`, где стена прервана.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Portal {
@@ -2393,6 +2454,38 @@ impl Map {
         }
     }
 
+    /// Вся карта, обрезанная по рамке (инструмент `crop_map`): полоса готовой карты под новую —
+    /// набережная города над осушенным дном. В отличие от [`Map::crop`] (район для выгрузки) край
+    /// чистый: стены режутся по рамке, оставляя полклетки за ней, как у стен, доведённых до края;
+    /// предметы, крыши, двери, помосты и подписи остаются, только если их середина внутри.
+    /// Этажи в `levels` (у карты из файла) режутся так же.
+    pub fn crop_all(&self, x0: u32, y0: u32, w: u32, h: u32) -> Map {
+        let (fw, fh) = (w as f32, h as f32);
+        let inside = move |p: [f32; 2]| (0.0..=fw).contains(&p[0]) && (0.0..=fh).contains(&p[1]);
+        let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let one = |l: &Map| {
+            let mut m = l.crop(x0, y0, w, h);
+            let frame = [-0.5, -0.5, fw + 0.5, fh + 0.5];
+            m.walls = std::mem::take(&mut m.walls).into_iter().flat_map(|wall| clip_wall(wall, frame)).collect();
+            m.props.retain(|p| inside(p.pos));
+            m.roofs.retain(|r| inside(mid(r.a, r.b)));
+            m.outline_roofs.retain(|r| {
+                let (lo, hi) = r.bounds();
+                inside(mid(lo, hi))
+            });
+            m.platforms.retain(|p| {
+                let (lo, hi) = p.bounds();
+                inside(mid(lo, hi))
+            });
+            m.portals.retain(|p| inside(p.a) && inside(p.b));
+            m.labels.retain(|l| inside(l.pos));
+            m
+        };
+        let mut m = one(self);
+        m.levels = self.levels.iter().map(one).collect();
+        m
+    }
+
     /// Район карты отдельной картой: `w`×`h` клеток от клетки `x0, y0`, всё нарисованное
     /// сдвинуто на `-x0, -y0`. Что целиком вне района, не берётся; что задевает край, —
     /// целиком, как стоит: стена, крыша, дерево у края не режутся. Этажей у района нет —
@@ -2629,6 +2722,37 @@ mod tests {
         assert!(parse_live_table("не json").is_empty() && parse_live_table("[1, 2]").is_empty());
         set_live_table(Vec::new());
         assert_eq!(living_by_name(fan), None);
+    }
+
+    #[test]
+    fn cropped_map_keeps_the_strip_and_its_floors() {
+        // Карта 6×8: предмет и стена в нижней полосе, крыша наверху; берём низ 6×3 со второго этажа тоже.
+        let mut m = Map::new(6, 8);
+        m.walls.push(Wall { points: vec![[0.0, 6.0], [6.0, 6.0]], closed: false, bends: Vec::new(), low: true, style: None });
+        // Берег канала через всю карту режется по рамке с полуклеткой за ней; стена, что выходит
+        // за край и возвращается, — двумя кусками.
+        m.walls.push(Wall { points: vec![[1.0, 0.5], [1.0, 8.0]], closed: false, bends: vec![0.0], low: true, style: None });
+        m.walls.push(Wall { points: vec![[3.0, 7.0], [3.0, 2.0], [5.0, 2.0], [5.0, 7.0]], closed: false, bends: vec![0.0, 0.3, 0.0], low: false, style: None });
+        m.props.push(Prop { asset: "x".into(), pos: [2.5, 6.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
+        let mut deck = m.new_level();
+        deck.props.push(m.props[0].clone());
+        m.levels.push(deck);
+        // Верёвка для белья серединой выше полосы — уходит, фонарь серединой в полосе — остаётся.
+        m.props.push(Prop { asset: "line".into(), pos: [4.0, 4.6], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "lamp".into(), pos: [4.0, 5.3], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        let c = m.crop_all(0, 5, 6, 3);
+        assert_eq!((c.width, c.height), (6, 3));
+        assert_eq!(c.props.iter().map(|p| (p.asset.as_str(), (p.pos[1] * 10.0).round())).collect::<Vec<_>>(), vec![("x", 15.0), ("lamp", 3.0)]);
+        assert_eq!(c.walls[0].points, vec![[0.0, 1.0], [6.0, 1.0]]);
+        assert_eq!((c.walls[1].points.clone(), c.walls[1].low), (vec![[1.0, -0.5], [1.0, 3.0]], true));
+        assert_eq!(c.walls[2].points, vec![[3.0, 2.0], [3.0, -0.5]]);
+        assert_eq!(c.walls[3].points, vec![[5.0, -0.5], [5.0, 2.0]]);
+        assert!(c.walls[2].bends.is_empty() && c.walls[3].bends.is_empty(), "изгиб был у срезанного отрезка");
+        assert_eq!(c.walls.len(), 4);
+        assert!(c.roofs.is_empty(), "крыша целиком выше полосы");
+        assert_eq!((c.levels.len(), c.levels[0].width, c.levels[0].height, c.levels[0].props[0].pos), (1, 6, 3, [2.5, 1.5]), "этаж режется так же");
+        assert_eq!(c.origin, [0, -5], "фишки в Foundry сдвинутся вверх на 5");
     }
 
     #[test]

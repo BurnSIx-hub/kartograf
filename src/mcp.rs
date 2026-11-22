@@ -113,6 +113,9 @@ fn tools() -> Value {
         tool("grow_map", "Add margins to the map, in cells, on every floor: everything drawn moves by left/top. Build the surroundings around a finished map — a harbour around a ship, a street around a house. Undo history is cleared. The map remembers how far it grew left and up (`origin`): when a Foundry scene is updated from a new export, the module moves the tokens already placed there by the same amount.", json!({
             "left": int("Cells to add on the left"), "top": int("Cells to add on top"), "right": int("Cells to add on the right"), "bottom": int("Cells to add at the bottom")
         }), &[]),
+        tool("crop_map", "Cut the map down to a rectangle of cells on every floor: everything drawn moves by -x, -y; what lies wholly outside is dropped, what touches the edge stays whole (a wall, a roof, a tree at the edge are not cut). Take a strip of a finished map into a new one — the waterfront of a town above a dry seabed — then grow_map around it. Undo history is cleared; the map remembers the shift (`origin`) for tokens in Foundry, as grow_map does.", json!({
+            "x": int("Left edge of the kept part, cells"), "y": int("Top edge, cells"), "width": int("Width kept, cells (default: to the right edge)"), "height": int("Height kept, cells (default: to the bottom)")
+        }), &[]),
         tool("add_roof", "Put a roof over a house: the rectangle of its walls (area) or, for towers, rotundas and slanted wings, the polygon of its walls (points). Players see the roof from outside; it fades when they walk in. Polygon roofs get roof index after the rectangular ones in describe.", json!({
             "area": area.clone(), "points": {"type": "array", "items": point.clone(), "minItems": 3, "description": "Polygon of the walls in cells, instead of area"},
             "paint": text("Roof covering asset key from find_assets (kind roof), default builtin:roof_metal"),
@@ -210,7 +213,7 @@ fn tools() -> Value {
         }), &[]),
         tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets. Also re-reads live.json in the folder's root — the user's own living machines for Foundry (Wild Canvas 0.30+): {\"File_Name_Start\": {\"fans\": [[cx, cy, r, speed]], \"lamps\": [[x, y, r, \"#rrggbb\"]], \"leds\": [x, y, colour, …], \"ledSize\": 0.006}}, fractions of the picture (leds: x and y in thousandths, colour 0 cyan, 1 magenta or a number 0xRRGGBB). An object whose file name starts with such a key gets its own tile and the layout in the tile flag: fans spin, lamps smoulder and flare, leds blink. Returns the keys read as live.", json!({}), &[]),
         tool("undo", "Undo the last changes. A batch is one step (one per floor it touched).", json!({"steps": int("Default 1")}), &[]),
-        tool("batch", "Run many edits in one call; they are undone as one step (one per floor touched). If any edit fails, the whole batch is rolled back and the map stays as it was. Not allowed inside: view, render_picture, preview_assets, export_foundry, save_map, open_map, new_map, generate, build_plan, terrain_from_place, grow_map, add_level, undo, reload_assets, batch.", json!({
+        tool("batch", "Run many edits in one call; they are undone as one step (one per floor touched). If any edit fails, the whole batch is rolled back and the map stays as it was. Not allowed inside: view, render_picture, preview_assets, export_foundry, save_map, open_map, new_map, generate, build_plan, terrain_from_place, grow_map, crop_map, add_level, undo, reload_assets, batch.", json!({
             "ops": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "properties": {"tool": text("Tool name, e.g. add_object"), "arguments": {"type": "object", "description": "Its arguments"}}, "required": ["tool"]}}
         }), &["ops"]),
         tool("view", "Look at the map: returns a PNG picture of the whole map or of an area, as the editor draws it (objects, doors, roofs; no editor windows).", json!({
@@ -344,7 +347,7 @@ mod tests {
     fn tools_found_missing_on_a_real_map_are_there() {
         let list = tools();
         let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map", "edit_door", "preview_assets", "batch", "check_map"] {
+        for n in ["reload_assets", "render_picture", "set_wall_style", "add_path", "edit_label", "edit_roof", "add_roof", "set_scene", "add_level", "switch_level", "grow_map", "crop_map", "edit_door", "preview_assets", "batch", "check_map"] {
             assert!(names.contains(&n), "{n}");
         }
         let props = |tool: &str| list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"].clone();

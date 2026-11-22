@@ -255,6 +255,7 @@ impl App {
             "add_level" => self.tool_add_level(a),
             "switch_level" => self.tool_switch_level(a),
             "grow_map" => self.tool_grow_map(a),
+            "crop_map" => self.tool_crop_map(a),
             "reload_assets" => {
                 if let Some(dir) = self.settings.textures_dir.clone() {
                     self.library.set_folder(&dir);
@@ -1096,7 +1097,7 @@ impl App {
     /// Пачка правок за один вызов: одна точка отмены на каждый тронутый этаж. Ошибка —
     /// вся пачка откатывается и ничего не меняется.
     fn tool_batch(&mut self, a: &Value) -> Res {
-        const NOT_IN_BATCH: [&str; 15] = ["batch", "view", "render_picture", "export_foundry", "terrain_from_place", "generate", "build_plan", "new_map", "open_map", "save_map", "grow_map", "add_level", "undo", "reload_assets", "preview_assets"];
+        const NOT_IN_BATCH: [&str; 16] = ["batch", "view", "render_picture", "export_foundry", "terrain_from_place", "generate", "build_plan", "new_map", "open_map", "save_map", "grow_map", "crop_map", "add_level", "undo", "reload_assets", "preview_assets"];
         let ops = a["ops"].as_array().ok_or("нужен ops: [{\"tool\": …, \"arguments\": {…}}]")?;
         if ops.is_empty() || ops.len() > 1000 {
             return Err("ops: от 1 до 1000 правок".into());
@@ -1215,6 +1216,36 @@ impl App {
                 m.grow(l, t, r, b);
             }
         }
+        self.undo.clear();
+        self.redo.clear();
+        self.touch();
+        self.refresh_below();
+        Ok(json!({"width": w, "height": h, "levels": self.levels.len().max(1), "origin": self.map.origin}))
+    }
+
+    fn tool_crop_map(&mut self, a: &Value) -> Res {
+        let n = |k: &str| a[k].as_u64().map(|v| v.min(map::MAX_SIDE as u64) as u32);
+        let (x, y) = (n("x").unwrap_or(0), n("y").unwrap_or(0));
+        let (w0, h0) = (self.map.width, self.map.height);
+        let (w, h) = (n("width").unwrap_or(w0.saturating_sub(x)), n("height").unwrap_or(h0.saturating_sub(y)));
+        if w == 0 || h == 0 || x + w > w0 || y + h > h0 {
+            return Err(format!("рамка {x}, {y}, {w}×{h} не внутри карты {w0}×{h0}"));
+        }
+        self.map = self.map.crop_all(x, y, w, h);
+        for m in self.levels.iter_mut().filter(|m| (m.width, m.height) == (w0, h0)) {
+            *m = m.crop_all(x, y, w, h);
+        }
+        // Выделение и начатое рисование держат номера и точки старой карты: после обрезки предметов
+        // меньше, и выделенный последней правкой номер роняет отрисовку.
+        self.sel = None;
+        self.picked.clear();
+        self.draft.clear();
+        self.draft_bends.clear();
+        self.wall_join = None;
+        self.path_draft.clear();
+        self.moving = None;
+        self.drag_from = None;
+        self.edges_dirty = true;
         self.undo.clear();
         self.redo.clear();
         self.touch();
