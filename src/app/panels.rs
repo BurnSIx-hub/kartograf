@@ -11,10 +11,25 @@ impl App {
             self.finish_path();
         }
         if tool != self.tool {
-            self.prev_tool = self.tool;
+            if tool == Tool::Pick {
+                self.pick_from = self.tool;
+                self.pick_prev = self.prev_tool;
+            }
+            // Пипетка — на щелчок: после неё «прежний» — тот, с которого её взяли.
+            self.prev_tool = match self.tool {
+                Tool::Pick if tool == self.pick_from => self.pick_prev,
+                Tool::Pick => self.pick_from,
+                t => t,
+            };
+        }
+        if tool != Tool::Pick {
+            self.pick_shot = None;
         }
         self.tool = tool;
-        if let Some(k) = Group::ALL.iter().position(|g| g.has(tool)) {
+        // Пипетка в ячейке «Выбора» не остаётся: щелчок по ячейке — снова «Выбор».
+        if tool != Tool::Pick
+            && let Some(k) = Group::ALL.iter().position(|g| g.has(tool))
+        {
             self.group_last[k] = tool;
         }
         // Инструмент сам открывает нужный раздел полки.
@@ -163,6 +178,7 @@ impl App {
                     "Ctrl+Shift с протяжкой — выгнуть стену",
                     "Ctrl+G — объединить выбранное",
                     "V — тоже «Выбор»",
+                    "I — пипетка и обратно к прежнему инструменту",
                 ] {
                     ui.label(line);
                 }
@@ -299,6 +315,8 @@ impl App {
             Tool::Relief => "Ярусы по 5 футов. Жёсткая кисть поднимает плато с обрывом — полоса скалы, в Foundry стена; мягкая — пологий склон уступами-гребнями. Нижние ярусы темнее. «Выровнять» тянет к ярусу, с которого начат мазок. Alt — наоборот.",
             Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки; Shift — ровная линия. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
             Tool::Scatter => "Ведите кистью — объекты из набора ложатся вразнобой. Alt — стирать их. Колесо — размер кисти. Объекты в набор — щелчком на полке.",
+            Tool::Pick if self.pick_color => "Щелчок берёт цвет под курсором и перекрашивает им картинку инструмента, с которого взяли пипетку, или выбранное: узор остаётся. I или Escape — назад.",
+            Tool::Pick => "Щелчок берёт картинку того, что под курсором, — как щелчок по ней на полке: пол, дорогу, стену, дверь, крышу, объект — и инструмент к ней. I или Escape — назад.",
             Tool::Object => "Щелчок ставит объект, протяжка двигает уже стоящий. Колесо — поворот, с Z — медленно; Alt с колесом — размер; Shift с колесом — следующая картинка; зажатая A — отразить; цифры 1–4, 7, 8, 9 — слой. Alt — на время наоборот с привязкой.",
         }
     }
@@ -335,7 +353,11 @@ impl App {
             p.rect_filled(rect, 0.0, fill);
             p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, LINE));
             let icon = Rect::from_center_size(pos2(rect.center().x - 3.0, rect.center().y - 8.0), vec2(24.0, 24.0));
-            tool_icon(p, icon, group, ink);
+            if tool == Tool::Pick {
+                pick_icon(p, icon, ink);
+            } else {
+                tool_icon(p, icon, group, ink);
+            }
             let label = if on { self.mode_label() } else { tool.label().to_owned() };
             p.text(pos2(rect.center().x - 3.0, rect.center().y + 14.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.0), ink);
             if !modes.is_empty() {
@@ -358,6 +380,7 @@ impl App {
     pub(super) fn group_modes(&self, group: Group) -> Vec<(String, Mode)> {
         let tool = |t: Tool| (format!("{}   {}", t.label(), t.key().name()), Mode::Tool(t));
         match group {
+            Group::Select => [Tool::Select, Tool::Pick].map(tool).to_vec(),
             Group::Brush => [Tool::Dungeon, Tool::Floor, Tool::Shade, Tool::Relief, Tool::Erase].map(tool).to_vec(),
             Group::Object => [Tool::Object, Tool::Scatter].map(tool).to_vec(),
             Group::Wall => std::iter::once(tool(Tool::Wall)).chain(PortalKind::ALL.map(|k| (k.label().to_owned(), Mode::Door(k)))).collect(),
@@ -625,6 +648,7 @@ impl App {
                 }
                 match self.tool {
                     _ if path_sel => self.path_panel(ui),
+                    Tool::Pick => self.pick_panel(ui),
                     Tool::Select if matches!(self.sel, Some(Sel::Platform(_) | Sel::PlatformEdge(..))) => self.platform_panel(ui),
                     Tool::Select if self.ground_sel().is_some() => self.ground_panel(ui),
                     Tool::Dungeon | Tool::Floor | Tool::Erase | Tool::Shade | Tool::Relief => {

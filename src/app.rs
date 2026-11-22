@@ -50,6 +50,8 @@ pub enum Tool {
     Relief,
     Text,
     Roof,
+    /// Пипетка: берёт картинку или цвет того, что под курсором.
+    Pick,
 }
 
 /// Кисть «Рельеф»: что делает мазок.
@@ -75,7 +77,7 @@ impl ReliefMode {
 }
 
 impl Tool {
-    const ALL: [Tool; 13] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Relief, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text];
+    const ALL: [Tool; 14] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Relief, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text, Tool::Pick];
 
     fn label(self) -> &'static str {
         match self {
@@ -92,6 +94,7 @@ impl Tool {
             Tool::Relief => "Рельеф",
             Tool::Text => "Подпись",
             Tool::Roof => "Крыша",
+            Tool::Pick => "Пипетка",
         }
     }
 
@@ -112,6 +115,8 @@ impl Tool {
             Tool::Relief => Key::M,
             Tool::Text => Key::T,
             Tool::Roof => Key::K,
+            // I — пипетка в Photoshop и GIMP.
+            Tool::Pick => Key::I,
         }
     }
 }
@@ -133,7 +138,7 @@ impl Group {
 
     fn has(self, tool: Tool) -> bool {
         match self {
-            Group::Select => tool == Tool::Select,
+            Group::Select => matches!(tool, Tool::Select | Tool::Pick),
             Group::Brush => matches!(tool, Tool::Dungeon | Tool::Floor | Tool::Shade | Tool::Relief | Tool::Erase),
             Group::Wall => matches!(tool, Tool::Wall | Tool::Door),
             Group::Roof => tool == Tool::Roof,
@@ -692,6 +697,14 @@ pub struct App {
     ground_grab: Option<ground_edit::GroundGrab>,
     /// Инструмент до «Выбора»: X возвращает к нему, как в Dungeondraft.
     pub prev_tool: Tool,
+    /// Пипетка берёт цвет (`true`) или картинку.
+    pub pick_color: bool,
+    /// С какого инструмента взяли пипетку и что тогда было «прежним»: после щелчка
+    /// пипеткой «прежний» — снова тот, а не она.
+    pub pick_from: Tool,
+    pick_prev: Tool,
+    /// Пипетка ждёт снимок окна: где щёлкнули, в точках экрана.
+    pick_shot: Option<Pos2>,
     /// Линейка (R) и её отрезок.
     pub ruler: bool,
     pub ruler_line: Option<([f32; 2], [f32; 2])>,
@@ -964,6 +977,10 @@ impl App {
             ground: None,
             ground_grab: None,
             prev_tool: Tool::Dungeon,
+            pick_color: false,
+            pick_from: Tool::Dungeon,
+            pick_prev: Tool::Dungeon,
+            pick_shot: None,
             ruler: false,
             ruler_line: None,
             check: Default::default(),
@@ -1060,6 +1077,7 @@ mod build;
 mod files;
 mod frame;
 mod panels;
+mod pick;
 mod shelf;
 mod input;
 mod draw;
@@ -1240,6 +1258,15 @@ fn tool_icon(p: &egui::Painter, r: Rect, group: Group, ink: Color32) {
             p.text(r.center(), egui::Align2::CENTER_CENTER, "Т", egui::FontId::proportional(25.0), ink);
         }
     }
+}
+
+/// Значок пипетки: груша сверху, трубка наискось к капле внизу слева.
+fn pick_icon(p: &egui::Painter, r: Rect, ink: Color32) {
+    let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    let line = Stroke::new(1.8, ink);
+    p.circle_filled(at(0.76, 0.24), r.width() * 0.15, ink);
+    p.line_segment([at(0.52, 0.32), at(0.68, 0.48)], Stroke::new(3.0, ink));
+    p.add(Shape::line(vec![at(0.60, 0.40), at(0.20, 0.80), at(0.14, 0.90), at(0.24, 0.84), at(0.64, 0.44)], line));
 }
 
 /// Наложить объект на картинку объединения: `ppc` точек на клетку, `origin` —

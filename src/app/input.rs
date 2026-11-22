@@ -486,6 +486,14 @@ impl App {
                     }
                 }
             }
+            Tool::Pick => {
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if let Some(p) = tap {
+                    self.pick_click(ui.ctx(), p);
+                }
+            }
             Tool::Select => {
                 let shift = ui.input(|i| i.modifiers.shift);
                 if resp.drag_started_by(PointerButton::Primary)

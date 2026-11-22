@@ -533,6 +533,8 @@ impl App {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, tool.key())) {
                 if tool == Tool::Select && self.tool == Tool::Select {
                     self.set_tool(self.prev_tool);
+                } else if tool == Tool::Pick && self.tool == Tool::Pick {
+                    self.leave_pick(self.pick_from);
                 } else {
                     self.set_tool(tool);
                 }
@@ -599,6 +601,9 @@ impl App {
             self.finish_path();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            if self.tool == Tool::Pick {
+                self.leave_pick(self.pick_from);
+            }
             self.draft.clear();
             self.path_draft.clear();
             self.sel = None;

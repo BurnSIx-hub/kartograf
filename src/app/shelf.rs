@@ -227,92 +227,98 @@ impl App {
             chosen = Some((key, false));
         }
         if let Some((key, as_floor)) = chosen {
-            match self.browse {
-                _ if as_floor => self.use_floor_texture(&key),
-                Kind::Floor => self.use_floor_texture(&key),
-                Kind::Wall if self.tool == Tool::Relief && self.relief_strip.is_some() => {
-                    if let Some(s) = self.relief_strip {
-                        self.set_relief_strip(s, key);
-                    }
+            self.use_key(self.browse, key, as_floor);
+        }
+    }
+
+    /// Картинка с полки (или взятая пипеткой) становится выбранной в своём разделе:
+    /// полом, видом стен, дверью, покрытием крыши, объектом.
+    pub(super) fn use_key(&mut self, kind: Kind, key: String, as_floor: bool) {
+        match kind {
+            _ if as_floor => self.use_floor_texture(&key),
+            Kind::Floor => self.use_floor_texture(&key),
+            Kind::Wall if self.tool == Tool::Relief && self.relief_strip.is_some() => {
+                if let Some(s) = self.relief_strip {
+                    self.set_relief_strip(s, key);
                 }
-                Kind::Wall => {
-                    // Встроенная полоса нарисована под свою толщину — её и ставим.
-                    let mut st = self.wall_style();
-                    if let Some(width) = library::builtin_wall_width(&key) {
-                        st.width = width;
-                    } else if library::is_cliff(&key)
-                        && let Some(px) = library::dimensions(&self.textures.sources, &key)
-                    {
-                        st.width = library::cliff_width(px);
-                    }
-                    st.paint = Paint::Texture(key);
-                    self.set_wall_style(st);
+            }
+            Kind::Wall => {
+                // Встроенная полоса нарисована под свою толщину — её и ставим.
+                let mut st = self.wall_style();
+                if let Some(width) = library::builtin_wall_width(&key) {
+                    st.width = width;
+                } else if library::is_cliff(&key)
+                    && let Some(px) = library::dimensions(&self.textures.sources, &key)
+                {
+                    st.width = library::cliff_width(px);
                 }
-                Kind::Door => {
-                    // В паках FA косяки, окна и створки лежат вместе: что это — по имени.
-                    let lower = key.to_lowercase();
-                    let name = library::label(&key).to_lowercase();
-                    if lower.contains("frame") || name.contains("косяк") {
-                        self.door_frame = Some(key);
+                st.paint = Paint::Texture(key);
+                self.set_wall_style(st);
+            }
+            Kind::Door => {
+                // В паках FA косяки, окна и створки лежат вместе: что это — по имени.
+                let lower = key.to_lowercase();
+                let name = library::label(&key).to_lowercase();
+                if lower.contains("frame") || name.contains("косяк") {
+                    self.door_frame = Some(key);
+                } else {
+                    let window = ["window", "arrowslit", "sill", "окно"].iter().any(|w| lower.contains(w) || name.contains(w));
+                    self.door_kind = if window {
+                        PortalKind::Window
+                    } else if lower.contains("double") {
+                        PortalKind::DoubleDoor
+                    } else if self.door_kind == PortalKind::DoubleDoor {
+                        PortalKind::DoubleDoor
                     } else {
-                        let window = ["window", "arrowslit", "sill", "окно"].iter().any(|w| lower.contains(w) || name.contains(w));
-                        self.door_kind = if window {
-                            PortalKind::Window
-                        } else if lower.contains("double") {
-                            PortalKind::DoubleDoor
-                        } else if self.door_kind == PortalKind::DoubleDoor {
-                            PortalKind::DoubleDoor
-                        } else {
-                            PortalKind::Door
-                        };
-                        // Ширина — из имени у FA (Door_Large_…_2x1); встроенные не меняют её.
-                        if !key.starts_with(library::BUILTIN)
-                            && let Some(size) = library::size_from_name(&library::label(&key))
-                        {
-                            self.door_width = size[0].clamp(1.0, 4.0);
-                        }
-                        self.door_asset = Some(key);
-                    }
-                    self.set_tool(Tool::Door);
-                }
-                Kind::Roof => {
-                    // Покрытие — выбранной крыше и образцу новых.
-                    if let Some(Sel::Roof(i)) = self.sel
-                        && self.map.roofs[i].paint != key
+                        PortalKind::Door
+                    };
+                    // Ширина — из имени у FA (Door_Large_…_2x1); встроенные не меняют её.
+                    if !key.starts_with(library::BUILTIN)
+                        && let Some(size) = library::size_from_name(&library::label(&key))
                     {
+                        self.door_width = size[0].clamp(1.0, 4.0);
+                    }
+                    self.door_asset = Some(key);
+                }
+                self.set_tool(Tool::Door);
+            }
+            Kind::Roof => {
+                // Покрытие — выбранной крыше и образцу новых.
+                if let Some(Sel::Roof(i)) = self.sel
+                    && self.map.roofs[i].paint != key
+                {
+                    self.checkpoint();
+                    self.map.roofs[i].paint = key.clone();
+                }
+                // Крыше OSM — только ей: образец новых прямоугольных не трогаем.
+                if let Some(Sel::Outline(i, k)) = self.sel {
+                    if self.map.outline_roofs[i].pieces[k].paint != key {
                         self.checkpoint();
-                        self.map.roofs[i].paint = key.clone();
+                        self.map.outline_roofs[i].pieces[k].paint = key;
                     }
-                    // Крыше OSM — только ей: образец новых прямоугольных не трогаем.
-                    if let Some(Sel::Outline(i, k)) = self.sel {
-                        if self.map.outline_roofs[i].pieces[k].paint != key {
-                            self.checkpoint();
-                            self.map.outline_roofs[i].pieces[k].paint = key;
-                        }
-                        if self.tool != Tool::Roof {
-                            self.set_tool(Tool::Roof);
-                        }
-                        return;
-                    }
-                    self.roof_style.paint = key;
                     if self.tool != Tool::Roof {
                         self.set_tool(Tool::Roof);
                     }
+                    return;
                 }
-                Kind::Object if self.tool == Tool::Scatter => {
-                    // В разбросе щелчок кладёт объект в набор или убирает из него.
-                    match self.scatter.set.iter().position(|k| *k == key) {
-                        Some(at) => {
-                            self.scatter.set.remove(at);
-                        }
-                        None => self.scatter.set.push(key),
+                self.roof_style.paint = key;
+                if self.tool != Tool::Roof {
+                    self.set_tool(Tool::Roof);
+                }
+            }
+            Kind::Object if self.tool == Tool::Scatter => {
+                // В разбросе щелчок кладёт объект в набор или убирает из него.
+                match self.scatter.set.iter().position(|k| *k == key) {
+                    Some(at) => {
+                        self.scatter.set.remove(at);
                     }
+                    None => self.scatter.set.push(key),
                 }
-                Kind::Object => {
-                    self.object_asset = Some(key);
-                    self.object_prefab = None;
-                    self.set_tool(Tool::Object);
-                }
+            }
+            Kind::Object => {
+                self.object_asset = Some(key);
+                self.object_prefab = None;
+                self.set_tool(Tool::Object);
             }
         }
     }

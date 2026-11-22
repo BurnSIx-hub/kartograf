@@ -1018,15 +1018,20 @@ impl App {
 
     /// `--shot файл.png`: снять окно, когда оно устоялось, и выйти.
     pub(super) fn screenshots(&mut self, ctx: &egui::Context) {
-        let images: Vec<_> = ctx.input(|i| {
+        // Снимок пипетки — ей, остальные — выгрузке, самопроверке, `--shot`.
+        let (picks, images): (Vec<_>, Vec<_>) = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
-                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    egui::Event::Screenshot { image, user_data, .. } => Some((user_data.data.as_ref().is_some_and(|d| d.downcast_ref::<pick::PickShot>().is_some()), image.clone())),
                     _ => None,
                 })
-                .collect()
+                .partition(|(pick, _)| *pick)
         });
+        let images: Vec<_> = images.into_iter().map(|(_, image)| image).collect();
+        if let Some((_, image)) = picks.first() {
+            self.pick_shot_taken(ctx, image);
+        }
         if self.export.as_ref().is_some_and(|e| e.asked) {
             if let Some(image) = images.first() {
                 self.export_tile(ctx, image);

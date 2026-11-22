@@ -35,6 +35,8 @@ pub struct SelfTest {
     pan: egui::Vec2,
     /// Куда поставить курсор перед снимком.
     hover_at: Option<Pos2>,
+    /// Вторая точка сценария (крыша для пипетки).
+    spot: [f32; 2],
 }
 
 impl SelfTest {
@@ -55,6 +57,7 @@ impl SelfTest {
             world: [0.0, 0.0],
             pan: egui::Vec2::ZERO,
             hover_at: None,
+            spot: [0.0, 0.0],
         }
     }
 
@@ -1353,10 +1356,112 @@ impl SelfTest {
             }
             133 => {
                 app.check.open = false;
+                // Пипетка: свой пол в углу карты, кисть пола с другим материалом.
+                let (w, h) = (app.map.width as i32, app.map.height as i32);
+                let m = app.map.materials.len() - 1;
+                app.map.paint_rect(Layer::Floor, (w - 3, h - 3), (w - 1, h - 1), Some(m));
+                app.touch();
+                self.world = [w as f32 - 1.5, h as f32 - 1.5];
+                app.set_tool(Tool::Floor);
+                app.material = 0;
+                app.pick_color = false;
+                self.key(Key::Home, Modifiers::NONE);
+                self.key(Key::I, Modifiers::NONE);
+                self.resume_at = now + 0.3;
+            }
+            134 => {
+                let free = app.pick(self.world).is_none();
+                self.check("I — пипетка, взята с кисти пола", app.tool == Tool::Pick && app.pick_from == Tool::Floor && free, &format!("{:?} с {:?}, под точкой {:?}", app.tool, app.pick_from, app.pick(self.world)));
+                self.click(at(app, self.world));
+                self.resume_at = now + CLICK_GAP;
+            }
+            135 => {
+                let m = app.map.materials.len() - 1;
+                self.check("пипетка взяла пол под курсором и вернула кисть", app.tool == Tool::Floor && app.material == m, &format!("{:?}, материал {} из {}", app.tool, app.material, app.map.materials.len()));
+                // Цвет: кисть с картинкой, щелчок по тому же полу перекрашивает её картинку.
+                let t = app.map.materials.iter().position(|x| matches!(x.paint, Paint::Texture(_)) && !texture_key(&x.paint).starts_with(crate::library::TINT));
+                self.check("у карты есть пол с картинкой", t.is_some(), "");
+                app.material = t.unwrap_or(0);
+                self.area = app.material as f32;
+                app.pick_color = true;
+                self.key(Key::I, Modifiers::NONE);
+                self.resume_at = now + 0.3;
+            }
+            136 => {
+                self.snap(ctx, "пипетка цвет");
+            }
+            137 => {
+                self.click(at(app, self.world));
+                self.resume_at = now + CLICK_GAP;
+            }
+            138 => {
+                if app.pick_busy() {
+                    self.step -= 1;
+                    self.resume_at = now + 0.1;
+                    return true;
+                }
+                let before = texture_key(&app.map.materials[self.area as usize].paint);
+                let after = app.map.materials.get(app.material).map(|x| texture_key(&x.paint)).unwrap_or_default();
+                let (color, inner) = crate::library::untint(&after);
+                let ok = app.tool == Tool::Floor && color.is_some() && inner == before && app.notice.as_deref().is_some_and(|n| n.contains("в цвет"));
+                self.check("пипетка с цветом перекрасила картинку кисти", ok, &format!("{:?}: {before} → {after}; {:?}", app.tool, app.notice));
+                self.snap(ctx, "пипетка");
+            }
+            139 => {
+                // Крыша: с «Выбором» крыши видны — пипетка берёт покрытие и ведёт к «Крыше».
+                let i = app.place_roof_rect([13.0, 1.0], [17.0, 3.0]);
+                self.area = i as f32;
+                app.roof_style.paint = "другое покрытие".into();
+                app.sel = None;
+                app.set_tool(Tool::Select);
+                app.pick_color = false;
+                self.spot = [15.0, 2.0];
+                self.key(Key::I, Modifiers::NONE);
+                self.resume_at = now + 0.3;
+            }
+            140 => {
+                self.check("под точкой — крыша", app.pick(self.spot) == Some(Sel::Roof(self.area as usize)), &format!("{:?}", app.pick(self.spot)));
+                self.click(at(app, self.spot));
+                self.resume_at = now + CLICK_GAP;
+            }
+            141 => {
+                let key = app.map.roofs[self.area as usize].paint.clone();
+                self.check("пипетка взяла покрытие крыши, инструмент «Крыша»", app.tool == Tool::Roof && app.roof_style.paint == key, &format!("{:?} {} / {key}", app.tool, app.roof_style.paint));
+                // Цвет: выбранная крыша перекрашивается цветом пола в углу.
+                app.set_tool(Tool::Select);
+                app.sel = Some(Sel::Roof(self.area as usize));
+                app.pick_color = true;
+                self.key(Key::I, Modifiers::NONE);
+                self.resume_at = now + 0.3;
+            }
+            142 => {
+                self.click(at(app, self.world));
+                self.resume_at = now + CLICK_GAP;
+            }
+            143 => {
+                if app.pick_busy() {
+                    self.step -= 1;
+                    self.resume_at = now + 0.1;
+                    return true;
+                }
+                let key = app.map.roofs[self.area as usize].paint.clone();
+                let (color, inner) = crate::library::untint(&key);
+                // Образец новых крыш перекрашен тем же цветом; узор — прежнее покрытие.
+                let ok = app.tool == Tool::Select && color.is_some() && !inner.starts_with(crate::library::TINT) && key == app.roof_style.paint;
+                self.check("пипетка с цветом перекрасила выбранную крышу", ok, &format!("{:?}: {key}; {:?}", app.tool, app.notice));
+                self.snap(ctx, "пипетка крыша");
             }
             _ => return false,
         }
         true
+    }
+}
+
+/// Ключ картинки пола; у сплошного цвета — пусто.
+fn texture_key(paint: &Paint) -> String {
+    match paint {
+        Paint::Texture(k) => k.clone(),
+        Paint::Color(_) => String::new(),
     }
 }
 

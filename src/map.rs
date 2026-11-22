@@ -2060,6 +2060,19 @@ pub fn coat_alpha(share: u8, above: u32) -> u8 {
     ((share as u32 * 255 + rest / 2) / rest) as u8
 }
 
+/// Слой, чья доля в точке больше всех (доли слоёв в сумме не больше 255 —
+/// [`coat_alpha`]); из равных — верхний.
+fn visible_coat(coats: &[Coat], i: isize, j: isize) -> Option<usize> {
+    let mut best: Option<(usize, u8)> = None;
+    for c in coats.iter().rev() {
+        let v = c.mask.get(i, j);
+        if v > best.map_or(0, |b| b.1) {
+            best = Some((c.material as usize, v));
+        }
+    }
+    best.map(|b| b.0)
+}
+
 fn dominant(coats: &[Coat], i: isize, j: isize) -> u8 {
     coats.iter().rev().map(|c| (c.material, c.mask.get(i, j))).filter(|(_, v)| *v >= 128).map(|(m, _)| m + 1).next().unwrap_or(0)
 }
@@ -2232,6 +2245,21 @@ impl Map {
 
     pub fn floor_at(&self, x: i32, y: i32) -> u8 {
         self.at(Layer::Floor, x, y)
+    }
+
+    /// Пол, который виден в точке `w` (клетки), — для пипетки: комната, если она там
+    /// есть, иначе местность. Из слоёв с мягким краем — тот, чья доля в точке больше.
+    pub fn floor_under(&self, w: [f32; 2]) -> Option<(Layer, usize)> {
+        let (i, j) = ((w[0] * mask::RES as f32).floor() as isize, (w[1] * mask::RES as f32).floor() as isize);
+        if i < 0 || j < 0 || i as usize >= self.rooms.w || j as usize >= self.rooms.h {
+            return None;
+        }
+        if self.rooms.get(i, j) >= 128
+            && let Some(m) = visible_coat(&self.room_floor, i, j)
+        {
+            return Some((Layer::Rooms, m));
+        }
+        visible_coat(&self.terrain, i, j).map(|m| (Layer::Floor, m))
     }
 
     pub fn room_at(&self, x: i32, y: i32) -> u8 {
@@ -2722,6 +2750,27 @@ mod tests {
         assert!(parse_live_table("не json").is_empty() && parse_live_table("[1, 2]").is_empty());
         set_live_table(Vec::new());
         assert_eq!(living_by_name(fan), None);
+    }
+
+    #[test]
+    fn floor_under_is_the_floor_one_sees_at_the_point() {
+        let mut m = Map::new(4, 4);
+        m.paint_rect(Layer::Floor, (0, 0), (3, 3), Some(0));
+        m.paint_rect(Layer::Floor, (2, 0), (3, 1), Some(1));
+        m.paint_rect(Layer::Rooms, (0, 2), (1, 3), Some(2));
+        assert_eq!(m.floor_under([0.5, 0.5]), Some((Layer::Floor, 0)));
+        assert_eq!(m.floor_under([3.9, 1.9]), Some((Layer::Floor, 1)), "верхний слой у самого края своей клетки");
+        assert_eq!(m.floor_under([1.2, 3.5]), Some((Layer::Rooms, 2)), "комната поверх местности");
+        assert_eq!(m.floor_under([-0.1, 1.0]), None);
+        assert_eq!(m.floor_under([4.0, 1.0]), None);
+        // Мягкий край: верхний слой на 40 % — виднее нижний, на 70 % — он сам.
+        let w = m.rooms.w;
+        let k = |i: usize, j: usize| j * w + i;
+        let (p, q) = (k(2 * mask::RES, 3 * mask::RES), k(3 * mask::RES, 3 * mask::RES));
+        m.paint(Layer::Floor, 3, &[(p, 0.4), (q, 0.7)]);
+        assert_eq!(m.floor_under([2.1, 3.1]), Some((Layer::Floor, 0)));
+        assert_eq!(m.floor_under([3.1, 3.1]), Some((Layer::Floor, 3)));
+        assert_eq!(m.floor_under([0.5, 0.5]), Some((Layer::Floor, 0)), "чужая точка не задета");
     }
 
     #[test]

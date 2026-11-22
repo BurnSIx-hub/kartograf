@@ -62,14 +62,14 @@ impl App {
         match self.roof_view {
             RoofView::Hidden => 0.0,
             RoofView::Ghost => 0.35,
-            RoofView::Auto if matches!(self.tool, Tool::Select | Tool::Roof) => 1.0,
+            RoofView::Auto if matches!(self.view_tool(), Tool::Select | Tool::Roof) => 1.0,
             RoofView::Auto => 0.35,
         }
     }
 
     /// Крыша под точкой, если её сейчас можно взять.
     pub(super) fn roof_at(&self, w: [f32; 2]) -> Option<usize> {
-        if self.roof_alpha() < 1.0 && self.tool != Tool::Roof {
+        if self.roof_alpha() < 1.0 && self.view_tool() != Tool::Roof {
             return None;
         }
         self.map.roofs.iter().rposition(|r| r.contains(w))
@@ -78,7 +78,7 @@ impl App {
     /// Крыша OSM и её кусок под точкой, если её сейчас можно взять: верхняя
     /// крыша, а в ней верхняя часть.
     pub(super) fn outline_at(&self, w: [f32; 2]) -> Option<Sel> {
-        if self.roof_alpha() < 1.0 && self.tool != Tool::Roof {
+        if self.roof_alpha() < 1.0 && self.view_tool() != Tool::Roof {
             return None;
         }
         let roofs = &self.map.outline_roofs;
@@ -256,7 +256,12 @@ impl App {
 
     /// Что лежит под точкой: сначала объекты (верхний — последний), потом проёмы, потом стены.
     pub fn pick(&self, w: [f32; 2]) -> Option<Sel> {
-        if let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
+        self.pick_at(w, true)
+    }
+
+    /// То же; `labels` — брать ли подписи (пипетка смотрит сквозь них).
+    pub(super) fn pick_at(&self, w: [f32; 2], labels: bool) -> Option<Sel> {
+        if labels && let Some(i) = self.map.labels.iter().rposition(|l| l.contains(w)) {
             return Some(Sel::Label(i));
         }
         // Видимая крыша закрывает всё, что под ней.
