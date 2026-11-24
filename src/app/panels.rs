@@ -76,6 +76,10 @@ impl App {
                         self.add_pack(f);
                     }
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if item(ui, "Предметы из WoW…", "") {
+                    self.wow.open = true;
+                }
                 ui.separator();
                 if item(ui, "Проверить обновления", "") {
                     let ctx = ui.ctx().clone();

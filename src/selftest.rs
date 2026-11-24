@@ -1451,6 +1451,45 @@ impl SelfTest {
                 self.check("пипетка с цветом перекрасила выбранную крышу", ok, &format!("{:?}: {key}; {:?}", app.tool, app.notice));
                 self.snap(ctx, "пипетка крыша");
             }
+            // «Предметы из WoW»: окно открывается всегда; с клиентом игры (переменная
+            // KARTOGRAF_WOW_CLIENT — папка WoW 1.x–3.x) — поиск, вид сверху и перенос на полку.
+            #[cfg(not(target_arch = "wasm32"))]
+            144 => {
+                app.wow.open = true;
+                if let Ok(dir) = std::env::var("KARTOGRAF_WOW_CLIENT") {
+                    match app.wow_client_now(Some(dir.into())) {
+                        Ok(_) => {
+                            app.wow.query = "scarletmonastery statue paladin".into();
+                            app.wow.picked = crate::app::wow_import::search(&app.wow.models, &app.wow.query).first().map(|m| (*m).clone());
+                        }
+                        Err(e) => self.check("клиент WoW открылся", false, &e),
+                    }
+                }
+                self.resume_at = now + 0.6;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            145 => {
+                if app.wow.client.is_some() {
+                    let preview = app.wow.preview.as_ref().map(|(m, r)| (m.clone(), r.as_ref().map(|(_, c)| *c).map_err(Clone::clone)));
+                    self.check("WoW: вид сверху выбранной модели", matches!(preview, Some((_, Ok(c))) if c[0] > 0.3 && c[1] > 0.2), &format!("{preview:?}"));
+                } else {
+                    self.check("окно «Предметы из WoW» без клиента открыто", app.wow.open, "");
+                }
+                // Снимок — кадром позже: окно до него должно остаться открытым.
+                self.snap(ctx, "предметы из WoW");
+                self.resume_at = now + 0.5;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            146 => {
+                if let Some(client) = app.wow.client.clone() {
+                    let picked: Vec<String> = app.wow.picked.iter().cloned().collect();
+                    let (done, errors) = app.wow_put_on_shelf(&client, &picked);
+                    let key = done.first().and_then(|d| d["key"].as_str()).unwrap_or_default().to_owned();
+                    let shelved = app.library.assets.iter().any(|a| a.key == key && a.folder.starts_with("WoW/") && a.kind == Kind::Object);
+                    self.check("WoW: модель на полке под «WoW/…»", shelved && errors.is_empty(), &format!("{key} {errors:?}"));
+                }
+                app.wow.open = false;
+            }
             _ => return false,
         }
         true

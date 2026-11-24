@@ -211,6 +211,17 @@ fn tools() -> Value {
             "asset": text("Wall asset key from find_assets (kind wall)"), "color": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3, "description": "Plain colour [r, g, b] instead of a picture"},
             "width": num("Thickness in cells, default 0.25 (0.35 for pictures)"), "area": area
         }), &[]),
+        tool("wow_models", "Search the models (.m2) of a World of Warcraft 1.x–3.x client by words of their path inside the game, e.g. 'scarlet statue', 'human candelabra', 'pew'. The client folder is remembered after the first call. Returns model paths for wow_import.", json!({
+            "words": text("Words that must all be in the model path (any case)"),
+            "client": text("WoW client folder (the one with Data); needed once, then remembered"),
+            "limit": int("At most this many paths back (default 100)"),
+        }), &["words"]),
+        tool("wow_import", "Draw World of Warcraft models from straight above (textured, lit from the top left; the model's +X axis points to the BOTTOM of the picture — the face of creatures, statues and benches, but some furniture such as bookshelves is modelled sideways, so check facing with preview_assets) and put them on the shelf as objects under 'WoW/<path in the game>', sized in cells from the game's yards (a 5-foot cell is 5/3 yards). Glows and additive effects are left out. Returns each object's key for add_object and its size; replaceable textures (creature skins) that could not be guessed are listed in missing_textures and drawn grey.", json!({
+            "models": {"type": "array", "items": {"type": "string"}, "description": "Model paths from wow_models (.m2; .mdx from old placements works too)"},
+            "words": text("Or: every model whose path has all these words"),
+            "client": text("WoW client folder; needed once, then remembered"),
+            "max": int("Refuse when more models match than this (default 50, up to 200)"),
+        }), &[]),
         tool("reload_assets", "Re-read the user's asset folder: pictures added there while the editor was open become available to find_assets. Also re-reads live.json in the folder's root — the user's own living machines for Foundry (Wild Canvas 0.30+): {\"File_Name_Start\": {\"fans\": [[cx, cy, r, speed]], \"lamps\": [[x, y, r, \"#rrggbb\"]], \"leds\": [x, y, colour, …], \"ledSize\": 0.006}}, fractions of the picture (leds: x and y in thousandths, colour 0 cyan, 1 magenta or a number 0xRRGGBB). An object whose file name starts with such a key gets its own tile and the layout in the tile flag: fans spin, lamps smoulder and flare, leds blink. Returns the keys read as live.", json!({}), &[]),
         tool("undo", "Undo the last changes. A batch is one step (one per floor it touched).", json!({"steps": int("Default 1")}), &[]),
         tool("batch", "Run many edits in one call; they are undone as one step (one per floor touched). If any edit fails, the whole batch is rolled back and the map stays as it was. Not allowed inside: view, render_picture, preview_assets, export_foundry, save_map, open_map, new_map, generate, build_plan, terrain_from_place, grow_map, crop_map, add_level, undo, reload_assets, batch.", json!({

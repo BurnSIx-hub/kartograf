@@ -123,6 +123,8 @@ impl App {
         self.update_window(ctx);
         self.check_window(ctx);
         self.place_window(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wow_window(ctx);
         self.sketch_window(ctx);
         if let Some(e) = self.error.clone() {
             let mut open = true;

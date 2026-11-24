@@ -43,6 +43,8 @@ mod update;
 #[path = "update_web.rs"]
 mod update;
 mod view;
+#[cfg(not(target_arch = "wasm32"))]
+mod wow;
 
 use eframe::egui;
 use std::path::PathBuf;

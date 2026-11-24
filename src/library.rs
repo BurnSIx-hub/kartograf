@@ -1509,12 +1509,14 @@ pub struct Library {
     from_packs: Vec<Asset>,
     /// Объединённые из нескольких объектов (`App::bake`) — папка в данных программы.
     baked: Vec<Asset>,
+    /// Предметы из клиента WoW (`crate::wow`) — тоже папка в данных программы.
+    wow: Vec<Asset>,
 }
 
 impl Default for Library {
     fn default() -> Self {
         let (tx, rx) = channel();
-        let mut library = Self { assets: Vec::new(), packs: Vec::new(), pending: 0, tx, rx, folder: Vec::new(), from_packs: Vec::new(), baked: Vec::new() };
+        let mut library = Self { assets: Vec::new(), packs: Vec::new(), pending: 0, tx, rx, folder: Vec::new(), from_packs: Vec::new(), baked: Vec::new(), wow: Vec::new() };
         library.rebuild();
         library
     }
@@ -1548,6 +1550,18 @@ impl Library {
             .map(|p| {
                 let inner = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().into_owned();
                 Asset::new(p.to_string_lossy().into_owned(), &format!("Запечённые/{inner}"), Kind::Object)
+            })
+            .collect();
+        self.rebuild();
+    }
+
+    /// Папка предметов из WoW: всё в ней — объекты, под папкой «WoW» с путём модели в игре.
+    pub fn set_wow(&mut self, dir: &Path) {
+        self.wow = scan(dir)
+            .into_iter()
+            .map(|p| {
+                let inner = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                Asset::new(p.to_string_lossy().into_owned(), &format!("WoW/{inner}"), Kind::Object)
             })
             .collect();
         self.rebuild();
@@ -1619,7 +1633,7 @@ impl Library {
             Some(Asset::new(format!("{SET}{rel}"), &format!("{title}/{rest}"), kind))
         });
         let builtin = textures.chain(objects).chain(walls).chain(portals).chain(roofs).chain(sets);
-        self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
+        self.assets = builtin.chain(self.baked.iter().cloned()).chain(self.wow.iter().cloned()).chain(self.folder.iter().cloned()).chain(self.from_packs.iter().cloned()).collect();
     }
 
     /// Номера ассетов нужного вида, подходящих под строку поиска.

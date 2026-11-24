@@ -256,6 +256,8 @@ impl App {
             "switch_level" => self.tool_switch_level(a),
             "grow_map" => self.tool_grow_map(a),
             "crop_map" => self.tool_crop_map(a),
+            "wow_models" => self.tool_wow_models(a),
+            "wow_import" => self.tool_wow_import(a),
             "reload_assets" => {
                 if let Some(dir) = self.settings.textures_dir.clone() {
                     self.library.set_folder(&dir);
@@ -1097,7 +1099,7 @@ impl App {
     /// Пачка правок за один вызов: одна точка отмены на каждый тронутый этаж. Ошибка —
     /// вся пачка откатывается и ничего не меняется.
     fn tool_batch(&mut self, a: &Value) -> Res {
-        const NOT_IN_BATCH: [&str; 16] = ["batch", "view", "render_picture", "export_foundry", "terrain_from_place", "generate", "build_plan", "new_map", "open_map", "save_map", "grow_map", "crop_map", "add_level", "undo", "reload_assets", "preview_assets"];
+        const NOT_IN_BATCH: [&str; 18] = ["batch", "view", "render_picture", "export_foundry", "terrain_from_place", "generate", "build_plan", "new_map", "open_map", "save_map", "grow_map", "crop_map", "add_level", "undo", "reload_assets", "preview_assets", "wow_models", "wow_import"];
         let ops = a["ops"].as_array().ok_or("нужен ops: [{\"tool\": …, \"arguments\": {…}}]")?;
         if ops.is_empty() || ops.len() > 1000 {
             return Err("ops: от 1 до 1000 правок".into());

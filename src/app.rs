@@ -314,6 +314,9 @@ pub struct Settings {
     /// Крыши в редакторе: 0 — видно, 1 — сквозь, 2 — скрыть. Запоминается.
     #[serde(default)]
     pub roof_view: u8,
+    /// Папка клиента World of Warcraft 1.x–3.x: откуда брать предметы (`crate::wow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wow_client: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -322,7 +325,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, roof_view: 0 }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, roof_view: 0, wow_client: None }
     }
 }
 
@@ -726,6 +729,9 @@ pub struct App {
     pub light_view: bool,
     #[cfg(not(target_arch = "wasm32"))]
     light: Option<view_tools::LightCache>,
+    /// Окно «Предметы из WoW» и открытый клиент игры.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub wow: wow_import::WowWindow,
     /// Слой новых объектов (цифры 1–4, 7, 8, 9); нет — по имени ассета.
     pub object_layer: Option<i16>,
     /// Кисть пола или подземелья с Alt стирает (как в Dungeondraft).
@@ -852,6 +858,7 @@ impl App {
         let orphans = if args.selftest.is_some() { Vec::new() } else { recovery.orphans() };
         let mut library = Library::default();
         library.set_baked(&data_dir.join("baked"));
+        library.set_wow(&data_dir.join("wow"));
         if let Some(dir) = &settings.textures_dir {
             library.set_folder(dir);
         }
@@ -992,6 +999,8 @@ impl App {
             light_view: false,
             #[cfg(not(target_arch = "wasm32"))]
             light: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            wow: Default::default(),
             object_layer: None,
             brush_erase: false,
             wall_join: None,
@@ -1098,6 +1107,9 @@ mod reference;
 /// Команды ИИ (MCP) — отдельным файлом: `app.rs` и так велик.
 #[cfg(not(target_arch = "wasm32"))]
 mod tools;
+/// Предметы из клиента World of Warcraft: окно и перенос на полку.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod wow_import;
 
 impl eframe::App for App {
     /// Свёрнутое окно eframe не рисует и `ui` не зовёт — только это: команды ИИ
