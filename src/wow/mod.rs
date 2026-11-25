@@ -4,7 +4,9 @@
 pub mod blp;
 pub mod m2;
 pub mod mpq;
+pub mod location;
 pub mod render;
+pub mod wmo;
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,8 @@ pub struct Imported {
     pub skipped: usize,
     /// Текстуры, которых нет или которые подменяются игрой (кожа существа) — нарисованы серым.
     pub missing: Vec<String>,
+    /// Начало координат модели в клетках от середины картинки (`render::Sprite::origin`).
+    pub origin: [f32; 2],
 }
 
 /// Текстура подменяемого вида: игра берёт её из таблиц. Рядом с моделью обычно лежит
@@ -149,6 +153,8 @@ fn resolve_dir(out: &Path, model: &str) -> PathBuf {
 /// `out/<путь модели>/<Имя>_<ш>x<в>.png`, размер в клетках — в имени, как у ассетов FA.
 /// Прежняя картинка той же модели (другого размера) заменяется.
 pub fn import(client: &Client, model: &str, out: &Path, opt: &render::Options) -> Result<Imported, String> {
+    // Имя — как в списках архивов: из расстановки WMO оно приходит капсом, и слова не видны.
+    let model = &client.spelled(&m2::m2_path(model));
     let (m, textures, missing) = load(client, model)?;
     let sprite = render::render(&m, &textures, opt)?;
     let dir = resolve_dir(out, model);
@@ -173,7 +179,7 @@ pub fn import(client: &Client, model: &str, out: &Path, opt: &render::Options) -
     sprite.img.save(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     // Ключ — как имя легло на диск (полка читает папку и берёт написание оттуда).
     let file = on_disk(&dir, &name).map_or(file, |n| dir.join(n));
-    Ok(Imported { file, cells: sprite.cells, drawn: sprite.drawn, skipped: sprite.skipped, missing })
+    Ok(Imported { file, cells: sprite.cells, drawn: sprite.drawn, skipped: sprite.skipped, missing, origin: sprite.origin })
 }
 
 #[cfg(test)]
@@ -213,11 +219,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
     }
 
-    /// Настоящий клиент: `WOW_CLIENT=папка OUT_DIR=папка cargo test wow_real -- --ignored --nocapture`.
+    /// Настоящий клиент: `WOW_CLIENT=папка WOW_OUT=папка cargo test wow_real -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn wow_real_client_models_to_pictures() {
-        let (Ok(dir), Ok(out)) = (std::env::var("WOW_CLIENT"), std::env::var("OUT_DIR")) else { return };
+        let (Ok(dir), Ok(out)) = (std::env::var("WOW_CLIENT"), std::env::var("WOW_OUT")) else { return };
         let t = std::time::Instant::now();
         let client = Client::open(Path::new(&dir)).unwrap();
         println!("архивов {} ({}), язык {}, {:?}", client.archives.len(), client.archives[0].path.display(), client.locale, t.elapsed());

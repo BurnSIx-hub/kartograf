@@ -261,6 +261,7 @@ pub struct Client {
     pub locale: String,
     pub archives: Vec<Archive>,
     names: OnceLock<Vec<String>>,
+    spelling: OnceLock<std::collections::HashMap<String, String>>,
 }
 
 /// Место архива в порядке загрузки игры (больше — главнее) или `None`, если архив не грузится.
@@ -331,7 +332,7 @@ impl Client {
         ranked.sort();
         ranked.reverse();
         let archives = ranked.into_iter().map(|(_, p)| Archive::open(&p)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { dir: root, locale, archives, names: OnceLock::new() })
+        Ok(Self { dir: root, locale, archives, names: OnceLock::new(), spelling: OnceLock::new() })
     }
 
     /// Файл из самого главного архива, где он есть.
@@ -375,6 +376,13 @@ impl Client {
             out.sort_by_key(|s| s.to_lowercase());
             out
         })
+    }
+
+    /// Имя, как оно лучше всего записано в списках архивов (`GENERALCANDELABRA01.M2` из
+    /// расстановки WMO → `…\GeneralCandelabra01.m2`); нет в списках — как есть.
+    pub fn spelled(&self, name: &str) -> String {
+        let map = self.spelling.get_or_init(|| self.names().iter().map(|n| (n.to_lowercase().replace('/', "\\"), n.clone())).collect());
+        map.get(&name.to_lowercase().replace('/', "\\")).cloned().unwrap_or_else(|| name.to_owned())
     }
 
     /// Имена с окончанием `ext` (`.m2`).

@@ -3,7 +3,7 @@
 use super::*;
 
 impl App {
-    pub(super) fn reset_doc(&mut self, mut map: Map, path: Option<PathBuf>) {
+    pub(crate) fn reset_doc(&mut self, mut map: Map, path: Option<PathBuf>) {
         self.scene_name = None;
         let rest = std::mem::take(&mut map.levels);
         self.levels = std::iter::once(map.clone()).chain(rest).collect();

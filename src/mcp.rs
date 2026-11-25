@@ -211,7 +211,16 @@ fn tools() -> Value {
             "asset": text("Wall asset key from find_assets (kind wall)"), "color": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3, "description": "Plain colour [r, g, b] instead of a picture"},
             "width": num("Thickness in cells, default 0.25 (0.35 for pictures)"), "area": area
         }), &[]),
-        tool("wow_models", "Search the models (.m2) of a World of Warcraft 1.x–3.x client by words of their path inside the game, e.g. 'scarlet statue', 'human candelabra', 'pew'. The client folder is remembered after the first call. Returns model paths for wow_import.", json!({
+        tool("wow_location", "Replace the open map with a World of Warcraft building or dungeon (a WMO root from wow_models with kind: wmo, e.g. the Scarlet Monastery cathedral). The floor of every level is a top-down snapshot of the game (its textures and baked light; ceilings, roofs and beams above the floor are cut away), laid as floor-layer picture tiles; walls for Foundry come from a chest-high cut through the game's collision (doorways stay open; doors themselves are not in the WMO); the WMO's own furniture and decorations stand where the game puts them, rotated and scaled, as ordinary objects (lights by their names). North of the game is up. Levels: floors standing over other floors (a cellar, an upper storey) become separate levels; a courtyard and a hall at different heights joined by stairs stay one level. Returns the size, levels, walls, objects and notes; the map is unsaved.", json!({
+            "wmo": text("Path of the WMO root inside the game (World\\\\wmo\\\\…\\\\Name.wmo)"),
+            "words": text("Or words that pick exactly one building"),
+            "client": text("WoW client folder; needed once, then remembered"),
+            "ppc": num("Pixels per cell of the floor pictures (default 128; big buildings get fewer so a level stays under ~160 megapixels)"),
+            "cut": num("How far above the floor the snapshot is cut, yards (default 3)"),
+            "set": text("Furnishing variant besides the always-standing objects: a doodad set name (Set_A) or number from doodad_sets in the reply; default — the first variant. Houses often have several (furnished, abandoned)"),
+        }), &[]),
+        tool("wow_models", "Search the models (.m2) of a World of Warcraft 1.x–3.x client by words of their path inside the game, e.g. 'scarlet statue', 'human candelabra', 'pew'; with kind: wmo — its buildings and dungeons for wow_location. The client folder is remembered after the first call. Returns paths for wow_import / wow_location.", json!({
+            "kind": {"type": "string", "enum": ["m2", "wmo"], "description": "m2 — models (default); wmo — buildings and dungeons"},
             "words": text("Words that must all be in the model path (any case)"),
             "client": text("WoW client folder (the one with Data); needed once, then remembered"),
             "limit": int("At most this many paths back (default 100)"),

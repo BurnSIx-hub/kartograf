@@ -29,6 +29,9 @@ pub struct Sprite {
     /// Сколько треугольников нарисовано и сколько кусков пропущено (свечения, наложения).
     pub drawn: usize,
     pub skipped: usize,
+    /// Где начало координат модели (точка, которой её ставит игра) — в клетках от середины
+    /// картинки, при повороте 0: по ней предмет из расстановки WMO встаёт на своё место.
+    pub origin: [f32; 2],
 }
 
 /// Направление на свет в осях модели: сверху, с верхнего левого угла картинки (−X, −Y).
@@ -88,9 +91,14 @@ pub fn render(model: &Model, textures: &[Option<Rgba>], opt: &Options) -> Result
     if longest > (opt.max_px - 4) as f32 {
         ppy *= (opt.max_px - 4) as f32 / longest;
     }
-    let ss = opt.supersample.max(1);
     let pad = 2u32;
     let (w, h) = ((span_u * ppy).ceil() as u32 + pad * 2, (span_v * ppy).ceil() as u32 + pad * 2);
+    // Сглаживание — пока буфер не больше ~25 млн точек: крупная модель в 4096 точек с 3× —
+    // это 150 млн точек и гигабайты памяти.
+    let mut ss = opt.supersample.max(1);
+    while ss > 1 && (w * ss) as u64 * (h * ss) as u64 > 25_000_000 {
+        ss -= 1;
+    }
     let (bw, bh) = (w * ss, h * ss);
     let s = ppy * ss as f32;
     let off = (pad * ss) as f32;
@@ -212,7 +220,8 @@ pub fn render(model: &Model, textures: &[Option<Rgba>], opt: &Options) -> Result
     }
     // Клеток на точку: ppy точек — ярд, ярд — cells_per_yard клеток.
     let cell_per_px = opt.cells_per_yard / ppy;
-    Ok(Sprite { img, cells: [w as f32 * cell_per_px, h as f32 * cell_per_px], drawn, skipped })
+    let origin = [(pad as f32 - lo[1] * ppy - w as f32 / 2.0) * cell_per_px, (pad as f32 - lo[0] * ppy - h as f32 / 2.0) * cell_per_px];
+    Ok(Sprite { img, cells: [w as f32 * cell_per_px, h as f32 * cell_per_px], drawn, skipped, origin })
 }
 
 #[cfg(test)]
@@ -239,5 +248,7 @@ mod tests {
         assert_eq!(a(4, 30), 255);
         assert_eq!(a(30, 4), 255);
         assert_eq!(sp.drawn, 1);
+        // Начало координат модели — в углу прямого угла: 2 точки поля от края, середина — 20.
+        assert!((sp.origin[0] + 18.0 / 60.0).abs() < 1e-4 && (sp.origin[1] + 18.0 / 60.0).abs() < 1e-4, "{:?}", sp.origin);
     }
 }

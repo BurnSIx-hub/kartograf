@@ -1490,6 +1490,31 @@ impl SelfTest {
                 }
                 app.wow.open = false;
             }
+            // Здание целиком: трактир Голдшира — подвал, зал и верхний этаж, стены, предметы.
+            #[cfg(not(target_arch = "wasm32"))]
+            147 => {
+                if let Some(client) = app.wow.client.clone() {
+                    let path = "World\\wmo\\Azeroth\\Buildings\\GoldshireInn\\GoldshireInn.wmo";
+                    let opt = crate::wow::location::Options { ppc: 48.0, ..Default::default() };
+                    match app.wow_build_now(&client, path, &opt) {
+                        Ok(b) => {
+                            let ok = b.levels == 3 && b.walls > 20 && b.objects > 20 && b.tiles > 0;
+                            self.check("WoW: трактир Голдшира — три этажа, стены, предметы", ok, &format!("этажей {}, стен {}, предметов {}, кусков {}", b.levels, b.walls, b.objects, b.tiles));
+                            app.library.set_wow(&app.data_dir.join("wow"));
+                            app.reset_doc(b.map, None);
+                            app.switch_level(1);
+                            self.resume_at = now + 1.0;
+                        }
+                        Err(e) => self.check("WoW: трактир Голдшира собрался", false, &e),
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            148 => {
+                if app.wow.client.is_some() {
+                    self.snap(ctx, "здание из WoW");
+                }
+            }
             _ => return false,
         }
         true
