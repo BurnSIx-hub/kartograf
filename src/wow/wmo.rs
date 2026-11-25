@@ -27,6 +27,8 @@ pub struct DoodadSet {
 }
 
 pub struct Group {
+    /// Флаги группы (`MOGP`): 0x2000 — внутренняя, 0x8 — наружная.
+    #[allow(dead_code)]
     pub flags: u32,
     pub verts: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -39,6 +41,8 @@ pub struct Group {
     pub tri_mat: Vec<u8>,
     /// Вода (`MLIQ`): угол, шаг 4,1667 ярда, высоты узлов, видимые клетки.
     pub liquid: Option<Liquid>,
+    /// Вид жидкости группы (`MOGP.groupLiquid`): номер из LiquidType.dbc или старый код.
+    pub group_liquid: u32,
 }
 
 pub struct Liquid {
@@ -47,6 +51,37 @@ pub struct Liquid {
     pub tiles: [usize; 2],
     pub heights: Vec<f32>,
     pub shown: Vec<bool>,
+    /// Младшие биты флагов первой видимой клетки — старый код вида жидкости.
+    pub tile_kind: u8,
+}
+
+/// Что за жидкость: вода, лава или слизь — рисуются разным цветом.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiquidKind {
+    Water,
+    Magma,
+    Slime,
+}
+
+/// Вид жидкости группы. Корень с флагом 0x4 (`MOHD`) пишет номер LiquidType.dbc: 1–12 —
+/// вода, океан, магма, слизь по кругу (обычные, медленные, быстрые), 15, 19, 121, 141 —
+/// магма, 20, 21, 181 — слизь, прочие — вода. Без флага — по флагам клеток: & 3 — 0 вода,
+/// 1 океан, 2 магма, 3 слизь (Огненная пропасть — 2, Стенающие пещеры — 4).
+pub fn liquid_kind(root_flags: u16, group_liquid: u32, tile_kind: u8) -> LiquidKind {
+    let basic = |n: u32| match n & 3 {
+        2 => LiquidKind::Magma,
+        3 => LiquidKind::Slime,
+        _ => LiquidKind::Water,
+    };
+    if root_flags & 0x4 == 0 {
+        return basic(tile_kind as u32);
+    }
+    match group_liquid {
+        n @ 1..=12 => basic(n - 1),
+        15 | 19 | 121 | 141 => LiquidKind::Magma,
+        20 | 21 | 181 => LiquidKind::Slime,
+        _ => LiquidKind::Water,
+    }
 }
 
 pub const LIQUID_STEP: f32 = 4.166_666_5;
@@ -64,6 +99,8 @@ impl Group {
 }
 
 pub struct Wmo {
+    /// Флаги корня (`MOHD`): 0x4 — вид жидкости групп — номер LiquidType.dbc.
+    pub flags: u16,
     pub materials: Vec<Material>,
     pub doodads: Vec<Doodad>,
     pub sets: Vec<DoodadSet>,
@@ -104,6 +141,7 @@ pub fn parse_root(b: &[u8]) -> Result<Wmo, String> {
     let c = chunks(b);
     let mohd = find(&c, b"MOHD").ok_or("WMO: нет MOHD (это файл группы, а не корень?)")?;
     let group_count = u32_at(mohd, 4) as usize;
+    let flags = mohd.get(60..62).map_or(0, |f| u16::from_le_bytes([f[0], f[1]]));
     let motx = find(&c, b"MOTX").unwrap_or_default();
     let materials = find(&c, b"MOMT")
         .unwrap_or_default()
@@ -126,7 +164,7 @@ pub fn parse_root(b: &[u8]) -> Result<Wmo, String> {
         .chunks_exact(32)
         .map(|s| DoodadSet { name: name_at(&s[..20], 0), first: u32_at(s, 20) as usize, count: u32_at(s, 24) as usize })
         .collect();
-    Ok(Wmo { materials, doodads, sets, group_count })
+    Ok(Wmo { flags, materials, doodads, sets, group_count })
 }
 
 pub fn parse_group(b: &[u8]) -> Result<Group, String> {
@@ -136,6 +174,7 @@ pub fn parse_group(b: &[u8]) -> Result<Group, String> {
         return Err("WMO: короткий MOGP".into());
     }
     let flags = u32_at(mogp, 8);
+    let group_liquid = u32_at(mogp, 0x34);
     let s = chunks(&mogp[0x44..]);
     let verts: Vec<[f32; 3]> = find(&s, b"MOVT").unwrap_or_default().chunks_exact(12).map(|v| [f32_at(v, 0), f32_at(v, 4), f32_at(v, 8)]).collect();
     let normals = find(&s, b"MONR").unwrap_or_default().chunks_exact(12).map(|v| [f32_at(v, 0), f32_at(v, 4), f32_at(v, 8)]).collect();
@@ -158,10 +197,11 @@ pub fn parse_group(b: &[u8]) -> Result<Group, String> {
         let heights: Vec<f32> = (0..nv).map(|i| l.get(30 + i * 8 + 4..30 + i * 8 + 8).map_or(corner[2], |h| f32::from_le_bytes(h.try_into().unwrap()))).collect();
         let tile_at = 30 + nv * 8;
         // Клетка с 0x0F в младших битах (тип 15) — пустая.
-        let shown = (0..tiles[0] * tiles[1]).map(|i| l.get(tile_at + i).is_some_and(|f| f & 0x0F != 0x0F)).collect();
-        Some(Liquid { corner, verts, tiles, heights, shown })
+        let shown: Vec<bool> = (0..tiles[0] * tiles[1]).map(|i| l.get(tile_at + i).is_some_and(|f| f & 0x0F != 0x0F)).collect();
+        let tile_kind = shown.iter().position(|&s| s).and_then(|i| l.get(tile_at + i)).map_or(0, |f| f & 0x0F);
+        Some(Liquid { corner, verts, tiles, heights, shown, tile_kind })
     });
-    Ok(Group { flags, verts, normals, uvs, colors, tris, tri_flags, tri_mat, liquid })
+    Ok(Group { flags, verts, normals, uvs, colors, tris, tri_flags, tri_mat, liquid, group_liquid })
 }
 
 /// Поворот предмета вокруг вертикали (рыскание) из кватерниона, в радианах.
@@ -193,6 +233,21 @@ mod tests {
         assert!(!is_root("World\\wmo\\Dungeon\\SM\\Monestary_Cathedral_012.wmo"));
         assert!(is_root("World\\wmo\\A\\Gate_02.wmo"));
         assert_eq!(group_path("A\\B.wmo", 7), "A\\B_007.wmo");
+    }
+
+    #[test]
+    fn liquid_kinds_from_dbc_ids_and_tile_flags() {
+        // Номер LiquidType.dbc (флаг корня 0x4): Чёрная гора — 7 (медленная магма),
+        // Подгород — 4 (слизь), Стальгорн — 3 (магма), 13 — вода WMO, 20 — слизь WMO.
+        assert_eq!(liquid_kind(0x5, 7, 0), LiquidKind::Magma);
+        assert_eq!(liquid_kind(0x5, 4, 0), LiquidKind::Slime);
+        assert_eq!(liquid_kind(0x5, 3, 0), LiquidKind::Magma);
+        assert_eq!(liquid_kind(0x4, 13, 0), LiquidKind::Water);
+        assert_eq!(liquid_kind(0x4, 20, 0), LiquidKind::Slime);
+        // Без флага — по клеткам: Огненная пропасть (15, клетка 2) — лава, Стенающие
+        // пещеры (15, клетка 4) — вода.
+        assert_eq!(liquid_kind(0, 15, 2), LiquidKind::Magma);
+        assert_eq!(liquid_kind(0, 15, 4), LiquidKind::Water);
     }
 
     #[test]

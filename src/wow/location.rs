@@ -50,6 +50,8 @@ pub struct Scene {
     /// Наборы предметов здания и какие взяты.
     pub sets: Vec<String>,
     pub sets_used: Vec<String>,
+    /// Флаги корня (`MOHD`): как читать вид жидкости групп.
+    pub root_flags: u16,
 }
 
 pub fn load(client: &Client, path: &str, set: Option<&str>) -> Result<Scene, String> {
@@ -105,7 +107,7 @@ pub fn load(client: &Client, path: &str, set: Option<&str>) -> Result<Scene, Str
     let sets_used = chosen.iter().map(|&i| root.sets[i].name.clone()).collect();
     let doodads = root.doodads.into_iter().enumerate().filter(|(i, _)| ranges.iter().any(|r| r.contains(i))).map(|(_, d)| d).collect();
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(".wmo").trim_end_matches(".WMO").to_owned();
-    Ok(Scene { name, groups, materials: root.materials, textures, mat_tex, doodads, lo, hi, missing, sets, sets_used })
+    Ok(Scene { name, groups, materials: root.materials, textures, mat_tex, doodads, lo, hi, missing, sets, sets_used, root_flags: root.flags })
 }
 
 fn tri_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> ([f32; 3], f32) {
@@ -126,7 +128,8 @@ impl Scene {
 /// Проходимые поверхности по сетке 0,5 ярда: в каждой клетке — высоты всех полов над ней
 /// (под балконом — пол и балкон). `walk` — до этой поверхности можно дойти пешком от главной
 /// части здания: соседние клетки, перепад не больше ступеньки. Кровля галерей, капители,
-/// верхушки стен смотрят вверх, но с пола на них не попасть — это не пол.
+/// верхушки стен смотрят вверх, но с пола на них не попасть — это не пол. Отдельный кусок
+/// над другим полом, над которым ничего нет (скаты крыши), — тоже не пол, даже большой.
 pub struct Surfaces {
     pub x0: f32,
     pub y0: f32,
@@ -136,6 +139,8 @@ pub struct Surfaces {
     /// Начало высот клетки в `z` (длина w·h + 1).
     start: Vec<usize>,
     z: Vec<f32>,
+    /// Поверхность наклонная (круче 25°): скат крыши, склон, пандус.
+    steep: Vec<bool>,
     walk: Vec<bool>,
 }
 
@@ -155,25 +160,27 @@ impl Surfaces {
         let (x0, y0) = (scene.lo[0] - 2.0, scene.lo[1] - 2.0);
         let w = ((scene.hi[0] + 2.0 - x0) / step).ceil() as usize + 1;
         let h = ((scene.hi[1] + 2.0 - y0) / step).ceil() as usize + 1;
-        let mut cells: Vec<Vec<f32>> = vec![Vec::new(); w * h];
-        // У дома есть внутренние группы — полы только из них: скаты крыши снаружи пологие и
-        // большие, а по ним не ходят. У подземелья все группы внутренние.
-        let indoor = scene.groups.iter().any(|g| g.flags & 0x2000 != 0);
+        let mut cells: Vec<Vec<(f32, bool)>> = vec![Vec::new(); w * h];
+        // Самое высокое, что есть над клеткой: под потолком пол «накрыт», крыша — нет.
+        let mut top = vec![f32::MIN; w * h];
         for g in 0..scene.groups.len() {
-            if indoor && scene.groups[g].flags & 0x2000 == 0 {
-                continue;
-            }
             for t in 0..scene.groups[g].tris.len() {
-                if !passable(scene, g, t) {
+                let gr = &scene.groups[g];
+                if !gr.collides(t) && !gr.renders(t) {
                     continue;
                 }
+                let floor = passable(scene, g, t);
                 let p = scene.tri(g, t);
+                let steep = tri_normal(p[0], p[1], p[2]).0[2] < 0.9;
                 // Треугольник в клетках сетки: по центрам клеток, мелкий — хотя бы клетку середины.
                 let q = p.map(|v| [(v[0] - x0) / step, (v[1] - y0) / step, v[2]]);
                 let mid = [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0, (q[0][2] + q[1][2] + q[2][2]) / 3.0];
                 let mut put = |i: usize, j: usize, v: f32| {
                     if i < w && j < h {
-                        cells[j * w + i].push(v);
+                        top[j * w + i] = top[j * w + i].max(v);
+                        if floor {
+                            cells[j * w + i].push((v, steep));
+                        }
                     }
                 };
                 let area = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[1][1] - q[0][1]) * (q[2][0] - q[0][0]);
@@ -205,20 +212,36 @@ impl Surfaces {
             }
         }
         let mut start = Vec::with_capacity(w * h + 1);
-        let mut z = Vec::new();
+        let (mut z, mut steep) = (Vec::new(), Vec::new());
         for c in &mut cells {
-            c.sort_by(f32::total_cmp);
+            c.sort_by(|a, b| a.0.total_cmp(&b.0));
             start.push(z.len());
-            for &v in c.iter() {
+            for &(v, st) in c.iter() {
                 if z.len() == *start.last().unwrap() || v - *z.last().unwrap() > 0.3 {
                     z.push(v);
+                    steep.push(st);
+                } else if !st {
+                    // Ровное в той же высоте (площадка у ската) — не скат.
+                    *steep.last_mut().unwrap() = false;
                 }
             }
         }
         start.push(z.len());
-        let mut s = Self { x0, y0, step, w, h, start, walk: vec![false; z.len()], z };
-        s.find_network();
+        let mut s = Self { x0, y0, step, w, h, start, walk: vec![false; z.len()], z, steep };
+        s.find_network(&top);
         s
+    }
+
+    /// Границы проходимого пола в ярдах: `[x0, y0, x1, y1]`; пола нет — `None`.
+    pub fn walk_bounds(&self) -> Option<[f32; 4]> {
+        let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for k in 0..self.w * self.h {
+            if self.cell(k).any(|a| self.walk[a]) {
+                let (x, y) = (self.x0 + (k % self.w) as f32 * self.step, self.y0 + (k / self.w) as f32 * self.step);
+                b = [b[0].min(x), b[1].min(y), b[2].max(x + self.step), b[3].max(y + self.step)];
+            }
+        }
+        (b[0] <= b[2]).then_some(b)
     }
 
     fn cell(&self, k: usize) -> std::ops::Range<usize> {
@@ -226,14 +249,19 @@ impl Surfaces {
     }
 
     /// Связные куски поверхностей; проходимые — самый большой и те, что не меньше его четверти
-    /// (крыло, куда ведёт дверь с порогом выше ступеньки).
-    fn find_network(&mut self) {
+    /// (крыло, куда ведёт дверь с порогом выше ступеньки). Над другим полом и открыто небу
+    /// (`top` — самое высокое над клеткой): наклонное — скат крыши или склон над домом, не пол
+    /// даже рядом с полом; кусок, который так лежит больше чем наполовину, — крыша: он не
+    /// проходим и не главный.
+    fn find_network(&mut self, top: &[f32]) {
         let n = self.z.len();
         let mut comp = vec![usize::MAX; n];
         let mut sizes = Vec::new();
         let cell_of: Vec<usize> = (0..self.w * self.h).flat_map(|k| self.cell(k).map(move |_| k)).collect();
+        let open_over = |a: usize| top[cell_of[a]] <= self.z[a] + 2.0 && self.cell(cell_of[a]).any(|b| self.z[b] < self.z[a] - 2.0);
+        let skip: Vec<bool> = (0..n).map(|a| self.steep[a] && open_over(a)).collect();
         for s0 in 0..n {
-            if comp[s0] != usize::MAX {
+            if comp[s0] != usize::MAX || skip[s0] {
                 continue;
             }
             let id = sizes.len();
@@ -250,7 +278,7 @@ impl Surfaces {
                         continue;
                     }
                     for b in self.cell(nj as usize * self.w + ni as usize) {
-                        if comp[b] == usize::MAX && (self.z[b] - self.z[a]).abs() <= STEP_UP {
+                        if comp[b] == usize::MAX && !skip[b] && (self.z[b] - self.z[a]).abs() <= STEP_UP {
                             comp[b] = id;
                             stack.push(b);
                         }
@@ -259,9 +287,17 @@ impl Surfaces {
             }
             sizes.push(size);
         }
-        let big = sizes.iter().copied().max().unwrap_or(0);
-        for a in 0..n {
-            self.walk[a] = comp[a] != usize::MAX && sizes[comp[a]] * 4 >= big;
+        // Крыши: открыто небу и под ним другой пол.
+        let mut over = vec![0usize; sizes.len()];
+        for (a, &c) in comp.iter().enumerate() {
+            if c != usize::MAX && open_over(a) {
+                over[c] += 1;
+            }
+        }
+        let roof: Vec<bool> = (0..sizes.len()).map(|c| over[c] * 2 > sizes[c]).collect();
+        let big = (0..sizes.len()).filter(|&c| !roof[c]).map(|c| sizes[c]).max().or_else(|| sizes.iter().copied().max()).unwrap_or(0);
+        for (w, &c) in self.walk.iter_mut().zip(&comp) {
+            *w = c != usize::MAX && !roof[c] && sizes[c] * 4 >= big;
         }
     }
 }
@@ -362,6 +398,13 @@ impl FloorMap {
         }
         let z = self.z[j as usize * self.w + i as usize];
         z.is_finite().then_some(z)
+    }
+
+    /// Есть ли пол хоть где-то в прямоугольнике (ярды).
+    pub fn any_in(&self, xa: f32, xb: f32, ya: f32, yb: f32) -> bool {
+        let ci = |v: f32, o: f32, n: usize| (((v - o) / self.step).floor().max(0.0) as usize).min(n.saturating_sub(1));
+        let (i0, i1, j0, j1) = (ci(xa, self.x0, self.w), ci(xb, self.x0, self.w), ci(ya, self.y0, self.h), ci(yb, self.y0, self.h));
+        (j0..=j1).any(|j| (i0..=i1).any(|i| self.z[j * self.w + i].is_finite()))
     }
 
     /// Пустые клетки рядом с полом — высотой ближайшего пола (волной по соседям), до `reach` ярдов.
@@ -475,6 +518,9 @@ fn render_tile(scene: &Scene, bins: &Bins, floor: &FloorMap, frame: Frame, rect:
     let corners = [frame.to_world(rect[0], rect[1]), frame.to_world(rect[2], rect[3])];
     let (xa, xb) = (corners[1][0].min(corners[0][0]), corners[1][0].max(corners[0][0]));
     let (ya, yb) = (corners[1][1].min(corners[0][1]), corners[1][1].max(corners[0][1]));
+    if !floor.any_in(xa, xb, ya, yb) {
+        return None;
+    }
     let list = bins.in_rect(xa, xb, ya, yb);
     if list.is_empty() {
         return None;
@@ -563,10 +609,15 @@ fn render_tile(scene: &Scene, bins: &Bins, floor: &FloorMap, frame: Frame, rect:
             }
         }
     }
-    // Вода групп (`MLIQ`): полупрозрачная гладь поверх дна, ниже среза.
-    const WATER: [f32; 3] = [0.16, 0.31, 0.40];
+    // Жидкость групп (`MLIQ`): полупрозрачная гладь поверх дна, ниже среза; только там, где
+    // дно нарисовано — клетки воды квадратные и выходят за стены пещеры.
     for gr in &scene.groups {
         let Some(l) = &gr.liquid else { continue };
+        let (tint, alpha) = match wmo::liquid_kind(scene.root_flags, gr.group_liquid, l.tile_kind) {
+            wmo::LiquidKind::Water => ([0.16, 0.31, 0.40], 0.72),
+            wmo::LiquidKind::Magma => ([0.95, 0.38, 0.08], 0.85),
+            wmo::LiquidKind::Slime => ([0.32, 0.62, 0.16], 0.78),
+        };
         let st = wmo::LIQUID_STEP;
         for ty in 0..l.tiles[1] {
             for tx in 0..l.tiles[0] {
@@ -601,12 +652,11 @@ fn render_tile(scene: &Scene, bins: &Bins, floor: &FloorMap, frame: Frame, rect:
                             let i = (y * bw + x) as usize;
                             let z = w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2];
                             let Some((lo, hi)) = window(w0 * p[0][0] + w1 * p[1][0] + w2 * p[2][0], w0 * p[0][1] + w1 * p[1][1] + w2 * p[2][1]) else { continue };
-                            if z > hi || z < lo || z + 0.05 < depth[i] {
+                            let d = color[i];
+                            if z > hi || z < lo || z + 0.05 < depth[i] || d[3] <= 0.0 {
                                 continue;
                             }
-                            let d = color[i];
-                            let a = if d[3] > 0.0 { 0.72 } else { 1.0 };
-                            color[i] = [WATER[0] * a + d[0] * (1.0 - a), WATER[1] * a + d[1] * (1.0 - a), WATER[2] * a + d[2] * (1.0 - a), 1.0];
+                            color[i] = [tint[0] * alpha + d[0] * (1.0 - alpha), tint[1] * alpha + d[1] * (1.0 - alpha), tint[2] * alpha + d[2] * (1.0 - alpha), 1.0];
                             depth[i] = z;
                             any = true;
                         }
@@ -769,8 +819,15 @@ pub struct Built {
 pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt: &Options) -> Result<Built, String> {
     let scene = load(client, path, opt.set.as_deref())?;
     let mut notes: Vec<String> = scene.missing.iter().take(5).cloned().collect();
-    let frame = Frame { hi_x: scene.hi[0], hi_y: scene.hi[1], cpy: opt.cells_per_yard, margin: opt.margin };
-    let (wc, hc) = (((scene.hi[1] - scene.lo[1]) * opt.cells_per_yard + 2.0 * opt.margin).ceil(), ((scene.hi[0] - scene.lo[0]) * opt.cells_per_yard + 2.0 * opt.margin).ceil());
+    let surf = Surfaces::new(&scene);
+    let floors = level_floors(&scene, &surf);
+    // Рамка — по проходимому полу с запасом: скалы снаружи и дальние куски карту не раздувают.
+    const PAD: f32 = 4.0;
+    let b = surf.walk_bounds().ok_or("в здании нет пола, по которому можно ходить")?;
+    let (lo_x, lo_y) = ((b[0] - PAD).max(scene.lo[0]), (b[1] - PAD).max(scene.lo[1]));
+    let (hi_x, hi_y) = ((b[2] + PAD).min(scene.hi[0]), (b[3] + PAD).min(scene.hi[1]));
+    let frame = Frame { hi_x, hi_y, cpy: opt.cells_per_yard, margin: opt.margin };
+    let (wc, hc) = (((hi_y - lo_y) * opt.cells_per_yard + 2.0 * opt.margin).ceil(), ((hi_x - lo_x) * opt.cells_per_yard + 2.0 * opt.margin).ceil());
     if wc > crate::map::MAX_SIDE as f32 || hc > crate::map::MAX_SIDE as f32 {
         return Err(format!("здание {wc}×{hc} клеток — больше {} по стороне", crate::map::MAX_SIDE));
     }
@@ -778,76 +835,136 @@ pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt:
     if ppc < opt.ppc {
         notes.push(format!("пол реже: {ppc} точек на клетку (здание {wc}×{hc} клеток)"));
     }
-    let surf = Surfaces::new(&scene);
-    let floors = level_floors(&scene, &surf);
     let bins = Bins::new(&scene);
     let dir = out_tiles.join(super::words_name(&scene.name));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    // Предметы: каждая модель — один раз на полку.
-    let mut sprites: HashMap<String, Option<super::Imported>> = HashMap::new();
-    let sprite_opt = super::render::Options::default();
-    let mut maps: Vec<Map> = Vec::new();
-    let (mut tiles, mut wall_count, mut objects) = (0, 0, 0);
-    let base = Map::new(wc as u32, hc as u32);
-    for (lv, floor) in floors.iter().enumerate() {
-        let mut m = if lv == 0 { base.clone() } else { base.new_level() };
-        // Пол кусками: предметы на слое пола, без тени.
-        let step = opt.tile as f32;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+
+    // Пол кусками, в несколько потоков: каждый берёт следующий кусок из общего списка.
+    let step = opt.tile as f32;
+    let mut jobs: Vec<(usize, usize, usize, [f32; 4])> = Vec::new();
+    for lv in 0..floors.len() {
         let (mut v, mut tj) = (0.0f32, 0);
         while v < hc {
             let (mut u, mut ti) = (0.0f32, 0);
             while u < wc {
-                let rect = [u, v, (u + step).min(wc), (v + step).min(hc)];
-                let low = (lv > 0).then_some(1.0);
-                if let Some(img) = render_tile(&scene, &bins, floor, frame, rect, ppc, opt, low) {
-                    let file = dir.join(format!("Floor_L{lv}_{tj:02}_{ti:02}.webp"));
-                    let enc = webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(90.0);
-                    std::fs::write(&file, &*enc).map_err(|e| format!("{}: {e}", file.display()))?;
-                    m.props.push(Prop {
-                        asset: file.to_string_lossy().into_owned(),
-                        pos: [(rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0],
-                        size: [rect[2] - rect[0], rect[3] - rect[1]],
-                        rot: 0.0,
-                        scale: 1.0,
-                        shadow: Some(false),
-                        light: None,
-                        canopy: None,
-                        layer: Some(100),
-                        tint: None,
-                        open: None,
-                        glow: None,
-                        sunk: None,
-                        flip: false,
-                    });
-                    tiles += 1;
-                }
+                jobs.push((lv, tj, ti, [u, v, (u + step).min(wc), (v + step).min(hc)]));
                 u += step;
                 ti += 1;
             }
             v += step;
             tj += 1;
         }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Result<Vec<(usize, PathBuf)>, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads.min(jobs.len().max(1)))
+            .map(|_| {
+                s.spawn(|| -> Result<Vec<(usize, PathBuf)>, String> {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(lv, tj, ti, rect)) = jobs.get(i) else { break };
+                        let low = (lv > 0).then_some(1.0);
+                        if let Some(img) = render_tile(&scene, &bins, &floors[lv], frame, rect, ppc, opt, low) {
+                            let file = dir.join(format!("Floor_L{lv}_{tj:02}_{ti:02}.webp"));
+                            let enc = webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(90.0);
+                            std::fs::write(&file, &*enc).map_err(|e| format!("{}: {e}", file.display()))?;
+                            out.push((i, file));
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("сбой при снимке пола".into()))).collect()
+    });
+    let mut pieces: Vec<(usize, PathBuf)> = Vec::new();
+    for r in done {
+        pieces.extend(r?);
+    }
+    pieces.sort_by_key(|(i, _)| *i);
+    let base = Map::new(wc as u32, hc as u32);
+    let mut maps: Vec<Map> = (0..floors.len()).map(|lv| if lv == 0 { base.clone() } else { base.new_level() }).collect();
+    let tiles = pieces.len();
+    for (i, file) in pieces {
+        let (lv, _, _, rect) = jobs[i];
+        // Предмет на слое пола, без тени.
+        maps[lv].props.push(Prop {
+            asset: file.to_string_lossy().into_owned(),
+            pos: [(rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0],
+            size: [rect[2] - rect[0], rect[3] - rect[1]],
+            rot: 0.0,
+            scale: 1.0,
+            shadow: Some(false),
+            light: None,
+            canopy: None,
+            layer: Some(100),
+            tint: None,
+            open: None,
+            glow: None,
+            sunk: None,
+            flip: false,
+        });
+    }
+    let mut wall_count = 0;
+    for (lv, floor) in floors.iter().enumerate() {
         for line in walls(&scene, floor, frame, opt) {
-            m.walls.push(Wall { points: line, closed: false, bends: Vec::new(), low: false, style: None });
+            maps[lv].walls.push(Wall { points: line, closed: false, bends: Vec::new(), low: false, style: None });
             wall_count += 1;
         }
-        m.wall_style = WallStyle { paint: Paint::Color([38, 34, 30]), width: 0.12 };
-        maps.push(m);
+        maps[lv].wall_style = WallStyle { paint: Paint::Color([38, 34, 30]), width: 0.12 };
     }
-    // Предметы — на этаж, где их пол; висящие выше среза (люстры у потолка) — нет.
-    for d in &scene.doodads {
-        // Этаж — тот, над чьим полом предмет стоит не выше среза (сверху вниз).
-        let Some(lv) = (0..floors.len()).rev().find(|&lv| floors[lv].at(d.pos[0], d.pos[1]).is_some_and(|f| d.pos[2] >= f - 0.3 && d.pos[2] <= f + opt.cut + 0.5)) else { continue };
-        let model = super::m2::m2_path(&d.model);
-        let entry = sprites.entry(model.to_lowercase()).or_insert_with(|| match super::import(client, &model, out_wow, &sprite_opt) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                notes.push(format!("{model}: {e}"));
-                None
+
+    // Предметы — на этаж, над чьим полом стоят не ниже пола и не выше среза (люстры у потолка —
+    // нет), сверху вниз; за краем карты — нет.
+    let placed: Vec<(usize, &wmo::Doodad, String)> = scene
+        .doodads
+        .iter()
+        .filter_map(|d| {
+            let lv = (0..floors.len()).rev().find(|&lv| floors[lv].at(d.pos[0], d.pos[1]).is_some_and(|f| d.pos[2] >= f - 0.3 && d.pos[2] <= f + opt.cut + 0.5))?;
+            let p = frame.to_map(d.pos[0], d.pos[1]);
+            (p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= wc && p[1] <= hc).then(|| (lv, d, client.spelled(&super::m2::m2_path(&d.model))))
+        })
+        .collect();
+    // Каждая модель — один раз на полку, в несколько потоков.
+    let mut models: Vec<&str> = placed.iter().map(|(_, _, m)| m.as_str()).collect();
+    models.sort_unstable_by_key(|m| m.to_lowercase());
+    models.dedup_by_key(|m| m.to_lowercase());
+    let sprite_opt = super::render::Options::default();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let imported: Vec<(String, Result<super::Imported, String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads.min(models.len().max(1)))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&m) = models.get(i) else { break };
+                        out.push((m.to_lowercase(), super::import(client, m, out_wow, &sprite_opt)));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
+    let mut sprites: HashMap<String, super::Imported> = HashMap::new();
+    let mut failed: Vec<String> = Vec::new();
+    for (key, r) in imported {
+        match r {
+            Ok(sp) => {
+                sprites.insert(key, sp);
             }
-        });
-        let Some(sp) = entry else { continue };
+            Err(e) => failed.push(format!("{}: {e}", models.iter().find(|m| m.to_lowercase() == key).unwrap_or(&key.as_str()))),
+        }
+    }
+    failed.sort();
+    notes.extend(failed);
+    let mut objects = 0;
+    for (lv, d, model) in placed {
+        let Some(sp) = sprites.get(&model.to_lowercase()) else { continue };
         let rot_deg = (180.0 - wmo::yaw(d.rot).to_degrees()).rem_euclid(360.0);
         let (s, c) = rot_deg.to_radians().sin_cos();
         let o = [sp.origin[0] * d.scale, sp.origin[1] * d.scale];
@@ -914,6 +1031,86 @@ mod tests {
         assert_eq!(lines[0].len(), 5, "{:?}", lines[0]);
     }
 
+    /// Сцена из прямоугольников-столкновений: (x0, y0, x1, y1, z у x0, z у x1).
+    fn scene_of(quads: &[[f32; 6]]) -> Scene {
+        let mut verts = Vec::new();
+        let mut tris = Vec::new();
+        for q in quads {
+            let b = verts.len() as u32;
+            verts.extend([[q[0], q[1], q[4]], [q[2], q[1], q[5]], [q[2], q[3], q[5]], [q[0], q[3], q[4]]]);
+            tris.extend([[b, b + 1, b + 2], [b, b + 2, b + 3]]);
+        }
+        let n = tris.len();
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &verts {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+        let group = Group { flags: 0, verts, normals: Vec::new(), uvs: Vec::new(), colors: None, tris, tri_flags: vec![0x08; n], tri_mat: vec![0xFF; n], liquid: None, group_liquid: 0 };
+        Scene { name: "t".into(), groups: vec![group], materials: Vec::new(), textures: Vec::new(), mat_tex: Vec::new(), doodads: Vec::new(), lo, hi, missing: Vec::new(), sets: Vec::new(), sets_used: Vec::new(), root_flags: 0 }
+    }
+
+    #[test]
+    fn roofs_over_floors_are_not_levels_but_open_slopes_are_floor() {
+        // Дом 10×10 с полом на 0 и двускатной крышей 3 → 6 → 3 (31°); к свесу крыши примыкает
+        // большая открытая площадка на 3 (скат с ней связан шагом); к дому ведёт открытый
+        // склон 0 → 3 без пола под ним (вход в пещеру) и площадка на 3 за ним.
+        let s = scene_of(&[
+            [0.0, 0.0, 10.0, 10.0, 0.0, 0.0],
+            [-1.0, -1.0, 5.0, 11.0, 3.0, 6.0],
+            [5.0, -1.0, 11.0, 11.0, 6.0, 3.0],
+            [-16.0, 0.0, -1.0, 10.0, 3.0, 3.0],
+            [-10.0, 20.0, 0.0, 26.0, 0.0, 3.0],
+            [0.0, 20.0, 10.0, 26.0, 3.0, 3.0],
+        ]);
+        let surf = Surfaces::new(&s);
+        let walk_at = |x: f32, y: f32, z: f32| {
+            let k = ((y - surf.y0) / surf.step) as usize * surf.w + ((x - surf.x0) / surf.step) as usize;
+            surf.cell(k).any(|a| surf.walk[a] && (surf.z[a] - z).abs() < 0.5)
+        };
+        assert!(walk_at(2.0, 5.0, 0.0), "пол дома");
+        assert!(!walk_at(2.0, 5.0, 4.2), "скат крыши — не пол");
+        assert!(!walk_at(8.0, 5.0, 4.2), "и другой скат");
+        assert!(walk_at(-8.0, 5.0, 3.0), "площадка у свеса — пол");
+        assert!(walk_at(-5.0, 23.0, 1.5), "открытый склон без пола под ним — пол");
+        assert_eq!(level_floors(&s, &surf).len(), 1);
+    }
+
+    #[test]
+    fn water_is_drawn_only_over_drawn_ground_and_lava_is_not_blue() {
+        // Дно 10×10 на 0, над ним и далеко за ним — жидкость на 0,5 (клетки по 4,17 ярда).
+        let mut s = scene_of(&[[0.0, 0.0, 10.0, 10.0, 0.0, 0.0]]);
+        s.groups[0].tri_mat = vec![0; 2];
+        s.materials = vec![wmo::Material { flags: 0, blend: 0, texture: String::new() }];
+        s.mat_tex = vec![None];
+        let (tiles, step) = ([6usize, 6usize], wmo::LIQUID_STEP);
+        let liquid = |kind: u8| wmo::Liquid { corner: [-6.0, -6.0, 0.5], verts: [7, 7], tiles, heights: vec![0.5; 49], shown: vec![true; 36], tile_kind: kind };
+        s.groups[0].liquid = Some(liquid(0));
+        let surf = Surfaces::new(&s);
+        let floors = level_floors(&s, &surf);
+        let bins = Bins::new(&s);
+        let opt = Options { supersample: 1, ..Default::default() };
+        let frame = Frame { hi_x: 10.0 + step, hi_y: 10.0 + step, cpy: 0.6, margin: 0.0 };
+        let rect = [0.0, 0.0, 12.0, 12.0];
+        let img = render_tile(&s, &bins, &floors[0], frame, rect, 8.0, &opt, None).unwrap();
+        // Клетка карты над дном — вода; рядом, где дна нет (но клетка воды есть), — пусто.
+        let at = |x: f32, y: f32| {
+            let [u, v] = frame.to_map(x, y);
+            *img.get_pixel((u * 8.0) as u32, (v * 8.0) as u32)
+        };
+        let water = at(5.0, 5.0);
+        assert!(water[3] == 255 && water[2] > water[0], "вода над дном: {water:?}");
+        assert_eq!(at(12.0, 5.0)[3], 0, "за дном воды нет");
+        // Та же жидкость лавой (клетка 2 без флага корня) — не синяя.
+        s.groups[0].liquid = Some(liquid(2));
+        let img = render_tile(&s, &bins, &floors[0], frame, rect, 8.0, &opt, None).unwrap();
+        let [u, v] = frame.to_map(5.0, 5.0);
+        let lava = img.get_pixel((u * 8.0) as u32, (v * 8.0) as u32);
+        assert!(lava[0] > lava[2] + 80, "лава: {lava:?}");
+    }
+
     #[test]
     fn frame_north_is_up_and_round_trips() {
         let f = Frame { hi_x: 100.0, hi_y: 50.0, cpy: 0.6, margin: 2.0 };
@@ -966,5 +1163,82 @@ mod tests {
             built.map.width, built.map.height, built.levels, built.tiles, built.walls, built.objects, built.ppc, t.elapsed(), built.notes
         );
         std::fs::write(out.join(format!("{}.karta", scene.name)), built.map.to_json()).unwrap();
+    }
+
+    /// Материалы и жидкости здания: `WOW_CLIENT=… WMO=… cargo test wow_wmo_materials -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn wow_wmo_materials() {
+        let (Ok(dir), Ok(path)) = (std::env::var("WOW_CLIENT"), std::env::var("WMO")) else { return };
+        let client = Client::open(Path::new(&dir)).unwrap();
+        let root = wmo::parse_root(&client.read(&path).unwrap()).unwrap();
+        println!("флаги корня {:#x}", root.flags);
+        for (i, m) in root.materials.iter().enumerate() {
+            println!("материал {i}: смешение {}, флаги {:#x}, {}", m.blend, m.flags, m.texture);
+        }
+        let scene = load(&client, &path, None).unwrap();
+        for (g, gr) in scene.groups.iter().enumerate() {
+            let mut used: Vec<u8> = gr.tri_mat.iter().copied().filter(|&m| m != 0xFF).collect();
+            used.sort_unstable();
+            used.dedup();
+            let liq = gr.liquid.as_ref().map(|l| (l.tile_kind, l.tiles));
+            println!("группа {g}: флаги {:#x}, жидкость {} {:?}, материалы {:?}", gr.flags, gr.group_liquid, liq, used);
+        }
+    }
+
+    /// Прогон по многим зданиям: `WOW_CLIENT=… WOW_OUT=… WMO_LIST=файл cargo test wow_location_sweep
+    /// -- --ignored --nocapture`. В файле — пути корней WMO по строке; без `WMO_LIST` — список всех
+    /// корней клиента (`roots.tsv`: путь, групп, предметов). Итог — `sweep.jsonl` и `.karta` каждого.
+    #[test]
+    #[ignore]
+    fn wow_location_sweep() {
+        let (Ok(dir), Ok(out)) = (std::env::var("WOW_CLIENT"), std::env::var("WOW_OUT")) else { return };
+        let out = Path::new(&out);
+        std::fs::create_dir_all(out).unwrap();
+        let client = Client::open(Path::new(&dir)).unwrap();
+        let Ok(list) = std::env::var("WMO_LIST") else {
+            let mut rows = Vec::new();
+            for p in client.list("wmo").into_iter().filter(|p| is_location(p)) {
+                let row = match client.read(p).and_then(|b| wmo::parse_root(&b)) {
+                    Ok(r) => format!("{p}\t{}\t{}", r.group_count, r.doodads.len()),
+                    Err(e) => format!("{p}\t-1\t-1\t{e}"),
+                };
+                rows.push(row);
+            }
+            std::fs::write(out.join("roots.tsv"), rows.join("\n")).unwrap();
+            println!("корней {}", rows.len());
+            return;
+        };
+        let ppc: f32 = std::env::var("PPC").ok().and_then(|v| v.parse().ok()).unwrap_or(24.0);
+        let karta = out.join("karta");
+        std::fs::create_dir_all(&karta).unwrap();
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(out.join("sweep.jsonl")).unwrap();
+        for path in std::fs::read_to_string(&list).unwrap().lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let t = std::time::Instant::now();
+            let total = load(&client, path, None).map(|s| (s.doodads.len(), s.groups.len(), s.groups.iter().filter(|g| g.flags & 0x2000 != 0).count(), s.hi[2] - s.lo[2]));
+            let opt = Options { ppc, ..Default::default() };
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&client, path, &out.join("tiles"), &out.join("wow"), &opt)));
+            let secs = t.elapsed().as_secs_f32();
+            let row = match res {
+                Err(p) => serde_json::json!({"path": path, "panic": p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())), "secs": secs}),
+                Ok(Err(e)) => serde_json::json!({"path": path, "error": e, "secs": secs}),
+                Ok(Ok(b)) => {
+                    let lv: Vec<serde_json::Value> = std::iter::once(&b.map)
+                        .chain(b.map.levels.iter())
+                        .map(|m| {
+                            let tiles: Vec<&Prop> = m.props.iter().filter(|p| p.layer == Some(100)).collect();
+                            serde_json::json!({"tiles": tiles.len(), "tile_cells": tiles.iter().map(|p| p.size[0] * p.size[1]).sum::<f32>(), "walls": m.walls.len(), "wall_len": m.walls.iter().map(|w| w.points.windows(2).map(|s| ((s[1][0] - s[0][0]).powi(2) + (s[1][1] - s[0][1]).powi(2)).sqrt()).sum::<f32>()).sum::<f32>(), "objects": m.props.len() - tiles.len()})
+                        })
+                        .collect();
+                    let name = crate::wow::words_name(path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(".wmo"));
+                    std::fs::write(karta.join(format!("{name}.karta")), b.map.to_json()).unwrap();
+                    let (doodads, groups, indoor, tall) = total.clone().unwrap_or((0, 0, 0, 0.0));
+                    serde_json::json!({"path": path, "name": name, "secs": secs, "size": [b.map.width, b.map.height], "ppc": b.ppc, "levels": lv, "objects": b.objects, "doodads": doodads, "groups": groups, "indoor_groups": indoor, "height": tall, "notes": b.notes, "sets": b.sets, "sets_used": b.sets_used})
+                }
+            };
+            use std::io::Write as _;
+            writeln!(log, "{row}").unwrap();
+            println!("{:.1} с {path}: {}", secs, row.get("error").or(row.get("panic")).map_or_else(|| format!("этажей {}", row["levels"].as_array().map_or(0, Vec::len)), |e| e.to_string()));
+        }
     }
 }

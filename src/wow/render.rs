@@ -59,7 +59,8 @@ pub fn render(model: &Model, textures: &[Option<Rgba>], opt: &Options) -> Result
     for b in &model.batches {
         let mat = model.materials.get(b.material);
         let blend = mat.map_or(0, |m| m.blend);
-        if blend > 2 {
+        // Свечения и наложения не рисуем; невидимые в покое (плоскости эмиттеров) — тоже.
+        if blend > 2 || b.alpha < 0.05 {
             skipped += 1;
             continue;
         }
@@ -83,6 +84,9 @@ pub fn render(model: &Model, textures: &[Option<Rgba>], opt: &Options) -> Result
     // Масштаб: точки на ярд в готовой картинке, с уменьшением для крупного.
     let (span_u, span_v) = (hi[1] - lo[1], hi[0] - lo[0]);
     // Стоит ребром (водопад, вертикальная плоскость): сверху — линия, а не предмет.
+    if span_u.max(span_v) * opt.cells_per_yard < 0.08 {
+        return Err(format!("слишком мелкий: {:.2} × {:.2} клетки", span_u * opt.cells_per_yard, span_v * opt.cells_per_yard));
+    }
     if span_u.min(span_v) * opt.cells_per_yard < 0.05 {
         return Err(format!("сверху видно ребро: {:.2} × {:.2} клетки", span_u * opt.cells_per_yard, span_v * opt.cells_per_yard));
     }

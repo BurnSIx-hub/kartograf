@@ -26,6 +26,9 @@ pub struct Batch {
     pub triangles: Vec<[u32; 3]>,
     pub texture: Option<usize>,
     pub material: usize,
+    /// Непрозрачность в покое: вес текстуры × альфа цвета (первый ключ первой анимации).
+    /// Ноль у служебных плоскостей эмиттеров частиц: в игре их не видно.
+    pub alpha: f32,
 }
 
 pub struct Model {
@@ -68,6 +71,21 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
 
+/// Первое значение дорожки `M2Track<fixed16>` (3.x: 20 байт — интерполяция, глобальная
+/// последовательность, массивы времён и значений по анимациям); ключей нет — `None`.
+fn track_first_fixed16(b: &[u8], at: usize) -> Option<f32> {
+    let (n, ofs) = (u32_at(b.get(at..at + 20)?, 12) as usize, u32_at(b.get(at..at + 20)?, 16) as usize);
+    for k in 0..n.min(64) {
+        let a = b.get(ofs + k * 8..ofs + k * 8 + 8)?;
+        let (cnt, vofs) = (u32_at(a, 0) as usize, u32_at(a, 4) as usize);
+        if cnt > 0 {
+            let v = b.get(vofs..vofs + 2)?;
+            return Some(i16::from_le_bytes([v[0], v[1]]) as f32 / 32767.0);
+        }
+    }
+    None
+}
+
 fn string(b: &[u8], (count, ofs): (usize, usize)) -> String {
     b.get(ofs..ofs + count).map(|s| String::from_utf8_lossy(s).trim_end_matches('\0').to_owned()).unwrap_or_default()
 }
@@ -94,9 +112,9 @@ pub fn parse(b: &[u8], skin: Option<&[u8]>) -> Result<Model, String> {
         r.skip(4);
         None
     };
-    r.skip(8); // цвета
+    let colors = r.arr()?;
     let textures = r.arr()?;
-    r.skip(8); // веса текстур
+    let weights = r.arr()?;
     if version <= 257 {
         r.skip(8);
     }
@@ -105,6 +123,19 @@ pub fn parse(b: &[u8], skin: Option<&[u8]>) -> Result<Model, String> {
     let materials = r.arr()?;
     r.skip(8); // поиск костей
     let tex_lookup = r.arr()?;
+    r.skip(8); // поиск текстурных блоков
+    let weight_lookup = r.arr()?;
+    // Непрозрачность: только у 3.x (у старших дорожки устроены иначе — считаем видимым).
+    let alpha_of = |color: usize, weight_combo: usize| -> f32 {
+        if version < 264 {
+            return 1.0;
+        }
+        let w = slice(b, weight_lookup, 2).ok().and_then(|l| l.get(weight_combo * 2..weight_combo * 2 + 2)).map(|c| u16_at(c, 0) as usize);
+        let w = w.and_then(|i| (i < weights.0).then(|| track_first_fixed16(b, weights.1 + i * 20)).flatten()).unwrap_or(1.0);
+        // Цвет: две дорожки — RGB (20 байт) и альфа (20 байт).
+        let c = (color < colors.0).then(|| track_first_fixed16(b, colors.1 + color * 40 + 20)).flatten().unwrap_or(1.0);
+        w.clamp(0.0, 1.0) * c.clamp(0.0, 1.0)
+    };
 
     let vb = slice(b, verts, 48)?;
     let vertices = vb
@@ -157,7 +188,8 @@ pub fn parse(b: &[u8], skin: Option<&[u8]>) -> Result<Model, String> {
             .filter_map(|t| Some([*index.get(t[0] as usize)?, *index.get(t[1] as usize)?, *index.get(t[2] as usize)?]))
             .collect();
         let texture = tex_lookup.get(tex_combo).map(|&t| t as usize);
-        batches.push(Batch { triangles, texture, material });
+        let alpha = alpha_of(u16_at(bt, 8) as usize, u16_at(bt, 20) as usize);
+        batches.push(Batch { triangles, texture, material, alpha });
     }
     Ok(Model { vertices, textures, materials, batches })
 }
@@ -262,5 +294,30 @@ pub(crate) mod tests {
         assert_eq!(model.batches[0].triangles, vec![[0, 1, 2]]);
         assert_eq!(model.batches[0].texture, Some(0));
         assert!(parse(&m, None).is_err());
+        assert_eq!(model.batches[0].alpha, 1.0, "без дорожек прозрачности — видим");
+    }
+
+    #[test]
+    fn batches_with_zero_texture_weight_are_invisible() {
+        // Дорожка веса текстуры с одним ключом 0 — так игра прячет плоскости эмиттеров частиц.
+        let (mut m, s) = tiny_model();
+        let put = |m: &mut Vec<u8>, at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let value_at = m.len();
+        m.extend(0i16.to_le_bytes());
+        let anim_at = m.len();
+        m.extend(1u32.to_le_bytes());
+        m.extend((value_at as u32).to_le_bytes());
+        let track_at = m.len();
+        m.extend([0u8; 12]);
+        m.extend(1u32.to_le_bytes());
+        m.extend((anim_at as u32).to_le_bytes());
+        put(&mut m, 0x58, 1);
+        put(&mut m, 0x5C, track_at as u32);
+        let lookup_at = m.len();
+        m.extend([0u8, 0]);
+        put(&mut m, 0x90, 1);
+        put(&mut m, 0x94, lookup_at as u32);
+        let model = parse(&m, Some(&s)).unwrap();
+        assert_eq!(model.batches[0].alpha, 0.0);
     }
 }
