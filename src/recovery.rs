@@ -214,8 +214,21 @@ impl Recovery {
         release_lock(&self.file(&self.id, "lock"), &self.id);
     }
 
-    /// Копии, хозяева которых уже не работают.
+    /// Копии, хозяева которых уже не работают. Заодно убирает замки умерших окон без
+    /// копии: окно, закрытое снаружи (снято из диспетчера, упало до первой копии), оставляет
+    /// свой `.lock`, и их копились сотни. Только в Windows: там замок держится открытым без
+    /// права чужого открытия, а в других системах живой замок от мёртвого не отличить.
     pub fn orphans(&self) -> Vec<Orphan> {
+        #[cfg(windows)]
+        for path in fs::list(&self.dir) {
+            if path.extension().is_none_or(|x| x != "lock") {
+                continue;
+            }
+            let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            if id != self.id && !fs::exists(&self.file(&id, "json")) && !owner_alive(&path, &id) {
+                release_lock(&path, &id);
+            }
+        }
         let mut out = Vec::new();
         for path in fs::list(&self.dir) {
             if path.extension().is_none_or(|x| x != "json") {
@@ -258,5 +271,31 @@ impl Recovery {
         #[cfg(target_arch = "wasm32")]
         crate::plat::release(&self.id);
         self.id.clone()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_windows_leave_no_locks_behind() {
+        let dir = std::env::temp_dir().join(format!("kartograf-recovery-{}-{}", std::process::id(), now_unix()));
+        let live = Recovery::new(&dir);
+        let other = Recovery::new(&dir);
+        // Окно, снятое снаружи: замок остался, копии нет.
+        std::fs::write(dir.join("recovery").join("999999-1-0.lock"), b"").unwrap();
+        // Упавшее окно с копией: замок не трогать, копию предложат вернуть.
+        let meta = Meta { name: "Карта".into(), path: None, saved: 1 };
+        std::fs::write(dir.join("recovery").join("999998-1-0.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("recovery").join("999998-1-0.karta"), b"{}").unwrap();
+        std::fs::write(dir.join("recovery").join("999998-1-0.lock"), b"").unwrap();
+        let found = live.orphans();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!dir.join("recovery").join("999999-1-0.lock").exists(), "замок мёртвого окна убран");
+        assert!(dir.join("recovery").join("999998-1-0.lock").exists(), "замок при копии остаётся до её разбора");
+        assert!(dir.join("recovery").join(format!("{}.lock", other.id)).exists(), "замок живого окна на месте");
+        drop((live, other));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
