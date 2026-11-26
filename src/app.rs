@@ -254,6 +254,8 @@ pub struct Args {
     pub cells: Option<[u32; 2]>,
     /// `--trees 0..1`: досадить рощи на свободную сушу.
     pub trees: Option<f32>,
+    /// `--3d`: выгрузка ещё и с 3D-моделью карты для 3D Canvas.
+    pub three_d: bool,
 }
 
 /// Окно «местность по координатам»: что вписано и размер в клетках.
@@ -311,6 +313,9 @@ pub struct Settings {
     /// Выгрузка: кроны деревьев отдельными тайлами над токенами, в картинке пни.
     #[serde(default = "yes")]
     pub export_canopies: bool,
+    /// Выгрузка: ещё и 3D-модель карты (`.glb`) тайлом для 3D Canvas (`crate::scene3d`).
+    #[serde(default)]
+    pub export_3d: bool,
     /// Крыши в редакторе: 0 — видно, 1 — сквозь, 2 — скрыть. Запоминается.
     #[serde(default)]
     pub roof_view: u8,
@@ -325,7 +330,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, roof_view: 0, wow_client: None }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, export_3d: false, roof_view: 0, wow_client: None }
     }
 }
 
@@ -380,6 +385,8 @@ struct Export {
     quit: bool,
     /// Кроны деревьев — тайлами над токенами; иначе деревья остаются в картинке как есть.
     canopies: bool,
+    /// Ещё и 3D-модель карты для 3D Canvas.
+    three_d: bool,
     /// Модуль: обновить последнюю сцену, а не заводить новую.
     update: bool,
     /// Только картинка области (MCP `view`, `render_picture`): предметы и двери в ней,
@@ -1056,6 +1063,10 @@ impl App {
             confirm_close: false,
             allow_close: false,
         };
+        // `--3d`: эта выгрузка — ещё и с 3D-моделью; в настройки не пишется.
+        if args.three_d {
+            app.settings.export_3d = true;
+        }
         if let Some(file) = args.file {
             app.open_path(&file);
         } else if app.test.is_none() && app.shot.is_none() && app.export_args.is_none() && args.plan.is_none() && args.osm.is_none() && args.place.is_none() && app.orphans.is_empty() {

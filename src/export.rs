@@ -2020,6 +2020,35 @@ pub fn shadow_flags(sh: &map::Shadows) -> Value {
     json!({"angle": r(sh.angle), "dist": r(sh.dist), "blur": r(sh.blur), "opacity": r(sh.opacity), "fade": r(sh.fade)})
 }
 
+/// Модуль 3D-вида Foundry.
+pub const CANVAS3D: &str = "levels-3d-preview";
+
+/// Тайл 3D Canvas с 3D-моделью карты (`crate::scene3d`): рамка тайла — рамка модели в точках
+/// сцены (3D Canvas растягивает модель по тайлу), низ — высота низа модели в футах; тайл на
+/// всех `levels` этажах сцены. В 3D-виде 3D Canvas не рисует свои стены, двери и фон: их
+/// заменяет модель, а значки дверей остаются — двери открывают как обычно.
+pub fn model_tile(scene: &mut Value, src: &str, bounds: [[f32; 3]; 2], px: u32, levels: usize) {
+    let [lo, hi] = bounds;
+    let p = px as f64;
+    let pts = |cells: f32| (cells as f64 * p).round();
+    // Как у тайлов модели макроса «Ярусы 3D»: без картинки, `x`/`y` — угол рамки модели.
+    let tile = json!({
+        "_id": doc_id('m', 0),
+        "x": pts(lo[0]), "y": pts(lo[2]),
+        "width": pts(hi[0] - lo[0]), "height": pts(hi[2] - lo[2]),
+        "elevation": (lo[1] as f64 * 5.0 * 100.0).round() / 100.0,
+        "levels": (0..levels.max(1)).map(level_id).collect::<Vec<_>>(),
+        "flags": {CANVAS3D: {"model3d": src, "fillType": "stretch", "depth": pts(hi[1] - lo[1]), "collision": true}},
+    });
+    match scene["tiles"].as_array_mut() {
+        Some(t) => t.push(tile),
+        None => scene["tiles"] = json!([tile]),
+    }
+    for (k, v) in [("showSceneWalls", false), ("showSceneDoors", false), ("renderBackground", false)] {
+        scene["flags"][CANVAS3D][k] = v.into();
+    }
+}
+
 /// Метка содержимого файла: 8 знаков хэша его байтов (FNV-1a).
 pub fn content_tag(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2038,7 +2067,12 @@ pub fn content_tag(bytes: &[u8]) -> String {
 pub fn tag_sources(v: &mut Value, tags: &std::collections::HashMap<String, String>) {
     match v {
         Value::String(s) => {
-            if let Some(t) = tags.get(s.as_str()) {
+            // Модель — без метки: 3D Canvas выбирает загрузчик по тому, что после последней
+            // точки, и `x.glb?v=…` для него уже не `.glb`.
+            let model = [".glb", ".gltf"].iter().any(|e| s.to_ascii_lowercase().ends_with(e));
+            if let Some(t) = tags.get(s.as_str())
+                && !model
+            {
                 *s = format!("{s}?v={t}");
             }
         }
@@ -2174,9 +2208,10 @@ mod tests {
         assert_ne!(sail, nest);
         assert_eq!(sail, content_tag(b"sail"));
         assert_eq!(sail.len(), 8);
-        let mut scene = json!({"name": "x", "background": {"src": "k/x_1.webp"}, "tiles": [{"texture": {"src": "k/x_1.webp"}, "flags": {"m": {"chest": ["k/x_2.webp", "k/other.webp"]}}}]});
-        let tags = std::collections::HashMap::from([("k/x_1.webp".to_owned(), sail.clone()), ("k/x_2.webp".to_owned(), nest.clone())]);
+        let mut scene = json!({"name": "x", "background": {"src": "k/x_1.webp"}, "tiles": [{"texture": {"src": "k/x_1.webp"}, "flags": {"m": {"chest": ["k/x_2.webp", "k/other.webp"]}}}, {"flags": {CANVAS3D: {"model3d": "k/x_3d.glb"}}}]});
+        let tags = std::collections::HashMap::from([("k/x_1.webp".to_owned(), sail.clone()), ("k/x_2.webp".to_owned(), nest.clone()), ("k/x_3d.glb".to_owned(), sail.clone())]);
         tag_sources(&mut scene, &tags);
+        assert_eq!(scene["tiles"][1]["flags"][CANVAS3D]["model3d"], "k/x_3d.glb", "модель — без метки: 3D Canvas смотрит расширение");
         let want = format!("k/x_1.webp?v={sail}");
         assert_eq!(scene["background"]["src"], want.as_str());
         assert_eq!(scene["tiles"][0]["texture"]["src"], want.as_str());
@@ -3057,5 +3092,20 @@ mod tests {
         assert_eq!((still["flags"][LIVE_MODULE]["foam"].as_i64(), still["flags"][LIVE_MODULE]["fish"].as_bool()), (Some(0), Some(false)));
         m.grow(1, 0, 0, 0);
         assert_eq!(m.flows[0].points[0], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn the_3d_model_is_a_tile_over_its_frame_on_every_storey() {
+        let mut scene = json!({"tiles": [], "flags": {}});
+        model_tile(&mut scene, "kartograf/x/x_3d.glb", [[-0.125, 0.0, -0.125], [20.125, 4.0, 10.0]], 100, 2);
+        let t = &scene["tiles"][0];
+        assert_eq!((t["x"].as_f64(), t["y"].as_f64(), t["width"].as_f64(), t["height"].as_f64()), (Some(-13.0), Some(-13.0), Some(2025.0), Some(1013.0)));
+        assert_eq!(t["elevation"], 0.0);
+        assert_eq!(t["levels"], json!([LEVEL_ID, level_id(1)]));
+        let f = &t["flags"][CANVAS3D];
+        assert_eq!((f["model3d"].as_str(), f["fillType"].as_str(), f["depth"].as_f64()), (Some("kartograf/x/x_3d.glb"), Some("stretch"), Some(400.0)));
+        assert_eq!(scene["flags"][CANVAS3D]["showSceneWalls"], false);
+        assert_eq!(scene["flags"][CANVAS3D]["renderBackground"], false);
+        assert!(t.get("texture").is_none(), "угол рамки, как у тайлов модели макроса");
     }
 }

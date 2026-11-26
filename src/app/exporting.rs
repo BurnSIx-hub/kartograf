@@ -36,6 +36,7 @@ impl App {
             asked: false,
             quit,
             canopies: self.settings.export_canopies,
+            three_d: self.settings.export_3d,
             update: false,
             stumps,
             picture: false,
@@ -139,6 +140,7 @@ impl App {
             asked: false,
             quit: false,
             canopies: false,
+            three_d: false,
             update: false,
             stumps: Vec::new(),
             picture: true,
@@ -844,6 +846,15 @@ impl App {
         for (k, (size, piece)) in &pieces {
             scene["levels"][*k]["textures"] = export::level_piece_textures(scene_px, *size, *piece);
         }
+        // 3D-модель карты для 3D Canvas: полы этажей с их картинкой, стены, проёмы, створки.
+        if e.three_d && !chunk {
+            let (bytes, bounds) = self.model_3d(e, &layouts, &open)?;
+            let path = e.dir.join(format!("{base}_3d.glb"));
+            let src = export::foundry_src(&path);
+            files.push((path, bytes));
+            export::model_tile(&mut scene, &src, bounds, e.px, n);
+            laps.lap("3d");
+        }
         // Тени предметов рисует «Wild Canvas»: солнце — у сцены.
         let shadows = &self.export_level(e, self.level).shadows;
         if shadows.on {
@@ -996,6 +1007,84 @@ impl App {
     /// Картинка ассета для общей папки: WebP пака как есть, если его не перекрашивали и
     /// он не в воде; иначе — заново (перекраска, сухой верх), не больше 4096 точек.
     /// `mirror` — отражённая слева направо (мир Boundless: отражать тайлы он не умеет).
+    /// 3D-модель карты (`.glb`) и её рамка в клетках. Пол этажа — его снимок «пол без стен»
+    /// (верхний — с дырами); стены — из раскладки выгрузки, вид — самый частый у стен этажа;
+    /// `id` створки — концы её стены-двери в точках сцены и этаж: по ним модуль Foundry
+    /// поворачивает створку вслед за дверью.
+    fn model_3d(&self, e: &Export, layouts: &[export::Layout], open: &[Option<image::RgbaImage>]) -> Result<(Vec<u8>, [[f32; 3]; 2]), String> {
+        /// Больше Foundry и видеокарты игроков не потянут: длинная сторона картинки пола.
+        const MAX_SIDE: u32 = 8192;
+        let shrink = |w: u32, h: u32| -> Option<(u32, u32)> {
+            let k = MAX_SIDE as f32 / w.max(h) as f32;
+            (k < 1.0).then(|| (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1)))
+        };
+        let p = e.px as f32;
+        let mut pics: std::collections::HashMap<String, (Vec<u8>, &'static str)> = std::collections::HashMap::new();
+        let mut storeys = Vec::new();
+        for (k, img) in e.done.iter().enumerate() {
+            let map = self.export_level(e, k);
+            let key = format!("floor_{}", k + 1);
+            let (w, h) = img.dimensions();
+            let alpha = open[k].is_some();
+            let bytes = match &open[k] {
+                Some(rgba) => {
+                    let small = shrink(w, h).map(|(sw, sh)| image::imageops::resize(rgba, sw, sh, image::imageops::FilterType::Triangle));
+                    (export::webp_bytes(small.as_ref().unwrap_or(rgba), 88.0), "image/webp")
+                }
+                None => {
+                    let small = shrink(w, h).map(|(sw, sh)| image::imageops::resize(img, sw, sh, image::imageops::FilterType::Triangle));
+                    let mut out = Vec::new();
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88).encode_image(small.as_ref().unwrap_or(img)).map_err(|x| format!("пол этажа {}: {x}", k + 1))?;
+                    (out, "image/jpeg")
+                }
+            };
+            pics.insert(key.clone(), bytes);
+            let floor = Some(crate::scene3d::Picture { key, size: [w, h], alpha });
+
+            // Вид стен этажа — самый частый у краёв комнат, иначе у нарисованных, иначе вид карты.
+            let mut votes: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+            for v in map.edge_looks.values() {
+                *votes.entry(*v).or_default() += 1;
+            }
+            let style = votes.into_iter().max_by_key(|&(i, c)| (c, std::cmp::Reverse(i))).and_then(|(i, _)| map.wall_looks.get(i as usize)).or_else(|| map.walls.iter().find_map(|w| w.style.as_ref())).unwrap_or(&map.wall_style);
+            let (strip, side, color) = match &style.paint {
+                map::Paint::Texture(t) => match self.textures.rgba(t) {
+                    Ok(rgba) => {
+                        let alpha = rgba.pixels().any(|px| px[3] < 250);
+                        let size = [rgba.width(), rgba.height()];
+                        pics.entry(t.clone()).or_insert_with(|| (export::webp_bytes(&rgba, 90.0), "image/webp"));
+                        // Бок — середина полосы: без кромок и бордюра вида сверху.
+                        let (sw, sh) = (rgba.width(), (rgba.height() / 2).max(1));
+                        let mid = image::imageops::crop_imm(&rgba, 0, rgba.height() / 4, sw, sh).to_image();
+                        let side_key = format!("{t}#side");
+                        let side_alpha = mid.pixels().any(|px| px[3] < 250);
+                        pics.entry(side_key.clone()).or_insert_with(|| (export::webp_bytes(&mid, 90.0), "image/webp"));
+                        (Some(crate::scene3d::Picture { key: t.clone(), size, alpha }), Some(crate::scene3d::Picture { key: side_key, size: [sw, sh], alpha: side_alpha }), [74, 64, 56])
+                    }
+                    Err(_) => (None, None, [74, 64, 56]),
+                },
+                map::Paint::Color(c) => (None, None, *c),
+            };
+            let lay = &layouts[k];
+            let at = |v: [f32; 2]| [(v[0] * p).round() as i64, (v[1] * p).round() as i64];
+            let openings = lay
+                .portals
+                .iter()
+                .map(|po| {
+                    let (a, b) = (at(po.seg.0), at(po.seg.1));
+                    crate::scene3d::Opening { seg: po.seg, kind: po.kind, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]) }
+                })
+                .collect();
+            let gaps = map.portals.iter().filter(|q| q.kind == PortalKind::Opening).map(|q| (q.a, q.b)).collect();
+            storeys.push(crate::scene3d::Storey { floor, walls: lay.walls.clone(), low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color } });
+        }
+        let map = self.export_level(e, 0);
+        let scene = crate::scene3d::build([map.width as f32, map.height as f32], &storeys);
+        let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
+        let bounds = scene.bounds().ok_or("3D: модель пустая")?;
+        Ok((crate::glb::write(&scene, &images, &e.name)?, bounds))
+    }
+
     fn asset_webp(&self, key: &str, sunk: f32, mirror: bool) -> Result<Vec<u8>, String> {
         if sunk <= 0.0 && !mirror && !key.starts_with(library::TINT) {
             let raw = self.textures.bytes(key)?;

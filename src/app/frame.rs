@@ -242,6 +242,9 @@ impl App {
                 if ui.checkbox(&mut self.settings.export_canopies, format!("Кроны деревьев тайлами над токенами ({trees} шт.)")).on_hover_text("В картинке на месте дерева пень, крона — отдельный тайл, который гаснет над токеном. Сама так уходит только встроенная крона; чужому дереву крону включают галочкой в панели объекта.").changed() {
                     self.save_settings();
                 }
+                if ui.checkbox(&mut self.settings.export_3d, "3D-модель для 3D Canvas (.glb)").on_hover_text("Ещё и объёмная карта: полы этажей с картинкой, стены в высоту этажа, над дверьми и окнами перемычки, створки открываются вслед за дверьми Foundry. В сцене — тайлом с моделью; свои стены и фон 3D Canvas в 3D-виде не рисует. Предметы пока остаются в картинке пола.").changed() {
+                    self.save_settings();
+                }
                 ui.add_space(4.0);
                 if cfg!(target_arch = "wasm32") {
                     ui.horizontal(|ui| {
