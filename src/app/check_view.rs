@@ -80,6 +80,10 @@ impl App {
             let p = r.pieces.first()?;
             Some(check::House { index: n + i, area: None, points: p.rings.first()?.iter().map(|&q| pt(q)).collect(), flat: p.form == map::RoofForm::Flat })
         }));
+        let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+        // Полка предметов WoW и папка пола зданий WoW (там же переходы между этажами).
+        let shelf = norm(&self.wow_dir().to_string_lossy()) + "/";
+        let floors = norm(&crate::wow::location::tiles_dir(&self.data_dir).to_string_lossy()) + "/";
         let objs = m
             .props
             .iter()
@@ -96,6 +100,7 @@ impl App {
                 canopy: p.is_canopy(),
                 vis: None,
                 mask: None,
+                game: norm(&p.asset).starts_with(&shelf) || norm(&p.asset).starts_with(&floors),
             })
             .collect();
         let keys = m.props.iter().map(|p| (p.asset.clone(), [p.size[0] * p.scale, p.size[1] * p.scale])).collect();

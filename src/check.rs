@@ -28,6 +28,9 @@ pub struct Obj {
     pub vis: Option<[f64; 4]>,
     /// Маска видимой части 16×16 (`library::visible_shape`): строка — число, бит i — столбец i.
     pub mask: Option<Vec<u16>>,
+    /// Расставлено игрой (здание WoW целиком): кусты внахлёст и камень в проходе стоят так в
+    /// самой игре — это не ошибка расстановки.
+    pub game: bool,
 }
 
 /// Крыша — она же дом: прямоугольник по стенам или контур.
@@ -213,10 +216,12 @@ const PARTS: &[(&str, &str)] = &[
     ("Drying_Rack", "Fur_Pelt"),
 ];
 /// Завал: обломки камня, балки, лом и брёвна штабелем лежат грудой — так и задумано.
-const HEAP: &[&str] = &["Rubble_", "Debris_", "Scrap_Metal", "Beam_Metal", "IBeam_Metal", "Fir_Log_Snowy_B"];
-/// Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску, покров на алтарь.
-const ON_TOP: &[&str] = &["Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle", "Tang_Metal_Molten", "Altar_Runner"];
-const DOOR_FLAT: &[&str] = &["Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light"];
+const HEAP: &[&str] = &["Rubble_", "Debris_", "Scrap_Metal", "Beam_Metal", "IBeam_Metal", "Fir_Log_Snowy_B", "Crystal_"];
+/// Кладут поверх другого: сеть на груз, цепь на ящик, подстилку в клетку, саван на доску, покров на алтарь;
+/// паутина затягивает коконы и камни.
+const ON_TOP: &[&str] = &["Net_01", "Chain_Metal", "Bedroll", "Shroud", "Bandage", "Candle", "Tang_Metal_Molten", "Altar_Runner", "Cobweb", "Spider_Web"];
+/// У двери не мешает: плоское на полу, настенная лампа, нарисованная тень (тьма хода, тень под навесом).
+const DOOR_FLAT: &[&str] = &["Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light", "Shadow_"];
 /// Крона над стеной — не предмет поперёк неё; труба входит в дом сквозь стену.
 const ACROSS_OK: &[&str] = &["Wall_Lamp", "Notice_Board", "Propeller_Wood", "Landing_Pad", "Fireplace", "Oven_Brick", "Pipe_Brass", "Track_", "_Beam_"];
 /// Не препятствие в проходе: плоское, над головой, растения, переходы между этажами, зев в обрыве.
@@ -224,6 +229,7 @@ const P_FLAT: &[&str] = &[
     "Rug", "Door_Mat", "Steam", "Track_", "Manhole", "Floor_", "Landing_Pad", "Propeller_Wood", "Wall_Lamp", "Alarm_Light", "Decal_", "Shadow_", "Puddle", "Stairs",
     "Ladder", "Hatch", "Trapdoor", "Tree", "Дерево", "Bush", "Reeds_", "Cattail", "Lilypad", "Fern", "Grass", "Pipe_Brass", "Chandelier", "Net_01", "Rope",
     "Chain_Metal", "Cable", "Sunken", "Paper", "Clothes_Line", "Hammock", "Tarp", "Awning", "Banner", "Flag", "Rigging", "Windsock", "Sail_", "Cliff_Entrance",
+    "Cobweb", "Spider_Web",
 ];
 /// Поставлено затем, чтобы загородить (кроме завала): ограда, ворота. В проходе — как стена.
 const P_BARRIER: &[&str] = &["Railing_", "Fence", "Gate", "Barricade", "Palisade", "Portcullis"];
@@ -257,6 +263,33 @@ fn bbox(o: &Obj, k: f64, pad: f64) -> [f64; 4] {
     let hw = ((w * a.cos()).abs() + (h * a.sin()).abs()) / 2.0 + pad;
     let hh = ((w * a.sin()).abs() + (h * a.cos()).abs()) / 2.0 + pad;
     [o.x - hw, o.y - hh, o.x + hw, o.y + hh]
+}
+
+/// Углы того, что занимает предмет, для наложений: 80 % холста, а если видимая часть меньше —
+/// она (чашка на холсте в клетку, увеличенная в полтора раза, — не полторы клетки).
+fn body(o: &Obj) -> [P; 4] {
+    match o.vis {
+        Some([l, t, r, b]) if (r - l) * (b - t) < 0.64 * o.w * o.h => {
+            let (x, y, hw, hh, ca, sa) = p_rect(o);
+            [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(sx, sy)| {
+                let (dx, dy) = (sx * hw, sy * hh);
+                [x + dx * ca - dy * sa, y + dx * sa + dy * ca]
+            })
+        }
+        _ => corners(o, 0.8),
+    }
+}
+
+/// Площадь того, что занимает предмет (см. `body`).
+fn body_area(o: &Obj) -> f64 {
+    poly_area(&body(o))
+}
+
+/// Рамка вдоль осей вокруг `body`.
+fn body_box(o: &Obj) -> [f64; 4] {
+    let c = body(o);
+    let (xs, ys) = (c.map(|q| q[0]), c.map(|q| q[1]));
+    [xs.iter().copied().fold(f64::MAX, f64::min), ys.iter().copied().fold(f64::MAX, f64::min), xs.iter().copied().fold(f64::MIN, f64::max), ys.iter().copied().fold(f64::MIN, f64::max)]
 }
 
 /// Углы видимой части: холст FA с запасом под тень — берётся `k` (обычно 80 %).
@@ -551,15 +584,15 @@ fn beam_run(c: &Ctx, a: usize, b: usize) -> bool {
 fn overlaps(c: &mut Ctx) {
     let objs = &c.inp.objs;
     let cand: Vec<usize> = (0..objs.len()).filter(|&k| !c.has(k, SKIP) && objs[k].w * objs[k].h >= 1.0 && objs[k].layer < 800 && !objs[k].canopy).collect();
-    let boxes: Vec<[f64; 4]> = cand.iter().map(|&k| bbox(&objs[k], 0.8, 0.0)).collect();
+    let boxes: Vec<[f64; 4]> = cand.iter().map(|&k| body_box(&objs[k])).collect();
     let grid = grid_of(&boxes);
     let mut found = Vec::new();
     for (i, &a) in cand.iter().enumerate() {
-        let (oa, ba, pa) = (&objs[a], boxes[i], corners(&objs[a], 0.8));
+        let (oa, ba, pa) = (&objs[a], boxes[i], body(&objs[a]));
         // Пары без пересечения рамок отсеялись бы ниже — сетка отсевает их сразу.
         for b in near(&grid, ba).into_iter().filter(|&j| j > i).map(|j| cand[j]) {
             let ob = &objs[b];
-            if oa.layer != ob.layer {
+            if oa.layer != ob.layer || oa.game && ob.game {
                 continue;
             }
             // Вещь на помосте — не наложение; два куска моста внахлёст — наложение.
@@ -572,15 +605,15 @@ fn overlaps(c: &mut Ctx) {
             if c.has(a, ON_TOP) || c.has(b, ON_TOP) || c.has(a, HEAP) && c.has(b, HEAP) || beam_run(c, a, b) {
                 continue;
             }
-            // Мелочь на столе (книги, свечи, черепа, ступка) — так и задумано.
-            if [a, b].iter().any(|&x| c.has(x, &["Table", "Desk", "Counter", "Bar_"])) && (oa.w * oa.h).min(ob.w * ob.h) <= 2.0 {
+            // Мелочь на столе (книги, свечи, черепа, ступка, чашки) — так и задумано.
+            if [a, b].iter().any(|&x| c.has(x, &["Table", "Desk", "Counter", "Bar_"])) && body_area(oa).min(body_area(ob)) <= 1.28 {
                 continue;
             }
-            let bb = bbox(ob, 0.8, 0.0);
+            let bb = body_box(ob);
             if ba[2].min(bb[2]) <= ba[0].max(bb[0]) || ba[3].min(bb[3]) <= ba[1].max(bb[1]) {
                 continue;
             }
-            let pb = corners(ob, 0.8);
+            let pb = body(ob);
             let ix = poly_area(&clip(&pa, &pb));
             let small = poly_area(&pa).min(poly_area(&pb));
             if small > 0.0 && ix / small > 0.3 {
@@ -730,6 +763,8 @@ impl Grid {
 // 7. Уличное не в домах, домашнее не на улице
 fn street_and_house(c: &mut Ctx, g: &Grid) {
     let (w, h) = (c.inp.width, c.inp.height);
+    // Ни домов, ни комнат — глушь: стол и стулья на поляне поставлены там нарочно (чаепитие, привал).
+    let wild = c.inp.houses.is_empty() && c.rooms.is_empty();
     let walled = |x: f64, y: f64| (0.0..w).contains(&x) && (0.0..h).contains(&y) && g.at(x, y).is_some_and(|i| !g.outside[i]);
     for k in 0..c.inp.objs.len() {
         let o = c.o(k);
@@ -742,7 +777,7 @@ fn street_and_house(c: &mut Ctx, g: &Grid) {
         {
             c.say(Kind::Street, format!("{} внутри: {}", c.label(k), c.rooms[r].0), [o.x, o.y], vec![o.index]);
         }
-        if r.is_none() && c.has(k, INDOOR) && !walled(o.x, o.y) && !(c.has(k, FACADE) && c.roof_at([o.x, o.y], 1.0)) {
+        if r.is_none() && !wild && c.has(k, INDOOR) && !walled(o.x, o.y) && !(c.has(k, FACADE) && c.roof_at([o.x, o.y], 1.0)) {
             c.say(Kind::Indoor, format!("{} на улице ({:.1}, {:.1})", c.label(k), o.x, o.y), [o.x, o.y], vec![o.index]);
         }
     }
@@ -1220,7 +1255,8 @@ fn passage(c: &mut Ctx) {
     let mut by_index: HashMap<usize, usize> = HashMap::new();
     for k in 0..inp.objs.len() {
         let o = c.o(k);
-        if !solid_obj(c, k) {
+        // Предмет, поставленный игрой, в Foundry — плитка: фишку он не держит.
+        if !solid_obj(c, k) || o.game {
             continue;
         }
         let cells = obj_cells(&p, o);
@@ -1431,6 +1467,46 @@ fn obj_cells(p: &Pass, o: &Obj) -> Vec<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn objects_placed_by_the_game_are_not_my_mistakes() {
+        let mut a = obj(0, "Coral_01_3x3", 5.0, 5.0, 3.0, 3.0, 0);
+        let mut b = obj(1, "Coral_01_3x3", 5.5, 5.0, 3.0, 3.0, 0);
+        let inp = |a: &Obj, b: &Obj| Input { width: 12.0, height: 12.0, objs: vec![a.clone(), b.clone()], ..Default::default() };
+        let mine = run(&inp(&a, &b));
+        assert!(mine.iter().any(|i| i.kind == Kind::Overlap), "свои внахлёст — наложение: {mine:?}");
+        a.game = true;
+        b.game = true;
+        let game = run(&inp(&a, &b));
+        assert!(!game.iter().any(|i| i.kind == Kind::Overlap), "игровые внахлёст — не наложение: {game:?}");
+    }
+
+    #[test]
+    fn tableware_on_a_table_counts_by_what_is_drawn() {
+        // Стол 2×2 и вокруг середины три блюдца: холст в клетку ×1,7, видно четверть клетки.
+        let table = obj(0, "Table_Round_Wood_Light_A1_2x2", 5.0, 5.0, 2.7, 2.7, 0);
+        let plate = |i: usize, x: f64, y: f64| Obj { vis: Some([-0.12, -0.12, 0.12, 0.12]), ..obj(i, "Porcelain_Pink_Plate_A1_1x1", x, y, 1.7, 1.7, 0) };
+        let inp = Input { width: 12.0, height: 12.0, objs: vec![table, plate(1, 4.5, 5.0), plate(2, 5.3, 4.6), plate(3, 5.3, 5.4)], ..Default::default() };
+        assert!(!kinds(&inp).contains(&Kind::Overlap), "посуда на столе — не наложение: {:?}", run(&inp));
+        // Два ящика без видимой части внахлёст — по-прежнему наложение.
+        let crates = Input { width: 12.0, height: 12.0, objs: vec![obj(0, "Crate_Wood_A_1x1", 5.0, 5.0, 1.0, 1.0, 0), obj(1, "Crate_Wood_B_1x1", 5.3, 5.0, 1.0, 1.0, 0)], ..Default::default() };
+        assert!(kinds(&crates).contains(&Kind::Overlap));
+    }
+
+    #[test]
+    fn crystals_of_one_cluster_grow_into_each_other() {
+        let inp = Input { width: 12.0, height: 12.0, objs: vec![obj(0, "Crystal_Black_Large_A1_1x2", 5.0, 5.0, 1.2, 2.4, 0), obj(1, "Crystal_Black_Large_A5_1x2", 5.2, 5.1, 1.2, 2.4, 0)], ..Default::default() };
+        assert!(!kinds(&inp).contains(&Kind::Overlap), "друза — не наложение");
+    }
+
+    #[test]
+    fn a_tea_table_in_the_wild_is_not_homeware_on_the_street() {
+        let table = || obj(0, "Table_Round_Wood_Light_A1_2x2", 5.0, 5.0, 2.0, 2.0, 0);
+        let wild = Input { width: 30.0, height: 30.0, objs: vec![table()], ..Default::default() };
+        assert!(!kinds(&wild).contains(&Kind::Indoor), "в лесу без домов стол — нарочно");
+        let town = Input { width: 30.0, height: 30.0, objs: vec![table()], houses: vec![house(0, [15.0, 15.0, 25.0, 25.0])], ..Default::default() };
+        assert!(kinds(&town).contains(&Kind::Indoor), "у домов стол на улице — ошибка");
+    }
+
     fn obj(index: usize, name: &str, x: f64, y: f64, w: f64, h: f64, layer: i32) -> Obj {
         Obj { index, name: name.into(), x, y, w, h, layer, ..Default::default() }
     }
@@ -1495,6 +1571,10 @@ mod tests {
         let out: Vec<Issue> = run(&inp).into_iter().filter(|i| i.kind == Kind::Door).collect();
         assert_eq!(out.len(), 1, "окно и ковёр не в счёт: {out:?}");
         assert_eq!(out[0].objects, vec![0]);
+        // Тьма в проёме хода — нарисованная тень, а не предмет.
+        inp.objs.push(obj(3, "Shadow_Colorable_Circle_Full", 10.5, 5.2, 2.0, 2.0, 500));
+        let out: Vec<Issue> = run(&inp).into_iter().filter(|i| i.kind == Kind::Door).collect();
+        assert_eq!(out.len(), 1, "тень у окна не в счёт: {out:?}");
     }
 
     #[test]
@@ -1540,6 +1620,16 @@ mod tests {
         inp.walls[1].points = vec![[0.0, 11.0], [30.0, 11.0]];
         inp.objs[0].y = 8.0;
         assert!(!kinds(&inp).contains(&Kind::Pass));
+    }
+
+    #[test]
+    fn cobweb_is_neither_a_blockage_nor_an_overlap() {
+        // Паутина поперёк хода пещеры и поверх кокона: её рвут, а не обходят, и она затягивает то, что под ней.
+        let mut inp = Input { width: 30.0, height: 12.0, ..Default::default() };
+        inp.walls = vec![Line { points: vec![[0.0, 5.0], [30.0, 5.0]], closed: false }, Line { points: vec![[0.0, 6.5], [30.0, 6.5]], closed: false }];
+        inp.objs = vec![obj(0, "Cobweb_White_A9_2x2", 15.0, 5.75, 2.0, 2.0, 300), obj(1, "Underdark_Spider_Cocoon_Gray_Body_B1_1x1", 20.0, 9.0, 1.0, 1.0, 300), obj(2, "Cobweb_White_A10_2x2", 20.2, 9.0, 2.0, 2.0, 300)];
+        let k = kinds(&inp);
+        assert!(!k.contains(&Kind::Pass) && !k.contains(&Kind::Overlap), "{k:?}");
     }
 
     #[test]
