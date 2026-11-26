@@ -936,6 +936,19 @@ impl App {
         if n > 1 {
             scene["initialLevel"] = serde_json::json!(export::level_id(self.level));
         }
+        // Авторы всего, что в сцене: в сцену (модуль Foundry делает из них журнал) и файлом рядом.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut credited = String::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        if !chunk {
+            let used: std::collections::BTreeSet<String> = (0..n).flat_map(|k| self.export_level(e, k).used_assets()).collect();
+            let credits = self.credits_for(&used);
+            if !credits.is_empty() {
+                scene["flags"][export::OWN_MODULE]["credits"] = serde_json::to_value(&credits).unwrap_or_default();
+                files.push((e.dir.join(format!("{base}_credits.txt")), super::props3d::credits_text(&e.name, &credits).into_bytes()));
+                credited = format!("; авторы ({}) — в {base}_credits.txt", credits.len());
+            }
+        }
         let scene_path = e.dir.join(format!("{base}.json"));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
         laps.lap("scene");
@@ -1063,7 +1076,7 @@ impl App {
             (all, wow) => format!(", предметов моделями 3D {all} (WoW — {wow}: только для своего стола)"),
         };
         Ok(format!(
-            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}{models}",
+            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}{models}{credited}",
             if cfg!(target_arch = "wasm32") { "На сцену —" } else { "Выгружено в" },
             e.dir.display(),
             e.district.as_ref().map_or_else(String::new, |d| format!("район {},{}–{},{}, ", d.area[0], d.area[1], d.area[2], d.area[3])),

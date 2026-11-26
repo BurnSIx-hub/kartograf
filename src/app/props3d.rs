@@ -48,7 +48,7 @@ pub(super) struct Cc0Job {
     pub errors: Vec<String>,
 }
 
-enum Cc0Note {
+pub(super) enum Cc0Note {
     Total(usize),
     One(Result<(), String>),
     End,
@@ -82,7 +82,10 @@ fn plain_name(stem: &str) -> String {
 /// Один файл набора — на полку: вид сверху `<Имя>_<ш>x<в>.png` и модель `.glb` рядом.
 /// `unit` — клеток в единице файла: у glTF это метр ([`model3d::PER_METER`]), но наборы бывают
 /// и в своих единицах (у KayKit стена в 4 единицы — 10 футов, единица — полклетки).
-pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path, unit: f32) -> Result<PathBuf, String> {
+/// `taken` — имена, уже занятые в этом переносе: у двух моделей набора имя на полке может
+/// совпасть без учёта регистра (`WoodenTable_02` и `wooden_table_02`), а Windows его не различает —
+/// вторая получает хвост `_2`.
+pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path, unit: f32, taken: &mut std::collections::HashSet<String>) -> Result<PathBuf, String> {
     let bytes = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let mut m = model3d::read_gltf(&bytes, src.parent(), unit)?;
     let shift = m.normalize();
@@ -95,7 +98,14 @@ pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path, unit: f32) ->
     let raw = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let raw = raw.strip_suffix(".gltf").unwrap_or(&raw);
     let raw = ["_1k", "_2k", "_4k", "_8k"].iter().find_map(|t| raw.strip_suffix(t)).unwrap_or(raw);
-    let stem = plain_name(raw);
+    let mut stem = plain_name(raw);
+    let dir_key = dir.to_string_lossy().to_lowercase();
+    let base = stem.clone();
+    let mut k = 2;
+    while !taken.insert(format!("{dir_key}|{}", stem.to_lowercase())) {
+        stem = format!("{base}_{k}");
+        k += 1;
+    }
     let num = |v: f32| format!("{v:.2}").trim_end_matches('0').trim_end_matches('.').to_owned();
     // Прежние картинка и модель того же предмета (другого размера) — прочь.
     let prefix = format!("{}_", stem.to_lowercase());
@@ -116,6 +126,211 @@ pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path, unit: f32) ->
     Ok(file)
 }
 
+/// Описание набора на полке (`данные/cc0/<набор>/pack.json`): чей он и на каких условиях; у набора
+/// с зеркала — ещё список файлов для сверки.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PackInfo {
+    pub name: String,
+    /// Автор или студия.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub license_url: String,
+    /// Как авторы просят их указывать.
+    #[serde(default)]
+    pub note: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<PackFile>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PackFile {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Наборы, что лежат зеркалом в выпусках Картографа на GitHub: название и метка выпуска.
+pub(super) const MIRRORS: &[(&str, &str)] = &[("Poly Haven", "models-polyhaven-1")];
+
+/// Адрес выпусков с наборами: зеркало на GitHub; для проверки — `KARTOGRAF_MODELS_URL`
+/// (папка, где лежат `<метка>/pack.json` и файлы).
+fn mirror_url(tag: &str, file: &str) -> String {
+    match std::env::var("KARTOGRAF_MODELS_URL") {
+        Ok(base) => format!("{}/{tag}/{file}", base.trim_end_matches('/')),
+        Err(_) => format!("{}/download/{tag}/{file}", crate::update::RELEASES),
+    }
+}
+
+fn http() -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_connect(Some(std::time::Duration::from_secs(15))).timeout_global(Some(std::time::Duration::from_secs(600))).build().into()
+}
+
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut r = http().get(url).header("User-Agent", concat!("Kartograf/", env!("CARGO_PKG_VERSION"))).call().map_err(|e| format!("{url}: {e}"))?;
+    r.body_mut().with_config().limit(1 << 31).read_to_vec().map_err(|e| format!("{url}: {e}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Имя файла набора — только простое имя: без папок и выходов наверх.
+fn plain_file(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != ".."
+}
+
+/// Описание набора (`pack.json` в его папке: автор, лицензия, ссылка) — на полку рядом с моделями.
+fn copy_pack_info(src: &Path, out: &Path) {
+    let Some(name) = src.file_name() else { return };
+    if let Ok(bytes) = std::fs::read(src.join("pack.json")) {
+        let _ = std::fs::create_dir_all(out.join(name));
+        let _ = std::fs::write(out.join(name).join("pack.json"), bytes);
+    }
+}
+
+/// Скачать набор с зеркала в `данные/cc0/<набор>/`: описание, затем файлы со сверкой SHA-256
+/// (уже лежащие и совпавшие — не качать). `note` — сколько файлов всего и каждый готовый.
+pub(super) fn download_pack(tag: &str, cc0: &Path, mut note: impl FnMut(Cc0Note)) -> Result<PackInfo, String> {
+    let info: PackInfo = serde_json::from_slice(&fetch(&mirror_url(tag, "pack.json"))?).map_err(|e| format!("pack.json: {e}"))?;
+    if !plain_file(&info.name) {
+        return Err(format!("странное имя набора: {}", info.name));
+    }
+    let dir = cc0.join(&info.name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    note(Cc0Note::Total(info.files.len()));
+    for f in &info.files {
+        let r = (|| {
+            if !plain_file(&f.name) {
+                return Err(format!("странное имя файла: {}", f.name));
+            }
+            let path = dir.join(&f.name);
+            if std::fs::read(&path).is_ok_and(|b| sha256_hex(&b) == f.sha256) {
+                return Ok(());
+            }
+            let bytes = fetch(&mirror_url(tag, &f.name))?;
+            if sha256_hex(&bytes) != f.sha256 {
+                return Err(format!("{}: не сошлась SHA-256", f.name));
+            }
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+        })();
+        note(Cc0Note::One(r));
+    }
+    let mut keep = info.clone();
+    keep.files.clear();
+    std::fs::write(dir.join("pack.json"), serde_json::to_string_pretty(&keep).unwrap_or_default()).map_err(|e| e.to_string())?;
+    Ok(info)
+}
+
+/// `--cc0-get метка`: набор с зеркала — на полку, без окна.
+pub fn download_pack_cli(tag: &str, data: &Path) -> i32 {
+    let (mut total, mut done, mut failed) = (0, 0, 0);
+    let r = download_pack(tag, &data.join("cc0"), |n| match n {
+        Cc0Note::Total(t) => total = t,
+        Cc0Note::One(Ok(())) => done += 1,
+        Cc0Note::One(Err(e)) => {
+            failed += 1;
+            eprintln!("{e}");
+        }
+        Cc0Note::End => {}
+    });
+    match r {
+        Ok(info) => {
+            println!("{}: на полке {} файлов из {total}", info.name, done);
+            (failed > 0) as i32
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// Кто чей в сцене: что использовано, чьё, на каких условиях, ссылка и просьба авторов.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Credit {
+    pub what: String,
+    pub by: String,
+    pub license: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// Описание набора на полке; нет — по имени папки.
+pub(super) fn pack_info(cc0: &Path, name: &str) -> PackInfo {
+    std::fs::read(cc0.join(name).join("pack.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| PackInfo { name: name.to_owned(), license: "CC0".into(), ..Default::default() })
+}
+
+/// Авторы всего, что есть среди ключей картинок `used`: наборы CC0 (по их описанию), WoW
+/// (Blizzard, только для своего стола), ассеты Forgotten Adventures (их просьба — ссылка и фраза),
+/// прочие паки Dungeondraft.
+pub(super) fn credits(used: &std::collections::BTreeSet<String>, cc0: &Path, wow: &[PathBuf]) -> Vec<Credit> {
+    let low = |p: &str| p.replace('\\', "/").to_lowercase();
+    let cc0_low = low(&cc0.to_string_lossy()) + "/";
+    let wow_low: Vec<String> = wow.iter().map(|d| low(&d.to_string_lossy()) + "/").collect();
+    let mut packs = std::collections::BTreeSet::new();
+    let (mut wow_used, mut fa) = (false, false);
+    let mut dd = std::collections::BTreeSet::new();
+    for key in used {
+        let k = low(key);
+        if let Some(rest) = k.strip_prefix(&cc0_low) {
+            // Имя набора — как папка лежит на диске.
+            let lower = rest.split('/').next().unwrap_or_default();
+            let real = std::fs::read_dir(cc0).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).find(|n| n.to_lowercase() == lower);
+            packs.insert(real.unwrap_or_else(|| lower.to_owned()));
+        } else if wow_low.iter().any(|w| k.starts_with(w.as_str())) {
+            wow_used = true;
+        } else if k.contains("fa_objects") || k.contains("fa_textures") || k.contains("forgotten") {
+            fa = true;
+        } else if let Some(i) = key.find("pack:") {
+            // Ключ пака — `pack:<файл пака>|<путь внутри>`, перед ним бывает подкраска `tint:…:`.
+            let pack = key[i + 5..].split('|').next().unwrap_or_default();
+            let stem = Path::new(pack).file_stem().map_or_else(|| pack.to_owned(), |s| s.to_string_lossy().into_owned());
+            dd.insert(stem);
+        }
+    }
+    let mut out = Vec::new();
+    for p in packs {
+        let i = pack_info(cc0, &p);
+        out.push(Credit { what: format!("3D-модели «{}»", i.name), by: i.by, license: i.license, url: i.url, note: i.note });
+    }
+    if fa {
+        out.push(Credit { what: "Ассеты Forgotten Adventures".into(), by: "Forgotten Adventures".into(), license: "лицензия Forgotten Adventures".into(), url: "https://www.forgotten-adventures.net".into(), note: "Maps were created using assets from Forgotten Adventures.".into() });
+    }
+    for d in dd {
+        out.push(Credit { what: format!("Пак Dungeondraft «{d}»"), by: String::new(), license: String::new(), url: String::new(), note: String::new() });
+    }
+    if wow_used {
+        out.push(Credit { what: "Модели и картинки World of Warcraft".into(), by: "Blizzard Entertainment".into(), license: "только для своего стола — не распространять".into(), url: String::new(), note: String::new() });
+    }
+    out
+}
+
+/// Авторы текстом — файлом рядом со сценой.
+pub(super) fn credits_text(scene: &str, credits: &[Credit]) -> String {
+    let mut s = format!("Авторы — «{scene}»\n\n");
+    for c in credits {
+        s.push_str(&format!("- {}", c.what));
+        for part in [&c.by, &c.license, &c.url] {
+            if !part.is_empty() {
+                s.push_str(&format!(" — {part}"));
+            }
+        }
+        if !c.note.is_empty() {
+            s.push_str(&format!("\n  {}", c.note));
+        }
+        s.push('\n');
+    }
+    s.push_str("\nКарта сделана в Картографе.\n");
+    s
+}
+
 /// `--cc0 папка [--cc0-unit клеток]`: набор — на полку в папке данных `data` (`cc0/<набор>/…`),
 /// итог — в консоль.
 pub fn import_cc0_cli(src: &Path, data: &Path, unit: Option<f32>) -> i32 {
@@ -123,8 +338,9 @@ pub fn import_cc0_cli(src: &Path, data: &Path, unit: Option<f32>) -> i32 {
     let out = data.join("cc0");
     let files = model_files(src);
     let mut failed = 0;
+    let mut taken = std::collections::HashSet::new();
     for f in &files {
-        match import_cc0_file(f, src, &out, unit) {
+        match import_cc0_file(f, src, &out, unit, &mut taken) {
             Ok(png) => println!("{}", png.display()),
             Err(e) => {
                 failed += 1;
@@ -132,6 +348,7 @@ pub fn import_cc0_cli(src: &Path, data: &Path, unit: Option<f32>) -> i32 {
             }
         }
     }
+    copy_pack_info(src, &out);
     println!("CC0: на полке {} моделей из {} ({})", files.len() - failed, files.len(), out.display());
     if files.is_empty() || failed == files.len() { 1 } else { 0 }
 }
@@ -141,6 +358,105 @@ impl App {
         self.data_dir.join("cc0")
     }
 
+    /// Скачать набор с зеркала на полку — в фоне, ход — как у переноса своего набора.
+    pub(super) fn start_mirror(&mut self, tag: &'static str) {
+        let (tx, rx) = mpsc::channel();
+        let cc0 = self.cc0_dir();
+        crate::plat::spawn(move || {
+            let tx2 = tx.clone();
+            if let Err(e) = download_pack(tag, &cc0, move |n| {
+                let _ = tx2.send(n);
+            }) {
+                let _ = tx.send(Cc0Note::One(Err(e)));
+            }
+            let _ = tx.send(Cc0Note::End);
+        });
+        self.cc0 = Some(Cc0Job { rx, done: 0, total: 0, errors: Vec::new() });
+    }
+
+    /// Авторы всего, что на этажах выгрузки: ключи картинок всех этажей.
+    pub(crate) fn credits_for(&self, used: &std::collections::BTreeSet<String>) -> Vec<Credit> {
+        credits(used, &self.cc0_dir(), &[self.wow_dir(), crate::wow::location::tiles_dir(&self.data_dir)])
+    }
+
+    /// Открыть окно «3D-модели: наборы и авторы» (меню, самопроверка).
+    pub(crate) fn open_models_window(&mut self) {
+        self.models_open = true;
+    }
+
+    /// Окно «3D-модели: наборы и авторы»: что на полке и чьё, наборы с зеркала, свой набор.
+    pub(super) fn models_window(&mut self, ctx: &egui::Context) {
+        if !self.models_open {
+            return;
+        }
+        let mut open = true;
+        let mut get: Option<&'static str> = None;
+        let mut own = false;
+        let cc0 = self.cc0_dir();
+        let busy = self.cc0.as_ref().map(|j| (j.done, j.total));
+        let count = |dir: &Path, ext: &str| std::fs::read_dir(dir).into_iter().flatten().flatten().filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case(ext))).count();
+        let mut packs: Vec<String> = std::fs::read_dir(&cc0).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        packs.sort();
+        let wow = library::scan(&self.wow_dir()).len();
+        egui::Window::new("3D-модели: наборы и авторы").open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.heading("На полке");
+            if packs.is_empty() && wow == 0 {
+                ui.weak("Наборов 3D-моделей пока нет.");
+            }
+            for p in &packs {
+                let info = pack_info(&cc0, p);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!("CC0/{p}"));
+                    ui.label(format!("— моделей {}", count(&cc0.join(p), "glb")));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let who = if info.by.is_empty() { "автор не указан".to_owned() } else { info.by.clone() };
+                    ui.label(format!("{who}, {}", if info.license.is_empty() { "лицензия не указана" } else { &info.license }));
+                    if !info.url.is_empty() {
+                        ui.hyperlink(&info.url);
+                    }
+                });
+                if !info.note.is_empty() {
+                    ui.weak(&info.note);
+                }
+                ui.add_space(4.0);
+            }
+            if wow > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("WoW/…");
+                    ui.label(format!("— предметов {wow}: Blizzard Entertainment, из клиента игры — только для своего стола, не распространять."));
+                });
+            }
+            ui.separator();
+            ui.heading("Скачать");
+            ui.weak("Наборы CC0 с зеркала в выпусках Картографа на GitHub: модели, вид сверху и масштаб уже готовы.");
+            for (title, tag) in MIRRORS {
+                ui.horizontal(|ui| {
+                    ui.label(*title);
+                    let have = packs.iter().any(|p| p == title);
+                    if ui.add_enabled(busy.is_none(), egui::Button::new(if have { "Скачать заново" } else { "Скачать" })).clicked() {
+                        get = Some(tag);
+                    }
+                });
+            }
+            if let Some((done, total)) = busy {
+                ui.add(egui::ProgressBar::new(if total == 0 { 0.0 } else { done as f32 / total as f32 }).text(format!("{done} из {total}")));
+            }
+            ui.separator();
+            if ui.add_enabled(busy.is_none(), egui::Button::new("Перенести свой набор (.glb, .gltf)…")).on_hover_text("Папка с моделями: вид сверху и модель каждой — на полку «CC0/<папка>». Единица — метр; для наборов в своих единицах — ключ --cc0-unit").clicked() {
+                own = true;
+            }
+            ui.weak("Авторы того, что стоит на карте, уходят и в выгрузку: в сцену и файлом «…_credits.txt» рядом с ней.");
+        });
+        self.models_open = open;
+        if let Some(tag) = get {
+            self.start_mirror(tag);
+        }
+        if own && let Some(dir) = crate::plat::FileDialog::new().pick_folder() {
+            self.start_cc0(dir);
+        }
+    }
+
     /// Перенести набор CC0 из папки на полку («CC0/<набор>/…») — в фоне.
     pub(super) fn start_cc0(&mut self, src: PathBuf) {
         let (tx, rx) = mpsc::channel();
@@ -148,10 +464,12 @@ impl App {
         crate::plat::spawn(move || {
             let files = model_files(&src);
             let _ = tx.send(Cc0Note::Total(files.len()));
+            let mut taken = std::collections::HashSet::new();
             for f in files {
-                let r = import_cc0_file(&f, &src, &out, model3d::PER_METER).map(|_| ()).map_err(|e| format!("{}: {e}", f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
+                let r = import_cc0_file(&f, &src, &out, model3d::PER_METER, &mut taken).map(|_| ()).map_err(|e| format!("{}: {e}", f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
                 let _ = tx.send(Cc0Note::One(r));
             }
+            copy_pack_info(&src, &out);
             let _ = tx.send(Cc0Note::End);
         });
         self.cc0 = Some(Cc0Job { rx, done: 0, total: 0, errors: Vec::new() });
@@ -318,6 +636,41 @@ mod tests {
     }
 
     #[test]
+    fn credits_name_every_source_and_the_wording_authors_ask_for() {
+        let dir = std::env::temp_dir().join(format!("kartograf-credits-{}", std::process::id()));
+        let cc0 = dir.join("cc0");
+        std::fs::create_dir_all(cc0.join("Poly Haven")).unwrap();
+        let info = PackInfo { name: "Poly Haven".into(), by: "Poly Haven".into(), url: "https://polyhaven.com".into(), license: "CC0 1.0".into(), ..Default::default() };
+        std::fs::write(cc0.join("Poly Haven").join("pack.json"), serde_json::to_string(&info).unwrap()).unwrap();
+        let wow = dir.join("wow");
+        let used: std::collections::BTreeSet<String> = [
+            cc0.join("Poly Haven").join("Barrel_01_0.39x0.39.png").to_string_lossy().into_owned(),
+            wow.join("Generic").join("Torch_0.2x0.2.png").to_string_lossy().into_owned(),
+            "pack:E:\\D&D\\FA_Objects_A_v3.52.dungeondraft_pack|textures/objects/Barrel_A1_1x1.webp".into(),
+            "tint:96322a:pack:E:\\packs\\2MT World Map.dungeondraft_pack|textures/hex.png".into(),
+        ]
+        .into_iter()
+        .collect();
+        let c = credits(&used, &cc0, &[wow]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let whats: Vec<&str> = c.iter().map(|c| c.what.as_str()).collect();
+        assert_eq!(whats, ["3D-модели «Poly Haven»", "Ассеты Forgotten Adventures", "Пак Dungeondraft «2MT World Map»", "Модели и картинки World of Warcraft"]);
+        assert_eq!(c[0].url, "https://polyhaven.com");
+        assert!(c[1].note.contains("created using assets from Forgotten Adventures") && c[1].url.contains("forgotten-adventures.net"));
+        assert!(c[3].license.contains("не распространять"));
+        let text = credits_text("Таверна", &c);
+        assert!(text.contains("Poly Haven — CC0 1.0 — https://polyhaven.com"), "{text}");
+    }
+
+    #[test]
+    fn a_mirror_file_name_cannot_climb_out_of_its_pack() {
+        assert!(plain_file("Barrel_01_0.39x0.39.glb"));
+        for bad in ["", "..", "../x.glb", "a/b.glb", "a\\b.glb", "C:x.glb"] {
+            assert!(!plain_file(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_cc0_model_goes_to_the_shelf_with_its_picture_and_model() {
         let dir = std::env::temp_dir().join(format!("kartograf-cc0-{}", std::process::id()));
         let (pack, out) = (dir.join("Набор"), dir.join("out"));
@@ -331,7 +684,12 @@ mod tests {
             material: crate::scene3d::Material { look: crate::scene3d::Look::Color([120, 80, 40]), alpha: crate::scene3d::Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 },
         });
         std::fs::write(pack.join("props").join("crateSmall.gltf.glb"), m.write_glb("crate").unwrap()).unwrap();
-        let png = import_cc0_file(&pack.join("props").join("crateSmall.gltf.glb"), &pack, &out, model3d::PER_METER).unwrap();
+        let mut taken = std::collections::HashSet::new();
+        let png = import_cc0_file(&pack.join("props").join("crateSmall.gltf.glb"), &pack, &out, model3d::PER_METER, &mut taken).unwrap();
+        // Та же модель под другим регистром имени — рядом, а не поверх.
+        std::fs::copy(pack.join("props").join("crateSmall.gltf.glb"), pack.join("props").join("CrateSmall.glb")).unwrap();
+        let twin = import_cc0_file(&pack.join("props").join("CrateSmall.glb"), &pack, &out, model3d::PER_METER, &mut taken).unwrap();
+        assert!(png.is_file() && twin.is_file() && twin != png, "{} {}", png.display(), twin.display());
         assert!(png.starts_with(out.join("Набор").join("props")), "{}", png.display());
         let name = png.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("crate_Small_1.0") || name.starts_with("crate_Small_1x") || name.starts_with("crate_Small_1."), "{name}");

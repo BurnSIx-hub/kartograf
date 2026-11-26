@@ -1612,6 +1612,22 @@ impl SelfTest {
                 self.check("фишка вышла в открытую дверь", at[1] < 1.8, &format!("{at:?}"));
                 self.snap(ctx, "тестовая зона 3D");
             }
+            // Окно наборов 3D-моделей: ящик из «Пробы» на полке, его автор — в описании набора.
+            #[cfg(not(target_arch = "wasm32"))]
+            159 => {
+                let dir = app.data_dir.join("cc0").join("Проба");
+                let info = serde_json::json!({"name": "Проба", "by": "самопроверка Картографа", "license": "CC0 1.0", "url": "https://example.org"});
+                let _ = std::fs::write(dir.join("pack.json"), info.to_string());
+                app.open_models_window();
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            160 => {
+                let used: std::collections::BTreeSet<String> = app.map.props.iter().map(|p| p.asset.clone()).collect();
+                let credits = app.credits_for(&used);
+                self.check("автор ящика с полки CC0 — из описания набора", credits.first().is_some_and(|c| c.by == "самопроверка Картографа"), &format!("{credits:?}"));
+                self.snap(ctx, "наборы 3D-моделей");
+            }
             _ => return false,
         }
         true

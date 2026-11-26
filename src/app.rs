@@ -262,6 +262,8 @@ pub struct Args {
     pub cc0: Option<PathBuf>,
     /// `--cc0-unit клеток`: клеток в единице моделей набора (по умолчанию метр).
     pub cc0_unit: Option<f32>,
+    /// `--cc0-get метка`: скачать набор с зеркала в выпусках и выйти.
+    pub cc0_get: Option<String>,
 }
 
 /// Окно «местность по координатам»: что вписано и размер в клетках.
@@ -759,6 +761,9 @@ pub struct App {
     /// Перенос набора 3D-моделей CC0 на полку, пока идёт.
     #[cfg(not(target_arch = "wasm32"))]
     cc0: Option<props3d::Cc0Job>,
+    /// Окно «3D-модели: наборы и авторы».
+    #[cfg(not(target_arch = "wasm32"))]
+    models_open: bool,
     /// Окно «Предметы из WoW» и открытый клиент игры.
     #[cfg(not(target_arch = "wasm32"))]
     pub wow: wow_import::WowWindow,
@@ -1039,6 +1044,8 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             cc0: None,
             #[cfg(not(target_arch = "wasm32"))]
+            models_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
             wow: Default::default(),
             object_layer: None,
             brush_erase: false,
@@ -1160,7 +1167,7 @@ pub(crate) mod view3d;
 #[cfg(not(target_arch = "wasm32"))]
 mod props3d;
 #[cfg(not(target_arch = "wasm32"))]
-pub use props3d::import_cc0_cli;
+pub use props3d::{download_pack_cli, import_cc0_cli};
 
 impl eframe::App for App {
     /// Свёрнутое окно eframe не рисует и `ui` не зовёт — только это: команды ИИ

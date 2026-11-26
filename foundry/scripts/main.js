@@ -130,11 +130,46 @@ async function applyScene(scene, old, { source } = {}) {
   }
   await game.settings.set(MODULE_ID, "lastScene", doc.id);
   await chests(doc).catch((err) => console.error(`${MODULE_ID} | сундуки`, err));
+  await credits(doc).catch((err) => console.error(`${MODULE_ID} | авторы`, err));
   try {
     const t = await doc.createThumbnail();
     await doc.update({ thumb: t.thumb });
   } catch (err) { console.warn(`${MODULE_ID} | миниатюра`, err); }
   return doc;
+}
+
+// Авторы того, что в сцене (флаг `credits` выгрузки: наборы 3D-моделей, ассеты паков, WoW) —
+// журнал «Авторы — <сцена>» в папке «Картограф»: его читают и игроки, сцена ссылается на него
+// как на свои заметки (если своих заметок у сцены нет). При обновлении сцены журнал тот же.
+async function credits(doc) {
+  const list = doc.flags?.[MODULE_ID]?.credits;
+  if (!Array.isArray(list) || !list.length) return;
+  const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const link = (u) => (/^https?:\/\//.test(u ?? "") ? `<a href="${esc(u)}">${esc(u)}</a>` : esc(u));
+  const item = (c) => {
+    const parts = [c.by, c.license].filter(Boolean).map(esc);
+    if (c.url) parts.push(link(c.url));
+    return `<li><strong>${esc(c.what)}</strong>${parts.length ? " — " + parts.join(" — ") : ""}${c.note ? `<br><em>${esc(c.note)}</em>` : ""}</li>`;
+  };
+  const content = `<p>Что использовано в этой сцене и чьё оно.</p><ul>${list.map(item).join("")}</ul><p>Карта сделана в Картографе.</p>`;
+  const name = `Авторы — ${doc.name}`;
+  let entry = game.journal.find((j) => j.flags?.[MODULE_ID]?.creditsFor === doc.id);
+  if (entry) {
+    const page = entry.pages.contents[0];
+    if (page) await page.update({ "text.content": content });
+    else await entry.createEmbeddedDocuments("JournalEntryPage", [{ name: "Авторы", type: "text", text: { content } }]);
+    if (entry.name !== name) await entry.update({ name });
+  } else {
+    const folder = game.folders.find((f) => f.type === "JournalEntry" && f.name === FOLDER) ?? (await Folder.implementation.create({ name: FOLDER, type: "JournalEntry" }));
+    entry = await JournalEntry.implementation.create({
+      name,
+      folder: folder.id,
+      ownership: { default: CONST.DOCUMENT_OWNERSHIP_LEVELS.OBSERVER },
+      flags: { [MODULE_ID]: { creditsFor: doc.id } },
+      pages: [{ name: "Авторы", type: "text", text: { content } }],
+    });
+  }
+  if (!doc.journal) await doc.update({ journal: entry.id });
 }
 
 // Как «Import Data» у сцены (ClientDocument#importFromJSON), но своё остаётся:

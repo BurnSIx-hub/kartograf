@@ -131,6 +131,8 @@ impl App {
         self.wow_window(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.view3d_window(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.models_window(ctx);
         self.sketch_window(ctx);
         if let Some(e) = self.error.clone() {
             let mut open = true;
