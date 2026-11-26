@@ -1627,6 +1627,76 @@ impl SelfTest {
                 let credits = app.credits_for(&used);
                 self.check("автор ящика с полки CC0 — из описания набора", credits.first().is_some_and(|c| c.by == "самопроверка Картографа"), &format!("{credits:?}"));
                 self.snap(ctx, "наборы 3D-моделей");
+                app.close_models_window();
+            }
+            // Тестовая зона 3D, этап 4: помост с лестницей в восточной части комнаты и
+            // двускатная крыша над ней. Фишка встаёт на помост, сходит по ступеням A и
+            // поднимается обратно D.
+            #[cfg(not(target_arch = "wasm32"))]
+            161 => {
+                let mut map = Map::new(14, 10);
+                map.paint_rect(Layer::Rooms, (2, 2), (11, 7), Some(0));
+                let mut pl = crate::platform::Platform::new(vec![[6.0, 2.0], [12.0, 2.0], [12.0, 8.0], [6.0, 8.0]], 0.4);
+                pl.stairs.push(crate::platform::Stair { at: [6.0, 5.0], width: 2.0, steps: 3, ramp: false });
+                map.platforms.push(pl);
+                map.roofs.push(map::Roof::new([2.0, 2.0], [12.0, 8.0], map::RoofShape::Gable, crate::library::DEFAULT_ROOF.into()));
+                app.reset_doc(map, None);
+                app.start_view3d();
+                self.deadline = now + 30.0;
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            162 => {
+                let probe = app.view3d_probe().filter(|p| p.painted >= 3 && p.rect.width() > 100.0);
+                let Some(p) = probe else {
+                    if now < self.deadline {
+                        self.step = 162;
+                        self.resume_at = now + 0.1;
+                    } else {
+                        self.check("окно 3D с помостом открылось", false, "за 30 секунд не нарисовало кадра");
+                        self.step = 999;
+                    }
+                    return true;
+                };
+                self.check("в 3D есть крыша дома", p.roofs == 1 && p.error.is_none(), &format!("крыш {}, {:?}", p.roofs, p.error));
+                let c = p.rect.center();
+                self.click(c);
+                self.click(c);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            163 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let rise = 0.4 * crate::ground3d::RISE;
+                self.check("двойной щелчок поставил фишку на помост", p.storey == 0 && (p.feet - rise).abs() < 1e-3 && p.token.is_some_and(|t| t[0] > 6.0), &format!("{:?}, ступни {}", p.token, p.feet));
+                self.hold(Key::A, true);
+                self.resume_at = now + 1.4;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            164 => {
+                self.hold(Key::A, false);
+                self.frames.push_back((Modifiers::NONE, vec![]));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            165 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let at = p.token.unwrap_or_default();
+                self.check("A свела фишку с помоста по ступеням на пол", p.feet.abs() < 1e-3 && at[0] < 4.8, &format!("{at:?}, ступни {}", p.feet));
+                self.hold(Key::D, true);
+                self.resume_at = now + 1.4;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            166 => {
+                self.hold(Key::D, false);
+                self.frames.push_back((Modifiers::NONE, vec![]));
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            167 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let at = p.token.unwrap_or_default();
+                let rise = 0.4 * crate::ground3d::RISE;
+                self.check("D подняла фишку по ступеням обратно на помост", (p.feet - rise).abs() < 1e-3 && at[0] > 6.0, &format!("{at:?}, ступни {}", p.feet));
+                self.snap(ctx, "помост и лестница в 3D");
             }
             _ => return false,
         }

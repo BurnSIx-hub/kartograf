@@ -67,6 +67,8 @@ struct NodeInfo {
     /// Образец предмета (модель или плоская картинка): сам не рисуется, только местами из
     /// [`View3d::props`].
     template: bool,
+    /// Крыша: её контур на карте — под ним фишка, и крыша прячется, как тайл крыши в Foundry.
+    roof: Vec<Vec<[f32; 2]>>,
 }
 
 /// Предмет на месте: образец, матрица, этаж; крона прячется, когда стены по пояс; `bias` —
@@ -100,6 +102,10 @@ struct Floor3 {
     doors: Vec<Door3>,
     light: lighting::Scene,
     map: Option<LightMap>,
+    /// Земля этажа: рельеф, помосты, ступени, марши к этажу выше.
+    ground: scene3d::Ground,
+    /// Где у этажа пол (у первого — везде): над дырой фишка сходит на этаж ниже.
+    cover: Option<scene3d::Cover>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -113,6 +119,8 @@ struct DoorState {
 struct Token {
     at: [f32; 2],
     storey: usize,
+    /// Ступни над полом этажа: на помосте, ступени, склоне.
+    feet: f32,
 }
 
 pub(super) struct View3d {
@@ -129,6 +137,8 @@ pub(super) struct View3d {
     top: usize,
     cut: bool,
     torch: bool,
+    /// Крыши видны (над фишкой — всё равно прячутся).
+    roofs: bool,
     /// Камера идёт за фишкой.
     follow: bool,
     /// Где сейчас горит факел фишки: место и этаж.
@@ -159,6 +169,11 @@ pub struct Probe3d {
     /// Предметов в 3D и сколько из них моделями.
     pub props: usize,
     pub modelled: usize,
+    /// Этаж фишки и высота её ступней над его полом.
+    pub storey: usize,
+    pub feet: f32,
+    /// Крыш в сцене.
+    pub roofs: usize,
 }
 
 fn id() -> egui::Id {
@@ -219,7 +234,7 @@ fn time_of(map: &Map) -> Time {
 impl Floor3 {
     /// Этаж `k` по разбору для Foundry: стены, двери (их метки — как у створок сцены, по
     /// точкам `px` на клетку) и свет.
-    fn new(k: usize, lay: &export::Layout, rooms: Mask, half: f32, px: f32) -> Floor3 {
+    fn new(k: usize, lay: &export::Layout, rooms: Mask, half: f32, px: f32, ground: scene3d::Ground, cover: Option<scene3d::Cover>) -> Floor3 {
         let light = lighting::Scene::new(lay, rooms, Vec::new());
         // Преграды света — сначала отрезки стен, потом двери и окна по порядку.
         let walls_n: usize = lay.walls.iter().map(|w| w.len().saturating_sub(1)).sum();
@@ -234,7 +249,7 @@ impl Floor3 {
                 solid.push(po.seg);
             }
         }
-        Floor3 { half, solid, doors, light, map: None }
+        Floor3 { half, solid, doors, light, map: None, ground, cover }
     }
 }
 
@@ -254,6 +269,7 @@ impl View3d {
             top: 0,
             cut: false,
             torch: true,
+            roofs: true,
             follow: false,
             torch_at: None,
             rev: 0,
@@ -266,13 +282,18 @@ impl View3d {
     }
 
     /// Взять у прежнего окна камеру, время, вид, фишку и открытые двери, что остались на месте.
+    /// Карта другого размера — другая карта: камера, фишка и двери — с нуля.
     fn carry(&mut self, old: View3d) {
         let n = self.floors.len();
-        self.cam = old.cam;
-        self.time = old.time;
-        self.top = old.top.min(n.saturating_sub(1));
         self.cut = old.cut;
         self.torch = old.torch;
+        self.roofs = old.roofs;
+        if old.size != self.size {
+            return;
+        }
+        self.time = old.time;
+        self.cam = old.cam;
+        self.top = old.top.min(n.saturating_sub(1));
         self.follow = old.follow;
         self.token = old.token.filter(|t| t.storey < n);
         for f in &mut self.floors {
@@ -300,6 +321,7 @@ impl View3d {
                 "night" => self.time = Time::Night,
                 "cut" => self.cut = true,
                 "notorch" => self.torch = false,
+                "noroofs" => self.roofs = false,
                 "open" => {
                     let all: Vec<(usize, usize)> = self.floors.iter().enumerate().flat_map(|(k, f)| (0..f.doors.len()).map(move |i| (k, i))).collect();
                     for (k, i) in all {
@@ -313,12 +335,9 @@ impl View3d {
                     let v = nums(val);
                     if v.len() >= 2 {
                         let storey = v.get(2).map_or(0, |&s| (s as usize).min(self.floors.len().saturating_sub(1)));
-                        self.token = Some(Token { at: [v[0], v[1]], storey });
-                        self.top = storey;
-                        self.walk([0.0, 1e-4]);
-                        self.follow = true;
+                        self.place_token([v[0], v[1]], storey);
                         if let Some(t) = self.token {
-                            self.cam.target = [t.at[0], Self::floor_y(t.storey) + 0.6, t.at[1]];
+                            self.cam.target = [t.at[0], Self::floor_y(t.storey) + t.feet + 0.6, t.at[1]];
                         }
                     }
                 }
@@ -482,25 +501,69 @@ impl View3d {
             .map(|(i, _)| i)
     }
 
-    /// Шаг фишки на `delta` клеток: мелкими шагами, выталкиваясь из стен и закрытых дверей.
+    /// Поставить фишку на этаж `k` в точку `p` — на верх того, что там стоит (помост, ступень),
+    /// и вытолкнуть из стен, как при шаге.
+    fn place_token(&mut self, p: [f32; 2], k: usize) {
+        let feet = self.floors.get(k).map_or(0.0, |f| f.ground.at(p));
+        self.token = Some(Token { at: p, storey: k, feet });
+        self.top = k;
+        self.walk([0.0, 1e-4]);
+        self.follow = true;
+    }
+
+    /// Куда встанет фишка, шагнув на этаже `k` в `p` со ступнями на `feet`: этаж и высота
+    /// ступней на нём; `None` — не пройти (стенка помоста, обрыв, дыра в полу глубже шага).
+    /// Марш довёл до пола этажа выше — она уже там; над дырой в полу сходит на марш этажа ниже.
+    fn footing(&self, k: usize, p: [f32; 2], feet: f32) -> Option<(usize, f32)> {
+        let f = self.floors.get(k)?;
+        let g = f.ground.step(p, feet)?;
+        if k > 0 && g < 1e-3 && f.cover.as_ref().is_some_and(|c| !c.has(p)) {
+            // Пола нет — под ногами этаж ниже: его марш (верх — у пола этого этажа) или пустота.
+            let below = self.floors[k - 1].ground.step(p, feet + STOREY)?;
+            if below >= STOREY - 0.05 {
+                return Some((k, 0.0));
+            }
+            return (below - STOREY >= feet - 1.5 * scene3d::STEP).then_some((k - 1, below));
+        }
+        if g >= STOREY - 0.05 && k + 1 < self.floors.len() {
+            return Some((k + 1, g - STOREY));
+        }
+        Some((k, g))
+    }
+
+    /// Шаг фишки на `delta` клеток: мелкими шагами, выталкиваясь из стен и закрытых дверей; по
+    /// земле — вверх не выше шага ([`scene3d::STEP`]), вниз — сходит; не пройти — скользит вдоль.
     fn walk(&mut self, delta: [f32; 2]) {
         let Some(t) = self.token else { return };
-        let Some(f) = self.floors.get(t.storey) else { return };
         let len = delta[0].hypot(delta[1]);
         if len < 1e-6 {
             return;
         }
         let steps = (len / 0.1).ceil().max(1.0) as usize;
-        let half = f.half;
-        let closed: Vec<Segment> = f.doors.iter().filter(|d| !self.door_open(&d.id)).map(|d| d.seg).collect();
-        let segs = f.solid.iter().map(move |s| (*s, half)).chain(closed.iter().map(|s| (*s, 0.06)));
-        let mut p = t.at;
+        let (mut p, mut k, mut feet) = (t.at, t.storey, t.feet);
+        let d = [delta[0] / steps as f32, delta[1] / steps as f32];
         for _ in 0..steps {
-            p = [p[0] + delta[0] / steps as f32, p[1] + delta[1] / steps as f32];
-            p = push_out(p, TOKEN_R, segs.clone());
+            let Some(f) = self.floors.get(k) else { break };
+            let half = f.half;
+            let closed: Vec<Segment> = f.doors.iter().filter(|d| !self.door_open(&d.id)).map(|d| d.seg).collect();
+            let segs = f.solid.iter().map(move |s| (*s, half)).chain(closed.iter().map(|s| (*s, 0.06)));
+            // Прямо, а упёрлись в стенку помоста — вдоль неё по одной оси.
+            for try_d in [d, [d[0], 0.0], [0.0, d[1]]] {
+                if try_d == [0.0, 0.0] {
+                    continue;
+                }
+                let q = push_out([p[0] + try_d[0], p[1] + try_d[1]], TOKEN_R, segs.clone());
+                let q = [q[0].clamp(TOKEN_R, self.size[0] - TOKEN_R), q[1].clamp(TOKEN_R, self.size[1] - TOKEN_R)];
+                if let Some((k2, f2)) = self.footing(k, q, feet) {
+                    (p, k, feet) = (q, k2, f2);
+                    break;
+                }
+            }
         }
-        p = [p[0].clamp(TOKEN_R, self.size[0] - TOKEN_R), p[1].clamp(TOKEN_R, self.size[1] - TOKEN_R)];
-        self.token = Some(Token { at: p, ..t });
+        if k != t.storey {
+            self.top = k;
+        }
+        self.token = Some(Token { at: p, storey: k, feet });
     }
 
     /// Луч из точки окна на пол этажа `k`.
@@ -528,8 +591,13 @@ impl View3d {
         let far = (self.cam.dist + self.size[0].max(self.size[1]) * 2.0 + 50.0).max(100.0);
         let vp = render3d::mul(&render3d::perspective(FOV, rect.width() / rect.height().max(1.0), near, far), &render3d::look_at(eye, self.cam.target, [0.0, 1.0, 0.0]));
         let mut items = Vec::new();
+        // Крыша над фишкой прячется, как тайл крыши в Foundry; со стенами по пояс — все.
+        let under = |n: &NodeInfo| self.token.is_some_and(|t| t.storey <= n.storey && scene3d::inside(&n.roof, t.at));
         for (i, n) in self.nodes.iter().enumerate() {
             if n.storey > self.top || n.template {
+                continue;
+            }
+            if n.part == Part::Roof && (!self.roofs || self.cut || under(n)) {
                 continue;
             }
             let yaw = n.yaw + n.door.as_ref().map_or(0.0, |(id, swing)| swing * self.doors.get(id).map_or(0.0, |d| d.t));
@@ -539,7 +607,7 @@ impl View3d {
         for p in self.props.iter().filter(|p| p.storey <= self.top && !(p.crown && self.cut)) {
             items.push(Item { node: p.node, model: p.model, storey: p.storey, cut: f32::MAX, caps: false, bias: p.bias });
         }
-        let pawn = self.token.map(|t| (render3d::placed([t.at[0], Self::floor_y(t.storey), t.at[1]], 0.0), t.storey, [0.93, 0.74, 0.30]));
+        let pawn = self.token.map(|t| (render3d::placed([t.at[0], Self::floor_y(t.storey) + t.feet, t.at[1]], 0.0), t.storey, [0.93, 0.74, 0.30]));
         let sky = match self.time {
             Time::Day => [0.55, 0.66, 0.78],
             Time::Dusk => [0.20, 0.20, 0.28],
@@ -590,6 +658,7 @@ impl View3d {
                 ui.separator();
             }
             ui.checkbox(&mut self.cut, "Стены по пояс").on_hover_text("Срезать стены выше пояса: видно комнаты сверху");
+            ui.checkbox(&mut self.roofs, "Крыши").on_hover_text("Крыши домов; над фишкой крыша прячется сама, как в Foundry");
             ui.checkbox(&mut self.torch, "Факел у фишки").on_hover_text("Свет 20 и 40 футов вокруг фишки вечером и ночью");
             if self.token.is_some() {
                 ui.checkbox(&mut self.follow, "Камера за фишкой");
@@ -638,6 +707,7 @@ impl View3d {
         self.top = k;
         if let Some(t) = &mut self.token {
             t.storey = k;
+            t.feet = self.floors[k].ground.at(t.at);
         }
         self.cam.target[1] = Self::floor_y(k) + 0.6;
     }
@@ -675,10 +745,7 @@ impl View3d {
             && p[0] <= self.size[0]
             && p[1] <= self.size[1]
         {
-            self.token = Some(Token { at: p, storey: self.top });
-            // Поставили в стену — вытолкнуть, как при шаге.
-            self.walk([0.0, 1e-4]);
-            self.follow = true;
+            self.place_token(p, self.top);
         } else if resp.clicked()
             && let Some(p) = resp.interact_pointer_pos().and_then(|p| self.floor_hit(rect, p, self.top))
             && let Some(i) = self.door_near(self.top, p, CLICK_REACH)
@@ -731,7 +798,7 @@ impl View3d {
             }
         }
         if self.follow && let Some(t) = self.token {
-            let goal = [t.at[0], Self::floor_y(t.storey) + 0.6, t.at[1]];
+            let goal = [t.at[0], Self::floor_y(t.storey) + t.feet + 0.6, t.at[1]];
             let k = 1.0 - (-dt * 10.0).exp();
             for (c, g) in self.cam.target.iter_mut().zip(goal) {
                 *c += (g - *c) * k;
@@ -767,7 +834,7 @@ struct Parts {
 
 impl Parts {
     fn template(&mut self, prims: Vec<(usize, crate::scene3d::Mesh)>) -> usize {
-        self.nodes.push(NodeInfo { part: Part::Floor, storey: 0, at: [0.0; 3], yaw: 0.0, door: None, template: true });
+        self.nodes.push(NodeInfo { part: Part::Floor, storey: 0, at: [0.0; 3], yaw: 0.0, door: None, template: true, roof: Vec::new() });
         self.meshes.push(prims);
         self.nodes.len() - 1
     }
@@ -816,7 +883,7 @@ impl Parts {
 impl App {
     /// Предметы в окно 3D: у кого есть модель — моделью (образец на модель), прочие — плоской
     /// картинкой (образец на картинку и подкраску), как их кладёт 3D Canvas. Образцы — в `parts`.
-    fn props_3d(&mut self, plans: &[(usize, Prop, props3d::Lift)], parts: &mut Parts) -> (Vec<PropAt>, usize) {
+    fn props_3d(&mut self, plans: &[(usize, Prop, props3d::Lift)], grounds: &[scene3d::Ground], parts: &mut Parts) -> (Vec<PropAt>, usize) {
         let mut out = Vec::new();
         let mut modelled = 0;
         let mut models: HashMap<String, (usize, std::sync::Arc<crate::model3d::Model3d>)> = HashMap::new();
@@ -851,7 +918,8 @@ impl App {
             }
         }
         for (i, (k, p, lift)) in plans.iter().enumerate() {
-            let y0 = View3d::floor_y(*k) + heights[i];
+            // На помосте, ступени, склоне — на их высоте.
+            let y0 = View3d::floor_y(*k) + grounds.get(*k).map_or(0.0, |g| g.at(p.pos)) + heights[i];
             let size = [p.size[0] * p.scale, p.size[1] * p.scale];
             let yaw = -p.rot.to_radians();
             let flip = if p.flip { -1.0 } else { 1.0 };
@@ -899,7 +967,7 @@ impl App {
     /// Окно 3D глазами самопроверки.
     pub(crate) fn view3d_probe(&self) -> Option<Probe3d> {
         let v = self.view3d.as_ref()?;
-        Some(Probe3d { rect: v.rect, yaw: v.cam.yaw, token: v.token.map(|t| t.at), open: v.doors.values().filter(|d| d.open).count(), painted: v.painted, error: v.renderer.error(), props: v.props.len(), modelled: v.modelled })
+        Some(Probe3d { rect: v.rect, yaw: v.cam.yaw, token: v.token.map(|t| t.at), open: v.doors.values().filter(|d| d.open).count(), painted: v.painted, error: v.renderer.error(), props: v.props.len(), modelled: v.modelled, storey: v.token.map_or(v.top, |t| t.storey), feet: v.token.map_or(0.0, |t| t.feet), roofs: v.nodes.iter().filter(|n| n.part == Part::Roof).count() })
     }
 
     /// Снять карту для окна 3D: как выгрузка, но только пол без стен, без файлов.
@@ -920,26 +988,59 @@ impl App {
     pub(super) fn finish_view3d(&mut self, e: &Export) {
         let mut layouts = Vec::new();
         let mut floors = Vec::new();
+        let mut covers = Vec::new();
         let mut pics: HashMap<String, image::RgbaImage> = HashMap::new();
+        let map0 = self.export_level(e, 0);
+        let size = [map0.width as f32, map0.height as f32];
+        let first_time = time_of(map0);
         for (k, img) in e.done.iter().enumerate() {
             let map = self.export_level(e, k);
             layouts.push(export::layout(map, &map.room_edges()));
             let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
+            covers.push((k > 0).then(|| super::exporting::covers_of(holes.as_ref(), size)));
             let alpha = holes.is_some();
             let rgba = holes.unwrap_or_else(|| image::DynamicImage::ImageRgb8(img.clone()).to_rgba8());
             let key = format!("floor_{}", k + 1);
             floors.push(Some(scene3d::Picture { key: key.clone(), size: [rgba.width(), rgba.height()], alpha }));
             pics.insert(key, rgba);
         }
-        let storeys = self.storeys_3d(e, &layouts, floors, &mut pics);
-        let map0 = self.export_level(e, 0);
-        let size = [map0.width as f32, map0.height as f32];
-        let first_time = time_of(map0);
-        // Предметы, что не в картинке пола (они в выгрузке своими тайлами), — по этажам, снизу вверх по слоям.
+        let (mut storeys, flights) = self.storeys_3d(e, &layouts, floors, &covers, &mut pics);
+        // Крыши — с картинками, как у тайлов крыш в выгрузке, на верху стен своего этажа.
+        for (k, st) in storeys.iter_mut().enumerate() {
+            let map = self.export_level(e, k);
+            let Ok(mut roof_pics) = self.roof_pictures(map, e.px, None) else { continue };
+            let rects = map.roofs.len();
+            let relief = st.ground.relief.clone();
+            let eave = |c: [f32; 2]| STOREY + relief.as_ref().map_or(0.0, |f| f.at(c));
+            for id in 0..rects + map.outline_roofs.len() {
+                let Some(pic) = roof_pics.remove(&id) else { continue };
+                let Ok(img) = image::load_from_memory(&pic.bytes) else { continue };
+                let key = format!("roof_{}_{}", k + 1, id + 1);
+                let picture = scene3d::Picture { key: key.clone(), size: pic.size, alpha: true };
+                let roof = match map.roofs.get(id) {
+                    Some(r) => Some(crate::roof3d::rect(r, eave([(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0]), picture, pic.frame())),
+                    None => {
+                        let r = &map.outline_roofs[id - rects];
+                        let (lo, hi) = r.bounds();
+                        crate::roof3d::outline(r, eave([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]), picture, pic.frame(), ([0.0, 0.0], size))
+                    }
+                };
+                if let Some(roof) = roof {
+                    pics.insert(key, img.to_rgba8());
+                    st.roofs.push(roof);
+                }
+            }
+        }
+        // Предметы, что не в картинке пола (они в выгрузке своими тайлами), — по этажам, снизу
+        // вверх по слоям. Лестница, ставшая маршем, — сам марш.
         let mut plans: Vec<(usize, Prop, props3d::Lift)> = Vec::new();
         for k in 0..e.done.len() {
             let m = self.export_level(e, k);
-            let mut here: Vec<(usize, Prop, props3d::Lift)> = m.props.iter().filter_map(|p| props3d::lift(p, m).map(|l| (k, p.clone(), l))).collect();
+            let gone = flights.get(k).cloned().unwrap_or_default();
+            // Та же лестница этажом выше — тоже: в дыре виден сам марш.
+            let below = (k > 0).then(|| self.export_level(e, k - 1));
+            let over = |p: &Prop| below.is_some_and(|b| crate::ground3d::over_flight(p, b, &super::exporting::has_model));
+            let mut here: Vec<(usize, Prop, props3d::Lift)> = m.props.iter().enumerate().filter(|(i, p)| !gone.contains(i) && !over(p)).filter_map(|(_, p)| props3d::lift(p, m).map(|l| (k, p.clone(), l))).collect();
             here.sort_by_key(|(_, p, _)| p.layer());
             plans.extend(here);
         }
@@ -962,6 +1063,8 @@ impl App {
                 *img = image::imageops::resize(img, ((img.width() as f32 * k) as u32).max(1), ((img.height() as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle);
             }
         }
+        // Узлы крыш идут в сцене по этажам и по порядку крыш — так же и их контуры.
+        let mut outlines = storeys.iter().flat_map(|s| s.roofs.iter().map(|r| r.outline.clone()));
         let nodes = scene
             .nodes
             .iter()
@@ -972,13 +1075,19 @@ impl App {
                 yaw: n.yaw,
                 door: n.door.as_ref().map(|d| (d.id.trim_end_matches("_a").trim_end_matches("_b").to_owned(), d.swing)),
                 template: false,
+                roof: if n.part == Part::Roof { outlines.next().unwrap_or_default() } else { Vec::new() },
             })
             .collect();
         let meshes = scene.nodes.iter_mut().map(|n| std::mem::take(&mut n.prims)).collect();
         let mut parts = Parts { nodes, meshes, materials: std::mem::take(&mut scene.materials), images };
-        let (props, modelled) = self.props_3d(&plans, &mut parts);
+        let grounds: Vec<scene3d::Ground> = storeys.iter().map(|s| s.ground.clone()).collect();
+        let (props, modelled) = self.props_3d(&plans, &grounds, &mut parts);
         let Parts { nodes, meshes, materials, images } = parts;
-        let floors3: Vec<Floor3> = layouts.iter().enumerate().map(|(k, lay)| Floor3::new(k, lay, self.export_level(e, k).rooms.clone(), storeys[k].look.width.max(0.02) / 2.0, e.px as f32)).collect();
+        let floors3: Vec<Floor3> = layouts
+            .iter()
+            .enumerate()
+            .map(|(k, lay)| Floor3::new(k, lay, self.export_level(e, k).rooms.clone(), storeys[k].look.width.max(0.02) / 2.0, e.px as f32, grounds[k].clone(), covers[k].clone()))
+            .collect();
         let renderer = self.view3d.as_ref().map_or_else(Renderer::default, |v| v.renderer.clone());
         renderer.upload(Upload { nodes: meshes, materials, images, pawn: render3d::pawn() });
         let mut v = View3d::fresh(renderer, nodes, floors3, size, first_time);
@@ -1035,14 +1144,14 @@ mod tests {
             zones: Vec::new(),
             passages: Vec::new(),
         };
-        let floor = Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0);
+        let floor = Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0, scene3d::Ground::default(), None);
         let mut v = View3d::fresh(Renderer::default(), Vec::new(), vec![floor], [10.0, 10.0], Time::Night);
         v.relight_all();
         v
     }
 
     fn walk_to(v: &mut View3d, from: [f32; 2], to: [f32; 2]) -> [f32; 2] {
-        v.token = Some(Token { at: from, storey: 0 });
+        v.token = Some(Token { at: from, storey: 0, feet: 0.0 });
         let d = [(to[0] - from[0]) / 60.0, (to[1] - from[1]) / 60.0];
         for _ in 0..60 {
             v.walk(d);
@@ -1092,7 +1201,7 @@ mod tests {
     fn closing_the_door_on_the_token_pushes_it_out_of_the_doorway() {
         let mut v = room();
         v.toggle(0, 0);
-        v.token = Some(Token { at: [5.0, 6.05], storey: 0 });
+        v.token = Some(Token { at: [5.0, 6.05], storey: 0, feet: 0.0 });
         v.toggle(0, 0);
         let at = v.token.map(|t| t.at).unwrap_or_default();
         assert!((at[1] - 6.0).abs() >= TOKEN_R, "{at:?}");
@@ -1115,7 +1224,7 @@ mod tests {
         let mut v = room();
         let spot = [5.0, 9.0];
         let dark = light_at(&v, spot);
-        v.token = Some(Token { at: [5.0, 8.5], storey: 0 });
+        v.token = Some(Token { at: [5.0, 8.5], storey: 0, feet: 0.0 });
         v.torch_step();
         let lit = light_at(&v, spot);
         assert!(lit > dark + 0.1, "факел светит: {dark} → {lit}");
@@ -1123,6 +1232,44 @@ mod tests {
         v.torch_step();
         assert!((light_at(&v, spot) - dark).abs() < 1e-4, "фишку убрали — темно");
         assert_eq!(v.floors[0].light.sources.len(), 1, "свой огонь фишки убран из света этажа");
+    }
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32, top: f32) -> scene3d::Block {
+        scene3d::Block { poly: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]], base: 0.0, top: scene3d::Top::Flat(top), side: [90, 90, 90], skin: None }
+    }
+
+    #[test]
+    fn a_token_climbs_the_steps_onto_a_dais_but_not_its_wall() {
+        let mut v = room();
+        // Помост 0,6 у северной стены, три ступени к югу посередине.
+        v.floors[0].ground.blocks = vec![rect(2.0, 2.0, 8.0, 3.5, 0.6), rect(4.5, 3.5, 5.5, 3.9, 0.45), rect(4.5, 3.9, 5.5, 4.3, 0.3), rect(4.5, 4.3, 5.5, 4.7, 0.15)];
+        let at = walk_to(&mut v, [3.0, 5.0], [3.0, 2.5]);
+        assert!(at[1] > 3.5 && v.token.unwrap().feet == 0.0, "в стенку помоста не вошла: {at:?}");
+        let at = walk_to(&mut v, [5.0, 5.5], [5.0, 2.8]);
+        assert!(at[1] < 3.5 && (v.token.unwrap().feet - 0.6).abs() < 1e-5, "по ступеням — на помост: {at:?} {}", v.token.unwrap().feet);
+    }
+
+    #[test]
+    fn a_flight_takes_the_token_upstairs_and_back_down() {
+        let lay = Layout { tents: Vec::new(), walls: Vec::new(), low: Vec::new(), cliffs: Vec::new(), portals: Vec::new(), lights: Vec::new(), zones: Vec::new(), passages: Vec::new() };
+        // Марш с юга (y = 6) на север (y = 3) по x 4..6: семь ступеней до пола второго этажа.
+        let steps: Vec<scene3d::Block> = (0..7).map(|i| rect(4.0, 6.0 - (i + 1) as f32 * 3.0 / 7.0, 6.0, 6.0 - i as f32 * 3.0 / 7.0, STOREY * (i + 1) as f32 / 7.0)).collect();
+        let ground = scene3d::Ground { relief: None, blocks: steps };
+        // Наверху над маршем — дыра.
+        let cover = scene3d::Cover { w: 10, h: 10, per: 1.0, data: (0..100).map(|k| !((4..6).contains(&(k % 10)) && (3..6).contains(&(k / 10)))).collect() };
+        let floors = vec![Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0, ground, None), Floor3::new(1, &lay, Mask::for_cells(10, 10), 0.1, 100.0, scene3d::Ground::default(), Some(cover))];
+        let mut v = View3d::fresh(Renderer::default(), Vec::new(), floors, [10.0, 10.0], Time::Day);
+        v.token = Some(Token { at: [5.0, 7.0], storey: 0, feet: 0.0 });
+        for _ in 0..100 {
+            v.walk([0.0, -0.05]);
+        }
+        let t = v.token.unwrap();
+        assert!(t.storey == 1 && t.at[1] < 3.0 && t.feet.abs() < 1e-5 && v.top == 1, "наверху: этаж {}, {:?}, {}", t.storey, t.at, t.feet);
+        for _ in 0..100 {
+            v.walk([0.0, 0.05]);
+        }
+        let t = v.token.unwrap();
+        assert!(t.storey == 0 && t.at[1] > 6.0 && t.feet.abs() < 1e-5, "внизу: этаж {}, {:?}, {}", t.storey, t.at, t.feet);
     }
 
     #[test]

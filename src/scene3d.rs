@@ -4,6 +4,11 @@
 //! двери — отдельный узел на петле. Эту сцену пишет выгрузка в `.glb` для 3D Canvas (`glb`),
 //! её же рисует тестовая зона — окно 3D в Картографе (`render3d`).
 //!
+//! Земля этажа ([`Ground`]) — рельеф и твёрдые тела на полу: помосты, ступени, пандусы, марши
+//! лестниц между этажами. Пол ложится на рельеф, стены встают на него; верх тел — та же
+//! картинка пола, на ней помост и ступени уже нарисованы сверху. Крыши ([`Roof3`]) — скаты с
+//! картинкой крыши из 2D, наложенной сверху.
+//!
 //! Единицы — клетки: x — вправо, z — вниз по карте (на юг), y — вверх; клетка — 5 футов.
 //! Так же лежит сцена 3D Canvas (x и z — точки холста / 1000), поэтому модель не зеркалится.
 
@@ -30,11 +35,17 @@ const LINTEL_MAX: f32 = 2.5;
 const SIDE_PERIOD: f32 = 0.5;
 /// Створка открывается на четверть оборота.
 const SWING: f32 = std::f32::consts::FRAC_PI_2;
+/// Выше этого фишка не шагает сама (как в 3D Canvas: треть клетки): стенка помоста, обрыв.
+pub const STEP: f32 = 1.0 / 3.0;
+/// Стена на рельефе дробится на куски не длиннее этого: низ идёт по земле.
+const RELIEF_PIECE: f32 = 1.0;
 
 /// Дерево створок, пока у дверей нет своих моделей.
 const WOOD: [u8; 3] = [104, 74, 48];
 /// Стекло окна.
 const GLASS_TINT: [u8; 3] = [170, 200, 220];
+/// Щипцы и торцы крыш.
+const GABLE: [u8; 3] = [112, 92, 72];
 
 /// Чем служит узел: по этому выгрузка ставит метки 3D Canvas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,6 +54,7 @@ pub enum Part {
     Wall,
     Glass,
     Door,
+    Roof,
 }
 
 /// Картинка: ключ, по которому её найдёт выгрузка (ассет или пол этажа), размер и есть ли
@@ -144,6 +156,184 @@ pub struct Opening {
     pub id: String,
 }
 
+/// Верх тела: ровный или плоскостью под уклон (пандус).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Top {
+    Flat(f32),
+    /// Высота `h` в точке `at` и подъём по осям карты: клеток высоты на клетку пути.
+    Slope { at: [f32; 2], h: f32, rise: [f32; 2] },
+}
+
+impl Top {
+    pub fn at(&self, p: [f32; 2]) -> f32 {
+        match *self {
+            Top::Flat(h) => h,
+            Top::Slope { at, h, rise } => h + (p[0] - at[0]) * rise[0] + (p[1] - at[1]) * rise[1],
+        }
+    }
+
+    /// Подъём по осям карты (у ровного — ноль).
+    fn rise(&self) -> [f32; 2] {
+        match *self {
+            Top::Flat(_) => [0.0, 0.0],
+            Top::Slope { rise, .. } => rise,
+        }
+    }
+}
+
+/// Своя картинка верха тела: `origin` — где у неё левый верхний угол, `u` и `v` — её ширина и
+/// высота на карте (векторы, клетки). Марш лестницы между этажами несёт рисунок своего предмета.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Skin {
+    pub picture: Picture,
+    pub origin: [f32; 2],
+    pub u: [f32; 2],
+    pub v: [f32; 2],
+}
+
+impl Skin {
+    fn uv(&self, p: [f32; 2]) -> [f32; 2] {
+        let d = [p[0] - self.origin[0], p[1] - self.origin[1]];
+        let along = |a: [f32; 2]| (d[0] * a[0] + d[1] * a[1]) / (a[0] * a[0] + a[1] * a[1]).max(1e-9);
+        [along(self.u), along(self.v)]
+    }
+}
+
+/// Твёрдое тело на полу этажа: помост, ступень, пандус, ступень марша. Бока — отвесно от
+/// `base` до верха; верх — картинка пола этажа (помост и ступени на ней уже нарисованы сверху)
+/// или своя (`skin`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    pub poly: Vec<[f32; 2]>,
+    pub base: f32,
+    pub top: Top,
+    pub side: [u8; 3],
+    pub skin: Option<Skin>,
+}
+
+/// Высоты земли по сетке: `w × h` точек через `step` клеток, первая — в левом верхнем углу карты.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub w: usize,
+    pub h: usize,
+    pub step: f32,
+    pub data: Vec<f32>,
+}
+
+impl Field {
+    fn get(&self, i: isize, j: isize) -> f32 {
+        let i = i.clamp(0, self.w as isize - 1) as usize;
+        let j = j.clamp(0, self.h as isize - 1) as usize;
+        self.data[j * self.w + i]
+    }
+
+    /// Высота в точке карты; между точками сетки — по прямой.
+    pub fn at(&self, p: [f32; 2]) -> f32 {
+        let (x, y) = (p[0] / self.step, p[1] / self.step);
+        let (i, j) = (x.floor(), y.floor());
+        let (tx, ty) = (x - i, y - j);
+        let (i, j) = (i as isize, j as isize);
+        let top = self.get(i, j) * (1.0 - tx) + self.get(i + 1, j) * tx;
+        let low = self.get(i, j + 1) * (1.0 - tx) + self.get(i + 1, j + 1) * tx;
+        top * (1.0 - ty) + low * ty
+    }
+}
+
+/// Земля этажа над его полом: рельеф и тела на нём.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ground {
+    pub relief: Option<Field>,
+    pub blocks: Vec<Block>,
+}
+
+impl Ground {
+    fn relief_at(&self, p: [f32; 2]) -> f32 {
+        self.relief.as_ref().map_or(0.0, |f| f.at(p))
+    }
+
+    /// Высота земли в точке: верх всего, что там стоит.
+    pub fn at(&self, p: [f32; 2]) -> f32 {
+        self.blocks.iter().filter(|b| crate::platform::contains(&b.poly, p)).fold(self.relief_at(p), |h, b| h.max(b.top.at(p)))
+    }
+
+    /// Куда встанет нога, шагнув в `p` со ступни на высоте `feet`: на самый высокий верх не
+    /// выше шага ([`STEP`]); `None` — там тело или земля выше шага (стенка помоста, обрыв).
+    pub fn step(&self, p: [f32; 2], feet: f32) -> Option<f32> {
+        let reach = feet + STEP + 1e-3;
+        let mut h = self.relief_at(p);
+        if h > reach {
+            return None;
+        }
+        for b in self.blocks.iter().filter(|b| crate::platform::contains(&b.poly, p)) {
+            let t = b.top.at(p);
+            if t > reach {
+                return None;
+            }
+            h = h.max(t);
+        }
+        Some(h)
+    }
+}
+
+/// Где у этажа есть пол, а где дыра (видно этаж ниже): по точке на `1 / per` клетки.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cover {
+    pub w: usize,
+    pub h: usize,
+    pub per: f32,
+    pub data: Vec<bool>,
+}
+
+impl Cover {
+    /// По прозрачности картинки пола во всю карту `cells`: пол — где она непрозрачна.
+    pub fn from_alpha(img: &image::RgbaImage, cells: [f32; 2], per: f32) -> Self {
+        let (w, h) = ((cells[0] * per).ceil().max(1.0) as usize, (cells[1] * per).ceil().max(1.0) as usize);
+        let (kx, ky) = (img.width() as f32 / (cells[0] * per).max(1e-6), img.height() as f32 / (cells[1] * per).max(1e-6));
+        let data = (0..w * h)
+            .map(|k| {
+                let (i, j) = (k % w, k / w);
+                let x = (((i as f32 + 0.5) * kx) as u32).min(img.width().saturating_sub(1));
+                let y = (((j as f32 + 0.5) * ky) as u32).min(img.height().saturating_sub(1));
+                img.get_pixel(x, y)[3] >= 128
+            })
+            .collect();
+        Self { w, h, per, data }
+    }
+
+    /// Пол во всю карту `cells` (этаж без дыр).
+    pub fn full(cells: [f32; 2], per: f32) -> Self {
+        let (w, h) = ((cells[0] * per).ceil().max(1.0) as usize, (cells[1] * per).ceil().max(1.0) as usize);
+        Self { w, h, per, data: vec![true; w * h] }
+    }
+
+    /// Есть ли пол в точке карты (за краем — нет).
+    pub fn has(&self, p: [f32; 2]) -> bool {
+        let (i, j) = ((p[0] * self.per).floor(), (p[1] * self.per).floor());
+        if i < 0.0 || j < 0.0 || i as usize >= self.w || j as usize >= self.h {
+            return false;
+        }
+        self.data[j as usize * self.w + i as usize]
+    }
+}
+
+/// Крыша: скаты и щипцы в клетках сцены, высота — над полом этажа. Картинка крыши из 2D
+/// ложится на скаты сверху по рамке `frame` (левый верхний угол, ширина, высота — клетки):
+/// uv у скатов уже по ней. `outline` — её контур на карте (кольца): под ним фишка — крыша
+/// прячется, как тайл крыши в Foundry.
+#[derive(Clone, Debug)]
+pub struct Roof3 {
+    pub picture: Picture,
+    pub frame: [f32; 4],
+    pub cover: Mesh,
+    pub gables: Mesh,
+    pub outline: Vec<Vec<[f32; 2]>>,
+}
+
+/// Точка внутри колец (внешний контур и дворы: внутри — в нечётном числе колец).
+pub fn inside(rings: &[Vec<[f32; 2]>], p: [f32; 2]) -> bool {
+    rings.iter().filter(|r| r.len() >= 3 && crate::platform::contains(r, p)).count() % 2 == 1
+}
+
 /// Этаж для построения.
 pub struct Storey {
     /// Картинка «пол без стен» во всю карту; на верхних этажах — с дырами.
@@ -157,6 +347,10 @@ pub struct Storey {
     /// Пустые проёмы (`PortalKind::Opening`): над узким — перемычка.
     pub gaps: Vec<Segment>,
     pub look: WallLook,
+    /// Рельеф и тела на полу.
+    pub ground: Ground,
+    /// Крыши этажа. Выгрузка кладёт их не в общую модель, а каждую в свой тайл крыши.
+    pub roofs: Vec<Roof3>,
 }
 
 impl Scene3d {
@@ -248,10 +442,22 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             }
             None => s.material(Material { look: Look::Color([96, 90, 84]), alpha: Alpha::Opaque, two_sided: true, repeat: false, opacity: 1.0 }),
         };
-        let mut floor = Mesh::default();
-        let (w, h) = (size[0], size[1]);
-        quad(&mut floor, [[0.0, y0, 0.0], [w, y0, 0.0], [w, y0, h], [0.0, y0, h]], [0.0, 1.0, 0.0], [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        // На рельефе пол — сетка высот, иначе плита.
+        let floor = match &st.ground.relief {
+            Some(f) => field_mesh(f, size, y0),
+            None => {
+                let mut m = Mesh::default();
+                let (w, h) = (size[0], size[1]);
+                quad(&mut m, [[0.0, y0, 0.0], [w, y0, 0.0], [w, y0, h], [0.0, y0, h]], [0.0, 1.0, 0.0], [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+                m
+            }
+        };
         s.nodes.push(Node { name: format!("floor_{}", k + 1), part: Part::Floor, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(floor_mat, floor)], door: None });
+        blocks_node(&mut s, k, &st.ground.blocks, size, y0, floor_mat);
+        // Низ стен и створок — по земле: на рельефе стена стоит на склоне.
+        let relief = st.ground.relief.as_ref();
+        let base = |p: [f32; 2]| relief.map_or(0.0, |f| f.at(p));
+        let fine = |line: &[[f32; 2]]| if relief.is_some() { subdivide(line, RELIEF_PIECE) } else { line.to_vec() };
 
         // Стены, перемычки и подоконники — одна сетка этажа.
         let look = &st.look;
@@ -273,14 +479,14 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
         };
         let mut walls = Shell::default();
         for line in &st.walls {
-            extrude(&mut walls, line, half, y0, y1, tiling);
+            extrude(&mut walls, &fine(line), half, y0, y1, tiling, &base);
         }
         for line in &st.low {
-            extrude(&mut walls, line, half, y0, y0 + LOW, tiling);
+            extrude(&mut walls, &fine(line), half, y0, y0 + LOW, tiling, &base);
         }
         for g in &st.gaps {
             if dist(g.0, g.1) <= LINTEL_MAX {
-                extrude(&mut walls, &[g.0, g.1], half, y0 + DOOR, y1, tiling);
+                extrude(&mut walls, &[g.0, g.1], half, y0 + DOOR, y1, tiling, &base);
             }
         }
 
@@ -288,31 +494,33 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
         let glass = s.material(Material { look: Look::Color(GLASS_TINT), alpha: Alpha::Blend, two_sided: true, repeat: true, opacity: 0.3 });
         for (i, o) in st.openings.iter().enumerate() {
             let (a, b) = o.seg;
+            // Створка — на земле у петли.
+            let foot = |p: [f32; 2]| y0 + base(p);
             match o.kind {
                 PortalKind::Door => {
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling);
-                    s.nodes.push(leaf(format!("door_{}_{}", k + 1, i + 1), k, a, b, y0, DOOR, wood, Door { id: o.id.clone(), swing: SWING }));
+                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
+                    s.nodes.push(leaf(format!("door_{}_{}", k + 1, i + 1), k, a, b, foot(a), DOOR, wood, Door { id: o.id.clone(), swing: SWING }));
                 }
                 PortalKind::DoubleDoor => {
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling);
+                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
                     let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-                    s.nodes.push(leaf(format!("door_{}_{}a", k + 1, i + 1), k, a, mid, y0, DOOR, wood, Door { id: format!("{}_a", o.id), swing: SWING }));
-                    s.nodes.push(leaf(format!("door_{}_{}b", k + 1, i + 1), k, b, mid, y0, DOOR, wood, Door { id: format!("{}_b", o.id), swing: -SWING }));
+                    s.nodes.push(leaf(format!("door_{}_{}a", k + 1, i + 1), k, a, mid, foot(a), DOOR, wood, Door { id: format!("{}_a", o.id), swing: SWING }));
+                    s.nodes.push(leaf(format!("door_{}_{}b", k + 1, i + 1), k, b, mid, foot(b), DOOR, wood, Door { id: format!("{}_b", o.id), swing: -SWING }));
                 }
                 // Тайный ход снаружи неотличим от стены: створка во всю высоту, из стены.
                 PortalKind::Secret => {
-                    s.nodes.push(leaf(format!("secret_{}_{}", k + 1, i + 1), k, a, b, y0, STOREY, side_mat, Door { id: o.id.clone(), swing: SWING }));
+                    s.nodes.push(leaf(format!("secret_{}_{}", k + 1, i + 1), k, a, b, foot(a), STOREY, side_mat, Door { id: o.id.clone(), swing: SWING }));
                 }
                 PortalKind::Window => {
-                    extrude(&mut walls, &[a, b], half, y0, y0 + SILL, tiling);
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling);
+                    extrude(&mut walls, &[a, b], half, y0, y0 + SILL, tiling, &base);
+                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
                     let mut pane = Shell::default();
-                    extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, y0 + DOOR, tiling);
+                    extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, y0 + DOOR, tiling, &base);
                     s.nodes.push(Node { name: format!("window_{}_{}", k + 1, i + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(glass, pane.into_one())], door: None });
                 }
                 PortalKind::Opening => {
                     if dist(a, b) <= LINTEL_MAX {
-                        extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling);
+                        extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
                     }
                 }
             }
@@ -322,8 +530,169 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
         if !prims.is_empty() {
             s.nodes.push(Node { name: format!("walls_{}", k + 1), part: Part::Wall, storey: k, at: [0.0; 3], yaw: 0.0, prims, door: None });
         }
+        for (i, r) in st.roofs.iter().enumerate() {
+            let node = roof_node(&mut s, k, i, r, y0);
+            s.nodes.push(node);
+        }
     }
     s
+}
+
+/// Узел крыши: скаты с её картинкой (прозрачное вне крыши — вырезом), щипцы — цветом. Обе
+/// стороны: из-под свеса и из комнаты видна изнанка.
+fn roof_node(s: &mut Scene3d, k: usize, i: usize, r: &Roof3, y0: f32) -> Node {
+    let pic = s.picture(&r.picture);
+    let cover = s.material(Material { look: Look::Picture(pic), alpha: if r.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: true, repeat: false, opacity: 1.0 });
+    let gable = s.material(Material { look: Look::Color(GABLE), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 });
+    let prims = [(cover, r.cover.clone()), (gable, r.gables.clone())].into_iter().filter(|(_, m)| !m.idx.is_empty()).collect();
+    Node { name: format!("roof_{}_{}", k + 1, i + 1), part: Part::Roof, storey: k, at: [0.0, y0, 0.0], yaw: 0.0, prims, door: None }
+}
+
+/// Крыша для своего тайла в выгрузке: сцена из одного узла в рамке картинки крыши (середина
+/// рамки — в нуле, низ крыши — на нуле) и рамка самой крыши в клетках над полом этажа. 3D Canvas
+/// растягивает модель по тайлу картинки, поэтому по углам рамки — по точке без площади: рамка
+/// модели равна рамке картинки, даже где крыша её не заполняет.
+pub fn roof_scene(r: &Roof3) -> Option<(Scene3d, [[f32; 3]; 2])> {
+    let mut s = Scene3d::default();
+    let node = roof_node(&mut s, 0, 0, r, 0.0);
+    s.nodes.push(node);
+    let [lo, hi] = s.bounds()?;
+    let [fx, fz, fw, fh] = r.frame;
+    let (cx, cz) = (fx + fw / 2.0, fz + fh / 2.0);
+    let n = &mut s.nodes[0];
+    for (_, m) in &mut n.prims {
+        for v in &mut m.v {
+            v.p = [v.p[0] - cx, v.p[1] - lo[1], v.p[2] - cz];
+        }
+    }
+    if let Some((_, m)) = n.prims.first_mut() {
+        let b = m.v.len() as u32;
+        for (x, z) in [(fx, fz), (fx + fw, fz + fh)] {
+            m.v.push(Vertex { p: [x - cx, 0.0, z - cz], n: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+        }
+        m.idx.extend([b, b, b + 1]);
+    }
+    Some((s, [lo, hi]))
+}
+
+/// Пол на рельефе: сетка высот поля во всю карту, картинка пола — по рамке карты.
+fn field_mesh(f: &Field, size: [f32; 2], y0: f32) -> Mesh {
+    let mut m = Mesh::default();
+    let h = |i: isize, j: isize| f.get(i, j);
+    for j in 0..f.h {
+        for i in 0..f.w {
+            let (x, z) = ((i as f32 * f.step).min(size[0]), (j as f32 * f.step).min(size[1]));
+            let (ii, jj) = (i as isize, j as isize);
+            let n = norm3([-(h(ii + 1, jj) - h(ii - 1, jj)) / (2.0 * f.step), 1.0, -(h(ii, jj + 1) - h(ii, jj - 1)) / (2.0 * f.step)]);
+            m.v.push(Vertex { p: [x, y0 + h(ii, jj), z], n, uv: [x / size[0].max(1e-6), z / size[1].max(1e-6)] });
+        }
+    }
+    for j in 0..f.h.saturating_sub(1) {
+        for i in 0..f.w.saturating_sub(1) {
+            let a = (j * f.w + i) as u32;
+            let (b, c, d) = (a + 1, a + 1 + f.w as u32, a + f.w as u32);
+            // Лицом вверх: x — вправо, z — на юг.
+            m.idx.extend([a, d, c, a, c, b]);
+        }
+    }
+    m
+}
+
+/// Тела на полу этажа одним узлом: верх — картинкой пола (или своей), бока — цветом тела.
+fn blocks_node(s: &mut Scene3d, k: usize, blocks: &[Block], size: [f32; 2], y0: f32, floor_mat: usize) {
+    let mut by_mat: Vec<(usize, Mesh)> = Vec::new();
+    let put = |mat: usize, by_mat: &mut Vec<(usize, Mesh)>| -> usize {
+        match by_mat.iter().position(|(m, _)| *m == mat) {
+            Some(i) => i,
+            None => {
+                by_mat.push((mat, Mesh::default()));
+                by_mat.len() - 1
+            }
+        }
+    };
+    for b in blocks {
+        let poly = crate::platform::tidy(&b.poly);
+        if poly.len() < 3 {
+            continue;
+        }
+        let top_mat = match &b.skin {
+            Some(sk) => {
+                let pic = s.picture(&sk.picture);
+                s.material(Material { look: Look::Picture(pic), alpha: if sk.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: false, opacity: 1.0 })
+            }
+            None => floor_mat,
+        };
+        let side_mat = s.material(Material { look: Look::Color(b.side), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 });
+        let uv = |p: [f32; 2]| match &b.skin {
+            Some(sk) => sk.uv(p),
+            None => [p[0] / size[0].max(1e-6), p[1] / size[1].max(1e-6)],
+        };
+        let rise = b.top.rise();
+        let up = norm3([-rise[0], 1.0, -rise[1]]);
+        let at = |p: [f32; 2], y: f32| [p[0], y0 + y, p[1]];
+        let t = put(top_mat, &mut by_mat);
+        for [i, j, l] in crate::platform::triangulate(&poly) {
+            let (a, c, d) = (poly[i], poly[j], poly[l]);
+            tri(&mut by_mat[t].1, [at(a, b.top.at(a)), at(c, b.top.at(c)), at(d, b.top.at(d))], up, [uv(a), uv(c), uv(d)]);
+        }
+        let sd = put(side_mat, &mut by_mat);
+        let nrm = crate::platform::normals(&poly);
+        let mut run = 0.0;
+        for e in 0..poly.len() {
+            let (a, c) = (poly[e], poly[(e + 1) % poly.len()]);
+            let (ha, hc) = (b.top.at(a), b.top.at(c));
+            let len = dist(a, c);
+            let (u0, u1) = (run, run + len);
+            run = u1;
+            if ha.max(hc) - b.base < 1e-3 {
+                continue;
+            }
+            let n = [nrm[e][0], 0.0, nrm[e][1]];
+            quad(&mut by_mat[sd].1, [at(a, b.base), at(c, b.base), at(c, hc), at(a, ha)], n, [[u0, ha - b.base], [u1, hc - b.base], [u1, 0.0], [u0, 0.0]]);
+        }
+    }
+    let prims: Vec<(usize, Mesh)> = by_mat.into_iter().filter(|(_, m)| !m.idx.is_empty()).collect();
+    if !prims.is_empty() {
+        s.nodes.push(Node { name: format!("ground_{}", k + 1), part: Part::Floor, storey: k, at: [0.0; 3], yaw: 0.0, prims, door: None });
+    }
+}
+
+/// Ломаная с кусками не длиннее `piece`.
+fn subdivide(line: &[[f32; 2]], piece: f32) -> Vec<[f32; 2]> {
+    let mut out = Vec::with_capacity(line.len());
+    for (i, &p) in line.iter().enumerate() {
+        if i > 0 {
+            let q = line[i - 1];
+            let n = (dist(q, p) / piece).ceil().max(1.0) as usize;
+            for t in 1..n {
+                let f = t as f32 / n as f32;
+                out.push([q[0] + (p[0] - q[0]) * f, q[1] + (p[1] - q[1]) * f]);
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+fn norm3(v: [f32; 3]) -> [f32; 3] {
+    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
+    [v[0] / l, v[1] / l, v[2] / l]
+}
+
+/// Треугольник лицом по `n` (как [`quad`]).
+pub(crate) fn tri(m: &mut Mesh, p: [[f32; 3]; 3], n: [f32; 3], uv: [[f32; 2]; 3]) {
+    let base = m.v.len() as u32;
+    for k in 0..3 {
+        m.v.push(Vertex { p: p[k], n, uv: uv[k] });
+    }
+    let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+    let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+    let c = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    if c[0] * n[0] + c[1] * n[1] + c[2] * n[2] >= 0.0 {
+        m.idx.extend([base, base + 1, base + 2]);
+    } else {
+        m.idx.extend([base, base + 2, base + 1]);
+    }
 }
 
 /// Створка от петли `hinge` к `to` на высоте `y0`, высотой `tall`: узел с началом на петле,
@@ -335,7 +704,7 @@ fn leaf(name: String, storey: usize, hinge: [f32; 2], to: [f32; 2], y0: f32, tal
     let mut m = Shell::default();
     let tiling = Tiling { top: 1.0, side_u: 1.0, side_v: 1.0 };
     // Чуть короче проёма и ниже притолоки: не трётся о косяк, когда поворачивается.
-    extrude(&mut m, &[[0.02, 0.0], [len - 0.02, 0.0]], LEAF / 2.0, 0.0, tall - 0.02, tiling);
+    extrude(&mut m, &[[0.02, 0.0], [len - 0.02, 0.0]], LEAF / 2.0, 0.0, tall - 0.02, tiling, &|_| 0.0);
     Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(mat, m.into_one())], door: Some(door) }
 }
 
@@ -355,8 +724,8 @@ fn left(d: [f32; 2]) -> [f32; 2] {
 
 /// Выдавить ломаную в стену толщиной `2·half` от `y0` до `y1`: стороны, верх и торцы у
 /// свободных концов; на изломах — скос (углы без щелей и нахлёстов). Замкнутая — если первая
-/// точка совпадает с последней.
-fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Tiling) {
+/// точка совпадает с последней. `base` поднимает стену в точке оси (земля на рельефе).
+fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Tiling, base: &dyn Fn([f32; 2]) -> f32) {
     let mut pts: Vec<[f32; 2]> = Vec::with_capacity(line.len());
     for &p in line {
         if pts.last().is_none_or(|&q| dist(q, p) > 1e-5) {
@@ -398,7 +767,9 @@ fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Til
         .collect();
     let l = |i: usize| [pts[i][0] + offs[i][0], pts[i][1] + offs[i][1]];
     let r = |i: usize| [pts[i][0] - offs[i][0], pts[i][1] - offs[i][1]];
-    let at = |p: [f32; 2], y: f32| [p[0], y, p[1]];
+    // Подъём точек оси: обе стороны стены в точке — на одной высоте, верх ровный поперёк.
+    let lift: Vec<f32> = pts.iter().map(|&p| base(p)).collect();
+    let at = |p: [f32; 2], i: usize, y: f32| [p[0], y + lift[i], p[1]];
     let segs = if closed { n } else { n - 1 };
     let mut run = 0.0;
     for s in 0..segs {
@@ -410,24 +781,25 @@ fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Til
         run = u1;
         let (su0, su1) = (u0 / t.side_u, u1 / t.side_u);
         let (sv0, sv1) = ((y1 - y0) / t.side_v, 0.0);
-        quad(&mut m.side, [at(l(i), y0), at(l(j), y0), at(l(j), y1), at(l(i), y1)], [nl[0], 0.0, nl[1]], [[su0, sv0], [su1, sv0], [su1, sv1], [su0, sv1]]);
-        quad(&mut m.side, [at(r(j), y0), at(r(i), y0), at(r(i), y1), at(r(j), y1)], [-nl[0], 0.0, -nl[1]], [[su1, sv0], [su0, sv0], [su0, sv1], [su1, sv1]]);
+        quad(&mut m.side, [at(l(i), i, y0), at(l(j), j, y0), at(l(j), j, y1), at(l(i), i, y1)], [nl[0], 0.0, nl[1]], [[su0, sv0], [su1, sv0], [su1, sv1], [su0, sv1]]);
+        quad(&mut m.side, [at(r(j), j, y0), at(r(i), i, y0), at(r(i), i, y1), at(r(j), j, y1)], [-nl[0], 0.0, -nl[1]], [[su1, sv0], [su0, sv0], [su0, sv1], [su1, sv1]]);
         let (tu0, tu1) = (u0 / t.top, u1 / t.top);
-        quad(&mut m.top, [at(l(i), y1), at(l(j), y1), at(r(j), y1), at(r(i), y1)], [0.0, 1.0, 0.0], [[tu0, 0.0], [tu1, 0.0], [tu1, 1.0], [tu0, 1.0]]);
+        quad(&mut m.top, [at(l(i), i, y1), at(l(j), j, y1), at(r(j), j, y1), at(r(i), i, y1)], [0.0, 1.0, 0.0], [[tu0, 0.0], [tu1, 0.0], [tu1, 1.0], [tu0, 1.0]]);
     }
     if !closed {
         let h = (y1 - y0) / t.side_v;
         let w = 2.0 * half / t.side_u;
         let d0 = dir(0, 1);
-        quad(&mut m.side, [at(r(0), y0), at(l(0), y0), at(l(0), y1), at(r(0), y1)], [-d0[0], 0.0, -d0[1]], [[0.0, h], [w, h], [w, 0.0], [0.0, 0.0]]);
+        quad(&mut m.side, [at(r(0), 0, y0), at(l(0), 0, y0), at(l(0), 0, y1), at(r(0), 0, y1)], [-d0[0], 0.0, -d0[1]], [[0.0, h], [w, h], [w, 0.0], [0.0, 0.0]]);
         let d1 = dir(n - 2, n - 1);
-        quad(&mut m.side, [at(l(n - 1), y0), at(r(n - 1), y0), at(r(n - 1), y1), at(l(n - 1), y1)], [d1[0], 0.0, d1[1]], [[0.0, h], [w, h], [w, 0.0], [0.0, 0.0]]);
+        let e = n - 1;
+        quad(&mut m.side, [at(l(e), e, y0), at(r(e), e, y0), at(r(e), e, y1), at(l(e), e, y1)], [d1[0], 0.0, d1[1]], [[0.0, h], [w, h], [w, 0.0], [0.0, 0.0]]);
     }
 }
 
 /// Четырёхугольник с нормалью `n`: обход вершин подбирается так, чтобы лицевая сторона
 /// смотрела по `n` (glTF: лицо — обход против часовой, если смотреть на него).
-fn quad(m: &mut Mesh, p: [[f32; 3]; 4], n: [f32; 3], uv: [[f32; 2]; 4]) {
+pub(crate) fn quad(m: &mut Mesh, p: [[f32; 3]; 4], n: [f32; 3], uv: [[f32; 2]; 4]) {
     let base = m.v.len() as u32;
     for k in 0..4 {
         m.v.push(Vertex { p: p[k], n, uv: uv[k] });
@@ -451,7 +823,7 @@ mod tests {
     }
 
     fn storey(walls: Vec<Vec<[f32; 2]>>, openings: Vec<Opening>) -> Storey {
-        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25) }
+        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25), ground: Ground::default(), roofs: Vec::new() }
     }
 
     /// Все треугольники сетки смотрят лицом по нормалям своих вершин.
@@ -577,7 +949,7 @@ mod tests {
         let strip = Picture { key: "stone".into(), size: [1024, 256], alpha: false };
         let side = Picture { key: "stone#side".into(), size: [1024, 128], alpha: false };
         let look = WallLook { width: 0.25, strip: Some(strip), side: Some(side), color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new() };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         assert_eq!(walls.prims.len(), 2);
@@ -593,7 +965,7 @@ mod tests {
     #[test]
     fn the_wall_strip_lies_along_the_top_like_on_the_2d_map() {
         let look = WallLook { width: 0.25, strip: Some(Picture { key: "stone".into(), size: [1024, 256], alpha: false }), side: None, color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new() };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         let m = &walls.prims[0].1;
@@ -603,5 +975,55 @@ mod tests {
         assert!((umax - 2.0).abs() < 1e-5, "{umax}");
         assert!(top.iter().all(|v| v.uv[1] == 0.0 || v.uv[1] == 1.0));
         assert!(s.materials[walls.prims[0].0].repeat);
+    }
+
+    #[test]
+    fn a_block_stands_on_the_floor_and_wears_the_floor_picture_on_top() {
+        let mut st = storey(Vec::new(), Vec::new());
+        st.ground.blocks.push(Block { poly: vec![[1.0, 1.0], [3.0, 1.0], [3.0, 2.0], [1.0, 2.0]], base: 0.0, top: Top::Flat(0.6), side: [90, 90, 90], skin: None });
+        let s = build([4.0, 4.0], &[st]);
+        let floor_mat = s.nodes.iter().find(|n| n.name == "floor_1").unwrap().prims[0].0;
+        let g = s.nodes.iter().find(|n| n.name == "ground_1").unwrap();
+        let top = &g.prims.iter().find(|(m, _)| *m == floor_mat).unwrap().1;
+        assert!(top.v.iter().all(|v| (v.p[1] - 0.6).abs() < 1e-6 && (v.uv[0] - v.p[0] / 4.0).abs() < 1e-6 && (v.uv[1] - v.p[2] / 4.0).abs() < 1e-6));
+        assert!(faces_follow_normals(top));
+        let sides = &g.prims.iter().find(|(m, _)| *m != floor_mat).unwrap().1;
+        assert_eq!(sides.idx.len(), 4 * 6);
+        assert!(faces_follow_normals(sides));
+        // Бока смотрят наружу.
+        assert!(sides.v.iter().all(|v| (v.p[0] - 2.0) * v.n[0] + (v.p[2] - 1.5) * v.n[2] > 0.0));
+    }
+
+    #[test]
+    fn on_relief_the_floor_follows_the_ground_and_walls_stand_on_it() {
+        // Земля поднимается к востоку на четверть клетки на клетку.
+        let f = Field { w: 5, h: 5, step: 1.0, data: (0..25).map(|k| (k % 5) as f32 * 0.25).collect() };
+        let mut st = storey(vec![vec![[0.0, 2.0], [4.0, 2.0]]], Vec::new());
+        st.ground.relief = Some(f);
+        let s = build([4.0, 4.0], &[st]);
+        let floor = &s.nodes.iter().find(|n| n.name == "floor_1").unwrap().prims[0].1;
+        assert_eq!(floor.v.len(), 25);
+        assert!(faces_follow_normals(floor));
+        let walls = &s.nodes.iter().find(|n| n.part == Part::Wall).unwrap().prims[0].1;
+        let span = |x: f32| walls.v.iter().filter(|v| (v.p[0] - x).abs() < 1e-4).fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.p[1]), hi.max(v.p[1])));
+        assert_eq!(span(0.0), (0.0, STOREY));
+        assert_eq!(span(4.0), (1.0, 1.0 + STOREY));
+        assert!((Ground { relief: s_field(), blocks: Vec::new() }.at([2.0, 1.0]) - 0.5).abs() < 1e-6);
+    }
+
+    fn s_field() -> Option<Field> {
+        Some(Field { w: 5, h: 5, step: 1.0, data: (0..25).map(|k| (k % 5) as f32 * 0.25).collect() })
+    }
+
+    #[test]
+    fn a_roof_for_its_own_tile_fills_the_picture_frame_from_zero_up() {
+        let r = crate::map::Roof::new([1.0, 1.0], [5.0, 4.0], crate::map::RoofShape::Gable, "x".into());
+        let roof = crate::roof3d::rect(&r, STOREY, Picture { key: "roof".into(), size: [10, 10], alpha: true }, [0.5, 0.5, 5.0, 4.0]);
+        let (scene, [lo, hi]) = roof_scene(&roof).unwrap();
+        let [a, b] = scene.bounds().unwrap();
+        assert!((a[0] + 2.5).abs() < 1e-4 && (b[0] - 2.5).abs() < 1e-4 && (a[2] + 2.0).abs() < 1e-4 && (b[2] - 2.0).abs() < 1e-4, "{a:?} {b:?}");
+        assert!(a[1].abs() < 1e-6 && (b[1] - (hi[1] - lo[1])).abs() < 1e-5);
+        // Свес ниже верха стен, конёк выше.
+        assert!(lo[1] < STOREY && hi[1] > STOREY);
     }
 }

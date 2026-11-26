@@ -384,6 +384,10 @@ impl App {
         self.models_open = true;
     }
 
+    pub(crate) fn close_models_window(&mut self) {
+        self.models_open = false;
+    }
+
     /// Окно «3D-модели: наборы и авторы»: что на полке и чьё, наборы с зеркала, свой набор.
     pub(super) fn models_window(&mut self, ctx: &egui::Context) {
         if !self.models_open {

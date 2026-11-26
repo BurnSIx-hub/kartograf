@@ -1821,7 +1821,7 @@ fn stairs_of(a: &Value) -> Result<Option<Vec<crate::platform::Stair>>, String> {
     list.iter()
         .map(|s| {
             let at = point_at(s, "at").ok_or("лестница: нужна точка at: [x, y] у края помоста")?;
-            Ok(crate::platform::Stair { at, width: f(s, "width").unwrap_or(2.0).clamp(0.4, 12.0), steps: s["steps"].as_u64().unwrap_or(3).clamp(1, 16) as u8 })
+            Ok(crate::platform::Stair { at, width: f(s, "width").unwrap_or(2.0).clamp(0.4, 12.0), steps: s["steps"].as_u64().unwrap_or(3).clamp(1, 16) as u8, ramp: s["ramp"].as_bool().unwrap_or(false) })
         })
         .collect::<Result<Vec<_>, String>>()
         .map(Some)

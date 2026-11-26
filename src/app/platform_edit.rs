@@ -190,7 +190,7 @@ impl App {
         self.checkpoint();
         let pl = &mut self.map.platforms[i];
         match put {
-            PlatformPut::Stair => pl.stairs.push(Stair { at: w, width: 2.0, steps: 3 }),
+            PlatformPut::Stair => pl.stairs.push(Stair { at: w, width: 2.0, steps: 3, ramp: false }),
             PlatformPut::Grate => pl.grates.push(Grate { at: w, length: 3.0 }),
         }
     }
@@ -241,7 +241,7 @@ impl App {
             let orange = Color32::from_rgb(255, 200, 90);
             match put {
                 PlatformPut::Stair => {
-                    if let Some(g) = platform::stair_geo(&p, &Stair { at: w, width: 2.0, steps: 3 }) {
+                    if let Some(g) = platform::stair_geo(&p, &Stair { at: w, width: 2.0, steps: 3, ramp: false }) {
                         line(&g.outline(), orange, 2.0);
                     }
                 }
@@ -344,7 +344,8 @@ impl App {
                 ui.spacing_mut().slider_width = 64.0;
                 ui.label(format!("{}", k + 1));
                 ui.add(egui::Slider::new(&mut s.width, 0.6..=8.0).step_by(0.1).text("шир."));
-                ui.add(egui::Slider::new(&mut s.steps, 1..=10).text("ступ."));
+                ui.add(egui::Slider::new(&mut s.steps, 1..=10).text(if s.ramp { "длина" } else { "ступ." }));
+                ui.checkbox(&mut s.ramp, "пандус").on_hover_text("Гладкий скат вместо ступеней: на карте без рёбер, в 3D — наклонная плоскость");
                 if ui.small_button("×").on_hover_text("Убрать лестницу").clicked() {
                     gone = Some(k);
                 }

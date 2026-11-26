@@ -1011,6 +1011,11 @@ pub struct RoofTile {
     pub model: Option<(String, f32)>,
     /// Предмет стоит на другом (подсвечник на столе): на столько футов над полом этажа.
     pub rest: f32,
+    /// Модель крыши (`model`): её низ над полом этажа, клетки. Тайл крыши остаётся на верху
+    /// этажа (в 2D он над токенами и створками дверей), модель 3D Canvas сдвигает вниз, на стены.
+    pub model_base: Option<f32>,
+    /// В 3D-виде не виден (лестница над маршем этажа ниже: там сам марш), в 2D — как есть.
+    pub hide3d: bool,
 }
 
 /// Сколько потоков брать на картинку: у программы — по ядрам (не больше восьми), в
@@ -1573,11 +1578,21 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 // В 3D-виде — модель в рамке тайла. Нетвёрдая: фишки ходят мимо мебели, как в 2D,
                 // а не взбираются на неё.
                 tile["flags"][CANVAS3D] = json!({"model3d": src, "fillType": "stretch", "depth": (tall * px as f32).round().max(1.0), "collision": false});
+                // Крыша: тайл — на верху этажа, модель — ниже, на стенах. Сдвиг 3D Canvas — в точках сцены.
+                if let Some(base) = r.model_base {
+                    let elevation = tile["elevation"].as_f64().unwrap_or(t as f64);
+                    let ft = b as f64 + base as f64 * 5.0 - elevation;
+                    tile["flags"][CANVAS3D]["offset"] = json!({"x": 0, "y": (ft / 5.0 * px as f64).round() + 0.0, "z": 0});
+                }
+            }
+            if r.hide3d {
+                tile["flags"][CANVAS3D]["transparency"] = json!(0);
             }
             if !r.scuppers.is_empty() {
                 // Сливы крыши: середина и поворот; размер — клетка сцены.
                 let s: Vec<Value> = r.scuppers.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();
-                tile["flags"] = json!({LIVE_MODULE: {"scuppers": s, "scupperSize": px}});
+                tile["flags"][LIVE_MODULE]["scuppers"] = json!(s);
+                tile["flags"][LIVE_MODULE]["scupperSize"] = json!(px);
             }
             if !r.chimneys.is_empty() {
                 let c: Vec<Value> = r.chimneys.iter().map(|v| json!([v[0].round() as i64, v[1].round() as i64, v[2].round() as i64])).collect();

@@ -630,14 +630,23 @@ impl App {
             let mut pics = self.roof_pictures(map, e.px, store)?;
             let rects = map.roofs.len();
             let p = e.px as f32;
+            // 3D: земля этажа под крышами и предметами — рельеф и помосты (марши здесь не нужны).
+            let ground3d = (e.three_d && !chunk).then(|| crate::ground3d::ground(map, None, &|_| None, &|_| true).0);
+            let eave_at = |g: &crate::scene3d::Ground, c: [f32; 2]| crate::scene3d::STOREY + g.relief.as_ref().map_or(0.0, |f| f.at(c));
             for (ri, r) in map.roofs.iter().enumerate() {
                 let Some(pic) = pics.remove(&ri) else { continue };
                 let fixtures = r.fixtures();
                 let smoke = smoke_spots(&on_roof(map, |q| r.contains(q)), p);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
+                let mut tile = export::RoofTile { src: export::foundry_src(&file), rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() };
+                if let Some(g) = &ground3d {
+                    let c = [(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0];
+                    let roof = crate::roof3d::rect(r, eave_at(g, c), roof_picture(&pic), pic.frame());
+                    roof_model(&mut tile, &roof, &pic.bytes, e.dir.join(format!("{}_roof_{roof_count}_3d.glb", stem(k))), &mut files)?;
+                }
                 files.push((file.clone(), pic.bytes));
-                tiles.push(export::RoofTile { src: export::foundry_src(&file), rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() });
+                tiles.push(tile);
             }
             // Крыши по контуру (из OSM) — тоже по одной. Крышное над ними (свод ангара,
             // купол, шатёр) — в их картинке: отдельным тайлом оно висело бы над комнатой.
@@ -646,8 +655,19 @@ impl App {
                 let smoke = smoke_spots(&on_roof(map, |q| r.contains(q)), p);
                 roof_count += 1;
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
+                let mut model = export::RoofTile::default();
+                if let Some(g) = &ground3d {
+                    let (lo, hi) = r.bounds();
+                    let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+                    let clip = ([0.0, 0.0], [map.width as f32, map.height as f32]);
+                    if let Some(roof) = crate::roof3d::outline(r, eave_at(g, c), roof_picture(&pic), pic.frame(), clip) {
+                        roof_model(&mut model, &roof, &pic.bytes, e.dir.join(format!("{}_roof_{roof_count}_3d.glb", stem(k))), &mut files)?;
+                    }
+                }
                 files.push((file.clone(), pic.bytes));
                 tiles.push(export::RoofTile {
+                    model: model.model,
+                    model_base: model.model_base,
                     src: export::foundry_src(&file),
                     rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64],
                     rotation: 0.0,
@@ -773,6 +793,12 @@ impl App {
                 {
                     // Клетка — 5 футов.
                     tile.rest = rests[idx] * 5.0;
+                }
+                // 3D: предмет на помосте или склоне — на их высоте (3D Canvas так же поднимает фишку).
+                // Лестница над маршем этажа ниже в 3D не видна: там сам марш (в 2D она на месте).
+                if let Some(g) = &ground3d {
+                    tile.rest += g.at(prop.pos) * 5.0;
+                    tile.hide3d = k > 0 && crate::ground3d::over_flight(prop, self.export_level(e, k - 1), &has_model);
                 }
                 #[cfg(target_arch = "wasm32")]
                 let _ = idx;
@@ -1121,23 +1147,30 @@ impl App {
             pics.insert(key.clone(), bytes);
             floors.push(Some(crate::scene3d::Picture { key, size: [w, h], alpha }));
         }
+        let map = self.export_level(e, 0);
+        let cells = [map.width as f32, map.height as f32];
+        let covers: Vec<Option<crate::scene3d::Cover>> = (0..e.done.len()).map(|k| (k > 0).then(|| covers_of(open[k].as_ref(), cells))).collect();
         let mut walls = std::collections::HashMap::new();
-        let storeys = self.storeys_3d(e, layouts, floors, &mut walls);
+        let (storeys, _) = self.storeys_3d(e, layouts, floors, &covers, &mut walls);
         for (key, rgba) in walls {
             pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
         }
-        let map = self.export_level(e, 0);
-        let scene = crate::scene3d::build([map.width as f32, map.height as f32], &storeys);
+        let scene = crate::scene3d::build(cells, &storeys);
         let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
         let bounds = scene.bounds().ok_or("3D: модель пустая")?;
         Ok((crate::glb::write(&scene, &images, &e.name)?, bounds))
     }
 
-    /// Этажи 3D-сцены по разбору выгрузки: стены, проёмы и вид стен; пол даёт `floors`.
-    /// Картинки стен — в `pics` по ключу: полоса и её середина без кромок (`#side`) для боков.
-    pub(super) fn storeys_3d(&self, e: &Export, layouts: &[export::Layout], floors: Vec<Option<crate::scene3d::Picture>>, pics: &mut std::collections::HashMap<String, image::RgbaImage>) -> Vec<crate::scene3d::Storey> {
+    /// Этажи 3D-сцены по разбору выгрузки: стены, проёмы, вид стен и земля — рельеф, помосты,
+    /// марши лестниц к этажу выше ([`crate::ground3d`]); пол даёт `floors`, где у этажа пол —
+    /// `covers` (у первого не нужен). Картинки — в `pics` по ключу: полоса стены и её середина
+    /// без кромок (`#side`) для боков, рисунок лестницы на марше. Ещё — номера предметов, ставших
+    /// маршами, по этажам. Крыш здесь нет: их кладёт тот, у кого их картинки.
+    pub(super) fn storeys_3d(&self, e: &Export, layouts: &[export::Layout], floors: Vec<Option<crate::scene3d::Picture>>, covers: &[Option<crate::scene3d::Cover>], pics: &mut std::collections::HashMap<String, image::RgbaImage>) -> (Vec<crate::scene3d::Storey>, Vec<Vec<usize>>) {
         let p = e.px as f32;
+        let n = floors.len();
         let mut storeys = Vec::new();
+        let mut flights = Vec::new();
         for (k, floor) in floors.into_iter().enumerate() {
             let map = self.export_level(e, k);
             // Вид стен этажа — самый частый у краёв комнат, иначе у нарисованных, иначе вид карты.
@@ -1175,9 +1208,25 @@ impl App {
                 })
                 .collect();
             let gaps = map.portals.iter().filter(|q| q.kind == PortalKind::Opening).map(|q| (q.a, q.b)).collect();
-            storeys.push(crate::scene3d::Storey { floor, walls: lay.walls.clone(), low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color } });
+            // Земля: рельеф, помосты, марши к этажу выше. Лестница со своей 3D-моделью — моделью.
+            let picture = |key: &str| self.textures.rgba(key).ok().map(|img| crate::scene3d::Picture { key: key.to_owned(), size: [img.width(), img.height()], alpha: false });
+            let upper = if k + 1 < n { covers.get(k + 1).and_then(|c| c.as_ref()) } else { None };
+            let (ground, up) = crate::ground3d::ground(map, upper, &picture, &has_model);
+            // Рисунок лестницы на ступенях — на сплошной подложке: вырез по прозрачности съел бы ступени.
+            for b in &ground.blocks {
+                if let Some(sk) = &b.skin
+                    && !pics.contains_key(&sk.picture.key)
+                    && let Ok(img) = self.textures.rgba(&sk.picture.key)
+                {
+                    pics.insert(sk.picture.key.clone(), solid_under(img));
+                }
+            }
+            flights.push(up);
+            let mut walls = lay.walls.clone();
+            walls.extend(facades(map, lay));
+            storeys.push(crate::scene3d::Storey { floor, walls, low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color }, ground, roofs: Vec::new() });
         }
-        storeys
+        (storeys, flights)
     }
 
     fn asset_webp(&self, key: &str, sunk: f32, mirror: bool) -> Result<Vec<u8>, String> {
@@ -1269,6 +1318,87 @@ impl<T: Send + 'static> Pending<T> {
             Self::Thread(h) => h.join().map_err(|_| "поток выгрузки упал".to_owned()),
         }
     }
+}
+
+/// У предмета своя 3D-модель (`.glb` рядом с картинкой на полке).
+pub(super) fn has_model(p: &Prop) -> bool {
+    std::path::Path::new(&p.asset).with_extension("glb").is_file()
+}
+
+/// Картинка на сплошной подложке её же среднего цвета (по непрозрачному).
+fn solid_under(mut img: image::RgbaImage) -> image::RgbaImage {
+    let (mut sum, mut n) = ([0.0f64; 3], 0.0f64);
+    for p in img.pixels().filter(|p| p[3] > 200) {
+        for c in 0..3 {
+            sum[c] += p[c] as f64;
+        }
+        n += 1.0;
+    }
+    let base = if n > 0.0 { sum.map(|v| v / n) } else { [110.0, 100.0, 90.0] };
+    for p in img.pixels_mut() {
+        let a = p[3] as f64 / 255.0;
+        for c in 0..3 {
+            p[c] = (p[c] as f64 * a + base[c] * (1.0 - a)).round() as u8;
+        }
+        p[3] = 255;
+    }
+    img
+}
+
+/// Картинка крыши для её 3D-скатов (с прозрачностью: вне крыши — пусто).
+fn roof_picture(pic: &RoofPic) -> crate::scene3d::Picture {
+    crate::scene3d::Picture { key: "roof".into(), size: pic.size, alpha: true }
+}
+
+/// Крыша в 3D — своя модель у её тайла: скаты с её картинкой (`bytes`, WebP), файл `path`. Низ
+/// модели — над полом этажа ([`export::RoofTile::model_base`]): тайл крыши в 2D висит выше.
+fn roof_model(tile: &mut export::RoofTile, roof: &crate::scene3d::Roof3, bytes: &[u8], path: PathBuf, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<(), String> {
+    let Some((scene, [lo, hi])) = crate::scene3d::roof_scene(roof) else { return Ok(()) };
+    let glb = crate::glb::write(&scene, &[(bytes.to_vec(), "image/webp")], "roof")?;
+    tile.model = Some((export::foundry_src(&path), hi[1] - lo[1]));
+    tile.model_base = Some(lo[1]);
+    files.push((path, glb));
+    Ok(())
+}
+
+/// Где у этажа пол для 3D: по прозрачности его картинки с дырами, без дыр — везде.
+pub(super) fn covers_of(holes: Option<&image::RgbaImage>, cells: [f32; 2]) -> crate::scene3d::Cover {
+    const PER: f32 = 4.0;
+    match holes {
+        Some(img) => crate::scene3d::Cover::from_alpha(img, cells, PER),
+        None => crate::scene3d::Cover::full(cells, PER),
+    }
+}
+
+/// Стены домов из OSM: такой дом на карте — одна крыша по контуру, и в 3D она висела бы в
+/// воздухе. Контур — стеной до верха этажа, если стены этажа идут вдоль него меньше чем на
+/// половине длины. Крыши, поставленные руками (прямоугольные и со своим свесом), не трогаются:
+/// без стен под ними — навес.
+fn facades(map: &Map, lay: &export::Layout) -> Vec<Vec<[f32; 2]>> {
+    const NEAR: f32 = 0.4;
+    const STEP: f32 = 0.5;
+    let segs: Vec<([f32; 2], [f32; 2])> = lay.walls.iter().chain(&lay.low).flat_map(|l| l.windows(2).map(|w| (w[0], w[1]))).chain(lay.portals.iter().map(|p| p.seg)).collect();
+    let near = |q: [f32; 2]| segs.iter().any(|&(a, b)| map::segment_distance(q, a, b) < NEAR);
+    let rings: Vec<Vec<[f32; 2]>> = map.outline_roofs.iter().filter_map(|r| r.pieces.first().filter(|p| p.overhang.is_none())?.rings.first().cloned()).collect();
+    let mut out = Vec::new();
+    for ring in rings.into_iter().filter(|r| r.len() >= 3) {
+        let (mut all, mut seen) = (0usize, 0usize);
+        for e in 0..ring.len() {
+            let (a, b) = (ring[e], ring[(e + 1) % ring.len()]);
+            let n = ((b[0] - a[0]).hypot(b[1] - a[1]) / STEP).ceil().max(1.0) as usize;
+            for t in 0..n {
+                let f = (t as f32 + 0.5) / n as f32;
+                all += 1;
+                seen += near([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]) as usize;
+            }
+        }
+        if seen * 2 < all {
+            let mut closed = ring.clone();
+            closed.push(ring[0]);
+            out.push(closed);
+        }
+    }
+    out
 }
 
 /// PNG без потерь (сверка кэша снимков).
@@ -1401,14 +1531,19 @@ impl Shelf {
 
 /// Картинка крыши для Foundry: WebP, левый верхний угол в клетках, точек на клетку, размер.
 /// Размер 0 — у крыши картинки нет (контур целиком за краем карты).
-struct RoofPic {
-    bytes: Vec<u8>,
-    origin: [f32; 2],
-    ppc: f32,
-    size: [u32; 2],
+pub(super) struct RoofPic {
+    pub(super) bytes: Vec<u8>,
+    pub(super) origin: [f32; 2],
+    pub(super) ppc: f32,
+    pub(super) size: [u32; 2],
 }
 
 impl RoofPic {
+    /// Рамка картинки на карте: левый верхний угол, ширина, высота — клетки.
+    pub(super) fn frame(&self) -> [f32; 4] {
+        [self.origin[0], self.origin[1], self.size[0] as f32 / self.ppc, self.size[1] as f32 / self.ppc]
+    }
+
     fn to_blob(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.bytes.len() + 20);
         for v in [self.origin[0], self.origin[1], self.ppc] {
@@ -1452,7 +1587,7 @@ impl App {
     /// картинка у каждой своя — только то, что у неё видно поверх соседей. Рисуют и
     /// сжимают потоки; работа с тем же отпечатком (крыша, её соседи по тени, вклеенное,
     /// покрытия, свет) берётся из кэша на диске.
-    fn roof_pictures(&self, map: &Map, px: u32, store: Option<&shotcache::Store>) -> Result<std::collections::HashMap<usize, RoofPic>, String> {
+    pub(super) fn roof_pictures(&self, map: &Map, px: u32, store: Option<&shotcache::Store>) -> Result<std::collections::HashMap<usize, RoofPic>, String> {
         use std::collections::{HashMap, HashSet};
         use std::hash::Hash;
         let light = map.shadows.light();

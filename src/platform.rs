@@ -32,12 +32,15 @@ pub struct Grate {
 }
 
 /// Лестница на помост: где примыкает (точка у края — берётся ближайшая на контуре),
-/// ширина наверху и число ступеней.
+/// ширина наверху и число ступеней. Пандус — та же лестница гладким скатом: длина та же,
+/// что у ступеней, на карте — без рёбер ступеней, в 3D — наклонная плоскость.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stair {
     pub at: [f32; 2],
     pub width: f32,
     pub steps: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ramp: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -698,7 +701,7 @@ mod tests {
         assert_eq!(ring.len(), 1);
         assert!(ring[0].1 && near(ring[0].0[0], [RAIL_IN, RAIL_IN]), "{:?}", ring[0].0[0]);
         // Лестница посреди нижнего края: кольцо размыкается в одну ломаную, плюс два бока лестницы.
-        let st = Stair { at: [3.0, 4.2], width: 2.0, steps: 3 };
+        let st = Stair { at: [3.0, 4.2], width: 2.0, steps: 3, ramp: false };
         let runs = rails(&big, &[true; 4], std::slice::from_ref(&st));
         assert_eq!(runs.len(), 3, "{runs:?}");
         assert!(runs.iter().all(|r| !r.1));

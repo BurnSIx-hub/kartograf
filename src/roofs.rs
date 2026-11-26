@@ -606,6 +606,33 @@ pub fn render_outline<'t>(roof: &OutlineRoof, tex: &dyn Fn(&str) -> Option<&'t i
     (img, origin)
 }
 
+/// Высоты крыши по контуру для 3D — тем же проходом, что её картинка ([`render_outline`]):
+/// сетка `ppc` точек на клетку в пределах `clip`, в точке — верх ската в клетках (как у
+/// кусков: над землёй), `f32::MIN` — не крыша. Ещё — ширина и высота сетки и её левый верхний
+/// угол в клетках.
+pub fn outline_heights(roof: &OutlineRoof, ppc: f32, clip: ([f32; 2], [f32; 2])) -> (Vec<f32>, u32, u32, [f32; 2]) {
+    let (lo, hi) = roof.bounds();
+    let (lo, hi) = ([lo[0].max(clip.0[0]), lo[1].max(clip.0[1])], [hi[0].min(clip.1[0]), hi[1].min(clip.1[1])]);
+    let origin = [(lo[0] * ppc).floor() / ppc, (lo[1] * ppc).floor() / ppc];
+    if hi[0] <= lo[0] || hi[1] <= lo[1] {
+        return (Vec::new(), 0, 0, origin);
+    }
+    let (w, h) = (((hi[0] - origin[0]) * ppc).ceil() as u32 + 1, ((hi[1] - origin[1]) * ppc).ceil() as u32 + 1);
+    let mut img = image::RgbaImage::new(w, h);
+    let rings: Vec<Vec<Vec<[f32; 2]>>> = roof.pieces.iter().map(|k| k.edge_rings().iter().map(|r| simplify_ring(r, if k.overhang.is_some() { 1e-3 } else { OUTLINE_TOL })).filter(|r| r.len() >= 3).collect()).collect();
+    let slopes: Vec<Vec<Vec<[f32; 2]>>> = rings.iter().zip(&roof.pieces).map(|(rs, k)| rs.iter().map(|r| if k.overhang.is_some() { r.clone() } else { iron_jogs(r) }).collect()).collect();
+    let mut relief = Relief { top: vec![f32::MIN; (w * h) as usize], owner: vec![u32::MAX; (w * h) as usize], rise: Vec::new() };
+    // Цвет не нужен — покрытие ровное серое, считаются только высоты.
+    let plain = image::RgbaImage::from_pixel(8, 8, image::Rgba([128, 128, 128, 255]));
+    let cover = Cover::new(&plain, ppc);
+    for (i, piece) in roof.pieces.iter().enumerate() {
+        let open = open_edges(&rings, &roof.pieces, i);
+        let slope = (&slopes[i][..], open_edges(&slopes, &roof.pieces, i));
+        paint_piece(&mut img, origin, ppc, piece, &rings[i], &open, (slope.0, &slope.1), &cover, [0.6, 0.8], (&mut relief, i as u32), false);
+    }
+    (relief.top, w, h, origin)
+}
+
 /// Дом без высоты в OSM — 6 м в клетках, как у его крыши и тени на земле.
 pub const DEFAULT_TOP: f32 = 6.0 / crate::procgen::osm::CELL_M;
 /// Сетка теней соседей и крон на крыше — точек на клетку: тени мягкие, а

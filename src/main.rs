@@ -31,9 +31,11 @@ mod plan;
 mod plat;
 mod platform;
 mod prefab;
+mod ground3d;
 mod procgen;
 mod recovery;
 mod relief;
+mod roof3d;
 #[cfg(not(target_arch = "wasm32"))]
 mod render3d;
 mod roofs;

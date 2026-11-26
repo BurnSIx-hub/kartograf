@@ -244,6 +244,8 @@ mod tests {
             openings: vec![door, win],
             gaps: Vec::new(),
             look: WallLook { width: 0.25, strip: None, side: None, color: [80, 70, 60] },
+            ground: Default::default(),
+            roofs: Vec::new(),
         };
         build([4.0, 4.0], &[st])
     }

@@ -255,7 +255,17 @@ fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bo
             let (light, dark) = (tone(pl.side, 1.0, 1.0), tone(pl.side, 0.45, 1.0));
             sheet.quad([g.pt(0.0, side), top_out, g.pt(run, side), g.pt(run, side)], [light, dark, dark, light]);
         }
-        for k in 0..steps as usize {
+        // Пандус — гладкий скат: от цвета площадки у края к цвету стенки внизу, без рёбер ступеней.
+        if st.ramp {
+            let mix = |f: f32| {
+                let m = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+                tone([m(pl.side[0], pl.color[0]), m(pl.side[1], pl.color[1]), m(pl.side[2], pl.color[2])], 1.0, 1.0)
+            };
+            let (hi, lo) = (mix(0.78), mix(0.42));
+            sheet.quad(across(0.0, run), [hi, hi, lo, lo]);
+            sheet.quad(across(0.0, 0.05), [tone(INK, 1.4, 0.95); 4]);
+        }
+        for k in 0..if st.ramp { 0 } else { steps as usize } {
             let (s0, s1) = (k as f32 * TREAD, (k + 1) as f32 * TREAD);
             // Ступень — между цветом стенки и площадки: верхняя ближе к площадке, нижняя к стенке.
             let f = 0.42 + 0.36 * (steps - k as f32) / (steps + 1.0);
