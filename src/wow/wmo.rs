@@ -2,6 +2,7 @@
 //! расстановка предметов) и группы (`<имя>_NNN.wmo`: вершины, треугольники, цвета вершин).
 
 /// Материал: текстура и как кладётся.
+#[derive(Clone)]
 pub struct Material {
     pub flags: u32,
     /// 0 — сплошной, 1 — с вырезом по альфе, 2 — полупрозрачный, дальше — свечения.
@@ -26,6 +27,7 @@ pub struct DoodadSet {
     pub count: usize,
 }
 
+#[derive(Clone)]
 pub struct Group {
     /// Флаги группы (`MOGP`): 0x2000 — внутренняя, 0x8 — наружная.
     #[allow(dead_code)]
@@ -43,8 +45,13 @@ pub struct Group {
     pub liquid: Option<Liquid>,
     /// Вид жидкости группы (`MOGP.groupLiquid`): номер из LiquidType.dbc или старый код.
     pub group_liquid: u32,
+    /// Номер первого материала группы в сцене: у карты с несколькими зданиями материалы подряд.
+    pub mat_base: usize,
+    /// Кусок местности: слои текстур с масками вместо материала.
+    pub terrain: Option<Box<super::adt::Paint>>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Liquid {
     pub corner: [f32; 3],
     pub verts: [usize; 2],
@@ -201,7 +208,7 @@ pub fn parse_group(b: &[u8]) -> Result<Group, String> {
         let tile_kind = shown.iter().position(|&s| s).and_then(|i| l.get(tile_at + i)).map_or(0, |f| f & 0x0F);
         Some(Liquid { corner, verts, tiles, heights, shown, tile_kind })
     });
-    Ok(Group { flags, verts, normals, uvs, colors, tris, tri_flags, tri_mat, liquid, group_liquid })
+    Ok(Group { flags, verts, normals, uvs, colors, tris, tri_flags, tri_mat, liquid, group_liquid, mat_base: 0, terrain: None })
 }
 
 /// Поворот предмета вокруг вертикали (рыскание) из кватерниона, в радианах.

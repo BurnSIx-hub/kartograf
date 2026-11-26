@@ -1,7 +1,9 @@
 //! Предметы из клиента World of Warcraft 1.x–3.x: модель M2 строго сверху — в картинку-ассет.
 //! Клиент читается сам (архивы MPQ в порядке игры), без wow.export и выгрузок.
 
+pub mod adt;
 pub mod blp;
+pub mod gltf;
 pub mod m2;
 pub mod mpq;
 pub mod location;

@@ -64,6 +64,8 @@ kartograf [карта.karta] [ключи]
   --place <широта,долгота> местность по координатам; --cells ШxВ, --trees 0..1
   --update <адрес>       поставить обновление
   --packinfo <пак…>      что в паке
+  --wow-glb <клиент> <здание.wmo|карта.wdt> <файл.glb> [ypc=3] [cut=4] [lit] [notop] [set=…] [area=x0,y0,x1,y1] [ground=256]
+                         здание WoW 3D-моделью для 3D-вида Foundry
   --analyse <участок.osm…> сверка анализа снимка
   --version, --help";
 
@@ -106,6 +108,7 @@ fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, Strin
             "--aside" => {}
             "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
+            "--wow-glb" => std::process::exit(wow_glb(&it.by_ref().collect::<Vec<_>>())),
             "--analyse" => std::process::exit(place::compare(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--size" => args.size = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             "--version" => {
@@ -128,6 +131,85 @@ fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, Strin
         return Err("--selftest работает только в своей папке данных (<папка>/data): с --data-dir самопроверка переписала бы настройки этой папки. Уберите --data-dir".to_owned());
     }
     Ok(args)
+}
+
+/// `--wow-glb клиент путь файл.glb [ypc=3] [cut=4] [lit] [set=…]`: без окна — здание (`.wmo`) или
+/// карта инстанса (`.wdt`) WoW 3D-моделью glTF: рамка та же, что у карты из «Предметов из WoW»,
+/// ярдов на клетку `ypc` (по умолчанию 5/3), срез над полом `cut` ярдов, `lit` — материалы под
+/// свет сцены, а не только запечённый свет игры, `notop` — без отдельной модели срезанного верха,
+/// `area` — рамка мира у карты (X — север, Y — запад, ярды; у материка обязательна), `ground` —
+/// точек текстуры местности на кусок ADT (33⅓ ярда). Рядом пишутся `<имя>.json` (рамка и модели)
+/// и `<имя>_walls.json` (стены для 3D-сцены Foundry).
+#[cfg(not(target_arch = "wasm32"))]
+fn wow_glb(args: &[String]) -> i32 {
+    let [client, path, out, rest @ ..] = args else {
+        say("--wow-glb <папка клиента> <путь в клиенте> <файл.glb> [ypc=3] [cut=4] [lit] [notop] [set=…] [area=x0,y0,x1,y1] [ground=256]");
+        return 2;
+    };
+    let mut opt = wow::gltf::Options::default();
+    for a in rest {
+        match a.split_once('=') {
+            Some(("ypc", v)) => match v.replace(',', ".").parse::<f32>() {
+                Ok(y) if y > 0.0 => opt.cells_per_yard = 1.0 / y,
+                _ => {
+                    say(&format!("ypc: не число «{v}»"));
+                    return 2;
+                }
+            },
+            Some(("cut", v)) => match v.replace(',', ".").parse::<f32>() {
+                Ok(c) if c > 0.0 => opt.cut = c,
+                _ => {
+                    say(&format!("cut: не число «{v}»"));
+                    return 2;
+                }
+            },
+            Some(("set", v)) => opt.set = Some(v.to_owned()),
+            Some(("area", v)) => match v.split(',').map(|s| s.trim().parse::<f32>()).collect::<Result<Vec<f32>, _>>() {
+                Ok(r) if r.len() == 4 => opt.area = Some([r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]),
+                _ => {
+                    say(&format!("area: нужно четыре числа x0,y0,x1,y1, а не «{v}»"));
+                    return 2;
+                }
+            },
+            Some(("ground", v)) => match v.parse::<u32>() {
+                Ok(g) if (8..=1024).contains(&g) => opt.ground = g,
+                _ => {
+                    say(&format!("ground: точек на кусок местности — от 8 до 1024, а не «{v}»"));
+                    return 2;
+                }
+            },
+            None if a == "lit" => opt.unlit = false,
+            None if a == "notop" => opt.top = false,
+            _ => {
+                say(&format!("неизвестный ключ {a}"));
+                return 2;
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let client = match wow::Client::open(std::path::Path::new(client)) {
+        Ok(c) => c,
+        Err(e) => {
+            say(&format!("клиент: {e}"));
+            return 1;
+        }
+    };
+    match wow::gltf::export(&client, path, std::path::Path::new(out), &opt) {
+        Ok(r) => {
+            for (f, b) in r.files.iter().zip(&r.boxes) {
+                say(&format!("{} — X {:.1}…{:.1}, Z {:.1}…{:.1}, высота {:.1}…{:.1} кл.", f.display(), b[0][0], b[1][0], b[0][2], b[1][2], b[0][1], b[1][1]));
+            }
+            say(&format!("карта {}×{} кл., треугольников {}, предметов {}, текстур {}, {:.1} с", r.cells[0], r.cells[1], r.triangles, r.doodads, r.textures, t.elapsed().as_secs_f64()));
+            for n in &r.notes {
+                say(&format!("  {n}"));
+            }
+            0
+        }
+        Err(e) => {
+            say(&format!("ошибка: {e}"));
+            1
+        }
+    }
 }
 
 /// `--packinfo пак…`: без окна — сколько в паке ассетов каждого вида, за сколько читается
@@ -229,7 +311,7 @@ mod tests {
         assert_eq!(ok.file, Some(PathBuf::from("карта.karta")));
         assert_eq!((ok.data, ok.px), (Some(PathBuf::from("d")), Some(140)));
         // Каждый ключ, который разбирается, есть в справке.
-        for flag in ["--data-dir", "--mcp", "--aside", "--selftest", "--shot", "--size", "--export", "--px", "--plan", "--osm", "--place", "--cells", "--trees", "--update", "--packinfo", "--analyse", "--version", "--help"] {
+        for flag in ["--data-dir", "--mcp", "--aside", "--selftest", "--shot", "--size", "--export", "--px", "--plan", "--osm", "--place", "--cells", "--trees", "--update", "--packinfo", "--wow-glb", "--analyse", "--version", "--help"] {
             assert!(USAGE.contains(flag), "{flag}");
         }
     }

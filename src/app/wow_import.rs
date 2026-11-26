@@ -68,13 +68,28 @@ fn location_options(a: &Value) -> location::Options {
     location::Options {
         ppc: a["ppc"].as_f64().map_or(d.ppc, |v| (v as f32).clamp(16.0, 256.0)),
         cut: a["cut"].as_f64().map_or(d.cut, |v| (v as f32).clamp(1.0, 12.0)),
+        // Игра просторнее настольной карты: ходы по 10–15 ярдов. Крупнее клетка — карта мельче.
+        cells_per_yard: a["yards_per_cell"].as_f64().map_or(d.cells_per_yard, |v| 1.0 / (v as f32).clamp(1.0, 10.0)),
         set: a["set"].as_str().map(str::to_owned).or_else(|| a["set"].as_u64().map(|n| n.to_string())),
+        cut_walls: a["walls"].as_str() == Some("cut"),
+        area: a["area"].as_array().filter(|v| v.len() == 4).map(|v| [0, 1, 2, 3].map(|i| v[i].as_f64().unwrap_or(0.0) as f32)),
+        extra: a["place"]
+            .as_array()
+            .map(|l| {
+                l.iter()
+                    .filter_map(|o| {
+                        let at = o["at"].as_array().filter(|v| v.len() == 3)?;
+                        Some((o["wmo"].as_str()?.to_owned(), [0, 1, 2].map(|i| at[i].as_f64().unwrap_or(0.0) as f32), o["turn"].as_f64().unwrap_or(0.0) as f32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         ..d
     }
 }
 
 impl App {
-    fn wow_dir(&self) -> PathBuf {
+    pub(super) fn wow_dir(&self) -> PathBuf {
         self.data_dir.join("wow")
     }
 
@@ -133,6 +148,7 @@ impl App {
     /// Собранная карта — вместо текущей; новые предметы — на полку.
     fn wow_install(&mut self, built: location::Built) {
         self.library.set_wow(&self.wow_dir());
+        self.textures.forget_dir(&built.tiles_dir);
         self.reset_doc(built.map, None);
         // Новая карта ещё не сохранена: при закрытии программа спросит.
         self.dirty = true;
@@ -359,6 +375,7 @@ impl App {
     pub(super) fn tool_wow_location(&mut self, a: &Value) -> Result<Value, String> {
         let client = self.wow_client_now(a["client"].as_str().map(PathBuf::from))?;
         let path = match (a["wmo"].as_str(), a["words"].as_str()) {
+            _ if a["map"].as_str().is_some() => location::map_path(a["map"].as_str().unwrap_or_default()),
             (Some(p), _) => p.to_owned(),
             (None, Some(w)) => {
                 let mut found = search(&self.wow.locations, w);
@@ -401,5 +418,13 @@ mod tests {
         assert_eq!(search(&models, "world").len(), 2);
         assert_eq!(search(&models, "scarlet pew").len(), 0);
         assert!(search(&models, "  ").is_empty());
+    }
+
+    #[test]
+    fn yards_per_cell_sets_the_scale_and_stays_sane() {
+        assert!((location_options(&json!({})).cells_per_yard - 0.6).abs() < 1e-6);
+        assert!((location_options(&json!({"yards_per_cell": 4})).cells_per_yard - 0.25).abs() < 1e-6);
+        // Больше 10 ярдов на клетку — уже не подземелье, а схема.
+        assert!((location_options(&json!({"yards_per_cell": 50})).cells_per_yard - 0.1).abs() < 1e-6);
     }
 }

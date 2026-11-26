@@ -1273,6 +1273,16 @@ impl Textures {
         serde_json::json!({"thumbs": thumbs, "full": full, "full_mb": bytes / (1 << 20), "top": top})
     }
 
+    /// Забыть картинки из папки (и их тени): файлы в ней переписаны.
+    pub fn forget_dir(&mut self, dir: &Path) {
+        let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+        let mut d = norm(&dir.to_string_lossy());
+        if !d.ends_with('/') {
+            d.push('/');
+        }
+        self.slots.retain(|k, _| !norm(&k.0).contains(&d));
+    }
+
     pub fn failed(&self, key: &str, thumb: bool) -> bool {
         matches!(self.slots.get(&(key.to_owned(), if thumb { THUMB } else { FULL })), Some(Slot::Failed))
     }
