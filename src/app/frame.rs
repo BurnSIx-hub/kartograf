@@ -43,6 +43,8 @@ impl App {
         if self.export.is_none() {
             self.shortcuts(&ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.view3d_auto_step();
         self.export_step(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.hide_after_ai(&ctx);
@@ -125,6 +127,8 @@ impl App {
         self.place_window(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.wow_window(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.view3d_window(ctx);
         self.sketch_window(ctx);
         if let Some(e) = self.error.clone() {
             let mut open = true;
@@ -561,6 +565,10 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::L)) {
             self.light_view = !self.light_view;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3)) {
+            self.start_view3d();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
             self.ruler = !self.ruler;

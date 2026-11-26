@@ -37,6 +37,8 @@ pub struct SelfTest {
     hover_at: Option<Pos2>,
     /// Вторая точка сценария (крыша для пипетки).
     spot: [f32; 2],
+    /// Ждать чего-то (снимка для окна 3D) не дольше этого времени.
+    deadline: f64,
 }
 
 impl SelfTest {
@@ -58,6 +60,7 @@ impl SelfTest {
             pan: egui::Vec2::ZERO,
             hover_at: None,
             spot: [0.0, 0.0],
+            deadline: 0.0,
         }
     }
 
@@ -1514,6 +1517,91 @@ impl SelfTest {
                 if app.wow.client.is_some() {
                     self.snap(ctx, "здание из WoW");
                 }
+            }
+            // Тестовая зона 3D: комната с дверью на севере. Облёт мышью, фишка двойным
+            // щелчком, шаг до стены, дверь по E, выход в неё.
+            #[cfg(not(target_arch = "wasm32"))]
+            149 => {
+                let mut map = Map::new(12, 10);
+                map.paint_rect(Layer::Rooms, (2, 2), (9, 7), Some(0));
+                map.portals.push(map::Portal { a: [5.0, 2.0], b: [7.0, 2.0], kind: PortalKind::Door, asset: None, frame: None });
+                app.reset_doc(map, None);
+                app.start_view3d();
+                self.deadline = now + 30.0;
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            150 => {
+                let probe = app.view3d_probe().filter(|p| p.painted >= 3 && p.rect.width() > 100.0);
+                let Some(p) = probe else {
+                    if now < self.deadline {
+                        self.step = 150;
+                        self.resume_at = now + 0.1;
+                    } else {
+                        self.check("окно 3D открылось", false, "за 30 секунд не нарисовало кадра");
+                        self.step = 999;
+                    }
+                    return true;
+                };
+                self.check("окно 3D открылось и рисует", p.error.is_none(), &format!("{:?}", p.error));
+                self.scale = p.yaw;
+                let c = p.rect.center();
+                self.drag(c, c + vec2(120.0, 0.0), PointerButton::Primary);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            151 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("протяжка в окне 3D повернула камеру", p.yaw < self.scale - 0.5, &format!("{} → {}", self.scale, p.yaw));
+                let c = p.rect.center();
+                self.drag(c + vec2(120.0, 0.0), c, PointerButton::Primary);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            152 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("обратная протяжка вернула камеру", (p.yaw - self.scale).abs() < 0.05, &format!("{} → {}", self.scale, p.yaw));
+                let c = p.rect.center();
+                self.click(c);
+                self.click(c);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            153 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let at = p.token.unwrap_or([-1.0, -1.0]);
+                self.check("двойной щелчок поставил фишку посреди комнаты", (at[0] - 6.0).abs() < 0.3 && (at[1] - 5.0).abs() < 0.3, &format!("{:?}", p.token));
+                self.hold(Key::W, true);
+                self.resume_at = now + 1.2;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            154 => {
+                self.hold(Key::W, false);
+                self.frames.push_back((Modifiers::NONE, vec![]));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            155 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let at = p.token.unwrap_or_default();
+                self.check("W довела фишку до закрытой двери, не сквозь неё", at[1] > 2.2 && at[1] < 3.0 && (at[0] - 6.0).abs() < 0.2, &format!("{at:?}"));
+                self.key(Key::E, Modifiers::NONE);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            156 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("E открыла дверь у фишки", p.open == 1, &format!("открыто {}", p.open));
+                self.hold(Key::W, true);
+                self.resume_at = now + 0.8;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            157 => {
+                self.hold(Key::W, false);
+                self.frames.push_back((Modifiers::NONE, vec![]));
+                self.resume_at = now + 0.6;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            158 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let at = p.token.unwrap_or_default();
+                self.check("фишка вышла в открытую дверь", at[1] < 1.8, &format!("{at:?}"));
+                self.snap(ctx, "тестовая зона 3D");
             }
             _ => return false,
         }

@@ -256,6 +256,8 @@ pub struct Args {
     pub trees: Option<f32>,
     /// `--3d`: выгрузка ещё и с 3D-моделью карты для 3D Canvas.
     pub three_d: bool,
+    /// `--view3d`: сразу открыть тестовую зону 3D.
+    pub view3d: bool,
 }
 
 /// Окно «местность по координатам»: что вписано и размер в клетках.
@@ -387,6 +389,8 @@ struct Export {
     canopies: bool,
     /// Ещё и 3D-модель карты для 3D Canvas.
     three_d: bool,
+    /// Снимок для окна 3D (тестовая зона): только пол без стен, файлов нет.
+    view3d: bool,
     /// Модуль: обновить последнюю сцену, а не заводить новую.
     update: bool,
     /// Только картинка области (MCP `view`, `render_picture`): предметы и двери в ней,
@@ -465,6 +469,9 @@ enum Shot {
 impl Export {
     /// Проходы снимка этажа по порядку.
     fn shots(&self) -> &'static [Shot] {
+        if self.view3d {
+            return if self.doing > 0 { &[Shot::Floor, Shot::White] } else { &[Shot::Floor] };
+        }
         let tiles = !self.picture && self.canopies;
         let upper = !self.picture && self.doing > 0;
         match (tiles, upper) {
@@ -736,6 +743,12 @@ pub struct App {
     pub light_view: bool,
     #[cfg(not(target_arch = "wasm32"))]
     light: Option<view_tools::LightCache>,
+    /// Окно 3D — тестовая зона.
+    #[cfg(not(target_arch = "wasm32"))]
+    view3d: Option<view3d::View3d>,
+    /// `--view3d`: открыть его, как только карта загрузится.
+    #[cfg(not(target_arch = "wasm32"))]
+    view3d_auto: bool,
     /// Окно «Предметы из WoW» и открытый клиент игры.
     #[cfg(not(target_arch = "wasm32"))]
     pub wow: wow_import::WowWindow,
@@ -1007,6 +1020,10 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             light: None,
             #[cfg(not(target_arch = "wasm32"))]
+            view3d: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            view3d_auto: args.view3d,
+            #[cfg(not(target_arch = "wasm32"))]
             wow: Default::default(),
             object_layer: None,
             brush_erase: false,
@@ -1121,6 +1138,9 @@ mod tools;
 /// Предметы из клиента World of Warcraft: окно и перенос на полку.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod wow_import;
+/// Окно 3D — тестовая зона: облёт, фишка, двери, свет.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod view3d;
 
 impl eframe::App for App {
     /// Свёрнутое окно eframe не рисует и `ui` не зовёт — только это: команды ИИ

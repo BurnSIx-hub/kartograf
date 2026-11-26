@@ -89,7 +89,7 @@ const DIM_DARKNESS: f64 = 0.5;
 
 /// Свет сцены Foundry: включён ли общий свет и насколько сцена притемнена. Выбор карты
 /// (`scene_light`) — прежде догадки по звуку места.
-fn scene_light(map: &Map) -> (bool, f64) {
+pub fn scene_light(map: &Map) -> (bool, f64) {
     match map.scene_light.as_str() {
         "day" => (true, 0.0),
         "dim" => (true, DIM_DARKNESS),

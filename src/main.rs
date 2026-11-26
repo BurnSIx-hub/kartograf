@@ -33,6 +33,8 @@ mod prefab;
 mod procgen;
 mod recovery;
 mod relief;
+#[cfg(not(target_arch = "wasm32"))]
+mod render3d;
 mod roofs;
 mod scene3d;
 mod selftest;
@@ -62,6 +64,7 @@ kartograf [карта.karta] [ключи]
   --shot <файл.png>      снимок карты и выход; --size ШxВ — размер окна
   --export <папка>       выгрузка для Foundry и выход; --px <точек на клетку>
   --3d                   выгрузка ещё и с 3D-моделью карты (.glb) для 3D Canvas
+  --view3d               сразу открыть тестовую зону 3D (с --shot — снять её)
   --plan <файл.json>     построить карту по плану
   --osm <файл.osm>       местность из выгрузки OpenStreetMap
   --place <широта,долгота> местность по координатам; --cells ШxВ, --trees 0..1
@@ -94,7 +97,7 @@ fn say(text: &str) {
 /// ключей испортит чужие данные.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, String> {
-    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false };
+    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false };
     let mut it = list.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -110,6 +113,7 @@ fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, Strin
             "--cells" => args.cells = it.next().and_then(|s| s.split_once(['x', 'х']).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))),
             "--aside" => {}
             "--3d" => args.three_d = true,
+            "--view3d" => args.view3d = true,
             "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--wow-glb" => std::process::exit(wow_glb(&it.by_ref().collect::<Vec<_>>())),
@@ -285,7 +289,7 @@ fn main() -> eframe::Result {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast;
-    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false };
+    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false };
     wasm_bindgen_futures::spawn_local(async move {
         let canvas = web_sys::window()
             .and_then(|w| w.document())

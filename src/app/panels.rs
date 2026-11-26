@@ -124,6 +124,10 @@ impl App {
                 if item(ui, "Вся карта", "Home") {
                     self.fitted = false;
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if item(ui, "Тестовая зона 3D", "F3") {
+                    self.start_view3d();
+                }
                 if ui.checkbox(&mut self.settings.snap, "Привязка к сетке   S").changed() {
                     self.save_settings();
                 }
@@ -183,6 +187,7 @@ impl App {
                     "Ctrl+G — объединить выбранное",
                     "V — тоже «Выбор»",
                     "I — пипетка и обратно к прежнему инструменту",
+                    "F3 — тестовая зона 3D: ЛКМ — повернуть, ПКМ — сдвинуть, двойной щелчок — фишка, WASD — идти, E — дверь, Page Up / Page Down — этаж",
                 ] {
                     ui.label(line);
                 }

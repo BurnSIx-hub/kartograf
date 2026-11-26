@@ -342,7 +342,9 @@ impl App {
             }
             if let Some(e) = &self.export {
                 ui.separator();
-                ui.strong(format!("Выгрузка: плитка {} из {}…", (e.next + 1).min(e.tiles.len()), e.tiles.len()));
+                let what = if e.view3d { "Снимаю для 3D" } else { "Выгрузка" };
+                let storey = if !e.picture && self.levels.len() > 1 { format!("этаж {} из {}, ", e.doing + 1, self.levels.len()) } else { String::new() };
+                ui.strong(format!("{what}: {storey}плитка {} из {}…", (e.next + 1).min(e.tiles.len()), e.tiles.len()));
             } else if let Some(n) = &self.notice {
                 ui.separator();
                 ui.label(n);

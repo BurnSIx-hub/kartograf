@@ -37,6 +37,7 @@ impl App {
             quit,
             canopies: self.settings.export_canopies,
             three_d: self.settings.export_3d,
+            view3d: false,
             update: false,
             stumps,
             picture: false,
@@ -106,7 +107,7 @@ impl App {
     }
 
     /// Этаж `k` для файлов выгрузки: вся карта или вырезанный район.
-    fn export_level<'a>(&'a self, e: &'a Export, k: usize) -> &'a Map {
+    pub(super) fn export_level<'a>(&'a self, e: &'a Export, k: usize) -> &'a Map {
         match &e.district {
             Some(d) => &d.maps[k],
             None if k == self.level => &self.map,
@@ -141,6 +142,7 @@ impl App {
             quit: false,
             canopies: false,
             three_d: false,
+            view3d: false,
             update: false,
             stumps: Vec::new(),
             picture: true,
@@ -471,6 +473,12 @@ impl App {
         self.switch_level(e.start_level);
         self.cam = e.cam;
         self.sel = e.sel.take();
+        // Снимок для окна 3D: файлов нет, сцена — в окно.
+        #[cfg(not(target_arch = "wasm32"))]
+        if e.view3d {
+            self.finish_view3d(&e);
+            return;
+        }
         let shot_s = e.began.elapsed().as_secs_f32();
         let result = self.write_export(&e);
         if self.big.is_some() {
@@ -1018,11 +1026,9 @@ impl App {
             let k = MAX_SIDE as f32 / w.max(h) as f32;
             (k < 1.0).then(|| (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1)))
         };
-        let p = e.px as f32;
         let mut pics: std::collections::HashMap<String, (Vec<u8>, &'static str)> = std::collections::HashMap::new();
-        let mut storeys = Vec::new();
+        let mut floors = Vec::new();
         for (k, img) in e.done.iter().enumerate() {
-            let map = self.export_level(e, k);
             let key = format!("floor_{}", k + 1);
             let (w, h) = img.dimensions();
             let alpha = open[k].is_some();
@@ -1039,8 +1045,27 @@ impl App {
                 }
             };
             pics.insert(key.clone(), bytes);
-            let floor = Some(crate::scene3d::Picture { key, size: [w, h], alpha });
+            floors.push(Some(crate::scene3d::Picture { key, size: [w, h], alpha }));
+        }
+        let mut walls = std::collections::HashMap::new();
+        let storeys = self.storeys_3d(e, layouts, floors, &mut walls);
+        for (key, rgba) in walls {
+            pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
+        }
+        let map = self.export_level(e, 0);
+        let scene = crate::scene3d::build([map.width as f32, map.height as f32], &storeys);
+        let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
+        let bounds = scene.bounds().ok_or("3D: модель пустая")?;
+        Ok((crate::glb::write(&scene, &images, &e.name)?, bounds))
+    }
 
+    /// Этажи 3D-сцены по разбору выгрузки: стены, проёмы и вид стен; пол даёт `floors`.
+    /// Картинки стен — в `pics` по ключу: полоса и её середина без кромок (`#side`) для боков.
+    pub(super) fn storeys_3d(&self, e: &Export, layouts: &[export::Layout], floors: Vec<Option<crate::scene3d::Picture>>, pics: &mut std::collections::HashMap<String, image::RgbaImage>) -> Vec<crate::scene3d::Storey> {
+        let p = e.px as f32;
+        let mut storeys = Vec::new();
+        for (k, floor) in floors.into_iter().enumerate() {
+            let map = self.export_level(e, k);
             // Вид стен этажа — самый частый у краёв комнат, иначе у нарисованных, иначе вид карты.
             let mut votes: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
             for v in map.edge_looks.values() {
@@ -1052,13 +1077,13 @@ impl App {
                     Ok(rgba) => {
                         let alpha = rgba.pixels().any(|px| px[3] < 250);
                         let size = [rgba.width(), rgba.height()];
-                        pics.entry(t.clone()).or_insert_with(|| (export::webp_bytes(&rgba, 90.0), "image/webp"));
                         // Бок — середина полосы: без кромок и бордюра вида сверху.
                         let (sw, sh) = (rgba.width(), (rgba.height() / 2).max(1));
                         let mid = image::imageops::crop_imm(&rgba, 0, rgba.height() / 4, sw, sh).to_image();
                         let side_key = format!("{t}#side");
                         let side_alpha = mid.pixels().any(|px| px[3] < 250);
-                        pics.entry(side_key.clone()).or_insert_with(|| (export::webp_bytes(&mid, 90.0), "image/webp"));
+                        pics.entry(side_key.clone()).or_insert(mid);
+                        pics.entry(t.clone()).or_insert(rgba);
                         (Some(crate::scene3d::Picture { key: t.clone(), size, alpha }), Some(crate::scene3d::Picture { key: side_key, size: [sw, sh], alpha: side_alpha }), [74, 64, 56])
                     }
                     Err(_) => (None, None, [74, 64, 56]),
@@ -1078,11 +1103,7 @@ impl App {
             let gaps = map.portals.iter().filter(|q| q.kind == PortalKind::Opening).map(|q| (q.a, q.b)).collect();
             storeys.push(crate::scene3d::Storey { floor, walls: lay.walls.clone(), low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color } });
         }
-        let map = self.export_level(e, 0);
-        let scene = crate::scene3d::build([map.width as f32, map.height as f32], &storeys);
-        let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
-        let bounds = scene.bounds().ok_or("3D: модель пустая")?;
-        Ok((crate::glb::write(&scene, &images, &e.name)?, bounds))
+        storeys
     }
 
     fn asset_webp(&self, key: &str, sunk: f32, mirror: bool) -> Result<Vec<u8>, String> {
@@ -1103,6 +1124,14 @@ impl App {
             image::imageops::flip_horizontal_in_place(&mut img);
         }
         Ok(export::webp_bytes(&img, 90.0))
+    }
+
+    /// Снимать окно можно: окно 3D, если его ждут, уже легло.
+    fn shot_settled(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.view3d_settled();
+        #[cfg(target_arch = "wasm32")]
+        true
     }
 
     /// `--shot файл.png`: снять окно, когда оно устоялось, и выйти.
@@ -1141,7 +1170,7 @@ impl App {
             }
             self.recovery.close();
             std::process::exit(0);
-        } else if !self.shot_asked && self.frame >= 10 && !self.library.loading() && self.textures.idle() {
+        } else if !self.shot_asked && self.frame >= 10 && !self.library.loading() && self.textures.idle() && self.export.is_none() && self.shot_settled() {
             self.shot_asked = true;
             ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
         }
