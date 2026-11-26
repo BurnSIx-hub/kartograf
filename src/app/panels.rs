@@ -80,6 +80,13 @@ impl App {
                 if item(ui, "Предметы из WoW…", "") {
                     self.wow.open = true;
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if item(ui, "3D-модели CC0…", "")
+                    && self.cc0.is_none()
+                    && let Some(dir) = crate::plat::FileDialog::new().pick_folder()
+                {
+                    self.start_cc0(dir);
+                }
                 ui.separator();
                 if item(ui, "Проверить обновления", "") {
                     let ctx = ui.ctx().clone();

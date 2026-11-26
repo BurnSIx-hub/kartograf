@@ -258,6 +258,8 @@ pub struct Args {
     pub three_d: bool,
     /// `--view3d`: сразу открыть тестовую зону 3D.
     pub view3d: bool,
+    /// `--cc0 папка`: перенести набор 3D-моделей CC0 на полку и выйти.
+    pub cc0: Option<PathBuf>,
 }
 
 /// Окно «местность по координатам»: что вписано и размер в клетках.
@@ -749,6 +751,12 @@ pub struct App {
     /// `--view3d`: открыть его, как только карта загрузится.
     #[cfg(not(target_arch = "wasm32"))]
     view3d_auto: bool,
+    /// Модели предметов по ключу картинки (и «нет модели») — [`props3d`].
+    #[cfg(not(target_arch = "wasm32"))]
+    models3d: std::collections::HashMap<String, Option<std::sync::Arc<crate::model3d::Model3d>>>,
+    /// Перенос набора 3D-моделей CC0 на полку, пока идёт.
+    #[cfg(not(target_arch = "wasm32"))]
+    cc0: Option<props3d::Cc0Job>,
     /// Окно «Предметы из WoW» и открытый клиент игры.
     #[cfg(not(target_arch = "wasm32"))]
     pub wow: wow_import::WowWindow,
@@ -879,6 +887,7 @@ impl App {
         let mut library = Library::default();
         library.set_baked(&data_dir.join("baked"));
         library.set_wow(&data_dir.join("wow"));
+        library.set_cc0(&data_dir.join("cc0"));
         if let Some(dir) = &settings.textures_dir {
             library.set_folder(dir);
         }
@@ -1024,6 +1033,10 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             view3d_auto: args.view3d,
             #[cfg(not(target_arch = "wasm32"))]
+            models3d: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cc0: None,
+            #[cfg(not(target_arch = "wasm32"))]
             wow: Default::default(),
             object_layer: None,
             brush_erase: false,
@@ -1141,6 +1154,11 @@ pub(crate) mod wow_import;
 /// Окно 3D — тестовая зона: облёт, фишка, двери, свет.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod view3d;
+/// Предметы в 3D: модели WoW и CC0, что выходит из картинки пола.
+#[cfg(not(target_arch = "wasm32"))]
+mod props3d;
+#[cfg(not(target_arch = "wasm32"))]
+pub use props3d::import_cc0_cli;
 
 impl eframe::App for App {
     /// Свёрнутое окно eframe не рисует и `ui` не зовёт — только это: команды ИИ

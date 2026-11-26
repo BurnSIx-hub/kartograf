@@ -547,6 +547,18 @@ impl App {
         let mut bg_jobs: Vec<Pending<Result<(Vec<u8>, &'static str), String>>> = Vec::new();
         // Кусок мира для Boundless: фон и стены идут в его пирамиду, своих файлов у куска нет.
         let chunk = self.big.is_some();
+        // Предметы с 3D-моделью (полки WoW и CC0): их тайлам — модель 3D Canvas рядом со сценой.
+        #[cfg(not(target_arch = "wasm32"))]
+        let models3d = if e.three_d && e.canopies && !chunk {
+            let keys: Vec<String> = (0..n).flat_map(|k| self.export_level(e, k).props.iter().filter(|p| p.own_tile()).map(|p| p.asset.clone()).collect::<Vec<_>>()).collect();
+            self.models_for(keys)
+        } else {
+            Default::default()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut model_srcs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Сколько тайлов-предметов вышло моделями и сколько из них — модели WoW.
+        let mut modelled = (0usize, 0usize);
         for (k, img) in e.done.iter().enumerate() {
             let holes = e.whites.get(k).and_then(|w| w.as_ref()).and_then(|white| export::floor_from_pair(img, white));
             let job = match &holes {
@@ -742,6 +754,28 @@ impl App {
                 };
                 let src = save(&prop.asset, &mut files)?;
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some((model, file)) = models3d.get(&prop.asset) {
+                    let src = match model_srcs.get(&prop.asset) {
+                        Some(s) => s.clone(),
+                        None => {
+                            let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
+                            let tag = export::content_tag(&bytes);
+                            let path = export::shared_dir(&e.dir).join(format!("{}_{}.glb", export::asset_stem(&prop.asset), &tag[..tag.len().min(8)]));
+                            let s = export::asset_src(&path);
+                            files.push((path, bytes));
+                            model_srcs.insert(prop.asset.clone(), s.clone());
+                            s
+                        }
+                    };
+                    let fit = super::props3d::fit(model, size);
+                    let tall = model.bounds().map_or(0.1, |[lo, hi]| (hi[1] - lo[1]).max(0.01)) * fit[1];
+                    tile.model = Some((src, tall));
+                    modelled.0 += 1;
+                    if self.on_wow_shelf(&prop.asset) {
+                        modelled.1 += 1;
+                    }
+                }
                 tile.flip = prop.flip && !mirror;
                 tile.fade = false;
                 tile.leaves = false;
@@ -1001,8 +1035,13 @@ impl App {
         self.export_timing = Some(laps.json());
         let walls: usize = layouts.iter().flat_map(|l| l.walls.iter()).map(|l| l.len().saturating_sub(1)).sum();
         let (w, h) = (e.done[0].width(), e.done[0].height());
+        let models = match modelled {
+            (0, _) => String::new(),
+            (all, 0) => format!(", предметов моделями 3D {all}"),
+            (all, wow) => format!(", предметов моделями 3D {all} (WoW — {wow}: только для своего стола)"),
+        };
         Ok(format!(
-            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}",
+            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}{models}",
             if cfg!(target_arch = "wasm32") { "На сцену —" } else { "Выгружено в" },
             e.dir.display(),
             e.district.as_ref().map_or_else(String::new, |d| format!("район {},{}–{},{}, ", d.area[0], d.area[1], d.area[2], d.area[3])),

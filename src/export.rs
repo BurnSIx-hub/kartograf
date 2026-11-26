@@ -1006,6 +1006,9 @@ pub struct RoofTile {
     /// В тайл он уходит долями тайла: Мастер подвинет или растянет тайл — контур
     /// поедет с ним. Без контура «Wild Canvas» берёт весь прямоугольник тайла.
     pub outline: Vec<(Vec<[f32; 2]>, bool)>,
+    /// 3D-модель предмета (`.glb` рядом со сценой) и его высота в клетках: в 3D-виде (3D Canvas)
+    /// тайл — эта модель, растянутая в его рамку; в 2D — прежняя картинка.
+    pub model: Option<(String, f32)>,
 }
 
 /// Сколько потоков брать на картинку: у программы — по ядрам (не больше восьми), в
@@ -1563,6 +1566,11 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
             if r.ground {
                 tile["elevation"] = json!(b);
                 tile["occlusion"]["modes"] = json!([]);
+            }
+            if let Some((src, tall)) = &r.model {
+                // В 3D-виде — модель в рамке тайла. Нетвёрдая: фишки ходят мимо мебели, как в 2D,
+                // а не взбираются на неё.
+                tile["flags"][CANVAS3D] = json!({"model3d": src, "fillType": "stretch", "depth": (tall * px as f32).round().max(1.0), "collision": false});
             }
             if !r.scuppers.is_empty() {
                 // Сливы крыши: середина и поворот; размер — клетка сцены.
@@ -2388,6 +2396,19 @@ mod tests {
         let xs: Vec<f32> = cuts[0].loops[0].0.iter().map(|v| v[0]).collect();
         // Повёрнуто на 90°: поперёк по x — клетка, а не две.
         assert!(xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min) < 1.0);
+    }
+
+    #[test]
+    fn a_prop_with_a_model_is_that_model_in_3d_and_its_picture_in_2d() {
+        let map = Map::new(8, 6);
+        let lay = layout(&map, &map.room_edges());
+        let chair = RoofTile { item: true, model: Some(("k/chair_ab12cd34.glb".into(), 0.8)), ..canopy_tile("k/chair.webp".into(), [2.0, 2.0], [1.0, 1.0], 30.0, 100) };
+        let one = [SceneLevel { name: "Дом".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![chair] }];
+        let walls = [LevelLayers { foreground: None, solid: None }];
+        let t = &foundry_layered(&map, "Дом", &one, &walls, 100, &Default::default())["tiles"][0];
+        assert_eq!(t["texture"]["src"], "k/chair.webp", "в 2D — картинка");
+        assert_eq!((t["rotation"].as_f64(), t["elevation"].as_i64()), (Some(30.0), Some(0)), "на полу и повёрнут, как картинка");
+        assert_eq!(t["flags"][CANVAS3D], json!({"model3d": "k/chair_ab12cd34.glb", "fillType": "stretch", "depth": 80.0, "collision": false}));
     }
 
     #[test]

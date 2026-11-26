@@ -1525,6 +1525,14 @@ impl SelfTest {
                 let mut map = Map::new(12, 10);
                 map.paint_rect(Layer::Rooms, (2, 2), (9, 7), Some(0));
                 map.portals.push(map::Portal { a: [5.0, 2.0], b: [7.0, 2.0], kind: PortalKind::Door, asset: None, frame: None });
+                // Ящик с полки CC0 (картинка и модель рядом) — в углу комнаты.
+                match test_crate(&app.data_dir.join("cc0").join("Проба")) {
+                    Ok((png, size)) => {
+                        app.library.set_cc0(&app.data_dir.join("cc0"));
+                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [3.5, 6.5], size, rot: 30.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                    }
+                    Err(e) => self.check("ящик CC0 для 3D собрался", false, &e),
+                }
                 app.reset_doc(map, None);
                 app.start_view3d();
                 self.deadline = now + 30.0;
@@ -1544,6 +1552,7 @@ impl SelfTest {
                     return true;
                 };
                 self.check("окно 3D открылось и рисует", p.error.is_none(), &format!("{:?}", p.error));
+                self.check("ящик с полки CC0 стоит в 3D моделью", p.props == 1 && p.modelled == 1, &format!("предметов {}, моделями {}", p.props, p.modelled));
                 self.scale = p.yaw;
                 let c = p.rect.center();
                 self.drag(c, c + vec2(120.0, 0.0), PointerButton::Primary);
@@ -1607,6 +1616,35 @@ impl SelfTest {
         }
         true
     }
+}
+
+/// Ящик 1×0,6×0,7 клетки: вид сверху и модель рядом, как их кладёт перенос набора CC0.
+/// Картинка и размер в клетках.
+#[cfg(not(target_arch = "wasm32"))]
+fn test_crate(dir: &std::path::Path) -> Result<(PathBuf, [f32; 2]), String> {
+    use crate::scene3d::{Alpha, Look, Material, Mesh, Vertex};
+    let (x, y, z) = (0.5, 0.7, 0.3);
+    let mut mesh = Mesh::default();
+    let faces: [([f32; 3], [[f32; 3]; 4]); 5] = [
+        ([0.0, 1.0, 0.0], [[-x, y, -z], [x, y, -z], [x, y, z], [-x, y, z]]),
+        ([0.0, 0.0, 1.0], [[-x, 0.0, z], [x, 0.0, z], [x, y, z], [-x, y, z]]),
+        ([0.0, 0.0, -1.0], [[x, 0.0, -z], [-x, 0.0, -z], [-x, y, -z], [x, y, -z]]),
+        ([1.0, 0.0, 0.0], [[x, 0.0, z], [x, 0.0, -z], [x, y, -z], [x, y, z]]),
+        ([-1.0, 0.0, 0.0], [[-x, 0.0, -z], [-x, 0.0, z], [-x, y, z], [-x, y, -z]]),
+    ];
+    for (n, q) in faces {
+        let base = mesh.v.len() as u32;
+        mesh.v.extend(q.iter().map(|&p| Vertex { p, n, uv: [0.0, 0.0] }));
+        mesh.idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    let material = Material { look: Look::Color([150, 100, 50]), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 };
+    let m = crate::model3d::Model3d { parts: vec![crate::model3d::Part3 { mesh, material }], images: Vec::new() };
+    let (img, cells) = crate::model3d::top_view(&m, 64.0)?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let png = dir.join(format!("Crate_Test_{:.2}x{:.2}.png", cells[0], cells[1]));
+    img.save(&png).map_err(|e| e.to_string())?;
+    std::fs::write(png.with_extension("glb"), m.write_glb("Crate_Test")?).map_err(|e| e.to_string())?;
+    Ok((png, cells))
 }
 
 /// Ключ картинки пола; у сплошного цвета — пусто.

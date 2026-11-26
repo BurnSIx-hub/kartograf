@@ -9,6 +9,7 @@ use super::*;
 use crate::lighting::{self, Time};
 use crate::render3d::{self, Frame, Item, LightMap, LightUpdate, Renderer, Upload};
 use crate::scene3d::{self, Part, STOREY};
+use super::props3d;
 use std::collections::HashMap;
 
 /// Длинная сторона картинки пола в окне, точки: больше — память видеокарты без пользы.
@@ -63,7 +64,26 @@ struct NodeInfo {
     yaw: f32,
     /// Створка: дверь (без `_a`/`_b` двойной) и на сколько поворачивается.
     door: Option<(String, f32)>,
+    /// Образец предмета (модель или плоская картинка): сам не рисуется, только местами из
+    /// [`View3d::props`].
+    template: bool,
 }
+
+/// Предмет на месте: образец, матрица, этаж; крона прячется, когда стены по пояс; `bias` —
+/// порядок плоской картинки на полу (сдвиг глубины).
+struct PropAt {
+    node: usize,
+    model: render3d::Mat4,
+    storey: usize,
+    crown: bool,
+    bias: f32,
+}
+
+/// Плоская картинка предмета (без модели) в окне 3D — не больше стольких точек по стороне.
+const CARD_SIDE: u32 = 384;
+/// Высота плоских картинок над полом этажа: навес и бельё, крона.
+const MID_Y: f32 = 1.5;
+const CROWN_Y: f32 = 2.4;
 
 struct Door3 {
     seg: Segment,
@@ -121,6 +141,10 @@ pub(super) struct View3d {
     painted: u32,
     /// Где вид на экране (прошлый кадр).
     rect: Rect,
+    /// Предметы, что в 3D не в картинке пола: моделью или плоской картинкой.
+    props: Vec<PropAt>,
+    /// Сколько из них моделями.
+    modelled: usize,
 }
 
 /// Что видно снаружи окна 3D — самопроверке.
@@ -132,6 +156,9 @@ pub struct Probe3d {
     pub open: usize,
     pub painted: u32,
     pub error: Option<String>,
+    /// Предметов в 3D и сколько из них моделями.
+    pub props: usize,
+    pub modelled: usize,
 }
 
 fn id() -> egui::Id {
@@ -233,6 +260,8 @@ impl View3d {
             took: 0.0,
             painted: 0,
             rect: Rect::NOTHING,
+            props: Vec::new(),
+            modelled: 0,
         }
     }
 
@@ -500,12 +529,15 @@ impl View3d {
         let vp = render3d::mul(&render3d::perspective(FOV, rect.width() / rect.height().max(1.0), near, far), &render3d::look_at(eye, self.cam.target, [0.0, 1.0, 0.0]));
         let mut items = Vec::new();
         for (i, n) in self.nodes.iter().enumerate() {
-            if n.storey > self.top {
+            if n.storey > self.top || n.template {
                 continue;
             }
             let yaw = n.yaw + n.door.as_ref().map_or(0.0, |(id, swing)| swing * self.doors.get(id).map_or(0.0, |d| d.t));
             let cut = if self.cut && matches!(n.part, Part::Wall | Part::Door) { Self::floor_y(n.storey) + CUT } else { f32::MAX };
-            items.push(Item { node: i, model: render3d::placed(n.at, yaw), storey: n.storey, cut, caps: self.cut && n.part == Part::Wall });
+            items.push(Item { node: i, model: render3d::placed(n.at, yaw), storey: n.storey, cut, caps: self.cut && n.part == Part::Wall, bias: 0.0 });
+        }
+        for p in self.props.iter().filter(|p| p.storey <= self.top && !(p.crown && self.cut)) {
+            items.push(Item { node: p.node, model: p.model, storey: p.storey, cut: f32::MAX, caps: false, bias: p.bias });
         }
         let pawn = self.token.map(|t| (render3d::placed([t.at[0], Self::floor_y(t.storey), t.at[1]], 0.0), t.storey, [0.93, 0.74, 0.30]));
         let sky = match self.time {
@@ -590,6 +622,10 @@ impl View3d {
         }
         ui.horizontal(|ui| {
             ui.weak(format!("снято за {:.1} с", self.took));
+            if !self.props.is_empty() {
+                ui.separator();
+                ui.weak(format!("предметов {}, моделями {}", self.props.len(), self.modelled)).on_hover_text("Модели — у предметов с полок «WoW/…» и «CC0/…»; прочие лежат плоской картинкой, как в 3D Canvas");
+            }
             ui.separator();
             ui.add(egui::Label::new(egui::RichText::new(hint).weak().small()).truncate());
         });
@@ -720,7 +756,112 @@ enum Action {
     Recapture,
 }
 
+/// Что уходит на видеокарту: узлы, их сетки, материалы, картинки — к ним добавляются образцы
+/// предметов.
+struct Parts {
+    nodes: Vec<NodeInfo>,
+    meshes: Vec<Vec<(usize, crate::scene3d::Mesh)>>,
+    materials: Vec<crate::scene3d::Material>,
+    images: Vec<image::RgbaImage>,
+}
+
+impl Parts {
+    fn template(&mut self, prims: Vec<(usize, crate::scene3d::Mesh)>) -> usize {
+        self.nodes.push(NodeInfo { part: Part::Floor, storey: 0, at: [0.0; 3], yaw: 0.0, door: None, template: true });
+        self.meshes.push(prims);
+        self.nodes.len() - 1
+    }
+
+    /// Модель — образцом: её картинки и материалы — в общие.
+    fn add_model(&mut self, m: &crate::model3d::Model3d) -> usize {
+        let base = self.images.len();
+        self.images.extend(m.images.iter().cloned());
+        let mut prims = Vec::new();
+        for part in &m.parts {
+            let mut mat = part.material.clone();
+            if let crate::scene3d::Look::Picture(i) = mat.look {
+                mat.look = crate::scene3d::Look::Picture(base + i);
+            }
+            self.materials.push(mat);
+            prims.push((self.materials.len() - 1, part.mesh.clone()));
+        }
+        self.template(prims)
+    }
+
+    /// Плоская картинка — образцом: квадрат 1×1 на полу, середина в нуле, верх картинки — на север.
+    fn add_card(&mut self, img: image::RgbaImage, tint: Option<[u8; 3]>) -> usize {
+        let side = img.width().max(img.height());
+        let mut img = if side > CARD_SIDE {
+            let k = CARD_SIDE as f32 / side as f32;
+            image::imageops::resize(&img, ((img.width() as f32 * k) as u32).max(1), ((img.height() as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+        if let Some(t) = tint {
+            for p in img.pixels_mut() {
+                for c in 0..3 {
+                    p[c] = (p[c] as u32 * t[c] as u32 / 255) as u8;
+                }
+            }
+        }
+        self.images.push(img);
+        let look = crate::scene3d::Look::Picture(self.images.len() - 1);
+        self.materials.push(crate::scene3d::Material { look, alpha: crate::scene3d::Alpha::Mask, two_sided: true, repeat: false, opacity: 1.0 });
+        let v = |x: f32, z: f32| crate::scene3d::Vertex { p: [x, 0.0, z], n: [0.0, 1.0, 0.0], uv: [x + 0.5, z + 0.5] };
+        let mesh = crate::scene3d::Mesh { v: vec![v(-0.5, -0.5), v(0.5, -0.5), v(0.5, 0.5), v(-0.5, 0.5)], idx: vec![0, 2, 1, 0, 3, 2] };
+        self.template(vec![(self.materials.len() - 1, mesh)])
+    }
+}
+
 impl App {
+    /// Предметы в окно 3D: у кого есть модель — моделью (образец на модель), прочие — плоской
+    /// картинкой (образец на картинку и подкраску), как их кладёт 3D Canvas. Образцы — в `parts`.
+    fn props_3d(&mut self, plans: &[(usize, Prop, props3d::Lift)], parts: &mut Parts) -> (Vec<PropAt>, usize) {
+        let mut out = Vec::new();
+        let mut modelled = 0;
+        let mut models: HashMap<String, (usize, std::sync::Arc<crate::model3d::Model3d>)> = HashMap::new();
+        let mut cards: HashMap<(String, Option<[u8; 3]>), Option<usize>> = HashMap::new();
+        for (i, (k, p, lift)) in plans.iter().enumerate() {
+            let y0 = View3d::floor_y(*k);
+            let size = [p.size[0] * p.scale, p.size[1] * p.scale];
+            let yaw = -p.rot.to_radians();
+            let flip = if p.flip { -1.0 } else { 1.0 };
+            let model = match models.get(&p.asset) {
+                Some(m) => Some(m.clone()),
+                None => self.prop_model(&p.asset).map(|m| {
+                    let node = parts.add_model(&m);
+                    models.insert(p.asset.clone(), (node, m.clone()));
+                    (node, m)
+                }),
+            };
+            if let Some((node, m)) = model {
+                let s = props3d::fit(&m, size);
+                out.push(PropAt { node, model: render3d::placed_scaled([p.pos[0], y0, p.pos[1]], yaw, [s[0] * flip, s[1], s[2]]), storey: *k, crown: false, bias: 0.0 });
+                modelled += 1;
+                continue;
+            }
+            let key = (p.asset.clone(), p.tint);
+            let node = match cards.get(&key) {
+                Some(n) => *n,
+                None => {
+                    let n = self.textures.rgba(&p.asset).ok().map(|img| parts.add_card(img, p.tint));
+                    cards.insert(key, n);
+                    n
+                }
+            };
+            let Some(node) = node else { continue };
+            // Плоские на полу — в одной плоскости чуть над ним, друг над другом по слою — сдвигом
+            // глубины: разная высота давала щели между соседними плитками.
+            let (h, bias) = match lift {
+                props3d::Lift::Floor => (0.01, 2.0 + 2.0 * i as f32),
+                props3d::Lift::Mid => (MID_Y, 0.0),
+                props3d::Lift::Crown => (CROWN_Y, 0.0),
+            };
+            out.push(PropAt { node, model: render3d::placed_scaled([p.pos[0], y0 + h, p.pos[1]], yaw, [size[0] * flip, 1.0, size[1]]), storey: *k, crown: *lift == props3d::Lift::Crown, bias });
+        }
+        (out, modelled)
+    }
+
     /// `--view3d`: открыть окно, когда карта и картинки загрузились.
     pub(super) fn view3d_auto_step(&mut self) {
         if self.view3d_auto && self.export.is_none() && self.frame >= 10 && self.pending_plan.is_none() && self.pending_osm.is_none() && !self.place.busy() && !self.library.loading() && self.textures.idle() && self.canvas.width() > 100.0 {
@@ -737,7 +878,7 @@ impl App {
     /// Окно 3D глазами самопроверки.
     pub(crate) fn view3d_probe(&self) -> Option<Probe3d> {
         let v = self.view3d.as_ref()?;
-        Some(Probe3d { rect: v.rect, yaw: v.cam.yaw, token: v.token.map(|t| t.at), open: v.doors.values().filter(|d| d.open).count(), painted: v.painted, error: v.renderer.error() })
+        Some(Probe3d { rect: v.rect, yaw: v.cam.yaw, token: v.token.map(|t| t.at), open: v.doors.values().filter(|d| d.open).count(), painted: v.painted, error: v.renderer.error(), props: v.props.len(), modelled: v.modelled })
     }
 
     /// Снять карту для окна 3D: как выгрузка, но только пол без стен, без файлов.
@@ -773,6 +914,14 @@ impl App {
         let map0 = self.export_level(e, 0);
         let size = [map0.width as f32, map0.height as f32];
         let first_time = time_of(map0);
+        // Предметы, что не в картинке пола (они в выгрузке своими тайлами), — по этажам, снизу вверх по слоям.
+        let mut plans: Vec<(usize, Prop, props3d::Lift)> = Vec::new();
+        for k in 0..e.done.len() {
+            let m = self.export_level(e, k);
+            let mut here: Vec<(usize, Prop, props3d::Lift)> = m.props.iter().filter_map(|p| props3d::lift(p, m).map(|l| (k, p.clone(), l))).collect();
+            here.sort_by_key(|(_, p, _)| p.layer());
+            plans.extend(here);
+        }
         let mut scene = scene3d::build(size, &storeys);
         let mut images = Vec::new();
         for p in &scene.pictures {
@@ -801,13 +950,19 @@ impl App {
                 at: n.at,
                 yaw: n.yaw,
                 door: n.door.as_ref().map(|d| (d.id.trim_end_matches("_a").trim_end_matches("_b").to_owned(), d.swing)),
+                template: false,
             })
             .collect();
         let meshes = scene.nodes.iter_mut().map(|n| std::mem::take(&mut n.prims)).collect();
+        let mut parts = Parts { nodes, meshes, materials: std::mem::take(&mut scene.materials), images };
+        let (props, modelled) = self.props_3d(&plans, &mut parts);
+        let Parts { nodes, meshes, materials, images } = parts;
         let floors3: Vec<Floor3> = layouts.iter().enumerate().map(|(k, lay)| Floor3::new(k, lay, self.export_level(e, k).rooms.clone(), storeys[k].look.width.max(0.02) / 2.0, e.px as f32)).collect();
         let renderer = self.view3d.as_ref().map_or_else(Renderer::default, |v| v.renderer.clone());
-        renderer.upload(Upload { nodes: meshes, materials: scene.materials, images, pawn: render3d::pawn() });
+        renderer.upload(Upload { nodes: meshes, materials, images, pawn: render3d::pawn() });
         let mut v = View3d::fresh(renderer, nodes, floors3, size, first_time);
+        v.props = props;
+        v.modelled = modelled;
         v.rev = self.rev;
         v.took = e.began.elapsed().as_secs_f32();
         // Пересняли — камера, время, фишка и открытые двери те же.

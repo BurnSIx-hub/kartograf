@@ -63,8 +63,13 @@ pub fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> Mat4 {
 /// Узел на месте: сдвиг в `at` и поворот вокруг вертикали, как в glTF (ось x уходит в
 /// (cos, 0, −sin)).
 pub fn placed(at: [f32; 3], yaw: f32) -> Mat4 {
-    let (s, c) = yaw.sin_cos();
-    [c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, at[0], at[1], at[2], 1.0]
+    placed_scaled(at, yaw, [1.0; 3])
+}
+
+/// То же, но сначала растянуть по осям узла (`s` — по x, y, z; меньше нуля — отражение).
+pub fn placed_scaled(at: [f32; 3], yaw: f32, s: [f32; 3]) -> Mat4 {
+    let (sn, c) = yaw.sin_cos();
+    [c * s[0], 0.0, -sn * s[0], 0.0, 0.0, s[1], 0.0, 0.0, sn * s[2], 0.0, c * s[2], 0.0, at[0], at[1], at[2], 1.0]
 }
 
 const VERTEX: &str = r#"#version 330 core
@@ -148,7 +153,9 @@ pub struct Upload {
     pub pawn: Mesh,
 }
 
-/// Узел в кадре: номер, матрица, этаж (его карта света), высота среза стен.
+/// Узел в кадре: номер, матрица, этаж (его карта света), высота среза стен; `bias` — сдвиг
+/// глубины к зрителю (плоские картинки в одной плоскости пола ложатся по порядку, без мерцания
+/// и без щелей между соседними).
 #[derive(Clone, Copy)]
 pub struct Item {
     pub node: usize,
@@ -156,6 +163,7 @@ pub struct Item {
     pub storey: usize,
     pub cut: f32,
     pub caps: bool,
+    pub bias: f32,
 }
 
 /// Что рисовать в этом кадре.
@@ -463,6 +471,12 @@ impl Gpu {
     unsafe fn draw_parts(&self, gl: &glow::Context, parts: &[Part], item: &Item, tint: Option<[f32; 3]>, blend: bool) {
         unsafe {
             gl.uniform_matrix_4_f32_slice(self.u.model.as_ref(), false, &item.model);
+            if item.bias > 0.0 {
+                gl.enable(glow::POLYGON_OFFSET_FILL);
+                gl.polygon_offset(-1.0, -item.bias);
+            } else {
+                gl.disable(glow::POLYGON_OFFSET_FILL);
+            }
             gl.uniform_1_f32(self.u.cut.as_ref(), item.cut);
             gl.uniform_1_i32(self.u.caps.as_ref(), item.caps as i32);
             let light = self.lights.get(item.storey).and_then(|l| l.as_ref());
@@ -531,7 +545,7 @@ impl Gpu {
                 }
             }
             if let Some((model, storey, color)) = frame.pawn {
-                let item = Item { node: 0, model, storey, cut: f32::MAX, caps: false };
+                let item = Item { node: 0, model, storey, cut: f32::MAX, caps: false, bias: 0.0 };
                 self.draw_parts(gl, &self.pawn, &item, Some(color), false);
             }
             // Стёкла — после всего, без записи глубины: сквозь них видно и друг друга.
@@ -545,6 +559,7 @@ impl Gpu {
             }
             gl.depth_mask(true);
             gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::POLYGON_OFFSET_FILL);
             gl.bind_vertex_array(None);
             for unit in 0..3 {
                 gl.bind_sampler(unit, None);

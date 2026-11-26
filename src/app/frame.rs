@@ -45,6 +45,8 @@ impl App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.view3d_auto_step();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cc0_poll(&ctx);
         self.export_step(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.hide_after_ai(&ctx);

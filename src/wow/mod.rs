@@ -153,7 +153,9 @@ fn resolve_dir(out: &Path, model: &str) -> PathBuf {
 
 /// Нарисовать модель сверху и положить картинку в `out` (папку WoW в данных программы):
 /// `out/<путь модели>/<Имя>_<ш>x<в>.png`, размер в клетках — в имени, как у ассетов FA.
-/// Прежняя картинка той же модели (другого размера) заменяется.
+/// Рядом — та же модель объёмом, `<Имя>_<ш>x<в>.glb` ([`crate::model3d`]): по ней 3D-вид и
+/// выгрузка для 3D Canvas ставят предмет моделью. Прежние картинка и модель того же предмета
+/// (другого размера) заменяются.
 pub fn import(client: &Client, model: &str, out: &Path, opt: &render::Options) -> Result<Imported, String> {
     // Имя — как в списках архивов: из расстановки WMO оно приходит капсом, и слова не видны.
     let model = &client.spelled(&m2::m2_path(model));
@@ -169,7 +171,7 @@ pub fn import(client: &Client, model: &str, out: &Path, opt: &render::Options) -
     let prefix = format!("{}_", stem.to_lowercase());
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().to_lowercase();
-        if let Some(rest) = n.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".png"))
+        if let Some(rest) = n.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".png").or_else(|| r.strip_suffix(".glb")))
             && !rest.contains('_')
             && crate::library::size_from_name(&format!("x_{rest}")).is_some()
         {
@@ -179,14 +181,50 @@ pub fn import(client: &Client, model: &str, out: &Path, opt: &render::Options) -
     let name = format!("{stem}_{}x{}.png", num(sprite.cells[0]), num(sprite.cells[1]));
     let file = dir.join(&name);
     sprite.img.save(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    write_model(&m, &textures, &file.with_extension("glb"), &stem)?;
     // Ключ — как имя легло на диск (полка читает папку и берёт написание оттуда).
     let file = on_disk(&dir, &name).map_or(file, |n| dir.join(n));
     Ok(Imported { file, cells: sprite.cells, drawn: sprite.drawn, skipped: sprite.skipped, missing, origin: sprite.origin })
 }
 
+/// 3D-модель предмета рядом с его картинкой на полке.
+pub fn write_model(m: &m2::Model, textures: &[Option<blp::Rgba>], file: &Path, name: &str) -> Result<(), String> {
+    let bytes = crate::model3d::from_m2(m, textures)?.write_glb(name)?;
+    std::fs::write(file, bytes).map_err(|e| format!("{}: {e}", file.display()))
+}
+
+/// Какая модель клиента нарисована в картинке полки `png` (папка полки — `out`): папка картинки —
+/// путь модели без `World\`, имя — слова имени модели и размер в хвосте ([`import`]).
+pub fn model_for(out: &Path, png: &Path, models: &[String]) -> Option<String> {
+    let low = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let want = low(png.parent()?);
+    let stem = png.file_stem()?.to_string_lossy().into_owned();
+    let name = match stem.rsplit_once('_') {
+        Some((n, size)) if crate::library::size_from_name(&format!("x_{size}")).is_some() => n.to_lowercase(),
+        _ => stem.to_lowercase(),
+    };
+    models
+        .iter()
+        .find(|m| {
+            let file = m.rsplit(['\\', '/']).next().unwrap_or(m);
+            let s = file.rsplit_once('.').map_or(file, |(s, _)| s);
+            words_name(s).to_lowercase() == name && low(&asset_dir(out, m)) == want
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shelf_picture_finds_its_model_by_folder_and_name() {
+        let out = Path::new("C:/data/wow");
+        let models = vec!["World\\Generic\\PassiveDoodads\\Lights\\FreestandingTorch01.m2".to_owned(), "World\\Generic\\PassiveDoodads\\Lights\\FreestandingTorch02.m2".to_owned()];
+        let png = Path::new("C:/data/wow\\Generic\\PASSIVEDOODADS\\Lights\\Freestanding_Torch_02_0.22x0.23.png");
+        assert_eq!(model_for(out, png, &models).as_deref(), Some(models[1].as_str()));
+        assert_eq!(model_for(out, Path::new("C:/data/wow/Generic/Other/Freestanding_Torch_02_0.22x0.23.png"), &models), None);
+    }
 
     #[test]
     fn asset_folder_follows_the_model_path_without_world() {

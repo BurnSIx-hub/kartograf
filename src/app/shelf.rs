@@ -340,6 +340,11 @@ impl App {
                 ui.separator();
                 ui.weak("копия на случай сбоя сделана");
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(job) = &self.cc0 {
+                ui.separator();
+                ui.strong(format!("CC0 на полку: {} из {}…", job.done, job.total));
+            }
             if let Some(e) = &self.export {
                 ui.separator();
                 let what = if e.view3d { "Снимаю для 3D" } else { "Выгрузка" };
