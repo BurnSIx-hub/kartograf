@@ -82,8 +82,11 @@ impl App {
         }));
         let norm = |s: &str| s.replace('\\', "/").to_lowercase();
         // Полка предметов WoW и папка пола зданий WoW (там же переходы между этажами).
-        let shelf = norm(&self.wow_dir().to_string_lossy()) + "/";
-        let floors = norm(&crate::wow::location::tiles_dir(&self.data_dir).to_string_lossy()) + "/";
+        // В модуле Foundry (браузер) WoW нет — и его папок тоже.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (shelf, floors) = (norm(&self.wow_dir().to_string_lossy()) + "/", norm(&crate::wow::location::tiles_dir(&self.data_dir).to_string_lossy()) + "/");
+        #[cfg(target_arch = "wasm32")]
+        let (shelf, floors) = ("\0".to_owned(), "\0".to_owned());
         let objs = m
             .props
             .iter()
