@@ -45,13 +45,15 @@ impl Model3d {
 
     /// Середину рамки сверху — в ноль по x и z. Ушедшее под пол больше чем на четверть высоты
     /// (начало модели посередине) — поставить на пол; немного ниже нуля (ножки в полу) — как есть.
-    pub fn normalize(&mut self) {
-        let Some([lo, hi]) = self.bounds() else { return };
+    /// Сдвиг — каким он вышел.
+    pub fn normalize(&mut self) -> [f32; 3] {
+        let Some([lo, hi]) = self.bounds() else { return [0.0; 3] };
         let (cx, cz) = ((lo[0] + hi[0]) / 2.0, (lo[2] + hi[2]) / 2.0);
         let lift = if -lo[1] > 0.25 * (hi[1] - lo[1]) { -lo[1] } else { 0.0 };
         for v in self.parts.iter_mut().flat_map(|p| p.mesh.v.iter_mut()) {
             v.p = [v.p[0] - cx, v.p[1] + lift, v.p[2] - cz];
         }
+        [-cx, lift, -cz]
     }
 
     /// `.glb` модели: один узел, куски по материалам, картинки PNG.
@@ -270,24 +272,8 @@ impl Doc {
 /// `scale` — клеток в единице файла: у наборов — [`PER_METER`], у своих записанных — 1.
 /// Модель не сдвигается: начало файла остаётся началом ([`Model3d::normalize`] — отдельно).
 pub fn read_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model3d, String> {
-    let (json, bin) = if bytes.len() >= 12 && &bytes[0..4] == b"glTF" {
-        let mut at = 12;
-        let (mut json, mut bin) = (None, None);
-        while at + 8 <= bytes.len() {
-            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            let kind = &bytes[at + 4..at + 8];
-            let body = bytes.get(at + 8..at + 8 + len).ok_or("glb: кусок за краем")?;
-            match kind {
-                b"JSON" => json = Some(body),
-                b"BIN\0" => bin = Some(body.to_vec()),
-                _ => {}
-            }
-            at += 8 + len;
-        }
-        (json.ok_or("glb: нет JSON")?, bin)
-    } else {
-        (bytes, None)
-    };
+    let (json, bin) = split_glb(bytes)?;
+    let bin = bin.map(<[u8]>::to_vec);
     let j: Value = serde_json::from_slice(json).map_err(|e| format!("glTF: {e}"))?;
     let mut bufs = Vec::new();
     for (i, b) in j["buffers"].as_array().into_iter().flatten().enumerate() {
@@ -440,6 +426,121 @@ pub fn read_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model3d
         return Err("glTF: в сцене нет сеток".into());
     }
     Ok(model)
+}
+
+/// Исходная модель glTF — одним `.glb` в пространстве предмета, как есть: материалы со всеми
+/// картами (рельеф, шероховатость, металл), расширения и картинки в своём разрешении. Буферы
+/// и картинки из соседних файлов вшиваются в один кусок; сверху — узел, что растягивает модель
+/// в клетки (`scale`) и сдвигает (`shift`, после растяжения) — как [`read_gltf`] и
+/// [`Model3d::normalize`]. Наше окно 3D рисует модель проще, 3D Canvas — как в оригинале.
+pub fn wrap_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32, shift: [f32; 3]) -> Result<Vec<u8>, String> {
+    let (json, bin) = split_glb(bytes)?;
+    let mut j: Value = serde_json::from_slice(json).map_err(|e| format!("glTF: {e}"))?;
+    let mut data: Vec<u8> = Vec::new();
+    let pad = |d: &mut Vec<u8>| {
+        while !d.len().is_multiple_of(4) {
+            d.push(0);
+        }
+    };
+    // Буферы — подряд в один; где каждый начался.
+    let mut starts = Vec::new();
+    for (i, b) in j["buffers"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        pad(&mut data);
+        starts.push(data.len());
+        match b["uri"].as_str() {
+            Some(u) => data.extend_from_slice(&load_uri(u, dir)?),
+            None if i == 0 => data.extend_from_slice(bin.unwrap_or_default()),
+            None => {}
+        }
+    }
+    for v in j["bufferViews"].as_array_mut().into_iter().flatten() {
+        let b = v["buffer"].as_u64().unwrap_or(0) as usize;
+        let off = v["byteOffset"].as_u64().unwrap_or(0) as usize + starts.get(b).copied().unwrap_or(0);
+        v["buffer"] = 0.into();
+        v["byteOffset"] = off.into();
+    }
+    // Картинки из файлов — внутрь, своими кусками.
+    let images = j["images"].as_array().map_or(0, |a| a.len());
+    for i in 0..images {
+        let Some(u) = j["images"][i]["uri"].as_str().map(str::to_owned) else { continue };
+        let bytes = load_uri(&u, dir)?;
+        let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            "image/png"
+        } else if bytes.starts_with(&[0xFF, 0xD8]) {
+            "image/jpeg"
+        } else if bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            "application/octet-stream"
+        };
+        pad(&mut data);
+        let view = j["bufferViews"].as_array().map_or(0, |a| a.len());
+        if j["bufferViews"].is_null() {
+            j["bufferViews"] = serde_json::json!([]);
+        }
+        j["bufferViews"].as_array_mut().unwrap().push(serde_json::json!({"buffer": 0, "byteOffset": data.len(), "byteLength": bytes.len()}));
+        data.extend_from_slice(&bytes);
+        let im = j["images"][i].as_object_mut().unwrap();
+        im.remove("uri");
+        im.insert("bufferView".into(), view.into());
+        im.insert("mimeType".into(), mime.into());
+    }
+    pad(&mut data);
+    j["buffers"] = serde_json::json!([{"byteLength": data.len()}]);
+    // Узел сверху: растянуть в клетки и сдвинуть в пространство предмета.
+    let scene = j["scene"].as_u64().unwrap_or(0) as usize;
+    let roots: Vec<Value> = match j["scenes"][scene]["nodes"].as_array() {
+        Some(r) => r.clone(),
+        None => (0..j["nodes"].as_array().map_or(0, |n| n.len())).map(Value::from).collect(),
+    };
+    let s = scale;
+    let root = serde_json::json!({"name": "kartograf", "matrix": [s, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, s, 0.0, shift[0], shift[1], shift[2], 1.0], "children": roots});
+    if j["nodes"].is_null() {
+        j["nodes"] = serde_json::json!([]);
+    }
+    let n = j["nodes"].as_array().map_or(0, |a| a.len());
+    j["nodes"].as_array_mut().unwrap().push(root);
+    if j["scenes"].is_null() {
+        j["scenes"] = serde_json::json!([{}]);
+        j["scene"] = 0.into();
+    }
+    j["scenes"][scene]["nodes"] = serde_json::json!([n]);
+    let mut text = serde_json::to_vec(&j).map_err(|e| e.to_string())?;
+    while !text.len().is_multiple_of(4) {
+        text.push(b' ');
+    }
+    let mut out = Vec::with_capacity(28 + text.len() + data.len());
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&((12 + 8 + text.len() + 8 + data.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&text);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN\0");
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// Куски `.glb`: JSON и двоичный; текст `.gltf` — весь JSON.
+fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"glTF" {
+        return Ok((bytes, None));
+    }
+    let mut at = 12;
+    let (mut json, mut bin) = (None, None);
+    while at + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let body = bytes.get(at + 8..at + 8 + len).ok_or("glb: кусок за краем")?;
+        match kind {
+            b"JSON" => json = Some(body),
+            b"BIN\0" => bin = Some(body),
+            _ => {}
+        }
+        at += 8 + len;
+    }
+    Ok((json.ok_or("glb: нет JSON")?, bin))
 }
 
 /// Прочитать файл модели: `.glb` или `.gltf` рядом со своими буферами.
@@ -651,6 +752,41 @@ mod tests {
         let (a, b, c) = (top.v[t[0] as usize].p, top.v[t[1] as usize].p, top.v[t[2] as usize].p);
         let g = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]);
         assert!(g > 0.0, "грань смотрит вверх");
+    }
+
+    #[test]
+    fn a_wrapped_model_keeps_its_maps_and_pictures_and_stands_in_cells() {
+        // Модель .gltf с буфером и картинкой в соседних файлах и картой рельефа.
+        let m = crate_box();
+        let glb = m.write_glb("x").unwrap();
+        let (json, bin) = split_glb(&glb).unwrap();
+        let mut j: Value = serde_json::from_slice(json).unwrap();
+        let view = j["images"][0]["bufferView"].as_u64().unwrap() as usize;
+        let (off, len) = (j["bufferViews"][view]["byteOffset"].as_u64().unwrap_or(0) as usize, j["bufferViews"][view]["byteLength"].as_u64().unwrap() as usize);
+        let png = bin.unwrap()[off..off + len].to_vec();
+        j["images"][0] = serde_json::json!({"uri": "tex.png"});
+        j["buffers"][0]["uri"] = "box.bin".into();
+        j["materials"][0]["normalTexture"] = serde_json::json!({"index": 0});
+        let dir = std::env::temp_dir().join(format!("kartograf-wrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("box.bin"), bin.unwrap()).unwrap();
+        std::fs::write(dir.join("tex.png"), &png).unwrap();
+        let text = serde_json::to_vec(&j).unwrap();
+        let wrapped = wrap_gltf(&text, Some(&dir), 2.0, [1.0, 0.0, -1.0]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (wj, wbin) = split_glb(&wrapped).unwrap();
+        let wj: Value = serde_json::from_slice(wj).unwrap();
+        assert_eq!(wj["buffers"].as_array().unwrap().len(), 1);
+        assert!(wj["buffers"][0].get("uri").is_none() && wj["images"][0].get("uri").is_none(), "всё внутри");
+        assert_eq!(wj["images"][0]["mimeType"], "image/png");
+        assert_eq!(wj["materials"][0]["normalTexture"]["index"], 0, "карта рельефа на месте");
+        let iv = wj["images"][0]["bufferView"].as_u64().unwrap() as usize;
+        let io = wj["bufferViews"][iv]["byteOffset"].as_u64().unwrap() as usize;
+        assert_eq!(&wbin.unwrap()[io..io + png.len()], &png[..], "картинка как была");
+        let back = read_gltf(&wrapped, None, 1.0).unwrap();
+        let [lo, hi] = back.bounds().unwrap();
+        let [olo, ohi] = m.bounds().unwrap();
+        assert!((lo[0] - (olo[0] * 2.0 + 1.0)).abs() < 1e-4 && (hi[2] - (ohi[2] * 2.0 - 1.0)).abs() < 1e-4, "{lo:?} {hi:?}");
     }
 
     #[test]

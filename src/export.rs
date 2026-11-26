@@ -1009,6 +1009,8 @@ pub struct RoofTile {
     /// 3D-модель предмета (`.glb` рядом со сценой) и его высота в клетках: в 3D-виде (3D Canvas)
     /// тайл — эта модель, растянутая в его рамку; в 2D — прежняя картинка.
     pub model: Option<(String, f32)>,
+    /// Предмет стоит на другом (подсвечник на столе): на столько футов над полом этажа.
+    pub rest: f32,
 }
 
 /// Сколько потоков брать на картинку: у программы — по ядрам (не больше восьми), в
@@ -1504,8 +1506,8 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 }
             }
             if r.item && r.living.is_none() && r.web.is_none() && r.chest.is_none() {
-                // Над крышами — выше крыши этажа, иначе на полу.
-                tile["elevation"] = if r.above { over.clone() } else { json!(b) };
+                // Над крышами — выше крыши этажа, иначе на полу (или на том, на чём стоит).
+                tile["elevation"] = if r.above { over.clone() } else if r.rest > 0.0 { json!(b as f64 + (r.rest as f64 * 10.0).round() / 10.0) } else { json!(b) };
                 tile["occlusion"]["modes"] = json!([]);
                 if r.hover {
                     tile["flags"] = json!({LIVE_MODULE: {"hover": 1}});

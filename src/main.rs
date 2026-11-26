@@ -66,7 +66,8 @@ kartograf [карта.karta] [ключи]
   --export <папка>       выгрузка для Foundry и выход; --px <точек на клетку>
   --3d                   выгрузка ещё и с 3D-моделью карты (.glb) для 3D Canvas
   --view3d               сразу открыть тестовую зону 3D (с --shot — снять её)
-  --cc0 <папка>          набор 3D-моделей CC0 (.glb, .gltf) — на полку «CC0/…», без окна
+  --cc0 <папка>          набор 3D-моделей CC0 (.glb, .gltf) — на полку «CC0/…», без окна;
+                         --cc0-unit <клеток> — клеток в единице модели (по умолчанию метр, 0.656)
   --plan <файл.json>     построить карту по плану
   --osm <файл.osm>       местность из выгрузки OpenStreetMap
   --place <широта,долгота> местность по координатам; --cells ШxВ, --trees 0..1
@@ -99,7 +100,7 @@ fn say(text: &str) {
 /// ключей испортит чужие данные.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, String> {
-    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false, cc0: None };
+    let mut args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false, cc0: None, cc0_unit: None };
     let mut it = list.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -117,6 +118,7 @@ fn parse_args(list: impl IntoIterator<Item = String>) -> Result<app::Args, Strin
             "--3d" => args.three_d = true,
             "--view3d" => args.view3d = true,
             "--cc0" => args.cc0 = it.next().map(PathBuf::from),
+            "--cc0-unit" => args.cc0_unit = it.next().and_then(|s| s.replace(',', ".").parse().ok()),
             "--update" => std::process::exit(update::cli(&it.next().unwrap_or_default())),
             "--packinfo" => std::process::exit(packinfo(&it.by_ref().map(PathBuf::from).collect::<Vec<_>>())),
             "--wow-glb" => std::process::exit(wow_glb(&it.by_ref().collect::<Vec<_>>())),
@@ -279,7 +281,7 @@ fn main() -> eframe::Result {
     };
     // `--cc0 папка`: набор 3D-моделей — на полку, без окна.
     if let Some(src) = &args.cc0 {
-        std::process::exit(app::import_cc0_cli(src, &args.data.clone().unwrap_or_else(app::default_data_dir)));
+        std::process::exit(app::import_cc0_cli(src, &args.data.clone().unwrap_or_else(app::default_data_dir), args.cc0_unit));
     }
     // Самопроверке нужен один и тот же размер окна, иначе точки щелчков поплывут.
     let size = args.size.or(args.selftest.as_ref().map(|_| [1280.0, 800.0])).unwrap_or([1400.0, 900.0]);
@@ -296,7 +298,7 @@ fn main() -> eframe::Result {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast;
-    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false, cc0: None };
+    let args = app::Args { file: None, selftest: None, shot: None, size: None, data: None, export: None, px: None, plan: None, osm: None, place: None, cells: None, trees: None, three_d: false, view3d: false, cc0: None, cc0_unit: None };
     wasm_bindgen_futures::spawn_local(async move {
         let canvas = web_sys::window()
             .and_then(|w| w.document())
@@ -327,7 +329,7 @@ mod tests {
         assert_eq!(ok.file, Some(PathBuf::from("карта.karta")));
         assert_eq!((ok.data, ok.px), (Some(PathBuf::from("d")), Some(140)));
         // Каждый ключ, который разбирается, есть в справке.
-        for flag in ["--data-dir", "--mcp", "--aside", "--selftest", "--shot", "--size", "--export", "--px", "--plan", "--osm", "--place", "--cells", "--trees", "--update", "--packinfo", "--wow-glb", "--analyse", "--version", "--help", "--view3d", "--cc0"] {
+        for flag in ["--data-dir", "--mcp", "--aside", "--selftest", "--shot", "--size", "--export", "--px", "--plan", "--osm", "--place", "--cells", "--trees", "--update", "--packinfo", "--wow-glb", "--analyse", "--version", "--help", "--view3d", "--cc0", "--cc0-unit"] {
             assert!(USAGE.contains(flag), "{flag}");
         }
     }

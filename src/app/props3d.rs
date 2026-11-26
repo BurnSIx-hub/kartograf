@@ -80,15 +80,22 @@ fn plain_name(stem: &str) -> String {
 }
 
 /// Один файл набора — на полку: вид сверху `<Имя>_<ш>x<в>.png` и модель `.glb` рядом.
-pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path) -> Result<PathBuf, String> {
-    let mut m = model3d::read_file(src, model3d::PER_METER)?;
-    m.normalize();
+/// `unit` — клеток в единице файла: у glTF это метр ([`model3d::PER_METER`]), но наборы бывают
+/// и в своих единицах (у KayKit стена в 4 единицы — 10 футов, единица — полклетки).
+pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path, unit: f32) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mut m = model3d::read_gltf(&bytes, src.parent(), unit)?;
+    let shift = m.normalize();
     let (img, cells) = model3d::top_view(&m, library::PX_PER_CELL)?;
     let pack = root.file_name().map_or_else(|| "CC0".into(), |n| n.to_string_lossy().into_owned());
     let rel = src.parent().and_then(|p| p.strip_prefix(root).ok()).map(Path::to_owned).unwrap_or_default();
     let dir = out.join(pack).join(rel);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let stem = plain_name(&src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    // `barrel.gltf.glb` (так пишет KayKit) — просто `barrel`; `chair_1k` (Poly Haven) — `chair`.
+    let raw = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let raw = raw.strip_suffix(".gltf").unwrap_or(&raw);
+    let raw = ["_1k", "_2k", "_4k", "_8k"].iter().find_map(|t| raw.strip_suffix(t)).unwrap_or(raw);
+    let stem = plain_name(raw);
     let num = |v: f32| format!("{v:.2}").trim_end_matches('0').trim_end_matches('.').to_owned();
     // Прежние картинка и модель того же предмета (другого размера) — прочь.
     let prefix = format!("{}_", stem.to_lowercase());
@@ -103,18 +110,21 @@ pub(super) fn import_cc0_file(src: &Path, root: &Path, out: &Path) -> Result<Pat
     }
     let file = dir.join(format!("{stem}_{}x{}.png", num(cells[0]), num(cells[1])));
     img.save(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let glb = m.write_glb(&stem)?;
+    // Модель — исходная, со всеми картами и в своём разрешении: только поставлена в рамку предмета.
+    let glb = model3d::wrap_gltf(&bytes, src.parent(), unit, shift)?;
     std::fs::write(file.with_extension("glb"), glb).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(file)
 }
 
-/// `--cc0 папка`: набор — на полку в папке данных `data` (`cc0/<набор>/…`), итог — в консоль.
-pub fn import_cc0_cli(src: &Path, data: &Path) -> i32 {
+/// `--cc0 папка [--cc0-unit клеток]`: набор — на полку в папке данных `data` (`cc0/<набор>/…`),
+/// итог — в консоль.
+pub fn import_cc0_cli(src: &Path, data: &Path, unit: Option<f32>) -> i32 {
+    let unit = unit.unwrap_or(model3d::PER_METER);
     let out = data.join("cc0");
     let files = model_files(src);
     let mut failed = 0;
     for f in &files {
-        match import_cc0_file(f, src, &out) {
+        match import_cc0_file(f, src, &out, unit) {
             Ok(png) => println!("{}", png.display()),
             Err(e) => {
                 failed += 1;
@@ -139,7 +149,7 @@ impl App {
             let files = model_files(&src);
             let _ = tx.send(Cc0Note::Total(files.len()));
             for f in files {
-                let r = import_cc0_file(&f, &src, &out).map(|_| ()).map_err(|e| format!("{}: {e}", f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
+                let r = import_cc0_file(&f, &src, &out, model3d::PER_METER).map(|_| ()).map_err(|e| format!("{}: {e}", f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
                 let _ = tx.send(Cc0Note::One(r));
             }
             let _ = tx.send(Cc0Note::End);
@@ -229,6 +239,42 @@ impl App {
     }
 }
 
+/// Предмет для укладки в 3D: середина, рамка (клетки), поворот (градусы) и верх его модели над
+/// его же низом (клетки; нет модели — плоский).
+pub(super) struct Rest {
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+    pub rot: f32,
+    pub top: Option<f32>,
+}
+
+/// На какой высоте над полом стоит каждый предмет (клетки), по порядку рисования на карте (снизу
+/// вверх): на 2D-карте «на столе» — просто слой выше, в 3D подсвечник иначе провалился бы под стол.
+/// Предмет встаёт на верх модели, что ниже его по порядку, если его середина внутри её рамки и сам
+/// он меньше её; таких несколько — на самую высокую.
+pub(super) fn rests(items: &[Rest]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let area = it.size[0] * it.size[1];
+        let mut h = 0.0f32;
+        for (j, under) in items[..i].iter().enumerate() {
+            let Some(top) = under.top else { continue };
+            if under.size[0] * under.size[1] <= area {
+                continue;
+            }
+            // Середина предмета — в осях нижнего (поворот по часовой на экране, y вниз).
+            let (s, c) = (-under.rot).to_radians().sin_cos();
+            let (dx, dy) = (it.pos[0] - under.pos[0], it.pos[1] - under.pos[1]);
+            let (lx, ly) = (dx * c - dy * s, dx * s + dy * c);
+            if lx.abs() <= under.size[0] / 2.0 && ly.abs() <= under.size[1] / 2.0 {
+                h = h.max(out[j] + top);
+            }
+        }
+        out.push(h);
+    }
+    out
+}
+
 /// Во сколько раз растянуть модель по x, y, z, чтобы она легла в рамку предмета `size` (клетки):
 /// по горизонтали — в рамку, по высоте — средним из двух.
 pub(super) fn fit(model: &Model3d, size: [f32; 2]) -> [f32; 3] {
@@ -254,6 +300,24 @@ mod tests {
     }
 
     #[test]
+    fn a_candle_stands_on_the_table_under_it_and_a_chair_beside_stays_on_the_floor() {
+        let r = |pos: [f32; 2], size: [f32; 2], rot: f32, top: Option<f32>| Rest { pos, size, rot, top };
+        let items = [
+            r([5.0, 5.0], [2.0, 1.0], 90.0, Some(0.5)), // стол, повёрнут: вдоль y
+            r([5.0, 5.8], [0.2, 0.2], 0.0, Some(0.3)),  // подсвечник у края — внутри повёрнутого стола
+            r([5.0, 5.8], [0.1, 0.1], 0.0, None),       // огонёк на подсвечнике
+            r([6.2, 5.0], [0.5, 0.5], 0.0, Some(0.9)),  // стул рядом — на полу
+            r([5.0, 5.0], [3.0, 3.0], 0.0, None),       // ковёр больше стола — на полу
+        ];
+        let h = rests(&items);
+        assert_eq!(h[0], 0.0);
+        assert_eq!(h[1], 0.5, "на столе");
+        assert!((h[2] - 0.8).abs() < 1e-6, "на подсвечнике на столе");
+        assert_eq!(h[3], 0.0, "стул не на столе");
+        assert_eq!(h[4], 0.0, "больше стола — на полу");
+    }
+
+    #[test]
     fn a_cc0_model_goes_to_the_shelf_with_its_picture_and_model() {
         let dir = std::env::temp_dir().join(format!("kartograf-cc0-{}", std::process::id()));
         let (pack, out) = (dir.join("Набор"), dir.join("out"));
@@ -266,8 +330,8 @@ mod tests {
             mesh: crate::scene3d::Mesh { v: vec![v([-x, 0.3, -z], [0.0, 1.0, 0.0]), v([x, 0.3, -z], [0.0, 1.0, 0.0]), v([x, 0.3, z], [0.0, 1.0, 0.0]), v([-x, -0.3, z], [0.0, 1.0, 0.0])], idx: vec![0, 2, 1, 0, 3, 2] },
             material: crate::scene3d::Material { look: crate::scene3d::Look::Color([120, 80, 40]), alpha: crate::scene3d::Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 },
         });
-        std::fs::write(pack.join("props").join("crateSmall.glb"), m.write_glb("crate").unwrap()).unwrap();
-        let png = import_cc0_file(&pack.join("props").join("crateSmall.glb"), &pack, &out).unwrap();
+        std::fs::write(pack.join("props").join("crateSmall.gltf.glb"), m.write_glb("crate").unwrap()).unwrap();
+        let png = import_cc0_file(&pack.join("props").join("crateSmall.gltf.glb"), &pack, &out, model3d::PER_METER).unwrap();
         assert!(png.starts_with(out.join("Набор").join("props")), "{}", png.display());
         let name = png.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("crate_Small_1.0") || name.starts_with("crate_Small_1x") || name.starts_with("crate_Small_1."), "{name}");

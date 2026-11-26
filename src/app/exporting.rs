@@ -730,7 +730,22 @@ impl App {
             let baked = |p: &Prop| (map::ON_ROOF..map::ABOVE_ROOFS).contains(&p.layer()) && (map.roofs.iter().any(|r| r.contains(p.pos)) || map.outline_roofs.iter().any(|r| r.contains(p.pos)));
             let mut items: Vec<&Prop> = map.props.iter().filter(|p| e.canopies && p.own_tile() && !baked(p) && !p.with_walls()).collect();
             items.sort_by_key(|p| p.layer());
-            for prop in items {
+            // Что на чём стоит (подсвечник на столе) — по моделям: высота тайла в 3D Canvas.
+            #[cfg(not(target_arch = "wasm32"))]
+            let rests = if models3d.is_empty() {
+                vec![0.0; items.len()]
+            } else {
+                let rest: Vec<super::props3d::Rest> = items
+                    .iter()
+                    .map(|p| {
+                        let size = [p.size[0] * p.scale, p.size[1] * p.scale];
+                        let top = models3d.get(&p.asset).and_then(|(m, _)| m.bounds().map(|[_, hi]| hi[1] * super::props3d::fit(m, size)[1]));
+                        super::props3d::Rest { pos: p.pos, size, rot: p.rot, top }
+                    })
+                    .collect();
+                super::props3d::rests(&rest)
+            };
+            for (idx, prop) in items.into_iter().enumerate() {
                 let size = [prop.size[0] * prop.scale, prop.size[1] * prop.scale];
                 // Картинка — одна на ассет и без тени (тень рисует «Wild Canvas» по пометке
                 // плитки); предмет в воде — только сухой верх, своя картинка на ватерлинию.
@@ -754,6 +769,13 @@ impl App {
                 };
                 let src = save(&prop.asset, &mut files)?;
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Клетка — 5 футов.
+                    tile.rest = rests[idx] * 5.0;
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = idx;
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some((model, file)) = models3d.get(&prop.asset) {
                     let src = match model_srcs.get(&prop.asset) {

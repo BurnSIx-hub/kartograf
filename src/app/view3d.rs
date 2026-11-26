@@ -821,11 +821,9 @@ impl App {
         let mut modelled = 0;
         let mut models: HashMap<String, (usize, std::sync::Arc<crate::model3d::Model3d>)> = HashMap::new();
         let mut cards: HashMap<(String, Option<[u8; 3]>), Option<usize>> = HashMap::new();
-        for (i, (k, p, lift)) in plans.iter().enumerate() {
-            let y0 = View3d::floor_y(*k);
-            let size = [p.size[0] * p.scale, p.size[1] * p.scale];
-            let yaw = -p.rot.to_radians();
-            let flip = if p.flip { -1.0 } else { 1.0 };
+        // Модели предметов — сначала: по ним видно, что на чём стоит.
+        let mut found = Vec::with_capacity(plans.len());
+        for (_, p, _) in plans {
             let model = match models.get(&p.asset) {
                 Some(m) => Some(m.clone()),
                 None => self.prop_model(&p.asset).map(|m| {
@@ -834,7 +832,30 @@ impl App {
                     (node, m)
                 }),
             };
-            if let Some((node, m)) = model {
+            found.push(model);
+        }
+        let mut heights = vec![0.0f32; plans.len()];
+        for k in plans.iter().map(|(k, _, _)| *k).collect::<std::collections::BTreeSet<_>>() {
+            let here: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].0 == k && plans[i].2 == props3d::Lift::Floor).collect();
+            let items: Vec<props3d::Rest> = here
+                .iter()
+                .map(|&i| {
+                    let p = &plans[i].1;
+                    let size = [p.size[0] * p.scale, p.size[1] * p.scale];
+                    let top = found[i].as_ref().and_then(|(_, m)| m.bounds().map(|[_, hi]| hi[1] * props3d::fit(m, size)[1]));
+                    props3d::Rest { pos: p.pos, size, rot: p.rot, top }
+                })
+                .collect();
+            for (i, h) in here.iter().zip(props3d::rests(&items)) {
+                heights[*i] = h;
+            }
+        }
+        for (i, (k, p, lift)) in plans.iter().enumerate() {
+            let y0 = View3d::floor_y(*k) + heights[i];
+            let size = [p.size[0] * p.scale, p.size[1] * p.scale];
+            let yaw = -p.rot.to_radians();
+            let flip = if p.flip { -1.0 } else { 1.0 };
+            if let Some((node, m)) = found[i].clone() {
                 let s = props3d::fit(&m, size);
                 out.push(PropAt { node, model: render3d::placed_scaled([p.pos[0], y0, p.pos[1]], yaw, [s[0] * flip, s[1], s[2]]), storey: *k, crown: false, bias: 0.0 });
                 modelled += 1;
