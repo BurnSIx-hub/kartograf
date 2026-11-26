@@ -119,14 +119,30 @@ fn world_liquid(l: &wmo::Liquid, p: &adt::Place, code: u8) -> wmo::Liquid {
         let m = p.to_model([x, y]);
         [(m[0] - l.corner[0]) / st, (m[1] - l.corner[1]) / st]
     };
+    // Высота узла мира — с ближайшего узла здания, который угол видимой клетки: у пустых клеток
+    // узлы без высоты (0 вместо глади на −6,5 у каналов Штормграда), а узел мира у края воды
+    // при повороте ближе к ним — гладь вставала косым парусом над мостовой. Угол видимой клетки
+    // среди четырёх соседних узлов есть всегда: угол клетки мира не дальше 0,71 клетки от её
+    // середины, а середина лежит в видимой клетке здания.
+    let wet = |ix: usize, iy: usize| {
+        (ix.saturating_sub(1)..=ix.min(l.tiles[0].saturating_sub(1))).any(|i| (iy.saturating_sub(1)..=iy.min(l.tiles[1].saturating_sub(1))).any(|j| l.shown.get(j * l.tiles[0] + i).copied().unwrap_or(false)))
+    };
     let hgt = |fx: f32, fy: f32| {
-        let (ix, iy) = ((fx.floor().max(0.0) as usize).min(l.verts[0].saturating_sub(1)), (fy.floor().max(0.0) as usize).min(l.verts[1].saturating_sub(1)));
-        l.heights.get(iy * l.verts[0] + ix).copied().unwrap_or(l.corner[2])
+        let clamp = |v: f32, n: usize| (v.max(0.0) as usize).min(n.saturating_sub(1));
+        let near = [(fx.floor(), fy.floor()), (fx.ceil(), fy.floor()), (fx.floor(), fy.ceil()), (fx.ceil(), fy.ceil())]
+            .into_iter()
+            .map(|(a, b)| (clamp(a, l.verts[0]), clamp(b, l.verts[1])))
+            .min_by(|&(a, b), &(c, d)| {
+                let key = |i: usize, j: usize| (!wet(i, j), (i as f32 - fx).powi(2) + (j as f32 - fy).powi(2));
+                let (ka, kb) = (key(a, b), key(c, d));
+                ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+            });
+        near.and_then(|(ix, iy)| l.heights.get(iy * l.verts[0] + ix).copied()).unwrap_or(l.corner[2])
     };
     let heights = (0..(nx + 1) * (ny + 1))
         .map(|k| {
             let g = grid(x0 + (k % (nx + 1)) as f32 * st, y0 + (k / (nx + 1)) as f32 * st);
-            hgt(g[0].round(), g[1].round()) + p.pos[1]
+            hgt(g[0], g[1]) + p.pos[1]
         })
         .collect();
     let shown = (0..nx * ny)
@@ -835,32 +851,77 @@ pub fn floor_edges(surf: &Surfaces, floors: &[FloorMap], lv: usize, frame: Frame
         }
     }
     let c = opt.cells_per_yard;
-    chain(&mask_edges(surf, &inside, frame), 0.01, 0.35 * c, 1.5 * c)
+    chain(&mask_edges(surf, &inside, None, frame), 0.01, 0.35 * c, 1.5 * c)
 }
 
-/// Стены одного слоя «у земли» для 3D-сцены, где этажи не разделены: край проходимого пола
-/// всех этажей вместе. Не берётся пол верхних этажей (под ним в 2,5–10 ярдах другой сухой пол:
-/// второй этаж, мост над улицей) и глубоко под другим полом (выше него больше чем на 25 ярдов
-/// ещё пол: земля под городом). Из оставшегося — связные куски, по которым ходят шагом (в воду
-/// — прыжком), не меньше четверти самого большого: земля в пустотах за домами — мелкие
-/// островки, она не слой. В клетках карты, по рамке `frame`.
-pub fn ground_walls(surf: &Surfaces, frame: Frame, cells_per_yard: f32) -> Vec<Vec<[f32; 2]>> {
+/// Ярус 3D-сцены — свой уровень Foundry: стены по краю его пола и (у верхних ярусов) зоны,
+/// войдя в которые фишка переходит на этот уровень.
+pub struct Storey {
+    pub walls: Vec<Vec<[f32; 2]>>,
+    pub zones: Vec<Zone>,
+    /// Пол яруса по сетке поверхностей (нижний его пол в клетке; `INFINITY` — нет) — для его
+    /// тайла в 3D: `storey_floor` делает из него карту пола.
+    pub floor: Vec<f32>,
+}
+
+/// Зона яруса: обводы в клетках карты и высоты мира в ярдах — фишка между `low` и `high`
+/// стоит на полу этого яруса, а не на улице под ним и не на этаже над ним.
+pub struct Zone {
+    pub rings: Vec<Vec<[f32; 2]>>,
+    pub low: f32,
+    pub high: f32,
+}
+
+/// Ярусы для 3D-сцены, где этажи не разделены по высоте (город на склоне). Ярус пола — сколько
+/// сухих полов под ним стопкой в 2,5–10 ярдах: улица и залы — 0, второй этаж и мост над улицей
+/// — 1, этаж над ним — 2. Пол глубоко под другим (выше него больше чем на 25 ярдов ещё пол:
+/// земля под городом) — ничей. Из пола яруса — связные куски, по которым ходят шагом (в воду —
+/// прыжком): у земли — не меньше четверти самого большого (земля в пустотах за домами — мелкие
+/// островки), у верхних — не меньше 6 кв. ярдов; мелкий кусок, к которому с другого яруса можно
+/// шагнуть (край балкона над пустотой, обрывок моста), — часть того яруса. Стены яруса — край
+/// его пола, кроме мест, где шагом переходят на другой ярус (верх лестницы, конец моста): там
+/// фишка проходит и меняет уровень. Петли и «шипы» меньше 2,25 ярда (дырка в мостовой под
+/// фонарём, столбик) не стены. В клетках карты, по рамке `frame`; берётся только то, что в
+/// карте размером `size` клеток (с запасом в клетку: край пола за картой отрежется по рамке).
+pub fn storeys(surf: &Surfaces, frame: Frame, cells_per_yard: f32, size: [f32; 2]) -> Vec<Storey> {
     const UPPER: (f32, f32) = (2.5, 10.0);
     const DEEP: f32 = 25.0;
+    const MIN_UPPER: f32 = 6.0;
+    const JOIN_MAX: f32 = 30.0;
     let (w, h, n) = (surf.w, surf.h, surf.z.len());
     let cell_of: Vec<usize> = (0..w * h).flat_map(|k| surf.cell(k).map(move |_| k)).collect();
-    let ground: Vec<bool> = (0..n)
-        .map(|a| {
-            let (z, cell) = (surf.z[a], surf.cell(cell_of[a]));
-            surf.walk[a]
-                && !cell.clone().any(|b| !surf.wet[b] && surf.walk[b] && surf.z[b] >= z - UPPER.1 && surf.z[b] <= z - UPPER.0)
-                && !cell.clone().any(|b| surf.walk[b] && surf.z[b] > z + DEEP)
+    let usable: Vec<bool> = (0..n).map(|a| surf.walk[a] && !surf.cell(cell_of[a]).any(|b| surf.walk[b] && surf.z[b] > surf.z[a] + DEEP)).collect();
+    // Ярус — снизу вверх по клетке (высоты в клетке по возрастанию): над ближайшим сухим полом.
+    let mut layer = vec![usize::MAX; n];
+    for k in 0..w * h {
+        for a in surf.cell(k) {
+            if !usable[a] {
+                continue;
+            }
+            let under = surf.cell(k).filter(|&b| !surf.wet[b] && surf.walk[b] && surf.z[b] >= surf.z[a] - UPPER.1 && surf.z[b] <= surf.z[a] - UPPER.0).max_by(|&b, &c| surf.z[b].total_cmp(&surf.z[c]));
+            layer[a] = under.map_or(0, |b| if layer[b] == usize::MAX { 1 } else { layer[b] + 1 });
+        }
+    }
+    let reach = |a: usize, b: usize| step_reach(surf, a, b);
+    let in_map: Vec<bool> = (0..w * h)
+        .map(|k| {
+            let m = frame.to_map(surf.x0 + ((k % w) as f32 + 0.5) * surf.step, surf.y0 + ((k / w) as f32 + 0.5) * surf.step);
+            m[0] >= -1.0 && m[1] >= -1.0 && m[0] <= size[0] + 1.0 && m[1] <= size[1] + 1.0
         })
         .collect();
+    let neighbours = |k: usize| {
+        let (i, j) = ((k % w) as i64, (k / w) as i64);
+        [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)].into_iter().filter_map(move |(di, dj)| {
+            let (ni, nj) = (i + di, j + dj);
+            (ni >= 0 && nj >= 0 && (ni as usize) < w && (nj as usize) < h).then_some(nj as usize * w + ni as usize)
+        })
+    };
+    // Связные куски одного яруса.
     let mut comp = vec![usize::MAX; n];
     let mut sizes: Vec<usize> = Vec::new();
+    let mut comp_layer: Vec<usize> = Vec::new();
     for s0 in 0..n {
-        if !ground[s0] || comp[s0] != usize::MAX {
+        if !usable[s0] || comp[s0] != usize::MAX {
             continue;
         }
         let id = sizes.len();
@@ -868,16 +929,9 @@ pub fn ground_walls(surf: &Surfaces, frame: Frame, cells_per_yard: f32) -> Vec<V
         comp[s0] = id;
         while let Some(a) = stack.pop() {
             size += 1;
-            let k = cell_of[a];
-            let (i, j) = ((k % w) as i64, (k / w) as i64);
-            for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-                let (ni, nj) = (i + di, j + dj);
-                if ni < 0 || nj < 0 || ni as usize >= w || nj as usize >= h {
-                    continue;
-                }
-                for b in surf.cell(nj as usize * w + ni as usize) {
-                    let dz = (surf.z[b] - surf.z[a]).abs();
-                    if ground[b] && comp[b] == usize::MAX && (dz <= STEP_UP || (surf.wet[a] || surf.wet[b]) && dz <= JUMP_IN) {
+            for nk in neighbours(cell_of[a]) {
+                for b in surf.cell(nk) {
+                    if usable[b] && comp[b] == usize::MAX && layer[b] == layer[s0] && reach(a, b) {
                         comp[b] = id;
                         stack.push(b);
                     }
@@ -885,24 +939,147 @@ pub fn ground_walls(surf: &Surfaces, frame: Frame, cells_per_yard: f32) -> Vec<V
             }
         }
         sizes.push(size);
+        comp_layer.push(layer[s0]);
     }
-    let big = sizes.iter().copied().max().unwrap_or(0);
-    let inside: Vec<bool> = (0..w * h).map(|k| surf.cell(k).any(|a| comp[a] != usize::MAX && sizes[comp[a]] * 4 >= big)).collect();
+    let big = (0..sizes.len()).filter(|&c| comp_layer[c] == 0).map(|c| sizes[c]).max().unwrap_or(0);
+    let area = surf.step * surf.step;
+    let mut kept: Vec<bool> = (0..sizes.len()).map(|c| if comp_layer[c] == 0 { sizes[c] * 4 >= big } else { sizes[c] as f32 * area >= MIN_UPPER }).collect();
+    // Мелкие (до 30 кв. ярдов) куски, к которым шагают с принятого куска другого яруса, — в тот
+    // ярус (волной). Крупный отброшенный кусок (земля под городом) так и остаётся ничьим.
+    let tiny: Vec<bool> = sizes.iter().map(|&s| (s as f32 * area) < JOIN_MAX).collect();
+    // Чей кусок: приклеенный — того, к кому приклеен (у них одна зона).
+    let mut root: Vec<usize> = (0..sizes.len()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for a in 0..n {
+            let ca = comp[a];
+            if ca == usize::MAX || !kept[ca] {
+                continue;
+            }
+            for nk in neighbours(cell_of[a]).chain([cell_of[a]]) {
+                for b in surf.cell(nk) {
+                    let cb = comp[b];
+                    if cb != usize::MAX && !kept[cb] && tiny[cb] && reach(a, b) {
+                        kept[cb] = true;
+                        comp_layer[cb] = comp_layer[ca];
+                        root[cb] = root[ca];
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    let layer_of = |a: usize| (comp[a] != usize::MAX && kept[comp[a]]).then(|| comp_layer[comp[a]]);
+    let top = (0..n).filter(|&a| in_map[cell_of[a]]).filter_map(layer_of).max().unwrap_or(0);
     let c = cells_per_yard;
-    // Дырки в мостовой под фонарём, столбик — петля или «шип» туда-обратно меньше 2,25 ярда:
-    // фишка спотыкалась бы о них посреди улицы.
-    chain(&mask_edges(surf, &inside, frame), 0.01, 0.35 * c, 1.5 * c)
-        .into_iter()
-        .filter(|l| {
-            let (lo, hi) = l.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), p| ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])]));
-            (hi[0] - lo[0]).max(hi[1] - lo[1]) >= 2.25 * c
+    let small = |l: &Vec<[f32; 2]>| {
+        let (lo, hi) = l.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), p| ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])]));
+        (hi[0] - lo[0]).max(hi[1] - lo[1]) < 2.25 * c
+    };
+    (0..=top)
+        .map(|lv| {
+            let inside: Vec<bool> = (0..w * h).map(|k| in_map[k] && surf.cell(k).any(|a| layer_of(a) == Some(lv))).collect();
+            // Проход на другой ярус: в клетке вне яруса пол другого яруса, на который шагают с
+            // пола этого в соседней клетке.
+            let open: Vec<bool> = (0..w * h)
+                .map(|k| !inside[k] && surf.cell(k).any(|b| layer_of(b).is_some_and(|l| l != lv) && neighbours(k).any(|nk| inside[nk] && surf.cell(nk).any(|a| layer_of(a) == Some(lv) && reach(a, b)))))
+                .collect();
+            let walls = chain(&mask_edges(surf, &inside, Some(&open), frame), 0.01, 0.35 * c, 1.5 * c).into_iter().filter(|l| !small(l)).collect();
+            let own = |a: usize| (comp[a] != usize::MAX && kept[comp[a]]).then(|| (root[comp[a]], comp_layer[comp[a]]));
+            let zones = if lv == 0 { Vec::new() } else { storey_zones(surf, frame, &own, &in_map, lv, c, size) };
+            let floor = (0..w * h).map(|k| if in_map[k] { surf.cell(k).filter(|&a| layer_of(a) == Some(lv)).map(|a| surf.z[a]).fold(f32::INFINITY, f32::min) } else { f32::INFINITY }).collect();
+            Storey { walls, zones, floor }
         })
         .collect()
 }
 
+/// Шагом или прыжком в воду с поверхности `a` на `b` в соседней клетке.
+fn step_reach(surf: &Surfaces, a: usize, b: usize) -> bool {
+    let dz = (surf.z[b] - surf.z[a]).abs();
+    dz <= STEP_UP || (surf.wet[a] || surf.wet[b]) && dz <= JUMP_IN
+}
+
+/// Зоны верхнего яруса: по зоне на кусок — клетки куска и ещё клетка вокруг (фишку у стены
+/// останавливает стена, а не край зоны), низ на 0,75 ярда под его полом (сухой пол под ярусом —
+/// не выше чем на 2,5 ниже), верх на 1,4 над ним (следующий ярус — не ниже чем на 2,5). Если в
+/// клетках куска на этой высоте есть чужой пол (у лестницы на второй этаж верх выше пола зала
+/// под ней), кусок режется на полосы высоты по ярду. Только в рамке карты `size` (клетки).
+fn storey_zones(surf: &Surfaces, frame: Frame, own: &dyn Fn(usize) -> Option<(usize, usize)>, in_map: &[bool], lv: usize, c: f32, size: [f32; 2]) -> Vec<Zone> {
+    const BAND: f32 = 1.0;
+    let (w, h) = (surf.w, surf.h);
+    // Кусок яруса → (клетка, поверхность).
+    let mut parts: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for k in (0..w * h).filter(|&k| in_map[k]) {
+        for a in surf.cell(k) {
+            if let Some((ca, l)) = own(a) {
+                if l == lv {
+                    parts.entry(ca).or_default().push((k, a));
+                }
+            }
+        }
+    }
+    let mut ids: Vec<usize> = parts.keys().copied().collect();
+    ids.sort_unstable();
+    let mut out = Vec::new();
+    for ca in ids {
+        let cells = &parts[&ca];
+        let zmin = cells.iter().map(|&(_, a)| surf.z[a]).fold(f32::MAX, f32::min);
+        let zmax = cells.iter().map(|&(_, a)| surf.z[a]).fold(f32::MIN, f32::max);
+        let foreign = cells.iter().any(|&(k, a)| surf.cell(k).any(|b| own(b).is_none_or(|(cb, _)| cb != ca) && surf.walk[b] && surf.z[b] >= zmin - 0.75 && surf.z[b] <= zmax + 1.4 && !step_reach(surf, a, b)));
+        let band = |z: f32| if foreign { ((z - zmin) / BAND).floor() as i32 } else { 0 };
+        let mut groups: Vec<(i32, Vec<bool>, f32, f32)> = Vec::new();
+        for &(k, a) in cells {
+            let b = band(surf.z[a]);
+            let g = match groups.iter().position(|g| g.0 == b) {
+                Some(i) => i,
+                None => {
+                    groups.push((b, vec![false; w * h], f32::MAX, f32::MIN));
+                    groups.len() - 1
+                }
+            };
+            let g = &mut groups[g];
+            g.1[k] = true;
+            g.2 = g.2.min(surf.z[a]);
+            g.3 = g.3.max(surf.z[a]);
+        }
+        groups.sort_by_key(|g| g.0);
+        for (_, mask, lo, hi) in groups {
+            let grown: Vec<bool> = (0..w * h)
+                .map(|k| {
+                    let (i, j) = ((k % w) as i64, (k / w) as i64);
+                    (-1..=1i64).any(|dj| {
+                        (-1..=1i64).any(|di| {
+                            let (ni, nj) = (i + di, j + dj);
+                            ni >= 0 && nj >= 0 && (ni as usize) < w && (nj as usize) < h && mask[nj as usize * w + ni as usize]
+                        })
+                    })
+                })
+                .collect();
+            let rings: Vec<Vec<[f32; 2]>> = chain(&mask_edges(surf, &grown, None, frame), 0.01, 0.35 * c, 0.0)
+                .into_iter()
+                .map(|mut r| {
+                    if r.len() > 2 && r.first() == r.last() {
+                        r.pop();
+                    }
+                    r.iter().map(|p| [p[0].clamp(0.0, size[0]), p[1].clamp(0.0, size[1])]).collect::<Vec<_>>()
+                })
+                .filter(|r: &Vec<[f32; 2]>| {
+                    let twice: f32 = (0..r.len()).map(|i| r[i][0] * r[(i + 1) % r.len()][1] - r[(i + 1) % r.len()][0] * r[i][1]).sum();
+                    r.len() >= 3 && twice.abs() / 2.0 >= 0.1
+                })
+                .collect();
+            if !rings.is_empty() {
+                out.push(Zone { rings, low: lo - 0.75, high: hi + 1.4 });
+            }
+        }
+    }
+    out
+}
+
 /// Край области клеток сетки поверхностей (`inside`) отрезками в клетках карты: квадраты по
 /// четырём серединам клеток, край — между серединами сторон.
-fn mask_edges(surf: &Surfaces, inside: &[bool], frame: Frame) -> Vec<([f32; 2], [f32; 2])> {
+fn mask_edges(surf: &Surfaces, inside: &[bool], open: Option<&[bool]>, frame: Frame) -> Vec<([f32; 2], [f32; 2])> {
     let (w, h) = (surf.w, surf.h);
     let at = |i: i64, j: i64| i >= 0 && j >= 0 && (i as usize) < w && (j as usize) < h && inside[j as usize * w + i as usize];
     let pt = |i: f32, j: f32| frame.to_map(surf.x0 + (i + 0.5) * surf.step, surf.y0 + (j + 0.5) * surf.step);
@@ -911,6 +1088,11 @@ fn mask_edges(surf: &Surfaces, inside: &[bool], frame: Frame) -> Vec<([f32; 2], 
         for i in -1..w as i64 {
             let code = at(i, j) as u8 | (at(i + 1, j) as u8) << 1 | (at(i + 1, j + 1) as u8) << 2 | (at(i, j + 1) as u8) << 3;
             if code == 0 || code == 15 {
+                continue;
+            }
+            // Квадрат у прохода на другой ярус — без края.
+            let passage = |i: i64, j: i64| i >= 0 && j >= 0 && (i as usize) < w && (j as usize) < h && open.is_some_and(|o| o[j as usize * w + i as usize]);
+            if passage(i, j) || passage(i + 1, j) || passage(i, j + 1) || passage(i + 1, j + 1) {
                 continue;
             }
             let (fi, fj) = (i as f32, j as f32);
@@ -942,6 +1124,16 @@ pub struct FloorMap {
     /// Следующий пол над полом этажа (`INFINITY` — нет): вода глубже среза рисуется до него —
     /// дно озера ниже глади на 5–10 ярдов, а срез — 3 ярда над дном.
     pub over: Vec<f32>,
+}
+
+/// Карта пола верхнего яруса (`z` — по сетке поверхностей, как `Storey::floor`): пустоты рядом
+/// с полом (стены) — высотой ближайшего пола до 2 ярдов, над полом — следующий пол.
+pub fn storey_floor(surf: &Surfaces, z: Vec<f32>) -> FloorMap {
+    let (w, h) = (surf.w, surf.h);
+    let mut f = FloorMap { x0: surf.x0, y0: surf.y0, step: surf.step, w, h, z, over: Vec::new() };
+    f.fill(2.0);
+    f.over = (0..w * h).map(|k| if f.z[k].is_finite() { surf.cell(k).map(|a| surf.z[a]).find(|&v| v > f.z[k] + 2.0).unwrap_or(f32::INFINITY) } else { f32::INFINITY }).collect();
+    f
 }
 
 impl FloorMap {
@@ -1952,9 +2144,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ground_walls_skip_upper_storeys() {
+    fn upper_storeys_get_their_own_walls_and_zone() {
         // Улица 30×30 на 0 с домом-дырой 13…17; над её частью — галерея на 5 под потолком на 9
-        // (второй этаж: под ним в 5 ярдах сухой пол). Стены 3D — край улицы и дыра, не галерея.
+        // (второй этаж: под ним в 5 ярдах сухой пол). Стены земли — край улицы и дыра, без
+        // галереи; у галереи — свой ярус: стены по её краю и зона на высоте её пола.
         let s = scene_of(&[
             [0.0, 0.0, 13.0, 30.0, 0.0, 0.0],
             [17.0, 0.0, 30.0, 30.0, 0.0, 0.0],
@@ -1967,10 +2160,84 @@ mod tests {
         let k = ((15.0 - surf.y0) / surf.step) as usize * surf.w + ((7.0 - surf.x0) / surf.step) as usize;
         assert!(surf.cell(k).any(|a| surf.walk[a] && (surf.z[a] - 5.0).abs() < 0.1), "галерея — проходимый пол");
         let frame = Frame { hi_x: 34.0, hi_y: 34.0, cpy: 1.0, margin: 0.0 };
-        let lines = ground_walls(&surf, frame, 1.0);
+        let st = storeys(&surf, frame, 1.0, [34.0, 34.0]);
+        assert_eq!(st.len(), 2, "земля и галерея");
+        let lines = &st[0].walls;
         assert_eq!(lines.len(), 2, "край улицы и дом: {lines:?}");
+        assert!(st[0].zones.is_empty());
         // Галерея (мир x 2…12, y 2…28) — на карте u = 34 − y, v = 34 − x: внутри неё стен нет.
         assert!(lines.iter().flatten().all(|p| !(p[0] > 7.0 && p[0] < 31.0 && p[1] > 23.0 && p[1] < 31.0)), "стена у галереи: {lines:?}");
+        // Стены яруса 1 — обвод галереи (u 6…32, v 22…32).
+        let up = &st[1].walls;
+        assert!(!up.is_empty());
+        assert!(up.iter().flatten().all(|p| p[0] > 5.0 && p[0] < 33.0 && p[1] > 21.0 && p[1] < 33.0), "стены галереи: {up:?}");
+        let len: f32 = up.iter().flat_map(|l| l.windows(2)).map(|s| ((s[1][0] - s[0][0]).powi(2) + (s[1][1] - s[0][1]).powi(2)).sqrt()).sum();
+        assert!((len - 72.0).abs() < 6.0, "обвод 26×10: {len}");
+        // Зона — одна, от чуть ниже пола галереи до чуть выше, ниже потолка и выше улицы.
+        assert_eq!(st[1].zones.len(), 1);
+        let z = &st[1].zones[0];
+        assert!(z.low > 0.5 && z.low < 5.0 && z.high > 5.0 && z.high < 9.0, "зона {}…{}", z.low, z.high);
+    }
+
+    #[test]
+    fn a_bridge_opens_onto_its_terraces() {
+        // Две террасы на 5 (мир x 0…10 и 20…30), между ними улица на 0, над улицей мост на 5
+        // (y 12…18). Мост — ярус 1: стены вдоль его бортов, а у концов, где шагают на террасы,
+        // — нет (там фишка меняет уровень).
+        let s = scene_of(&[
+            [0.0, 0.0, 10.0, 30.0, 5.0, 5.0],
+            [20.0, 0.0, 30.0, 30.0, 5.0, 5.0],
+            [10.0, 0.0, 20.0, 30.0, 0.0, 0.0],
+            [10.0, 12.0, 20.0, 18.0, 5.0, 5.0],
+        ]);
+        let surf = Surfaces::new(&s);
+        let frame = Frame { hi_x: 34.0, hi_y: 34.0, cpy: 1.0, margin: 0.0 };
+        let st = storeys(&surf, frame, 1.0, [34.0, 34.0]);
+        assert_eq!(st.len(), 2, "земля и мост");
+        // На карте u = 34 − y, v = 34 − x: мост — u 16…22, v 14…24.
+        let up = &st[1].walls;
+        assert!(up.iter().flatten().all(|p| p[0] > 15.0 && p[0] < 23.0 && p[1] > 13.0 && p[1] < 25.0), "стены моста: {up:?}");
+        let along: f32 = up.iter().flat_map(|l| l.windows(2)).map(|s| (s[1][1] - s[0][1]).abs()).sum();
+        let across: f32 = up.iter().flat_map(|l| l.windows(2)).map(|s| (s[1][0] - s[0][0]).abs()).sum();
+        assert!(along > 15.0, "борта моста: {up:?}");
+        assert!(across < 1.5, "поперёк моста у концов стен нет: {up:?}");
+        assert_eq!(st[1].zones.len(), 1);
+        let z = &st[1].zones[0];
+        assert!(z.low > 1.0 && z.low < 5.0 && z.high > 5.0, "зона {}…{}", z.low, z.high);
+        // Зона — над мостом, а не над улицей у моста: обвод не дальше клетки от моста.
+        assert!(z.rings.iter().flatten().all(|p| p[0] > 15.0 && p[0] < 23.0), "зона {:?}", z.rings);
+    }
+
+    #[test]
+    fn turned_water_stays_flat_at_its_shore() {
+        // Пруд 6×6 клеток посреди сетки 12×12; узлы вне пруда — 0 (у Штормграда так у каналов),
+        // гладь — на −6,48. Здание повёрнуто на 30°: углы клеток мира у берега ближе к пустым узлам.
+        let n = 12usize;
+        let pond = |i: usize, j: usize| (3..9).contains(&i) && (3..9).contains(&j);
+        let heights = (0..(n + 1) * (n + 1))
+            .map(|k| {
+                let (i, j) = (k % (n + 1), k / (n + 1));
+                let touches = (i.saturating_sub(1)..=i.min(n - 1)).any(|a| (j.saturating_sub(1)..=j.min(n - 1)).any(|b| pond(a, b)));
+                if touches { -6.48 } else { 0.0 }
+            })
+            .collect();
+        let shown = (0..n * n).map(|k| pond(k % n, k / n)).collect();
+        let l = wmo::Liquid { corner: [0.0, 0.0, -6.48], verts: [n + 1, n + 1], tiles: [n, n], heights, shown, tile_kind: 0 };
+        let p = adt::Place { name: 0, unique: 0, pos: [17000.0, 40.0, 17000.0], rot: [0.0, 30.0, 0.0], scale: 1.0, set: 0, bounds: None };
+        let w = world_liquid(&l, &p, 0);
+        let mut seen = 0;
+        for k in 0..w.tiles[0] * w.tiles[1] {
+            if !w.shown[k] {
+                continue;
+            }
+            seen += 1;
+            let (i, j) = (k % w.tiles[0], k / w.tiles[0]);
+            for (a, b) in [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)] {
+                let z = w.heights[b * w.verts[0] + a];
+                assert!((z - (40.0 - 6.48)).abs() < 1e-3, "клетка {i},{j}: угол {a},{b} на {z}");
+            }
+        }
+        assert!(seen > 20, "видимых клеток {seen}");
     }
 
     #[test]

@@ -3,8 +3,11 @@
 //! крыши срезаны над полом этажа, как у снимка пола (вид сверху под углом — «кукольный домик»).
 //! Местность карты (ADT) — слоями, запечёнными в картинку на 4×4 куска; вода, лава и слизь —
 //! гладью с рисунком игры. Карта материка — только с рамкой `area`: из большого города можно
-//! взять квартал. Рядом — `<имя>_walls.json`: стены Foundry одним слоем «у земли» (без верхних
-//! этажей), в точках сцены по 100 на клетку.
+//! взять квартал. Пол верхних ярусов (мост над улицей, второй этаж над залом того же этажа по
+//! высоте) — своими тайлами `_S1.glb`…, тоже срезанными над полом: в верхе (`_top`) их не видно
+//! и фишки на них не встают. Рядом — `<имя>_walls.json`: стены Foundry по ярусам (каждый — свой
+//! уровень Foundry) и зоны верхних ярусов, где фишка переходит на их уровень; в точках сцены по
+//! 100 на клетку, высоты зон — в клетках над началом модели.
 //!
 //! Оси модели — клетки карты Картографа: X — вправо (восток), Z — вниз карты (юг), Y — вверх.
 //! Начало — левый верхний угол той же рамки, что у `location::build` (`map_frame`), высота 0 —
@@ -260,9 +263,10 @@ struct Level<'a> {
     hi: [f32; 3],
     segs: Vec<Seg>,
     caps_count: usize,
-    /// Верх здания (`Some` — все этажи): то, что выше среза верхнего этажа над точкой, и то, что
-    /// стоит вдали от пола (наружные стены, свесы крыш), — вторым тайлом, его прячут на время игры.
-    all: Option<&'a [FloorMap]>,
+    /// Верх здания (`Some` — полы всех этажей и ярусов с их `low`): то, что выше среза верхнего
+    /// этажа над точкой, и то, что стоит вдали от пола (наружные стены, свесы крыш), — отдельным
+    /// тайлом, его прячут на время игры.
+    all: Option<&'a [(&'a FloorMap, Option<f32>)]>,
 }
 
 /// Верх здания берёт и то, что за рамкой карты на столько ярдов: свесы крыш, контрфорсы.
@@ -270,6 +274,27 @@ const TOP_PAD: f32 = 12.0;
 
 /// Верхние этажи рисуют и на ярд ниже своего пола (толща перекрытия).
 const UPPER_LOW: f32 = 1.0;
+
+/// Пол яруса (по сетке поверхностей: угол и шаг `grid`, `w` клеток в ряд), которого не взял
+/// ни один этаж по высоте: где пол яруса уже в окне этажа (второй этаж — своя полоса высот),
+/// он лежит в тайле этажа, и тайл яруса его не дублирует. Чего нет — `INFINITY`.
+fn storey_only(floor: &[f32], grid: [f32; 3], w: usize, floors: &[FloorMap], liquid: impl Fn(f32, f32) -> f32, cut: f32) -> Vec<f32> {
+    floor
+        .iter()
+        .enumerate()
+        .map(|(k, &z)| {
+            let (x, y) = (grid[0] + ((k % w) as f32 + 0.5) * grid[2], grid[1] + ((k / w) as f32 + 0.5) * grid[2]);
+            let lq = liquid(x, y);
+            let taken = floors.iter().enumerate().any(|(lv, f)| {
+                f.at(x, y).is_some_and(|fz| {
+                    let (b, t) = level_window(fz, lq, cut, (lv > 0).then_some(UPPER_LOW));
+                    z >= b && z <= t
+                })
+            });
+            if z.is_finite() && !taken { z } else { f32::INFINITY }
+        })
+        .collect()
+}
 
 /// Промежутки высот, которых не взял ни один этаж (`taken` — что взяли, в любом порядке).
 fn untaken(mut taken: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
@@ -309,7 +334,7 @@ impl Level<'_> {
             let inside = m[0] >= 0.0 && m[1] >= 0.0 && m[0] <= self.cells[0] && m[1] <= self.cells[1];
             let lq = self.liquid.at(c[0], c[1]);
             let taken: Vec<(f32, f32)> = if inside {
-                all.iter().enumerate().filter_map(|(lv, f)| f.at(c[0], c[1]).map(|f| level_window(f, lq, self.cut, (lv > 0).then_some(UPPER_LOW)))).collect()
+                all.iter().filter_map(|&(f, low)| f.at(c[0], c[1]).map(|f| level_window(f, lq, self.cut, low))).collect()
             } else {
                 Vec::new()
             };
@@ -652,13 +677,31 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
     let ambient = Ambient::new(&scene);
     let z0 = floors.first().map_or(scene.lo[2], |f| f.z.iter().copied().filter(|z| z.is_finite()).fold(f32::MAX, f32::min));
     let mut images = Images::default();
+    // Ярусы для 3D-сцены (земля, мосты над улицей и вторые этажи): стены и зоны — рядом в
+    // `_walls.json`, полы верхних ярусов — свои тайлы `_S1.glb`…: в верхе их не видно и фишки на
+    // них не встают. Пол яруса, который уже лежит в окне этажа по высоте (второй этаж — своя
+    // полоса высот), ярусу не нужен: тайлы не дублируют друг друга.
+    let storeys = location::storeys(&surf, frame, opt.cells_per_yard, [wc, hc]);
+    let storey_floors: Vec<FloorMap> = storeys
+        .iter()
+        .skip(1)
+        .map(|s| location::storey_floor(&surf, storey_only(&s.floor, [surf.x0, surf.y0, surf.step], surf.w, &floors, |x, y| liquid.at(x, y), opt.cut)))
+        .filter(|f| f.z.iter().any(|z| z.is_finite()))
+        .collect();
+    let all: Vec<(&FloorMap, Option<f32>)> = floors.iter().enumerate().map(|(lv, f)| (f, (lv > 0).then_some(UPPER_LOW))).chain(storey_floors.iter().map(|f| (f, Some(UPPER_LOW)))).collect();
     let level = |floor, low, all| Level { floor, liquid: &liquid, frame, cells: [wc, hc], z0, cut: opt.cut, low, mats: HashMap::new(), prims: Vec::new(), triangles: 0, lo: [f32::MAX; 3], hi: [f32::MIN; 3], segs: Vec::new(), caps_count: 0, all };
     let mut levels: Vec<Level> = floors.iter().enumerate().map(|(lv, floor)| level(floor, (lv > 0).then_some(UPPER_LOW), None)).collect();
-    // Верх — последним: в него идёт всё, что срезано у этажей и что стоит вдали от пола.
+    let mut part_names: Vec<String> = (0..floors.len()).map(|lv| format!("L{lv}")).collect();
+    for (k, f) in storey_floors.iter().enumerate() {
+        levels.push(level(f, Some(UPPER_LOW), None));
+        part_names.push(format!("S{}", k + 1));
+    }
+    // Верх — последним: в него идёт всё, что срезано у этажей и ярусов и что стоит вдали от пола.
     if opt.top
         && let Some(last) = floors.last()
     {
-        levels.push(level(last, None, Some(&floors)));
+        levels.push(level(last, None, Some(&all)));
+        part_names.push("top".into());
     }
     let near = |p: [f32; 3]| {
         let m = frame.to_map(p[0], p[1]);
@@ -922,15 +965,12 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
     if !dir.as_os_str().is_empty() {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    for (lv, l) in levels.iter().enumerate() {
+    for (l, part) in levels.iter().zip(&part_names) {
         if l.triangles == 0 {
             continue;
         }
-        let (file, part) = match (l.all.is_some(), lv) {
-            (true, _) => (dir.join(format!("{stem}_top.glb")), "top".to_owned()),
-            (false, 0) => (out.to_path_buf(), "L0".to_owned()),
-            (false, _) => (dir.join(format!("{stem}_L{lv}.glb")), format!("L{lv}")),
-        };
+        let part = part.clone();
+        let file = if part == "L0" { out.to_path_buf() } else { dir.join(format!("{stem}_{part}.glb")) };
         write_glb(&file, &l.prims, &images, opt.unlit, &format!("{}_{part}", scene.name))?;
         triangles += l.triangles;
         boxes.push([l.lo, l.hi]);
@@ -954,23 +994,50 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
         "world": {"north": frame.hi_x, "west": frame.hi_y, "cells_per_yard": frame.cpy, "margin": frame.margin},
         "models": files.iter().zip(&boxes).zip(&parts).map(|((f, b), p)| json!({"part": p, "file": f.file_name().map(|n| n.to_string_lossy().into_owned()), "min": b[0], "max": b[1]})).collect::<Vec<_>>(),
     });
-    // Стены для 3D-сцены Foundry одним слоем «у земли» — в точках сцены по 100 на клетку
-    // (тайлы моделей там же в 0, 0).
-    let walls: Vec<Value> = location::ground_walls(&surf, frame, opt.cells_per_yard)
+    // Стены и зоны 3D-сцены Foundry — в точках сцены по 100 на клетку (тайлы моделей там же в
+    // 0, 0), по ярусам: земля, мосты над улицей и вторые этажи — свои уровни Foundry. Высоты
+    // зон — в клетках над началом моделей: у тайла это его высота плюс клетки × размер клетки.
+    let px = |p: [f32; 2]| [(p[0] * 100.0).round() as i64, (p[1] * 100.0).round() as i64];
+    let to_walls = |lines: &[Vec<[f32; 2]>]| -> Vec<Value> {
+        lines
+            .iter()
+            .flat_map(|l| location::clip_line(l, wc, hc))
+            .flat_map(|l| {
+                l.windows(2)
+                    .map(|s| {
+                        let (a, b) = (px(s[0]), px(s[1]));
+                        json!({ "c": [a[0], a[1], b[0], b[1]] })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let up = |z: f32| ((z - z0) * frame.cpy * 100.0).round() / 100.0;
+    let storeys_json: Vec<Value> = storeys
         .iter()
-        .flat_map(|l| location::clip_line(l, wc, hc))
-        .flat_map(|l| {
-            l.windows(2)
-                .map(|s| {
-                    let c = [s[0][0], s[0][1], s[1][0], s[1][1]].map(|v| (v * 100.0).round() as i64);
-                    json!({ "c": c })
+        .enumerate()
+        .map(|(lv, s)| {
+            let zones: Vec<Value> = s
+                .zones
+                .iter()
+                .map(|z| {
+                    let rings: Vec<Vec<i64>> = z.rings.iter().map(|r| r.iter().flat_map(|p| px([p[0].clamp(0.0, wc), p[1].clamp(0.0, hc)])).collect()).collect();
+                    json!({"rings": rings, "bottom": up(z.low), "top": up(z.high)})
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            json!({"storey": lv, "walls": to_walls(&s.walls), "zones": zones})
         })
         .collect();
+    let ground = storeys.first().map(|s| to_walls(&s.walls)).unwrap_or_default();
     let walls_file = dir.join(format!("{stem}_walls.json"));
-    std::fs::write(&walls_file, serde_json::to_string(&json!({"px_per_cell": 100, "walls": walls})).unwrap_or_default()).map_err(|e| format!("{}: {e}", walls_file.display()))?;
-    notes.push(format!("стен для 3D-сцены: {} (`{stem}_walls.json`)", walls.len()));
+    std::fs::write(&walls_file, serde_json::to_string(&json!({"px_per_cell": 100, "walls": ground, "storeys": storeys_json})).unwrap_or_default()).map_err(|e| format!("{}: {e}", walls_file.display()))?;
+    let upper: Vec<String> = storeys_json
+        .iter()
+        .skip(1)
+        .map(|s| format!("ярус {}: стен {}, зон {}", s["storey"], s["walls"].as_array().map_or(0, Vec::len), s["zones"].as_array().map_or(0, Vec::len)))
+        .collect();
+    let upper = if upper.is_empty() { String::new() } else { format!("; {}", upper.join("; ")) };
+    notes.push(format!("стен для 3D-сцены: на земле {}{upper} (`{stem}_walls.json`)", ground.len()));
     let info_file = dir.join(format!("{stem}.json"));
     std::fs::write(&info_file, serde_json::to_string_pretty(&info).unwrap_or_default()).map_err(|e| format!("{}: {e}", info_file.display()))?;
     Ok(Exported { files, cells: [wc, hc], boxes, triangles, doodads: placed, textures: images.list.len(), notes })
@@ -1164,6 +1231,18 @@ mod tests {
         assert_eq!(untaken(vec![(9.0, 14.0)]), vec![(f32::MIN, 9.0), (14.0, f32::MAX)]);
         // Пола нет — всё верху.
         assert_eq!(untaken(Vec::new()), vec![(f32::MIN, f32::MAX)]);
+    }
+
+    #[test]
+    fn a_storey_tile_skips_floor_a_level_already_holds() {
+        // Этаж: пол на 0 во всех четырёх клетках, срез 4. Ярус: пол на 3 (в окне этажа — уже в
+        // его тайле), на 6 (выше среза — тайлу яруса), пусто, на 6.
+        let floors = vec![FloorMap { x0: 0.0, y0: 0.0, step: 1.0, w: 2, h: 2, z: vec![0.0; 4], over: vec![f32::INFINITY; 4] }];
+        let got = storey_only(&[3.0, 6.0, f32::INFINITY, 6.0], [0.0, 0.0, 1.0], 2, &floors, |_, _| f32::MIN, 4.0);
+        assert_eq!(got, vec![f32::INFINITY, 6.0, f32::INFINITY, 6.0]);
+        // Вода выше пола этажа поднимает его окно: пол яруса на 6 над гладью на 3 — уже в окне.
+        let wet = storey_only(&[6.0], [0.0, 0.0, 1.0], 1, &floors[..1], |_, _| 3.0, 4.0);
+        assert_eq!(wet, vec![f32::INFINITY]);
     }
 
     #[test]
