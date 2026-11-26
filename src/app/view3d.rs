@@ -3,7 +3,13 @@
 //! её рисует ([`crate::render3d`]): облёт камерой, фишка ходит со столкновениями о стены и
 //! закрытые двери, двери открываются, свет огней — как на ночном снимке и в Foundry.
 //!
-//! Окно — снимок карты: правки на карте видны после «Снять заново».
+//! Окно — снимок карты, но предметы, что стоят в 3D своими моделями и картинками, живые: их
+//! правка на карте (и их огни) видна сразу. Прочие правки — после «Снять заново».
+//!
+//! Правка в 3D (Tab): щелчок выбирает предмет — тот же выбор, что на карте; протяжка
+//! переносит по полу, Q и E поворачивают, Alt с колесом — размер, Delete убирает; с полки
+//! инструмента «Объект» щелчок по полу ставит новый. Правку делает карта ([`App::apply_3d`]) —
+//! с отменой, как правку мышью на холсте.
 
 use super::*;
 use crate::lighting::{self, Time};
@@ -11,6 +17,7 @@ use crate::render3d::{self, Frame, Item, LightMap, LightUpdate, Renderer, Upload
 use crate::scene3d::{self, Part, STOREY};
 use super::props3d;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Длинная сторона картинки пола в окне, точки: больше — память видеокарты без пользы.
 const FLOOR_SIDE: f32 = 4096.0;
@@ -72,14 +79,116 @@ struct NodeInfo {
 }
 
 /// Предмет на месте: образец, матрица, этаж; крона прячется, когда стены по пояс; `bias` —
-/// порядок плоской картинки на полу (сдвиг глубины).
+/// порядок плоской картинки на полу (сдвиг глубины). Для выбора лучом: номер на карте этажа,
+/// где стоит, поворот и растяжка образца, его рамка.
 struct PropAt {
     node: usize,
     model: render3d::Mat4,
     storey: usize,
     crown: bool,
     bias: f32,
+    index: usize,
+    at: [f32; 3],
+    yaw: f32,
+    scale: [f32; 3],
+    bounds: [[f32; 3]; 2],
 }
+
+impl PropAt {
+    /// Где луч из `eye` по `dir` входит в рамку предмета; мимо — нет.
+    fn hit(&self, eye: [f32; 3], dir: [f32; 3]) -> Option<f32> {
+        // В оси образца: сдвиг, поворот назад, растяжка.
+        let (s, c) = self.yaw.sin_cos();
+        let local = |d: [f32; 3]| [(c * d[0] - s * d[2]) / self.scale[0], d[1] / self.scale[1], (s * d[0] + c * d[2]) / self.scale[2]];
+        let (o, d) = (local(render3d::sub(eye, self.at)), local(dir));
+        let [lo, hi] = self.bounds;
+        let (mut t0, mut t1) = (0.0f32, f32::MAX);
+        for a in 0..3 {
+            if d[a].abs() < 1e-9 {
+                if o[a] < lo[a] || o[a] > hi[a] {
+                    return None;
+                }
+                continue;
+            }
+            let (ta, tb) = ((lo[a] - o[a]) / d[a], (hi[a] - o[a]) / d[a]);
+            t0 = t0.max(ta.min(tb));
+            t1 = t1.min(ta.max(tb));
+            if t0 > t1 {
+                return None;
+            }
+        }
+        Some(t0)
+    }
+
+    /// Рёбра рамки в мире.
+    fn edges(&self) -> Vec<([f32; 3], [f32; 3])> {
+        let [lo, hi] = self.bounds;
+        let corner = |k: usize| render3d::apply(&self.model, [if k & 1 == 0 { lo[0] } else { hi[0] }, if k & 2 == 0 { lo[1] } else { hi[1] }, if k & 4 == 0 { lo[2] } else { hi[2] }]);
+        let mut out = Vec::new();
+        for k in 0..8usize {
+            for bit in [1, 2, 4] {
+                if k & bit == 0 {
+                    out.push((corner(k), corner(k | bit)));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Образцы предметов, уже отданные видеокарте: модель — по картинке (нет модели — `None`),
+/// плоская картинка — по картинке и подкраске (не прочиталась — `None`).
+#[derive(Default)]
+struct Templates {
+    models: HashMap<String, Option<(usize, Arc<crate::model3d::Model3d>)>>,
+    cards: HashMap<(String, Option<[u8; 3]>), Option<usize>>,
+}
+
+/// Правка из окна 3D: этаж и номер предмета на нём. Делает её карта после окна
+/// ([`App::apply_3d`]).
+#[derive(Clone, Debug, PartialEq)]
+enum Edit3 {
+    /// Выбрать предмет или снять выбор.
+    Select(Option<(usize, usize)>),
+    /// Точка отмены перед правкой этажа.
+    Begin(usize),
+    Move(usize, usize, [f32; 2]),
+    /// Повернуть на столько градусов по часовой (вид сверху, как на карте).
+    Turn(usize, usize, f32),
+    /// Растянуть во столько раз.
+    Scale(usize, usize, f32),
+    Delete(usize, usize),
+    /// Поставить, что выбрано у «Объекта», в точку этажа; `alt` — привязка наоборот.
+    Place(usize, [f32; 2], bool),
+}
+
+/// Что поставит щелчок в правке: рамка предмета с полки (клетки, с размером) и поворот.
+#[derive(Clone, Copy, PartialEq)]
+struct Ghost {
+    size: [f32; 2],
+    rot: f32,
+}
+
+/// Предмет, который тащат: этаж и номер на карте, высота плоскости протяжки и где взяли —
+/// от середины предмета.
+#[derive(Clone, Copy)]
+struct Grab {
+    storey: usize,
+    index: usize,
+    plane: f32,
+    offset: [f32; 2],
+}
+
+/// Выбранное на карте: этаж, номер предмета и его рамка на полу.
+#[derive(Clone, Copy, PartialEq)]
+struct Picked {
+    storey: usize,
+    index: usize,
+    corners: [[f32; 2]; 4],
+}
+
+/// Шаг поворота в правке, градусы: Q и E — крупный, с Shift — мелкий.
+const TURN_STEP: (f32, f32) = (15.0, 1.0);
 
 /// Плоская картинка предмета (без модели) в окне 3D — не больше стольких точек по стороне.
 const CARD_SIDE: u32 = 384;
@@ -106,6 +215,8 @@ struct Floor3 {
     ground: scene3d::Ground,
     /// Где у этажа пол (у первого — везде): над дырой фишка сходит на этаж ниже.
     cover: Option<scene3d::Cover>,
+    /// Что закрывает предметы от взгляда при выборе: отрезок стены и её высота над полом.
+    occluders: Vec<(Segment, f32)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -143,8 +254,6 @@ pub(super) struct View3d {
     follow: bool,
     /// Где сейчас горит факел фишки: место и этаж.
     torch_at: Option<([f32; 2], usize)>,
-    /// Карта, с которой снято: правки после — «Снять заново».
-    rev: u64,
     /// Сколько ушло на снимок и сборку, для подписи.
     took: f32,
     /// Сколько кадров нарисовано: снимок окна (`--shot`) ждёт, пока сцена ляжет.
@@ -155,6 +264,32 @@ pub(super) struct View3d {
     props: Vec<PropAt>,
     /// Сколько из них моделями.
     modelled: usize,
+    /// Образцы предметов на видеокарте: новый предмет на карте добавляет свой.
+    templates: Templates,
+    /// Предметы каждого этажа, по которым поставлены `props`: карта их поменяла — переставить.
+    seen: Vec<Vec<Prop>>,
+    /// Лестницы, ставшие маршами при снимке (картинка и место) — в `props` их нет.
+    flights: Vec<Vec<(String, [f32; 2])>>,
+    /// Этажи при снимке без живых предметов: что-то из этого поменялось — «Снять заново».
+    base: Vec<Map>,
+    /// Карта менялась не только живыми предметами; с какой правкой (`App::rev`) сверено.
+    stale: bool,
+    checked: u64,
+    /// Правка (Tab): мышь выбирает и тащит предметы, а не только камеру.
+    edit: bool,
+    grab: Option<Grab>,
+    /// Предмет, который вертит или растягивает колесо: правка в истории на него одна.
+    wheel: Option<(usize, usize)>,
+    /// Предмет под курсором в правке — номер в `props`.
+    hover: Option<usize>,
+    /// Выбранное на карте, что ставит щелчок, привязка к сетке — от карты, на кадр.
+    picked: Option<Picked>,
+    ghost: Option<Ghost>,
+    snap: bool,
+    /// Правки этого кадра — карте.
+    edits: Vec<Edit3>,
+    /// Вид прошлого кадра — для выбора и самопроверки.
+    vp: Option<render3d::Mat4>,
 }
 
 /// Что видно снаружи окна 3D — самопроверке.
@@ -174,6 +309,11 @@ pub struct Probe3d {
     pub feet: f32,
     /// Крыш в сцене.
     pub roofs: usize,
+    /// Окно в правке; карта менялась не только живыми предметами (пора снять заново).
+    pub edit: bool,
+    pub stale: bool,
+    /// Где на экране середины предметов: этаж, номер на карте, точка.
+    pub spots: Vec<(usize, usize, Pos2)>,
 }
 
 fn id() -> egui::Id {
@@ -241,15 +381,20 @@ impl Floor3 {
         let at = |v: [f32; 2]| [(v[0] * px).round() as i64, (v[1] * px).round() as i64];
         let mut solid: Vec<Segment> = segments(&lay.walls).chain(segments(&lay.low)).chain(segments(&lay.cliffs)).collect();
         let mut doors = Vec::new();
+        // Стены во всю высоту, низкие и подоконники — по пояс (сквозь стекло видно).
+        let mut occluders: Vec<(Segment, f32)> = segments(&lay.walls).map(|s| (s, STOREY)).chain(segments(&lay.low).map(|s| (s, scene3d::LOW))).collect();
         for (i, po) in lay.portals.iter().enumerate() {
             if po.kind.is_door() || po.kind == PortalKind::Secret {
                 let (a, b) = (at(po.seg.0), at(po.seg.1));
                 doors.push(Door3 { seg: po.seg, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]), blocker: walls_n + i });
             } else {
                 solid.push(po.seg);
+                if po.kind == PortalKind::Window {
+                    occluders.push((po.seg, scene3d::SILL));
+                }
             }
         }
-        Floor3 { half, solid, doors, light, map: None, ground, cover }
+        Floor3 { half, solid, doors, light, map: None, ground, cover, occluders }
     }
 }
 
@@ -272,12 +417,26 @@ impl View3d {
             roofs: true,
             follow: false,
             torch_at: None,
-            rev: 0,
             took: 0.0,
             painted: 0,
             rect: Rect::NOTHING,
             props: Vec::new(),
             modelled: 0,
+            templates: Templates::default(),
+            seen: Vec::new(),
+            flights: Vec::new(),
+            base: Vec::new(),
+            stale: false,
+            checked: 0,
+            edit: false,
+            grab: None,
+            wheel: None,
+            hover: None,
+            picked: None,
+            ghost: None,
+            snap: false,
+            edits: Vec::new(),
+            vp: None,
         }
     }
 
@@ -288,6 +447,7 @@ impl View3d {
         self.cut = old.cut;
         self.torch = old.torch;
         self.roofs = old.roofs;
+        self.edit = old.edit;
         if old.size != self.size {
             return;
         }
@@ -322,6 +482,7 @@ impl View3d {
                 "cut" => self.cut = true,
                 "notorch" => self.torch = false,
                 "noroofs" => self.roofs = false,
+                "edit" => self.edit = true,
                 "open" => {
                     let all: Vec<(usize, usize)> = self.floors.iter().enumerate().flat_map(|(k, f)| (0..f.doors.len()).map(move |i| (k, i))).collect();
                     for (k, i) in all {
@@ -501,6 +662,36 @@ impl View3d {
             .map(|(i, _)| i)
     }
 
+    /// Огни предметов этажа `k` по карте (`lights` — [`export::prop_lights`]): какие сдвинулись,
+    /// появились или пропали — вокруг них свет заново. Факел фишки остаётся последним.
+    fn prop_lights(&mut self, k: usize, lights: &[export::Light]) {
+        let torch = self.torch_at.is_some_and(|(_, j)| j == k);
+        let Some(f) = self.floors.get_mut(k) else { return };
+        let want: Vec<lighting::Source> = lights.iter().map(|l| lighting::Source::of(l, &[])).collect();
+        let n = f.light.sources.len().saturating_sub(torch as usize);
+        if f.light.sources[..n] == want[..] {
+            return;
+        }
+        let frame = |s: &lighting::Source| [s.at[0] - s.dim, s.at[1] - s.dim, s.at[0] + s.dim, s.at[1] + s.dim];
+        let mut area: Option<[f32; 4]> = None;
+        for i in 0..n.max(want.len()) {
+            let (a, b) = (f.light.sources[..n].get(i), want.get(i));
+            if a != b {
+                for r in [a, b].into_iter().flatten().map(frame) {
+                    area = Some(area.map_or(r, |q| [q[0].min(r[0]), q[1].min(r[1]), q[2].max(r[2]), q[3].max(r[3])]));
+                }
+            }
+        }
+        let fire = torch.then(|| f.light.sources.last().cloned()).flatten();
+        f.light.sources = want;
+        f.light.sources.extend(fire);
+        if let Some(a) = area
+            && self.time != Time::Day
+        {
+            self.relight(k, Some(a));
+        }
+    }
+
     /// Поставить фишку на этаж `k` в точку `p` — на верх того, что там стоит (помост, ступень),
     /// и вытолкнуть из стен, как при шаге.
     fn place_token(&mut self, p: [f32; 2], k: usize) {
@@ -566,8 +757,8 @@ impl View3d {
         self.token = Some(Token { at: p, storey: k, feet });
     }
 
-    /// Луч из точки окна на пол этажа `k`.
-    fn floor_hit(&self, rect: Rect, pos: Pos2, k: usize) -> Option<[f32; 2]> {
+    /// Луч из точки окна: глаз и направление.
+    fn ray(&self, rect: Rect, pos: Pos2) -> ([f32; 3], [f32; 3]) {
         let eye = self.cam.eye();
         let f = render3d::norm(render3d::sub(self.cam.target, eye));
         let s = render3d::norm(render3d::cross(f, [0.0, 1.0, 0.0]));
@@ -575,13 +766,85 @@ impl View3d {
         let (x, y) = ((pos.x - rect.center().x) / (rect.width() / 2.0), -(pos.y - rect.center().y) / (rect.height() / 2.0));
         let tan = (FOV / 2.0).tan();
         let aspect = rect.width() / rect.height().max(1.0);
-        let d = [0, 1, 2].map(|i| f[i] + s[i] * x * tan * aspect + u[i] * y * tan);
-        let plane = Self::floor_y(k);
+        (eye, [0, 1, 2].map(|i| f[i] + s[i] * x * tan * aspect + u[i] * y * tan))
+    }
+
+    /// Луч из точки окна на плоскость высотой `y`.
+    fn plane_hit(&self, rect: Rect, pos: Pos2, y: f32) -> Option<[f32; 2]> {
+        let (eye, d) = self.ray(rect, pos);
         if d[1].abs() < 1e-6 {
             return None;
         }
-        let t = (plane - eye[1]) / d[1];
+        let t = (y - eye[1]) / d[1];
         (t > 0.0).then(|| [eye[0] + d[0] * t, eye[2] + d[2] * t])
+    }
+
+    /// Луч из точки окна на пол этажа `k`.
+    fn floor_hit(&self, rect: Rect, pos: Pos2, k: usize) -> Option<[f32; 2]> {
+        self.plane_hit(rect, pos, Self::floor_y(k))
+    }
+
+    /// Предмет виден в кадре: его этаж показан, крона — не при стенах по пояс.
+    fn shown(&self, p: &PropAt) -> bool {
+        p.storey <= self.top && !(p.crown && self.cut)
+    }
+
+    /// Крыша видна в кадре (над фишкой и при стенах по пояс — спрятана).
+    fn roof_shown(&self, n: &NodeInfo) -> bool {
+        n.part == Part::Roof && n.storey <= self.top && self.roofs && !self.cut && !self.token.is_some_and(|t| t.storey <= n.storey && scene3d::inside(&n.roof, t.at))
+    }
+
+    /// Как далеко по лучу первое, что закрывает предметы: стена, пол этажа выше, видная крыша.
+    fn blocked(&self, eye: [f32; 3], d: [f32; 3]) -> f32 {
+        let mut best = f32::MAX;
+        let plane = |y: f32| (d[1].abs() > 1e-6).then(|| (y - eye[1]) / d[1]).filter(|t| *t > 0.0);
+        for (k, f) in self.floors.iter().enumerate().take(self.top + 1) {
+            let y0 = Self::floor_y(k);
+            if k > 0
+                && let Some(t) = plane(y0)
+                && t < best
+                && f.cover.as_ref().is_none_or(|c| c.has([eye[0] + d[0] * t, eye[2] + d[2] * t]))
+            {
+                best = t;
+            }
+            for &((a, b), h) in &f.occluders {
+                let h = if self.cut { h.min(CUT) } else { h };
+                let e = [b[0] - a[0], b[1] - a[1]];
+                let den = d[0] * e[1] - d[2] * e[0];
+                if den.abs() < 1e-9 {
+                    continue;
+                }
+                let w = [a[0] - eye[0], a[1] - eye[2]];
+                let t = (w[0] * e[1] - w[1] * e[0]) / den;
+                let u = (w[0] * d[2] - w[1] * d[0]) / den;
+                let y = eye[1] + d[1] * t;
+                if t > 0.0 && t < best && (0.0..=1.0).contains(&u) && y >= y0 && y <= y0 + h {
+                    best = t;
+                }
+            }
+        }
+        // Крыша — по плоскости свеса: низ её скатов, предметы в доме — под ней.
+        for n in self.nodes.iter().filter(|n| self.roof_shown(n)) {
+            if let Some(t) = plane(Self::floor_y(n.storey) + STOREY)
+                && t < best
+                && scene3d::inside(&n.roof, [eye[0] + d[0] * t, eye[2] + d[2] * t])
+            {
+                best = t;
+            }
+        }
+        best
+    }
+
+    /// Предмет под точкой окна — номер в `props`: ближний по лучу, не за стеной, полом или крышей.
+    fn pick(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        let (eye, d) = self.ray(rect, pos);
+        let wall = self.blocked(eye, d);
+        self.props.iter().enumerate().filter(|(_, p)| self.shown(p)).filter_map(|(i, p)| p.hit(eye, d).filter(|t| *t < wall).map(|t| (i, t))).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
+    }
+
+    /// Предмет карты (этаж, номер) в `props`.
+    fn prop_of(&self, storey: usize, index: usize) -> Option<&PropAt> {
+        self.props.iter().find(|p| p.storey == storey && p.index == index)
     }
 
     /// Кадр: камера, узлы видимых этажей со створками на их углах, фишка.
@@ -591,20 +854,19 @@ impl View3d {
         let far = (self.cam.dist + self.size[0].max(self.size[1]) * 2.0 + 50.0).max(100.0);
         let vp = render3d::mul(&render3d::perspective(FOV, rect.width() / rect.height().max(1.0), near, far), &render3d::look_at(eye, self.cam.target, [0.0, 1.0, 0.0]));
         let mut items = Vec::new();
-        // Крыша над фишкой прячется, как тайл крыши в Foundry; со стенами по пояс — все.
-        let under = |n: &NodeInfo| self.token.is_some_and(|t| t.storey <= n.storey && scene3d::inside(&n.roof, t.at));
         for (i, n) in self.nodes.iter().enumerate() {
             if n.storey > self.top || n.template {
                 continue;
             }
-            if n.part == Part::Roof && (!self.roofs || self.cut || under(n)) {
+            // Крыша над фишкой прячется, как тайл крыши в Foundry; со стенами по пояс — все.
+            if n.part == Part::Roof && !self.roof_shown(n) {
                 continue;
             }
             let yaw = n.yaw + n.door.as_ref().map_or(0.0, |(id, swing)| swing * self.doors.get(id).map_or(0.0, |d| d.t));
             let cut = if self.cut && matches!(n.part, Part::Wall | Part::Door) { Self::floor_y(n.storey) + CUT } else { f32::MAX };
             items.push(Item { node: i, model: render3d::placed(n.at, yaw), storey: n.storey, cut, caps: self.cut && n.part == Part::Wall, bias: 0.0 });
         }
-        for p in self.props.iter().filter(|p| p.storey <= self.top && !(p.crown && self.cut)) {
+        for p in self.props.iter().filter(|p| self.shown(p)) {
             items.push(Item { node: p.node, model: p.model, storey: p.storey, cut: f32::MAX, caps: false, bias: p.bias });
         }
         let pawn = self.token.map(|t| (render3d::placed([t.at[0], Self::floor_y(t.storey) + t.feet, t.at[1]], 0.0), t.storey, [0.93, 0.74, 0.30]));
@@ -631,10 +893,15 @@ impl View3d {
     }
 
     /// Окно: панель над видом и сам вид; что попросили сделать.
-    fn ui(&mut self, ui: &mut egui::Ui, stale: bool) -> Action {
+    fn ui(&mut self, ui: &mut egui::Ui) -> Action {
         let mut action = Action::None;
         let storeys = self.floors.len();
+        let stale = self.stale;
         ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.edit, "Правка").on_hover_text("Выбирать, переносить, вертеть и ставить предметы прямо в 3D (Tab)").clicked() {
+                self.set_edit(!self.edit);
+            }
+            ui.separator();
             let before = self.time;
             ui.selectable_value(&mut self.time, Time::Day, "День");
             ui.selectable_value(&mut self.time, Time::Dusk, "Вечер");
@@ -669,7 +936,11 @@ impl View3d {
                 action = Action::Recapture;
             }
         });
-        let hint = "ЛКМ — повернуть, ПКМ — сдвинуть, колесо — ближе; двойной щелчок — поставить фишку; WASD — идти (Shift — бегом), E или щелчок у двери — открыть";
+        let hint = if self.edit {
+            "Правка: щелчок — выбрать предмет, протяжка — перенести (Alt — без привязки), Q/E — повернуть (Shift — на градус), Alt+колесо — размер, Delete — убрать; с полки «Объекта» щелчок по полу ставит; Tab — к фишке"
+        } else {
+            "ЛКМ — повернуть, ПКМ — сдвинуть, колесо — ближе; двойной щелчок — поставить фишку; WASD — идти (Shift — бегом), E или щелчок у двери — открыть; Tab — правка"
+        };
         let bottom = 22.0;
         let avail = ui.available_rect_before_wrap();
         let rect = Rect::from_min_max(avail.min, pos2(avail.max.x, (avail.max.y - bottom).max(avail.min.y + 50.0)));
@@ -683,9 +954,12 @@ impl View3d {
         }
         self.input(ui, &resp, rect);
         let painter = ui.painter_at(rect);
-        self.renderer.paint(&painter, rect, self.frame(rect));
+        let frame = self.frame(rect);
+        self.vp = frame.vp;
+        self.renderer.paint(&painter, rect, frame);
         self.painted += 1;
         self.rect = rect;
+        self.overlay(&painter, rect, resp.hover_pos());
         if let Some(e) = self.renderer.error() {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, format!("3D не рисуется: {e}"), egui::FontId::proportional(15.0), Color32::from_rgb(240, 120, 100));
         }
@@ -715,11 +989,45 @@ impl View3d {
     fn input(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: Rect) {
         let dt = ui.input(|i| i.stable_dt).min(0.05);
         let mut busy = false;
-        if resp.dragged_by(PointerButton::Primary) {
+        let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+        if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Tab)) {
+            self.set_edit(!self.edit);
+        }
+        if ui.input(|i| i.pointer.any_pressed()) {
+            self.wheel = None;
+        }
+        self.hover = if self.edit && self.grab.is_none() { resp.hover_pos().and_then(|p| self.pick(rect, p)) } else { None };
+        // Правка: протяжка с предмета тащит его по полу, мимо — вертит камеру.
+        if self.edit
+            && resp.drag_started_by(PointerButton::Primary)
+            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+            && let Some(j) = self.pick(rect, o)
+        {
+            let p = &self.props[j];
+            let (k, i, plane, at) = (p.storey, p.index, p.at[1], p.at);
+            if let Some(w) = self.plane_hit(rect, o, plane) {
+                self.grab = Some(Grab { storey: k, index: i, plane, offset: [w[0] - at[0], w[1] - at[2]] });
+                self.edits.push(Edit3::Select(Some((k, i))));
+                self.edits.push(Edit3::Begin(k));
+            }
+        }
+        if let Some(g) = self.grab {
+            if resp.dragged_by(PointerButton::Primary)
+                && let Some(w) = resp.interact_pointer_pos().and_then(|p| self.plane_hit(rect, p, g.plane))
+            {
+                let pos = self.snapped([w[0] - g.offset[0], w[1] - g.offset[1]], alt);
+                let pos = [pos[0].clamp(0.0, self.size[0]), pos[1].clamp(0.0, self.size[1])];
+                self.edits.push(Edit3::Move(g.storey, g.index, pos));
+                busy = true;
+            }
+        } else if resp.dragged_by(PointerButton::Primary) {
             let d = resp.drag_delta();
             self.cam.yaw -= d.x * 0.008;
             self.cam.pitch = (self.cam.pitch + d.y * 0.008).clamp(0.06, 1.53);
             busy = true;
+        }
+        if resp.drag_stopped() {
+            self.grab = None;
         }
         if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
             let d = resp.drag_delta();
@@ -732,22 +1040,58 @@ impl View3d {
             busy = true;
         }
         if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.cam.dist = (self.cam.dist * (-scroll * 0.0018).exp()).clamp(1.2, 600.0);
-                busy = true;
+            // Колесо с Alt — размер выбранного, с Shift — поворот (в правке); иначе — ближе и дальше.
+            let notches = ui.input(|i| {
+                i.events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. } => delta.y / 50.0,
+                        egui::Event::MouseWheel { delta, .. } => delta.y,
+                        _ => 0.0,
+                    })
+                    .sum::<f32>()
+            });
+            match self.picked.filter(|_| self.edit && (alt || shift)) {
+                Some(pk) => {
+                    if notches != 0.0 {
+                        if self.wheel != Some((pk.storey, pk.index)) {
+                            self.edits.push(Edit3::Begin(pk.storey));
+                            self.wheel = Some((pk.storey, pk.index));
+                        }
+                        self.edits.push(if alt { Edit3::Scale(pk.storey, pk.index, 1.1f32.powf(notches)) } else { Edit3::Turn(pk.storey, pk.index, notches * TURN_STEP.0) });
+                    }
+                }
+                None => {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        self.cam.dist = (self.cam.dist * (-scroll * 0.0018).exp()).clamp(1.2, 600.0);
+                        busy = true;
+                    }
+                }
             }
         }
-        if resp.double_clicked()
-            && let Some(p) = resp.interact_pointer_pos().and_then(|p| self.floor_hit(rect, p, self.top))
-            && p[0] >= 0.0
-            && p[1] >= 0.0
-            && p[0] <= self.size[0]
-            && p[1] <= self.size[1]
+        let at = resp.interact_pointer_pos();
+        let size = self.size;
+        let inside = move |p: &[f32; 2]| p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= size[0] && p[1] <= size[1];
+        if self.edit {
+            // Щелчок: предмет — выбрать; мимо — поставить с полки или снять выбор.
+            if resp.clicked()
+                && let Some(p) = at
+            {
+                match self.pick(rect, p) {
+                    Some(j) => self.edits.push(Edit3::Select(Some((self.props[j].storey, self.props[j].index)))),
+                    None => match self.ground_hit(rect, p, self.top).filter(|w| inside(w) && self.ghost.is_some()) {
+                        Some(w) => self.edits.push(Edit3::Place(self.top, w, alt)),
+                        None => self.edits.push(Edit3::Select(None)),
+                    },
+                }
+            }
+        } else if resp.double_clicked()
+            && let Some(p) = at.and_then(|p| self.floor_hit(rect, p, self.top)).filter(inside)
         {
             self.place_token(p, self.top);
         } else if resp.clicked()
-            && let Some(p) = resp.interact_pointer_pos().and_then(|p| self.floor_hit(rect, p, self.top))
+            && let Some(p) = at.and_then(|p| self.floor_hit(rect, p, self.top))
             && let Some(i) = self.door_near(self.top, p, CLICK_REACH)
         {
             self.toggle(self.top, i);
@@ -755,14 +1099,15 @@ impl View3d {
         if resp.has_focus() {
             let (fwd, right) = self.cam.ground();
             let (mut mx, mut my) = (0.0f32, 0.0f32);
-            let (up, down, left, rt, run, door, pgup, pgdn) = ui.input(|i| {
+            let (up, down, left, rt, e, q, del, pgup, pgdn) = ui.input(|i| {
                 (
                     i.key_down(Key::W) || i.key_down(Key::ArrowUp),
                     i.key_down(Key::S) || i.key_down(Key::ArrowDown),
                     i.key_down(Key::A) || i.key_down(Key::ArrowLeft),
                     i.key_down(Key::D) || i.key_down(Key::ArrowRight),
-                    i.modifiers.shift,
                     i.key_pressed(Key::E),
+                    i.key_pressed(Key::Q),
+                    i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
                     i.key_pressed(Key::PageUp),
                     i.key_pressed(Key::PageDown),
                 )
@@ -775,7 +1120,7 @@ impl View3d {
             }
             let l = mx.hypot(my);
             if l > 0.0 {
-                let speed = SPEED * if run { 2.0 } else { 1.0 } * dt / l;
+                let speed = SPEED * if shift { 2.0 } else { 1.0 } * dt / l;
                 if self.token.is_some() {
                     self.walk([mx * speed, my * speed]);
                     self.follow = true;
@@ -787,8 +1132,28 @@ impl View3d {
                 }
                 busy = true;
             }
-            if door && let Some(t) = self.token && let Some(i) = self.door_near(t.storey, t.at, REACH) {
-                self.toggle(t.storey, i);
+            match self.picked.filter(|_| self.edit) {
+                // Правка: Q и E вертят выбранный, Delete убирает.
+                Some(pk) => {
+                    let step = if shift { TURN_STEP.1 } else { TURN_STEP.0 };
+                    for (on, deg) in [(q, -step), (e, step)] {
+                        if on {
+                            self.edits.push(Edit3::Begin(pk.storey));
+                            self.edits.push(Edit3::Turn(pk.storey, pk.index, deg));
+                        }
+                    }
+                    if del {
+                        self.edits.push(Edit3::Begin(pk.storey));
+                        self.edits.push(Edit3::Delete(pk.storey, pk.index));
+                        self.grab = None;
+                    }
+                }
+                None if !self.edit => {
+                    if e && let Some(t) = self.token && let Some(i) = self.door_near(t.storey, t.at, REACH) {
+                        self.toggle(t.storey, i);
+                    }
+                }
+                None => {}
             }
             if pgup {
                 self.change_storey(1);
@@ -811,9 +1176,74 @@ impl View3d {
             busy = true;
         }
         self.torch_step();
-        // Клавиши и щелчки сами будят кадр; дальше — пока что-то движется.
-        if busy {
+        // Клавиши и щелчки сами будят кадр; дальше — пока что-то движется или ждёт правка.
+        if busy || !self.edits.is_empty() {
             ui.ctx().request_repaint();
+        }
+    }
+
+    fn set_edit(&mut self, on: bool) {
+        self.edit = on;
+        self.grab = None;
+        self.hover = None;
+    }
+
+    /// Точка с привязкой к сетке, как у предметов на карте: `alt` меняет настройку на время.
+    fn snapped(&self, p: [f32; 2], alt: bool) -> [f32; 2] {
+        if self.snap != alt { [snap_half(p[0]), snap_half(p[1])] } else { p }
+    }
+
+    /// Луч из точки окна на землю этажа `k`: на пол, а где помост или склон — на их верх.
+    fn ground_hit(&self, rect: Rect, pos: Pos2, k: usize) -> Option<[f32; 2]> {
+        let f = self.floors.get(k)?;
+        let mut w = self.floor_hit(rect, pos, k)?;
+        for _ in 0..2 {
+            w = self.plane_hit(rect, pos, Self::floor_y(k) + f.ground.at(w))?;
+        }
+        Some(w)
+    }
+
+    /// Поверх кадра: рамка выбранного (синяя, как на карте), того, что под курсором, и того,
+    /// что поставит щелчок.
+    fn overlay(&self, painter: &egui::Painter, rect: Rect, hover: Option<Pos2>) {
+        let Some(vp) = self.vp else { return };
+        let line = |a: [f32; 3], b: [f32; 3], stroke: Stroke| {
+            if let (Some(p), Some(q)) = (render3d::project(&vp, rect, a), render3d::project(&vp, rect, b)) {
+                painter.line_segment([p, q], stroke);
+            }
+        };
+        let ring = |k: usize, corners: [[f32; 2]; 4], stroke: Stroke| {
+            let ground = self.floors.get(k).map(|f| &f.ground);
+            let lift = |c: [f32; 2]| [c[0], Self::floor_y(k) + ground.map_or(0.0, |g| g.at(c)) + 0.02, c[1]];
+            for i in 0..4 {
+                line(lift(corners[i]), lift(corners[(i + 1) % 4]), stroke);
+            }
+        };
+        let blue = Stroke::new(2.0, Color32::from_rgb(120, 180, 255));
+        if let Some(pk) = self.picked.filter(|pk| pk.storey <= self.top) {
+            // Стоит в 3D — рамкой своей модели; в картинке пола — рамкой на полу.
+            match self.prop_of(pk.storey, pk.index).filter(|p| self.shown(p)) {
+                Some(p) => p.edges().into_iter().for_each(|(a, b)| line(a, b, blue)),
+                None => ring(pk.storey, pk.corners, blue),
+            }
+        }
+        if !self.edit {
+            return;
+        }
+        let soft = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 150));
+        if let Some(p) = self.hover.and_then(|j| self.props.get(j)).filter(|p| self.picked.is_none_or(|pk| (pk.storey, pk.index) != (p.storey, p.index))) {
+            p.edges().into_iter().for_each(|(a, b)| line(a, b, soft));
+        }
+        // Что поставит щелчок: рамка картинки с полки на земле под курсором.
+        if let (Some(g), Some(h), None, None) = (self.ghost, hover, self.hover, self.grab)
+            && let Some(w) = self.ground_hit(rect, h, self.top)
+        {
+            let alt = painter.ctx().input(|i| i.modifiers.alt);
+            let c = self.snapped(w, alt);
+            let (hw, hh) = (g.size[0] / 2.0, g.size[1] / 2.0);
+            let (s, co) = g.rot.to_radians().sin_cos();
+            let corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [c[0] + x * co - y * s, c[1] + x * s + y * co]);
+            ring(self.top, corners, Stroke::new(1.5, ACCENT));
         }
     }
 }
@@ -824,8 +1254,10 @@ enum Action {
 }
 
 /// Что уходит на видеокарту: узлы, их сетки, материалы, картинки — к ним добавляются образцы
-/// предметов.
+/// предметов. `base` — сколько узлов у сцены уже есть: у добавки к залитой сцене номера её
+/// узлов — после них, а номера материалов и картинок — свои, с нуля ([`render3d::Addition`]).
 struct Parts {
+    base: usize,
     nodes: Vec<NodeInfo>,
     meshes: Vec<Vec<(usize, crate::scene3d::Mesh)>>,
     materials: Vec<crate::scene3d::Material>,
@@ -833,10 +1265,15 @@ struct Parts {
 }
 
 impl Parts {
+    /// Добавка к сцене из `base` узлов.
+    fn after(base: usize) -> Parts {
+        Parts { base, nodes: Vec::new(), meshes: Vec::new(), materials: Vec::new(), images: Vec::new() }
+    }
+
     fn template(&mut self, prims: Vec<(usize, crate::scene3d::Mesh)>) -> usize {
         self.nodes.push(NodeInfo { part: Part::Floor, storey: 0, at: [0.0; 3], yaw: 0.0, door: None, template: true, roof: Vec::new() });
         self.meshes.push(prims);
-        self.nodes.len() - 1
+        self.base + self.nodes.len() - 1
     }
 
     /// Модель — образцом: её картинки и материалы — в общие.
@@ -880,34 +1317,71 @@ impl Parts {
     }
 }
 
+/// Предмет стоит в окне 3D сам (моделью или картинкой), а не в картинке пола — и правится в
+/// 3D без снимка. Лестницы — нет: из них марши, это земля этажа.
+fn live_prop(p: &Prop, map: &Map) -> bool {
+    props3d::lift(p, map).is_some() && !crate::ground3d::flight_by_name(&p.asset)
+}
+
+/// Этаж без живых предметов: по нему видно, что поменялось то, что видно только после снимка.
+fn still(map: &Map) -> Map {
+    let mut m = map.clone();
+    m.props.retain(|p| !live_prop(p, map));
+    m
+}
+
+/// Предмет на этаже: этаж, номер на карте, сам предмет и как выходит в 3D.
+type Plan = (usize, usize, Prop, props3d::Lift);
+
 impl App {
+    /// Этаж `k` — живой: у текущего это `map`.
+    fn level_ref(&self, k: usize) -> &Map {
+        if k == self.level { &self.map } else { &self.levels[k] }
+    }
+
+    /// Что стоит в 3D само, по этажам снизу вверх, на этаже — по слоям: без лестниц, ставших
+    /// маршами (`flights` — их картинки и места при снимке), и без той же лестницы этажом выше
+    /// (в дыре виден сам марш).
+    fn plans_3d(&self, flights: &[Vec<(String, [f32; 2])>]) -> Vec<Plan> {
+        let mut plans = Vec::new();
+        for k in 0..self.levels.len() {
+            let m = self.level_ref(k);
+            let gone = |p: &Prop| flights.get(k).is_some_and(|f| f.iter().any(|(a, at)| *a == p.asset && *at == p.pos));
+            let below = (k > 0).then(|| self.level_ref(k - 1));
+            let over = |p: &Prop| below.is_some_and(|b| crate::ground3d::over_flight(p, b, &super::exporting::has_model));
+            let mut here: Vec<Plan> = m.props.iter().enumerate().filter(|(_, p)| !gone(p) && !over(p)).filter_map(|(i, p)| props3d::lift(p, m).map(|l| (k, i, p.clone(), l))).collect();
+            here.sort_by_key(|(_, _, p, _)| p.layer());
+            plans.extend(here);
+        }
+        plans
+    }
+
     /// Предметы в окно 3D: у кого есть модель — моделью (образец на модель), прочие — плоской
-    /// картинкой (образец на картинку и подкраску), как их кладёт 3D Canvas. Образцы — в `parts`.
-    fn props_3d(&mut self, plans: &[(usize, Prop, props3d::Lift)], grounds: &[scene3d::Ground], parts: &mut Parts) -> (Vec<PropAt>, usize) {
+    /// картинкой (образец на картинку и подкраску), как их кладёт 3D Canvas. Образцы, которых ещё
+    /// нет в `templates`, — в `parts`.
+    fn props_3d(&mut self, templates: &mut Templates, plans: &[Plan], grounds: &[&scene3d::Ground], parts: &mut Parts) -> (Vec<PropAt>, usize) {
         let mut out = Vec::new();
         let mut modelled = 0;
-        let mut models: HashMap<String, (usize, std::sync::Arc<crate::model3d::Model3d>)> = HashMap::new();
-        let mut cards: HashMap<(String, Option<[u8; 3]>), Option<usize>> = HashMap::new();
         // Модели предметов — сначала: по ним видно, что на чём стоит.
         let mut found = Vec::with_capacity(plans.len());
-        for (_, p, _) in plans {
-            let model = match models.get(&p.asset) {
-                Some(m) => Some(m.clone()),
-                None => self.prop_model(&p.asset).map(|m| {
-                    let node = parts.add_model(&m);
-                    models.insert(p.asset.clone(), (node, m.clone()));
-                    (node, m)
-                }),
+        for (_, _, p, _) in plans {
+            let model = match templates.models.get(&p.asset) {
+                Some(m) => m.clone(),
+                None => {
+                    let m = self.prop_model(&p.asset).map(|m| (parts.add_model(&m), m));
+                    templates.models.insert(p.asset.clone(), m.clone());
+                    m
+                }
             };
             found.push(model);
         }
         let mut heights = vec![0.0f32; plans.len()];
-        for k in plans.iter().map(|(k, _, _)| *k).collect::<std::collections::BTreeSet<_>>() {
-            let here: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].0 == k && plans[i].2 == props3d::Lift::Floor).collect();
+        for k in plans.iter().map(|(k, ..)| *k).collect::<std::collections::BTreeSet<_>>() {
+            let here: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].0 == k && plans[i].3 == props3d::Lift::Floor).collect();
             let items: Vec<props3d::Rest> = here
                 .iter()
                 .map(|&i| {
-                    let p = &plans[i].1;
+                    let p = &plans[i].2;
                     let size = [p.size[0] * p.scale, p.size[1] * p.scale];
                     let top = found[i].as_ref().and_then(|(_, m)| m.bounds().map(|[_, hi]| hi[1] * props3d::fit(m, size)[1]));
                     props3d::Rest { pos: p.pos, size, rot: p.rot, top }
@@ -917,7 +1391,7 @@ impl App {
                 heights[*i] = h;
             }
         }
-        for (i, (k, p, lift)) in plans.iter().enumerate() {
+        for (i, (k, index, p, lift)) in plans.iter().enumerate() {
             // На помосте, ступени, склоне — на их высоте.
             let y0 = View3d::floor_y(*k) + grounds.get(*k).map_or(0.0, |g| g.at(p.pos)) + heights[i];
             let size = [p.size[0] * p.scale, p.size[1] * p.scale];
@@ -925,16 +1399,18 @@ impl App {
             let flip = if p.flip { -1.0 } else { 1.0 };
             if let Some((node, m)) = found[i].clone() {
                 let s = props3d::fit(&m, size);
-                out.push(PropAt { node, model: render3d::placed_scaled([p.pos[0], y0, p.pos[1]], yaw, [s[0] * flip, s[1], s[2]]), storey: *k, crown: false, bias: 0.0 });
+                let (at, scale) = ([p.pos[0], y0, p.pos[1]], [s[0] * flip, s[1], s[2]]);
+                let bounds = m.bounds().unwrap_or([[-0.5, 0.0, -0.5], [0.5, 1.0, 0.5]]);
+                out.push(PropAt { node, model: render3d::placed_scaled(at, yaw, scale), storey: *k, crown: false, bias: 0.0, index: *index, at, yaw, scale, bounds });
                 modelled += 1;
                 continue;
             }
             let key = (p.asset.clone(), p.tint);
-            let node = match cards.get(&key) {
+            let node = match templates.cards.get(&key) {
                 Some(n) => *n,
                 None => {
                     let n = self.textures.rgba(&p.asset).ok().map(|img| parts.add_card(img, p.tint));
-                    cards.insert(key, n);
+                    templates.cards.insert(key, n);
                     n
                 }
             };
@@ -946,7 +1422,8 @@ impl App {
                 props3d::Lift::Mid => (MID_Y, 0.0),
                 props3d::Lift::Crown => (CROWN_Y, 0.0),
             };
-            out.push(PropAt { node, model: render3d::placed_scaled([p.pos[0], y0 + h, p.pos[1]], yaw, [size[0] * flip, 1.0, size[1]]), storey: *k, crown: *lift == props3d::Lift::Crown, bias });
+            let (at, scale) = ([p.pos[0], y0 + h, p.pos[1]], [size[0] * flip, 1.0, size[1]]);
+            out.push(PropAt { node, model: render3d::placed_scaled(at, yaw, scale), storey: *k, crown: *lift == props3d::Lift::Crown, bias, index: *index, at, yaw, scale, bounds: [[-0.5, -0.02, -0.5], [0.5, 0.02, 0.5]] });
         }
         (out, modelled)
     }
@@ -967,7 +1444,34 @@ impl App {
     /// Окно 3D глазами самопроверки.
     pub(crate) fn view3d_probe(&self) -> Option<Probe3d> {
         let v = self.view3d.as_ref()?;
-        Some(Probe3d { rect: v.rect, yaw: v.cam.yaw, token: v.token.map(|t| t.at), open: v.doors.values().filter(|d| d.open).count(), painted: v.painted, error: v.renderer.error(), props: v.props.len(), modelled: v.modelled, storey: v.token.map_or(v.top, |t| t.storey), feet: v.token.map_or(0.0, |t| t.feet), roofs: v.nodes.iter().filter(|n| n.part == Part::Roof).count() })
+        // Где на экране середины предметов — их этаж и номер на карте.
+        let spots = v.vp.map_or_else(Vec::new, |vp| {
+            v.props
+                .iter()
+                .filter(|p| v.shown(p))
+                .filter_map(|p| {
+                    let [lo, hi] = p.bounds;
+                    let mid = render3d::apply(&p.model, [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0]);
+                    render3d::project(&vp, v.rect, mid).map(|s| (p.storey, p.index, s))
+                })
+                .collect()
+        });
+        Some(Probe3d {
+            rect: v.rect,
+            yaw: v.cam.yaw,
+            token: v.token.map(|t| t.at),
+            open: v.doors.values().filter(|d| d.open).count(),
+            painted: v.painted,
+            error: v.renderer.error(),
+            props: v.props.len(),
+            modelled: v.modelled,
+            storey: v.token.map_or(v.top, |t| t.storey),
+            feet: v.token.map_or(0.0, |t| t.feet),
+            roofs: v.nodes.iter().filter(|n| n.part == Part::Roof).count(),
+            edit: v.edit,
+            stale: v.stale,
+            spots,
+        })
     }
 
     /// Снять карту для окна 3D: как выгрузка, но только пол без стен, без файлов.
@@ -1031,19 +1535,11 @@ impl App {
                 }
             }
         }
+        // Лестницы, ставшие маршами, — по картинке и месту: номера предметов сдвинутся с правкой.
+        let flights: Vec<Vec<(String, [f32; 2])>> = flights.iter().enumerate().map(|(k, f)| f.iter().filter_map(|&i| self.export_level(e, k).props.get(i)).map(|p| (p.asset.clone(), p.pos)).collect()).collect();
         // Предметы, что не в картинке пола (они в выгрузке своими тайлами), — по этажам, снизу
-        // вверх по слоям. Лестница, ставшая маршем, — сам марш.
-        let mut plans: Vec<(usize, Prop, props3d::Lift)> = Vec::new();
-        for k in 0..e.done.len() {
-            let m = self.export_level(e, k);
-            let gone = flights.get(k).cloned().unwrap_or_default();
-            // Та же лестница этажом выше — тоже: в дыре виден сам марш.
-            let below = (k > 0).then(|| self.export_level(e, k - 1));
-            let over = |p: &Prop| below.is_some_and(|b| crate::ground3d::over_flight(p, b, &super::exporting::has_model));
-            let mut here: Vec<(usize, Prop, props3d::Lift)> = m.props.iter().enumerate().filter(|(i, p)| !gone.contains(i) && !over(p)).filter_map(|(_, p)| props3d::lift(p, m).map(|l| (k, p.clone(), l))).collect();
-            here.sort_by_key(|(_, p, _)| p.layer());
-            plans.extend(here);
-        }
+        // вверх по слоям.
+        let plans = self.plans_3d(&flights);
         let mut scene = scene3d::build(size, &storeys);
         let mut images = Vec::new();
         for p in &scene.pictures {
@@ -1079,21 +1575,28 @@ impl App {
             })
             .collect();
         let meshes = scene.nodes.iter_mut().map(|n| std::mem::take(&mut n.prims)).collect();
-        let mut parts = Parts { nodes, meshes, materials: std::mem::take(&mut scene.materials), images };
-        let grounds: Vec<scene3d::Ground> = storeys.iter().map(|s| s.ground.clone()).collect();
-        let (props, modelled) = self.props_3d(&plans, &grounds, &mut parts);
-        let Parts { nodes, meshes, materials, images } = parts;
+        let mut parts = Parts { base: 0, nodes, meshes, materials: std::mem::take(&mut scene.materials), images };
+        let mut templates = Templates::default();
+        let (props, modelled) = {
+            let grounds: Vec<&scene3d::Ground> = storeys.iter().map(|s| &s.ground).collect();
+            self.props_3d(&mut templates, &plans, &grounds, &mut parts)
+        };
+        let Parts { nodes, meshes, materials, images, .. } = parts;
         let floors3: Vec<Floor3> = layouts
             .iter()
             .enumerate()
-            .map(|(k, lay)| Floor3::new(k, lay, self.export_level(e, k).rooms.clone(), storeys[k].look.width.max(0.02) / 2.0, e.px as f32, grounds[k].clone(), covers[k].clone()))
+            .map(|(k, lay)| Floor3::new(k, lay, self.export_level(e, k).rooms.clone(), storeys[k].look.width.max(0.02) / 2.0, e.px as f32, storeys[k].ground.clone(), covers[k].clone()))
             .collect();
         let renderer = self.view3d.as_ref().map_or_else(Renderer::default, |v| v.renderer.clone());
         renderer.upload(Upload { nodes: meshes, materials, images, pawn: render3d::pawn() });
         let mut v = View3d::fresh(renderer, nodes, floors3, size, first_time);
         v.props = props;
         v.modelled = modelled;
-        v.rev = self.rev;
+        v.templates = templates;
+        v.flights = flights;
+        v.seen = (0..self.levels.len()).map(|k| self.level_ref(k).props.clone()).collect();
+        v.base = (0..self.levels.len()).map(|k| still(self.level_ref(k))).collect();
+        v.checked = self.rev;
         v.took = e.began.elapsed().as_secs_f32();
         // Пересняли — камера, время, фишка и открытые двери те же.
         if let Some(old) = self.view3d.take() {
@@ -1106,21 +1609,125 @@ impl App {
         self.view3d = Some(v);
     }
 
+    /// Окно 3D вслед за картой: живые предметы и их огни — заново, если карта их поменяла; что
+    /// выбрано и что поставит щелчок; сверка, не пора ли снять заново (`released` — отпустили
+    /// кнопку мыши: протяжка на холсте кончилась).
+    fn view3d_follow(&mut self, v: &mut View3d, released: bool) {
+        let n = v.floors.len();
+        v.snap = self.settings.snap;
+        v.picked = match self.sel {
+            Some(Sel::Prop(i)) if i < self.map.props.len() && self.level < n => Some(Picked { storey: self.level, index: i, corners: self.map.props[i].corners() }),
+            _ => None,
+        };
+        v.ghost = match (self.tool, self.object_asset.clone(), self.object_prefab) {
+            (Tool::Object, _, Some(_)) => Some(Ghost { size: [1.0, 1.0], rot: self.object_rot }),
+            (Tool::Object, Some(a), None) => {
+                let s = self.asset_size(&a);
+                Some(Ghost { size: [s[0] * self.object_scale, s[1] * self.object_scale], rot: self.object_rot })
+            }
+            _ => None,
+        };
+        // Другие этажи или размер — другая карта: только снимком.
+        if self.levels.len() != n || [self.map.width as f32, self.map.height as f32] != v.size {
+            v.stale = true;
+            return;
+        }
+        let changed: Vec<usize> = (0..n).filter(|&k| v.seen.get(k).is_none_or(|s| *s != self.level_ref(k).props)).collect();
+        if !changed.is_empty() {
+            let plans = self.plans_3d(&v.flights);
+            let mut parts = Parts::after(v.nodes.len());
+            let (props, modelled) = {
+                let grounds: Vec<&scene3d::Ground> = v.floors.iter().map(|f| &f.ground).collect();
+                self.props_3d(&mut v.templates, &plans, &grounds, &mut parts)
+            };
+            v.props = props;
+            v.modelled = modelled;
+            v.hover = None;
+            if !parts.nodes.is_empty() {
+                let Parts { nodes, meshes, materials, images, .. } = parts;
+                v.nodes.extend(nodes);
+                v.renderer.add(render3d::Addition { nodes: meshes, materials, images });
+            }
+            v.seen = (0..n).map(|k| self.level_ref(k).props.clone()).collect();
+            for k in changed {
+                v.prop_lights(k, &export::prop_lights(self.level_ref(k)));
+            }
+        }
+        if v.checked != self.rev || released {
+            v.stale = (0..n).any(|k| v.base.get(k).is_none_or(|b| *b != still(self.level_ref(k))));
+            v.checked = self.rev;
+        }
+    }
+
+    /// Правки из окна 3D — карте, как правки мышью на холсте: с точкой отмены, на своём этаже.
+    fn apply_3d(&mut self, edits: Vec<Edit3>) {
+        for e in edits {
+            match e {
+                Edit3::Select(None) => {
+                    self.sel = None;
+                    self.picked.clear();
+                }
+                Edit3::Select(Some((k, i))) => {
+                    self.switch_level(k);
+                    if i < self.map.props.len() {
+                        self.sel = Some(Sel::Prop(i));
+                        self.picked.clear();
+                        // Свойства выбранного — у «Выбора»; «Объект» продолжает ставить с полки.
+                        if self.tool != Tool::Object && self.tool != Tool::Select {
+                            self.set_tool(Tool::Select);
+                        }
+                    }
+                }
+                Edit3::Begin(k) => {
+                    self.switch_level(k);
+                    self.checkpoint();
+                }
+                Edit3::Move(k, i, pos) if k == self.level && i < self.map.props.len() => self.map.props[i].pos = pos,
+                Edit3::Turn(k, i, deg) if k == self.level && i < self.map.props.len() => {
+                    let r = &mut self.map.props[i].rot;
+                    *r = ((*r + deg) % 360.0 + 360.0) % 360.0;
+                }
+                Edit3::Scale(k, i, f) if k == self.level && i < self.map.props.len() => {
+                    let s = &mut self.map.props[i].scale;
+                    *s = (*s * f).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+                }
+                Edit3::Delete(k, i) if k == self.level && i < self.map.props.len() => {
+                    self.map.props.remove(i);
+                    self.sel = None;
+                }
+                Edit3::Place(k, p, alt) => {
+                    self.switch_level(k);
+                    match self.object_prefab {
+                        Some(j) => {
+                            self.place_prefab(j, p, alt);
+                        }
+                        None => {
+                            self.place_prop(p, alt);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Окно 3D, если открыто; закрытое отдаёт видеокарте память.
     pub(super) fn view3d_window(&mut self, ctx: &egui::Context) {
-        let Some(v) = &mut self.view3d else { return };
-        let stale = v.rev != self.rev;
+        let Some(mut v) = self.view3d.take() else { return };
+        let released = ctx.input(|i| i.pointer.any_released());
+        self.view3d_follow(&mut v, released);
         let mut open = v.open;
         let mut action = Action::None;
         egui::Window::new("Тестовая зона 3D").open(&mut open).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).default_size([960.0, 640.0]).min_size([420.0, 300.0]).resizable(true).collapsible(false).show(ctx, |ui| {
-            action = v.ui(ui, stale);
+            action = v.ui(ui);
         });
         if !open {
-            let renderer = v.renderer.clone();
-            self.view3d = None;
-            renderer.release(&ctx.layer_painter(egui::LayerId::background()));
+            v.renderer.release(&ctx.layer_painter(egui::LayerId::background()));
             return;
         }
+        let edits = std::mem::take(&mut v.edits);
+        self.view3d = Some(v);
+        self.apply_3d(edits);
         if let Action::Recapture = action {
             self.start_view3d();
         }
@@ -1270,6 +1877,83 @@ mod tests {
         }
         let t = v.token.unwrap();
         assert!(t.storey == 0 && t.at[1] > 6.0 && t.feet.abs() < 1e-5, "внизу: этаж {}, {:?}, {}", t.storey, t.at, t.feet);
+    }
+
+    /// Ящик 1 × 0,7 × 0,6 клетки моделью на полу в `p`, номер на карте `index`.
+    fn crate_at(p: [f32; 2], index: usize) -> PropAt {
+        let at = [p[0], 0.0, p[1]];
+        PropAt { node: 0, model: render3d::placed(at, 0.0), storey: 0, crown: false, bias: 0.0, index, at, yaw: 0.0, scale: [1.0; 3], bounds: [[-0.5, 0.0, -0.3], [0.5, 0.7, 0.3]] }
+    }
+
+    #[test]
+    fn a_ray_hits_the_turned_and_mirrored_box_of_a_prop() {
+        // Узкая плита вдоль x, повёрнута на четверть: в мире — вдоль z.
+        let mut p = crate_at([0.0, 0.0], 0);
+        p.bounds = [[-1.0, 0.0, -0.1], [1.0, 0.2, 0.1]];
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        p.model = render3d::placed(p.at, p.yaw);
+        let down = [0.0, -1.0, 0.0];
+        assert!(p.hit([0.0, 5.0, 0.8], down).is_some_and(|t| (t - 4.8).abs() < 1e-4), "вдоль z — попал в верх");
+        assert!(p.hit([0.8, 5.0, 0.0], down).is_none(), "вдоль x — мимо");
+        // Отражённый (растяжка меньше нуля) — та же рамка.
+        p.scale = [-1.0, 1.0, 1.0];
+        assert!(p.hit([0.0, 5.0, -0.8], down).is_some());
+        // Рёбра рамки — по повороту: все концы у оси z.
+        p.scale = [1.0; 3];
+        assert!(p.edges().iter().all(|(a, b)| a[0].abs() < 0.11 && b[0].abs() < 0.11 && a[2].abs() <= 1.0 + 1e-5));
+    }
+
+    #[test]
+    fn a_click_picks_the_prop_unless_a_wall_is_in_front_of_it() {
+        let mut v = room();
+        v.props = vec![crate_at([3.0, 4.0], 7)];
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
+        let aim = |v: &View3d| render3d::project(&v.frame(rect).vp.unwrap(), rect, [3.0, 0.35, 4.0]).unwrap();
+        // Сверху, через стену комнаты, — ящик.
+        v.cam = Orbit { target: [3.0, 0.35, 4.0], yaw: 0.0, pitch: 1.2, dist: 8.0 };
+        assert_eq!(v.pick(rect, aim(&v)), Some(0));
+        assert_eq!(v.prop_of(0, 7).map(|p| p.index), Some(7));
+        // Снизу, с юга, луч идёт сквозь стену — не выбрать; стены по пояс — всё равно выше луча.
+        v.cam = Orbit { target: [3.0, 0.35, 4.0], yaw: 0.0, pitch: 0.15, dist: 8.0 };
+        assert_eq!(v.pick(rect, aim(&v)), None, "за стеной");
+        // Мимо ящика — ничего.
+        v.cam.pitch = 1.2;
+        assert_eq!(v.pick(rect, aim(&v) + vec2(150.0, 0.0)), None);
+    }
+
+    #[test]
+    fn the_light_of_a_moved_lamp_goes_with_it_and_the_torch_stays_last() {
+        let mut v = room();
+        let corner = [7.5, 5.5];
+        let lit = light_at(&v, corner);
+        v.token = Some(Token { at: [5.0, 3.0], storey: 0, feet: 0.0 });
+        v.torch = false;
+        let lamp = |at: [f32; 2]| export::Light { at, bright: 2.0, dim: 4.0, color: "#ffffff".into(), animation: String::new(), look: (0.5, 1, 0.0, 0.0), tempo: (5, 5) };
+        v.prop_lights(0, &[lamp([2.5, 2.5])]);
+        assert_eq!(v.floors[0].light.sources[0].at, [2.5, 2.5]);
+        assert!(light_at(&v, corner) < lit - 0.1, "лампу унесли — в углу темнее: {lit} → {}", light_at(&v, corner));
+        // С факелом фишки: огни предметов — заново, факел — последним.
+        v.torch = true;
+        v.torch_step();
+        assert_eq!(v.floors[0].light.sources.len(), 2);
+        v.prop_lights(0, &[lamp([5.0, 4.0])]);
+        let s = &v.floors[0].light.sources;
+        assert!(s.len() == 2 && s[0].at == [5.0, 4.0] && s[1].at == [5.0, 3.0], "{:?}", s.iter().map(|s| s.at).collect::<Vec<_>>());
+        assert!((light_at(&v, corner) - lit).abs() < 0.05 || light_at(&v, corner) > lit, "лампа на месте — снова светло");
+    }
+
+    #[test]
+    fn moving_furniture_needs_no_new_shot_but_moving_a_rug_does() {
+        let mut map = Map::new(10, 10);
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        map.props.push(prop("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
+        map.props.push(prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp"));
+        let base = still(&map);
+        map.props[0].pos = [6.0, 6.0];
+        map.props[0].rot = 45.0;
+        assert!(still(&map) == base, "бочка стоит в 3D сама — снимок не нужен");
+        map.props[1].pos = [6.0, 6.0];
+        assert!(still(&map) != base, "ковёр — в картинке пола");
     }
 
     #[test]

@@ -1698,6 +1698,95 @@ impl SelfTest {
                 self.check("D подняла фишку по ступеням обратно на помост", (p.feet - rise).abs() < 1e-3 && at[0] > 6.0, &format!("{at:?}, ступни {}", p.feet));
                 self.snap(ctx, "помост и лестница в 3D");
             }
+            // Этап 5, правка в 3D: ящик посреди комнаты. Tab — правка, щелчок выбирает ящик (и на
+            // карте), протяжка переносит, E вертит, Delete убирает, Ctrl+Z возвращает; с полки
+            // «Объекта» щелчок по полу ставит новый. Снимок не нужен — ящик в 3D живой.
+            #[cfg(not(target_arch = "wasm32"))]
+            168 => {
+                let mut map = Map::new(12, 10);
+                map.paint_rect(Layer::Rooms, (2, 2), (9, 7), Some(0));
+                match test_crate(&app.data_dir.join("cc0").join("Проба")) {
+                    Ok((png, size)) => {
+                        app.library.set_cc0(&app.data_dir.join("cc0"));
+                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [6.0, 5.0], size, rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                    }
+                    Err(e) => self.check("ящик CC0 для правки в 3D собрался", false, &e),
+                }
+                app.reset_doc(map, None);
+                app.set_tool(Tool::Select);
+                app.start_view3d();
+                self.deadline = now + 30.0;
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            169 => {
+                let probe = app.view3d_probe().filter(|p| p.painted >= 3 && p.rect.width() > 100.0 && p.spots.len() == 1);
+                let Some(p) = probe else {
+                    if now < self.deadline {
+                        self.step = 169;
+                        self.resume_at = now + 0.1;
+                    } else {
+                        self.check("окно 3D с ящиком для правки открылось", false, "за 30 секунд не нарисовало кадра");
+                        self.step = 999;
+                    }
+                    return true;
+                };
+                // Щелчок в пустой угол — окно 3D ловит клавиши; Tab — правка.
+                self.click(p.rect.min + vec2(20.0, 20.0));
+                self.key(Key::Tab, Modifiers::NONE);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            170 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("Tab включил правку в окне 3D", p.edit, "");
+                let spot = p.spots.first().map_or(p.rect.center(), |s| s.2);
+                self.click(spot);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            171 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("щелчок в 3D выбрал ящик и на карте", app.sel == Some(Sel::Prop(0)) && app.level == 0, &format!("{:?}", app.sel));
+                let spot = p.spots.first().map_or(p.rect.center(), |s| s.2);
+                self.drag(spot, spot + vec2(140.0, 0.0), PointerButton::Primary);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            172 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let pos = app.map.props.first().map_or([0.0; 2], |q| q.pos);
+                let moved = p.spots.first().is_some_and(|s| s.2.x > p.rect.center().x + 60.0);
+                self.check("протяжка в 3D перенесла ящик на карте вправо, в 3D он там же, снимок не нужен", pos[0] > 6.9 && (pos[1] - 5.0).abs() < 0.3 && moved && !p.stale, &format!("{pos:?}, на экране {:?}, снять заново: {}", p.spots, p.stale));
+                self.key(Key::E, Modifiers::NONE);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            173 => {
+                let rot = app.map.props.first().map_or(-1.0, |q| q.rot);
+                self.check("E в правке повернула ящик на 15°", (rot - 15.0).abs() < 1e-3, &format!("{rot}"));
+                self.key(Key::Delete, Modifiers::NONE);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            174 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("Delete в правке убрал ящик — с карты и из 3D", app.map.props.is_empty() && p.props == 0, &format!("на карте {}, в 3D {}", app.map.props.len(), p.props));
+                self.key(Key::Z, Modifiers::COMMAND);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            175 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                self.check("Ctrl+Z вернул ящик повёрнутым, в 3D — тоже", app.map.props.len() == 1 && p.props == 1 && app.map.props[0].rot == 15.0, &format!("на карте {}, в 3D {}", app.map.props.len(), p.props));
+                // С полки «Объекта» — щелчок по полу левее середины ставит второй ящик.
+                app.set_tool(Tool::Object);
+                app.object_asset = app.map.props.first().map(|q| q.asset.clone());
+                app.object_prefab = None;
+                self.click(p.rect.center() - vec2(160.0, 0.0));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            176 => {
+                let Some(p) = app.view3d_probe() else { return false };
+                let second = app.map.props.get(1).map(|q| q.pos);
+                self.check("щелчок по полу в правке поставил предмет с полки, в 3D он моделью", app.map.props.len() == 2 && p.props == 2 && p.modelled == 2 && second.is_some_and(|q| q[0] < 5.5), &format!("{second:?}, в 3D {} / моделями {}", p.props, p.modelled));
+                self.snap(ctx, "правка в 3D");
+                app.set_tool(Tool::Select);
+            }
             _ => return false,
         }
         true

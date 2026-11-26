@@ -49,6 +49,7 @@ impl Time {
 
 /// Огонь: середина, радиус яркого и тусклого в клетках, цвет 0..1, сила (магия
 /// тише пламени); `roofed` — под крышей (на саму крышу он не светит).
+#[derive(Clone, PartialEq)]
 pub struct Source {
     pub at: [f32; 2],
     pub bright: f32,
@@ -118,22 +119,24 @@ impl Scene {
             let pass = if *kind == PortalKind::Window { WINDOW_PASS } else { 0.0 };
             blockers.push(Blocker { a: seg.0, b: seg.1, pass });
         }
-        let sources = layout
-            .lights
-            .iter()
-            // Цвет огня — наполовину с белым: в Foundry он ложится полупрозрачно, иначе
-            // жёлтый фонарь красил траву в салатовый. Магический свет — холодный и на
-            // тёмно-синей ночи кажется белее пламени, поэтому тише.
-            .map(|l| Source {
-                at: l.at,
-                bright: l.bright,
-                dim: l.dim.max(l.bright + 0.1),
-                color: hex(&l.color).map(|c| 0.5 + 0.5 * c),
-                power: if l.animation == "energy" { 0.75 } else { 1.0 },
-                roofed: roofs.iter().any(|r| inside_poly(l.at, r)),
-            })
-            .collect();
+        let sources = layout.lights.iter().map(|l| Source::of(l, &roofs)).collect();
         Scene { sources, blockers, inside, roofs }
+    }
+}
+
+impl Source {
+    /// Огонь по свету из разбора этажа. Цвет — наполовину с белым: в Foundry он ложится
+    /// полупрозрачно, иначе жёлтый фонарь красил траву в салатовый. Магический свет —
+    /// холодный и на тёмно-синей ночи кажется белее пламени, поэтому тише.
+    pub fn of(l: &crate::export::Light, roofs: &[Vec<[f32; 2]>]) -> Source {
+        Source {
+            at: l.at,
+            bright: l.bright,
+            dim: l.dim.max(l.bright + 0.1),
+            color: hex(&l.color).map(|c| 0.5 + 0.5 * c),
+            power: if l.animation == "energy" { 0.75 } else { 1.0 },
+            roofed: roofs.iter().any(|r| inside_poly(l.at, r)),
+        }
     }
 }
 

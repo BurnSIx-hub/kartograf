@@ -576,6 +576,8 @@ pub(super) struct Rest {
 /// он меньше её; таких несколько — на самую высокую.
 pub(super) fn rests(items: &[Rest]) -> Vec<f32> {
     let mut out: Vec<f32> = Vec::with_capacity(items.len());
+    // Окно 3D укладывает заново при каждой правке предметов: поворот — один раз на предмет.
+    let turns: Vec<(f32, f32)> = items.iter().map(|it| (-it.rot).to_radians().sin_cos()).collect();
     for (i, it) in items.iter().enumerate() {
         let area = it.size[0] * it.size[1];
         let mut h = 0.0f32;
@@ -585,7 +587,7 @@ pub(super) fn rests(items: &[Rest]) -> Vec<f32> {
                 continue;
             }
             // Середина предмета — в осях нижнего (поворот по часовой на экране, y вниз).
-            let (s, c) = (-under.rot).to_radians().sin_cos();
+            let (s, c) = turns[j];
             let (dx, dy) = (it.pos[0] - under.pos[0], it.pos[1] - under.pos[1]);
             let (lx, ly) = (dx * c - dy * s, dx * s + dy * c);
             if lx.abs() <= under.size[0] / 2.0 && ly.abs() <= under.size[1] / 2.0 {

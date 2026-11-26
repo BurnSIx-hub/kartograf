@@ -153,6 +153,27 @@ pub struct Upload {
     pub pawn: Mesh,
 }
 
+/// Добавка к уже залитой сцене — образцы новых предметов: сетки узлов (номера материалов —
+/// свои, с нуля), материалы (номера картинок — свои, с нуля), картинки. Узлы встают в конец
+/// сцены, по порядку.
+#[derive(Default)]
+pub struct Addition {
+    pub nodes: Vec<Vec<(usize, Mesh)>>,
+    pub materials: Vec<Material>,
+    pub images: Vec<image::RgbaImage>,
+}
+
+/// Точка через матрицу узла.
+pub fn apply(m: &Mat4, p: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|r| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r])
+}
+
+/// Точка мира на экране окна `rect` с матрицей вида `vp`; за камерой — нет.
+pub fn project(vp: &Mat4, rect: egui::Rect, p: [f32; 3]) -> Option<egui::Pos2> {
+    let c = [0, 1, 3].map(|r| vp[r] * p[0] + vp[4 + r] * p[1] + vp[8 + r] * p[2] + vp[12 + r]);
+    (c[2] > 1e-3).then(|| egui::pos2(rect.center().x + c[0] / c[2] * rect.width() / 2.0, rect.center().y - c[1] / c[2] * rect.height() / 2.0))
+}
+
 /// Узел в кадре: номер, матрица, этаж (его карта света), высота среза стен; `bias` — сдвиг
 /// глубины к зрителю (плоские картинки в одной плоскости пола ложатся по порядку, без мерцания
 /// и без щелей между соседними).
@@ -390,6 +411,38 @@ impl Gpu {
         }
     }
 
+    /// Дозалить образцы: номера материалов и картинок добавки — после уже залитых.
+    unsafe fn add(&mut self, gl: &glow::Context, add: Addition) -> Result<(), String> {
+        unsafe {
+            let (tex0, mat0) = (self.textures.len(), self.materials.len());
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            for img in &add.images {
+                let t = gl.create_texture()?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, img.width() as i32, img.height() as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(img.as_raw())));
+                gl.generate_mipmap(glow::TEXTURE_2D);
+                self.textures.push(t);
+            }
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            for mut m in add.materials {
+                if let Look::Picture(i) = m.look {
+                    m.look = Look::Picture(tex0 + i);
+                }
+                self.materials.push(m);
+            }
+            for prims in &add.nodes {
+                let mut parts = Vec::new();
+                for (mat, mesh) in prims {
+                    if !mesh.idx.is_empty() {
+                        parts.push(Self::part(gl, mat0 + *mat, mesh)?);
+                    }
+                }
+                self.nodes.push(parts);
+            }
+            Ok(())
+        }
+    }
+
     unsafe fn light(&mut self, gl: &glow::Context, up: LightUpdate) -> Result<(), String> {
         unsafe {
             let m = &up.map;
@@ -586,6 +639,8 @@ impl Gpu {
 struct Shared {
     gpu: Option<Gpu>,
     upload: Option<Upload>,
+    /// Добавки к сцене — после `upload`, по порядку.
+    adds: Vec<Addition>,
     lights: Vec<LightUpdate>,
     frame: Frame,
     /// Окно закрыли: при следующем рисовании отдать видеокарте всё.
@@ -603,7 +658,16 @@ impl Renderer {
     pub fn upload(&self, up: Upload) {
         if let Ok(mut s) = self.shared.lock() {
             s.upload = Some(up);
+            // Добавки к прежней сцене ей уже не нужны.
+            s.adds.clear();
             s.release = false;
+        }
+    }
+
+    /// Добавить к сцене образцы: их узлы встанут после всех уже отданных.
+    pub fn add(&self, add: Addition) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.adds.push(add);
         }
     }
 
@@ -659,6 +723,9 @@ impl Renderer {
             if let Some(up) = s.upload.take() {
                 g.upload(gl, up)?;
             }
+            for add in std::mem::take(&mut s.adds) {
+                g.add(gl, add)?;
+            }
             for up in std::mem::take(&mut s.lights) {
                 g.light(gl, up)?;
             }
@@ -679,6 +746,7 @@ impl Renderer {
         if let Ok(mut s) = self.shared.lock() {
             s.release = true;
             s.upload = None;
+            s.adds.clear();
             s.lights.clear();
             s.frame = Frame::default();
         }

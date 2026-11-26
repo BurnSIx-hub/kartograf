@@ -385,6 +385,18 @@ pub struct Light {
     pub tempo: (u8, u8),
 }
 
+/// Огни предметов этажа по порядку: встроенный по ключу, чужой по имени файла, либо выбранный
+/// рукой; поверх вида света — свой свет предмета (радиус, цвет, анимация).
+pub fn prop_lights(map: &Map) -> Vec<Light> {
+    map.props
+        .iter()
+        .filter_map(|p| {
+            let s = p.shine()?;
+            Some(Light { at: p.pos, bright: s.bright, dim: s.dim, color: s.color, animation: s.animation, look: s.look, tempo: s.tempo })
+        })
+        .collect()
+}
+
 /// Стены карты для VTT: края комнат и нарисованные, без проёмов, сшитые в
 /// ломаные и упрощённые — Foundry медленнеет от тысяч мелких отрезков.
 pub fn layout(map: &Map, room_edges: &[Segment]) -> Layout {
@@ -427,16 +439,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             leaf: p.kind.is_door().then(|| p.asset.clone().unwrap_or_else(|| crate::library::DEFAULT_DOOR.into())),
         })
         .collect();
-    let lights = map
-        .props
-        .iter()
-        .filter_map(|p| {
-            // Огонь: встроенный по ключу, чужой по имени файла, либо выбранный рукой;
-            // поверх вида света — свой свет предмета (радиус, цвет, анимация).
-            let s = p.shine()?;
-            Some(Light { at: p.pos, bright: s.bright, dim: s.dim, color: s.color, animation: s.animation, look: s.look, tempo: s.tempo })
-        })
-        .collect();
+    let lights = prop_lights(map);
     let mut zones = zones(map, room_edges, seen);
     // Костёр под открытым небом — маленькая область: пламя и дым рисует модуль.
     for p in map.props.iter().filter(|p| p.asset.strip_prefix(crate::library::BUILTIN) == Some("campfire")) {
