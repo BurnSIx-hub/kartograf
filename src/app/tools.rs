@@ -237,6 +237,7 @@ impl App {
             "remove" => self.tool_remove(a),
             "paint" => self.tool_paint(a, false),
             "erase" => self.tool_paint(a, true),
+            "shade" => self.tool_shade(a),
             "relief" => self.tool_relief(a),
             "add_wall" => self.tool_add_wall(a),
             "add_door" => self.tool_add_door(a),
@@ -287,12 +288,14 @@ impl App {
                 if self.export.is_some() {
                     return Out::Done(Err("идёт выгрузка — подождите".into()));
                 }
-                let roofs = match a["roofs"].as_str().unwrap_or("solid") {
-                    "ghost" => 0.35,
-                    "hidden" => 0.0,
-                    _ => 1.0,
+                // Неверное значение — отказ, а не молча «как днём» (`lighting: true` давал дневной снимок).
+                let roofs = match picture_word(a, "roofs", "solid") {
+                    Ok("solid") => 1.0,
+                    Ok("ghost") => 0.35,
+                    Ok("hidden") => 0.0,
+                    _ => return Out::Done(Err("roofs: solid, ghost или hidden".into())),
                 };
-                let time = match crate::lighting::Time::parse(a["lighting"].as_str().unwrap_or("day")) {
+                let time = match picture_word(a, "lighting", "day").and_then(crate::lighting::Time::parse) {
                     Ok(t) => t,
                     Err(e) => return Out::Done(Err(e)),
                 };
@@ -795,12 +798,15 @@ impl App {
 
     /// Пол по прямоугольнику, овалу или многоугольнику. Края — с шагом маски, четверть
     /// клетки: комната [4, 3, 14, 11] стенами встаёт ровно на 4, 14, 3 и 11, а пол
-    /// до 9,5 — под стену `add_wall` на 9,5. `feather` (земля и стирание) — мягкий
-    /// край: доля пути от края к середине, на которой сила спадает.
-    fn tool_paint(&mut self, a: &Value, erase: bool) -> Res {
+    /// до 9,5 — под стену `add_wall` на 9,5. `feather` — мягкий край: доля пути от края
+    /// к середине, на которой сила спадает. У комнаты — только там, где она уже есть
+    /// (гравий, песок, мох по полу пещеры, `room_patch`); где кисть добавляет комнату,
+    /// край твёрдый — по нему встают стены.
+    /// Сила кисти по фигуре `shape` (rect, oval или poly) — у paint, erase и shade.
+    fn shape_weights(&self, a: &Value) -> Result<Vec<(usize, f32)>, String> {
         let (mw, mh) = (self.map.rooms.w, self.map.rooms.h);
         let shape = a["shape"].as_str().unwrap_or("rect");
-        let mut weights = match shape {
+        let weights = match shape {
             "poly" => {
                 let pts = points_of(a);
                 if pts.len() < 3 {
@@ -817,12 +823,39 @@ impl App {
         if weights.is_empty() {
             return Err("область пустая или вне карты".into());
         }
+        Ok(weights)
+    }
+
+    /// Тень кистью, как «Тень» в окне: точка темнеет до `level` и не светлеет, сколько ни
+    /// води; `level` 0 — стереть тень. Скала вокруг пещеры, пол под нависшим уступом.
+    fn tool_shade(&mut self, a: &Value) -> Res {
+        let (mw, mh) = (self.map.rooms.w, self.map.rooms.h);
+        let mut weights = self.shape_weights(a)?;
+        let level = f(a, "level").unwrap_or(0.6).clamp(0.0, 1.0);
+        let feather = f(a, "feather").unwrap_or(0.5).clamp(0.0, 1.0);
+        mask::soften(mw, mh, &mut weights, feather);
+        self.checkpoint();
+        if level > 0.0 {
+            self.map.shade_paint(&weights, level);
+        } else {
+            self.map.shade_fade(&weights);
+        }
+        self.map.prune();
+        let cells = (weights.iter().map(|w| w.1).sum::<f32>() / (mask::RES * mask::RES) as f32 * 100.0).round() / 100.0;
+        Ok(json!({"cells": cells, "level": level, "feather": feather}))
+    }
+
+    fn tool_paint(&mut self, a: &Value, erase: bool) -> Res {
+        let (mw, mh) = (self.map.rooms.w, self.map.rooms.h);
+        let mut weights = self.shape_weights(a)?;
         let room = !erase && a["target"].as_str() == Some("room");
         let feather = f(a, "feather").unwrap_or(0.0).clamp(0.0, 1.0);
-        if feather > 0.0 && room {
-            return Err("feather — для земли (target terrain) и стирания: у комнаты край — её стены".into());
-        }
+        let hard = if room && feather > 0.0 { weights.clone() } else { Vec::new() };
         mask::soften(mw, mh, &mut weights, feather);
+        if !hard.is_empty() {
+            let rooms = &self.map.rooms;
+            weights = room_patch(&hard, &weights, |i| rooms.at(i) > 200);
+        }
         let cells = (weights.iter().map(|w| w.1).sum::<f32>() / (mask::RES * mask::RES) as f32 * 100.0).round() / 100.0;
         if erase {
             self.checkpoint();
@@ -1372,6 +1405,8 @@ impl App {
         if let Some(v) = rails {
             m.rails = v;
         }
+        self.share_scene();
+        let m = &self.map;
         let flows: Vec<Value> = m.flows.iter().map(|f| json!({"points": f.points, "current": f.current, "drift": f.drift})).collect();
         let s = &m.shadows;
         Ok(json!({"ambience": m.ambience, "light": m.scene_light, "particles": m.particles, "weather": m.weather, "current": m.current, "drift": m.drift, "flows": flows, "rails": m.rails,
@@ -1910,6 +1945,25 @@ fn color_of(a: &Value, k: &str) -> Result<Option<Option<[u8; 3]>>, String> {
     }
 }
 
+/// Слово-параметр снимка (`roofs`, `lighting`): нет поля или null — `default`, не строка — отказ.
+fn picture_word<'a>(a: &'a Value, k: &str, default: &'a str) -> Result<&'a str, String> {
+    match a.get(k).filter(|v| !v.is_null()) {
+        None => Ok(default),
+        Some(v) => v.as_str().ok_or_else(|| format!("{k}: строка, а не {v}")),
+    }
+}
+
+/// Мягкое пятно комнатной кистью (гравий, песок, мох по полу пещеры): где комната уже
+/// есть (`full`), пятно тает к краю (`soft`); где кисть добавляет комнату — край твёрдый
+/// (`hard`), по нему встанут стены, как без `feather`.
+fn room_patch(hard: &[(usize, f32)], soft: &[(usize, f32)], full: impl Fn(usize) -> bool) -> Vec<(usize, f32)> {
+    let soft: std::collections::HashMap<usize, f32> = soft.iter().copied().collect();
+    hard.iter()
+        .map(|&(i, v)| (i, if full(i) { soft.get(&i).copied().unwrap_or(0.0) } else { v }))
+        .filter(|w| w.1 > 0.0)
+        .collect()
+}
+
 /// Чем оживает закрашенное (`live` у paint): нет поля — как решит имя картинки.
 fn live_of(a: &Value) -> Result<Option<map::Live>, String> {
     let Some(s) = a["live"].as_str() else { return Ok(None) };
@@ -2198,6 +2252,26 @@ mod tests {
         let (_, n4) = wall_side(seg, [2.05, 2.05], 0.2, None, |p| p[0] + p[1] < 4.0);
         assert!(n4[0] < 0.0 && n4[1] < 0.0, "из толщи стены — в комнату: {n4:?}");
         assert_eq!(back_extent("right", [-0.3, -0.5, 0.5, 0.5], [1.0, 1.0]), 0.3);
+    }
+
+    #[test]
+    fn picture_words_refuse_what_is_not_a_word() {
+        assert_eq!(picture_word(&json!({}), "lighting", "day"), Ok("day"));
+        assert_eq!(picture_word(&json!({"lighting": null}), "lighting", "day"), Ok("day"));
+        assert_eq!(picture_word(&json!({"lighting": "night"}), "lighting", "day"), Ok("night"));
+        assert!(picture_word(&json!({"lighting": true}), "lighting", "day").is_err(), "true — не ночь и не день");
+    }
+
+    #[test]
+    fn room_patch_is_soft_inside_the_room_and_hard_where_it_adds_one() {
+        // Полоса из пяти точек: 0–2 уже комната, 3–4 — нет. Мягкий край тает к обоим концам.
+        let hard: Vec<(usize, f32)> = (0..5).map(|i| (i, 1.0)).collect();
+        let soft = vec![(0, 0.2), (1, 0.6), (2, 1.0), (3, 0.6), (4, 0.2)];
+        let w = room_patch(&hard, &soft, |i| i < 3);
+        assert_eq!(w, vec![(0, 0.2), (1, 0.6), (2, 1.0), (3, 1.0), (4, 1.0)], "в комнате — мягко, за ней — твёрдо");
+        // Точка, которую мягкий край обнулил, внутри комнаты пропадает, а не красится в полную силу.
+        let w = room_patch(&[(0, 1.0), (1, 1.0)], &[(1, 0.5)], |_| true);
+        assert_eq!(w, vec![(1, 0.5)]);
     }
 
     #[test]

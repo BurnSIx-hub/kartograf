@@ -2595,9 +2595,22 @@ impl Map {
         let mut m = Map::new(self.width, self.height);
         m.materials = self.materials.clone();
         m.wall_style = self.wall_style.clone();
-        m.shadows = self.shadows.clone();
         m.origin = self.origin;
+        m.take_scene(self);
         m
+    }
+
+    /// Настройки сцены, а не этажа: звук места, свет сцены, что летит от крон, погода,
+    /// течение всей воды и солнце. Выгрузка берёт их с открытого этажа — поэтому у всех
+    /// этажей они одни. Пути вагонеток и участки течения — у своего этажа.
+    pub fn take_scene(&mut self, from: &Map) {
+        self.ambience = from.ambience.clone();
+        self.scene_light = from.scene_light.clone();
+        self.particles = from.particles.clone();
+        self.weather = from.weather.clone();
+        self.current = from.current;
+        self.drift = from.drift;
+        self.shadows = from.shadows.clone();
     }
 
     /// Стены вокруг комнат: контур маски комнат.
@@ -2833,6 +2846,11 @@ mod tests {
         assert_eq!((m.origin, m.levels[0].origin), ([2, 1], [2, 1]));
         m.grow(0, 5, 0, 0);
         assert_eq!((m.origin, m.new_level().origin), ([2, 6], [2, 6]));
+        // Звук места и свет сцены — у сцены: новый этаж их наследует.
+        m.ambience = "cave-2".into();
+        m.scene_light = "dim".into();
+        let up = m.new_level();
+        assert_eq!((up.ambience.as_str(), up.scene_light.as_str()), ("cave-2", "dim"));
         // В файле — только если карта росла; старый файл без поля читается с нулём.
         let fresh = serde_json::to_value(Map::new(2, 2)).unwrap();
         assert!(fresh.get("origin").is_none());

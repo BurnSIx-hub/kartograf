@@ -229,6 +229,7 @@ impl App {
             self.map.ambience = place;
             self.map.particles = particles.to_owned();
             self.map.weather = weather.to_owned();
+            self.share_scene();
         }
         ui.separator();
         ui.label("Свет сцены").on_hover_text("В Foundry: день — видно всё; полумрак — видно всё в поле зрения, но сцена притемнена, лампы выделяются; темнота — видно только у огней");
@@ -242,6 +243,7 @@ impl App {
         if light != self.map.scene_light {
             self.checkpoint();
             self.map.scene_light = light;
+            self.share_scene();
         }
         ui.separator();
         ui.label("От крон");
@@ -252,6 +254,7 @@ impl App {
         if particles != self.map.particles {
             self.checkpoint();
             self.map.particles = particles;
+            self.share_scene();
         }
         ui.separator();
         ui.label("Погода");
@@ -262,6 +265,7 @@ impl App {
         if weather != self.map.weather {
             self.checkpoint();
             self.map.weather = weather;
+            self.share_scene();
         }
         ui.separator();
         // Корабль на ходу: вода уходит мимо борта (области воды в «Wild Canvas»).
@@ -272,7 +276,10 @@ impl App {
         if r1.drag_started() || r2.drag_started() || ((r1.changed() || r2.changed()) && !r1.dragged() && !r2.dragged()) {
             self.checkpoint();
         }
-        (self.map.current, self.map.drift) = (current, drift);
+        if (current, drift) != (self.map.current, self.map.drift) {
+            (self.map.current, self.map.drift) = (current, drift);
+            self.share_scene();
+        }
     }
 
     pub(super) fn swatch(&mut self, ui: &mut egui::Ui, paint: &Paint, size: f32) -> egui::Response {
@@ -1130,7 +1137,9 @@ impl App {
         if on.changed() || rs.iter().any(|r| r.drag_started() || (r.changed() && !r.dragged())) {
             self.checkpoint();
         }
-        self.map.shadows = sh;
-
+        if sh != self.map.shadows {
+            self.map.shadows = sh;
+            self.share_scene();
+        }
     }
 }

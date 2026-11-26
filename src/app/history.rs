@@ -91,6 +91,16 @@ impl App {
     }
 
     /// Новый этаж выше текущего (`above`) или ниже; история правок сбрасывается.
+    /// Настройки сцены с открытого этажа — на все остальные ([`Map::take_scene`]).
+    pub fn share_scene(&mut self) {
+        let at = self.level;
+        for (k, other) in self.levels.iter_mut().enumerate() {
+            if k != at {
+                other.take_scene(&self.map);
+            }
+        }
+    }
+
     pub fn add_level(&mut self, above: bool) {
         let fresh = self.map.new_level();
         let at = if above { self.level + 1 } else { self.level };
