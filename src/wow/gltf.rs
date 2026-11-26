@@ -2,7 +2,9 @@
 //! текстуры как в игре, запечённый свет — цветом вершин, предметы на своих местах; потолки и
 //! крыши срезаны над полом этажа, как у снимка пола (вид сверху под углом — «кукольный домик»).
 //! Местность карты (ADT) — слоями, запечёнными в картинку на 4×4 куска; вода, лава и слизь —
-//! гладью с рисунком игры. Карта материка — только с рамкой `area`: из большого города можно
+//! гладью с рисунком игры. Текущий рисунок (водопад — предмет со сдвигом текстуры, гладь — медленным
+//! дрейфом) — `extras.flow` материала, текстур в секунду: его двигает скрипт тайла 3D Canvas, а у
+//! модели в `.json` — `flow: true`. Карта материка — только с рамкой `area`: из большого города можно
 //! взять квартал. Пол верхних ярусов (мост над улицей, второй этаж над залом того же этажа по
 //! высоте) — своими тайлами `_S1.glb`…, тоже срезанными над полом: в верхе (`_top`) их не видно
 //! и фишки на них не встают. Рядом — `<имя>_walls.json`: стены Foundry по ярусам (каждый — свой
@@ -220,7 +222,19 @@ struct Mat {
     alpha: u8,
     /// Крышка среза: тёмная, без текстуры (цвет стен снимка пола).
     cap: bool,
+    /// Течение рисунка в тысячных долях текстуры за секунду по U и V (`flow_key`); в glb — `extras.flow`
+    /// материала, рисунок по ней сдвигает скрипт тайла 3D Canvas.
+    flow: [i16; 2],
 }
+
+/// Течение рисунка — ключом материала: тысячные доли текстуры за секунду.
+fn flow_key(f: [f32; 2]) -> [i16; 2] {
+    f.map(|c| (c * 1000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+}
+
+/// Течение глади, текстур за секунду: в игре вода, лава и слизь — покадровая анимация на месте,
+/// glTF её не умеет; медленный дрейф рисунка (вода — четверть ярда в секунду) оживляет гладь.
+const LIQUID_FLOW: [[f32; 2]; 3] = [[0.02, 0.01], [0.008, 0.004], [0.01, 0.005]];
 
 #[derive(Default)]
 struct Prim {
@@ -498,7 +512,7 @@ impl Level<'_> {
                 close(o, &mut quads);
             }
         }
-        let mat = Mat { image: None, mode: 0, two_sided: false, wrap: [true, true], alpha: 255, cap: true };
+        let mat = Mat { image: None, mode: 0, two_sided: false, wrap: [true, true], alpha: 255, cap: true, flow: [0, 0] };
         let v = |x: f32, y: f32, z: f32| V { p: [x, y, z + 0.02], n: [0.0, 0.0, 1.0], uv: [0.0, 0.0], c: [1.0; 3] };
         let pieces: Vec<([V; 3], Option<[u64; 3]>)> = quads
             .iter()
@@ -515,26 +529,47 @@ impl Level<'_> {
     }
 }
 
-/// Цвет жидкости без текстуры (и оттенок воды): вода, лава, слизь — как у снимка пола.
-const LIQUID_TINT: [[f32; 3]; 3] = [[0.16, 0.31, 0.40], [0.95, 0.38, 0.08], [0.32, 0.62, 0.16]];
+/// Цвет жидкости без текстуры: вода (её толща), лава, слизь.
+const LIQUID_TINT: [[f32; 3]; 3] = [[0.18, 0.40, 0.48], [0.95, 0.38, 0.08], [0.32, 0.62, 0.16]];
 
-/// Рисунок глади: вода — рябь игры в своём цвете, лава и слизь — как есть, ярче (как у снимка).
+/// Гребни ряби на воде: светлая бирюза, как блики в игре.
+const WATER_CREST: [f32; 3] = [0.70, 0.86, 0.90];
+
+/// Непрозрачность воды: дно мелкого бассейна видно, рябь читается.
+const WATER_ALPHA: u8 = 150;
+
+/// Рисунок глади: вода — рябь игры между цветом толщи и гребня, лава и слизь — как есть, ярче
+/// (как у снимка). Рябь игры почти чёрная и бледная (`lake_a`: яркость 0–0,25, в игре её кладёт
+/// шейдер поверх цвета воды): её размах растягивается на весь — от 2-го до 98-го процентиля.
 fn liquid_texture(t: &Rgba, kind: wmo::LiquidKind) -> Rgba {
-    let tint = LIQUID_TINT[0];
+    let luma = |p: &[u8; 4]| (p[0] as f32 * 0.3 + p[1] as f32 * 0.59 + p[2] as f32 * 0.11) / 255.0;
+    let mut sorted: Vec<f32> = t.px.iter().map(luma).collect();
+    sorted.sort_by(f32::total_cmp);
+    let at = |q: f32| sorted.get(((sorted.len().saturating_sub(1)) as f32 * q) as usize).copied().unwrap_or(0.0);
+    let (lo, hi) = (at(0.02), at(0.98));
+    let span = (hi - lo).max(1e-3);
     let px = t
         .px
         .iter()
         .map(|p| {
-            let c = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
             let o = match kind {
-                wmo::LiquidKind::Water => [0, 1, 2].map(|q| tint[q] * (0.55 + 0.9 * c[q])),
-                _ => c.map(|v| (v * 1.25).min(1.0)),
+                wmo::LiquidKind::Water => {
+                    let w = ((luma(p) - lo) / span).clamp(0.0, 1.0).powf(1.3);
+                    [0, 1, 2].map(|q| LIQUID_TINT[0][q] + (WATER_CREST[q] - LIQUID_TINT[0][q]) * w)
+                }
+                _ => [p[0], p[1], p[2]].map(|v| (v as f32 / 255.0 * 1.25).min(1.0)),
             };
             let o = o.map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8);
             [o[0], o[1], o[2], 255]
         })
         .collect();
     Rgba { w: t.w, h: t.h, px }
+}
+
+/// Вода по имени текстуры (водопад, река, ручей), а не лава или слизь.
+fn watery(file: &str) -> bool {
+    let f = file.to_lowercase();
+    ["water", "fall", "river", "stream"].iter().any(|w| f.contains(w)) && !["lava", "magma", "slime"].iter().any(|w| f.contains(w))
 }
 
 /// Кусков местности в стороне картинки: 4×4 куска (133⅓ ярда) — одна текстура.
@@ -732,7 +767,7 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
                 Some(i) => Some(images.add(&format!("wmo:{}", scene.tex_names[i].to_lowercase()), &scene.textures[i])?),
                 None => None,
             };
-            let mat = Mat { image, mode: m.blend as u8, two_sided: m.flags & 0x4 != 0, wrap: [m.flags & 0x40 == 0, m.flags & 0x80 == 0], alpha: 255, cap: false };
+            let mat = Mat { image, mode: m.blend as u8, two_sided: m.flags & 0x4 != 0, wrap: [m.flags & 0x40 == 0, m.flags & 0x80 == 0], alpha: 255, cap: false, flow: [0, 0] };
             let unlit_mat = m.flags & 1 != 0;
             let mut ids = g.tris[t];
             if flip {
@@ -769,7 +804,7 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
         }
         for &GroundChunk { group: gi, block, at: sub } in &ground.chunks {
             let g = &scene.groups[gi];
-            let mat = Mat { image: block_img.get(&block).copied(), mode: 0, two_sided: false, wrap: [false, false], alpha: 255, cap: false };
+            let mat = Mat { image: block_img.get(&block).copied(), mode: 0, two_sided: false, wrap: [false, false], alpha: 255, cap: false, flow: [0, 0] };
             let nrm = |i: u32| g.normals.get(i as usize).copied().unwrap_or([0.0, 0.0, 1.0]);
             let flip = flipped(g.tris.iter().map(|t| t.map(|i| g.verts[i as usize])), g.tris.iter().map(|t| t.iter().fold([0.0; 3], |s, &i| {
                 let n = nrm(i);
@@ -820,7 +855,7 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
         }
         let image = liquid_img[k].flatten();
         let water = k == 0;
-        let mat = Mat { image, mode: if water { 2 } else { 0 }, two_sided: water, wrap: [true, true], alpha: if water { 215 } else { 255 }, cap: false };
+        let mat = Mat { image, mode: if water { 2 } else { 0 }, two_sided: water, wrap: [true, true], alpha: if water { WATER_ALPHA } else { 255 }, cap: false, flow: flow_key(LIQUID_FLOW[k]) };
         let c = if image.is_some() { [1.0; 3] } else { linear(LIQUID_TINT[k]) };
         let hgt = |ix: usize, iy: usize| l.heights.get(iy * l.verts[0] + ix).copied().unwrap_or(l.corner[2]);
         for ty in 0..l.tiles[1] {
@@ -901,13 +936,20 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
                 Some(ti) => {
                     let file = &model.textures[ti].file;
                     let k = if file.is_empty() { format!("m2:{key}#{ti}") } else { file.to_lowercase() };
-                    Some(images.add(&k, textures[ti].as_ref().unwrap())?)
+                    let img = textures[ti].as_ref().unwrap();
+                    // Текущая вода предмета (водопад, ручей): картинка игры тёмная и бледная —
+                    // рисунок кладётся в цвета воды, как гладь.
+                    if b.flow.is_some() && watery(&k) {
+                        Some(images.add(&format!("{k}#water"), &liquid_texture(img, wmo::LiquidKind::Water))?)
+                    } else {
+                        Some(images.add(&k, img)?)
+                    }
                 }
                 None => None,
             };
             let wrap = tex.and_then(|ti| model.textures.get(ti)).map_or([true, true], |t| [t.flags & 1 != 0, t.flags & 2 != 0]);
             let alpha = if blend == 2 { (b.alpha.clamp(0.0, 1.0) * 255.0).round() as u8 } else { 255 };
-            let mat = Mat { image, mode: blend, two_sided: m.is_some_and(|m| m.flags & 0x4 != 0), wrap, alpha, cap: false };
+            let mat = Mat { image, mode: blend, two_sided: m.is_some_and(|m| m.flags & 0x4 != 0), wrap, alpha, cap: false, flow: b.flow.map_or([0, 0], flow_key) };
             let unlit_mat = m.is_some_and(|m| m.flags & 1 != 0);
             for t in &b.triangles {
                 let mut ids = *t;
@@ -959,6 +1001,7 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
     let mut files = Vec::new();
     let mut boxes = Vec::new();
     let mut parts = Vec::new();
+    let mut flowing = Vec::new();
     let mut triangles = 0;
     let stem = out.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into());
     let dir = out.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -976,6 +1019,7 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
         boxes.push([l.lo, l.hi]);
         parts.push(part);
         files.push(file);
+        flowing.push(l.prims.iter().any(|(m, p)| m.flow != [0, 0] && m.image.is_some() && !p.idx.is_empty()));
     }
     if files.is_empty() {
         return Err("нечего выгружать: ни одного треугольника над полом".into());
@@ -992,7 +1036,8 @@ pub fn export(client: &Client, path: &str, out: &Path, opt: &Options) -> Result<
         // Рамка карты в мире (X — север, Y — запад, ярды): клетка (u, v) — точка
         // X = north − (v − margin) / cells_per_yard, Y = west − (u − margin) / cells_per_yard.
         "world": {"north": frame.hi_x, "west": frame.hi_y, "cells_per_yard": frame.cpy, "margin": frame.margin},
-        "models": files.iter().zip(&boxes).zip(&parts).map(|((f, b), p)| json!({"part": p, "file": f.file_name().map(|n| n.to_string_lossy().into_owned()), "min": b[0], "max": b[1]})).collect::<Vec<_>>(),
+        // `flow` — в модели есть текущий рисунок (водопад, вода, лава): тайлу нужен скрипт течения.
+        "models": files.iter().zip(&boxes).zip(&parts).zip(&flowing).map(|(((f, b), p), &flow)| json!({"part": p, "file": f.file_name().map(|n| n.to_string_lossy().into_owned()), "min": b[0], "max": b[1], "flow": flow})).collect::<Vec<_>>(),
     });
     // Стены и зоны 3D-сцены Foundry — в точках сцены по 100 на клетку (тайлы моделей там же в
     // 0, 0), по ярусам: земля, мосты над улицей и вторые этажи — свои уровни Foundry. Высоты
@@ -1128,6 +1173,10 @@ fn write_glb(file: &Path, prims: &[(Mat, Prim)], images: &Images, unlit: bool, n
         if unlit {
             m["extensions"] = json!({"KHR_materials_unlit": {}});
         }
+        // Three.js кладёт `extras` материала в `userData`: оттуда течение берёт скрипт тайла.
+        if mat.flow != [0, 0] {
+            m["extras"] = json!({"flow": mat.flow.map(|c| c as f64 / 1000.0)});
+        }
         materials.push(m);
 
         let (lo, hi) = prim.v.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| ([0, 1, 2].map(|k| lo[k].min(v.p[k])), [0, 1, 2].map(|k| hi[k].max(v.p[k]))));
@@ -1249,6 +1298,13 @@ mod tests {
     fn water_is_tinted_and_lava_brightened() {
         let w = liquid_texture(&solid([128, 128, 128, 255]), wmo::LiquidKind::Water);
         assert!(w.px[0][2] > w.px[0][0], "вода синее, чем красная: {:?}", w.px[0]);
+        // Тёмная бледная рябь игры растягивается: впадина — цвет толщи, гребень — светлый.
+        let ripple = Rgba { w: 60, h: 1, px: (0..60u8).map(|v| [v, v, v, 255]).collect() };
+        let w = liquid_texture(&ripple, wmo::LiquidKind::Water);
+        let (dark, light) = (w.px[0], w.px[59]);
+        assert!(dark[1] < 110 && light[1] > 200, "рябь на весь размах: {dark:?} … {light:?}");
+        assert!(watery("fountains/monasteryfalls.blp"));
+        assert!(!watery("generic/lavafall01.blp"), "лавопад — не вода");
         let l = liquid_texture(&solid([100, 50, 0, 255]), wmo::LiquidKind::Magma);
         assert_eq!(l.px[0], [125, 63, 0, 255]);
     }
@@ -1288,7 +1344,7 @@ mod tests {
             let i = prim.vert(None, v(z));
             prim.idx.push(i);
         }
-        let mat = Mat { image: None, mode: 0, two_sided: false, wrap: [true, true], alpha: 255, cap: false };
+        let mat = Mat { image: None, mode: 0, two_sided: false, wrap: [true, true], alpha: 255, cap: false, flow: [0, 0] };
         let file = dir.join("t.glb");
         write_glb(&file, &[(mat, prim)], &Images::default(), true, "t").unwrap();
         let b = std::fs::read(&file).unwrap();
@@ -1299,6 +1355,28 @@ mod tests {
         let doc: Value = serde_json::from_slice(&b[20..20 + js_len]).unwrap();
         assert_eq!(doc["accessors"][0]["count"], 3);
         assert_eq!(doc["materials"][0]["extensions"]["KHR_materials_unlit"], json!({}));
+        assert!(doc["materials"][0].get("extras").is_none(), "стоячий рисунок — без течения");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flowing_material_carries_its_speed_for_the_tile_script() {
+        let dir = std::env::temp_dir().join(format!("kartograf_flow_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut prim = Prim::default();
+        for z in [0.0, 1.0, 2.0] {
+            let i = prim.vert(None, v(z));
+            prim.idx.push(i);
+        }
+        // Водопад: полтекстуры в секунду по U — как у MonasteryFalls.
+        let mat = Mat { image: None, mode: 0, two_sided: true, wrap: [true, false], alpha: 255, cap: false, flow: flow_key([0.5, 0.0]) };
+        let file = dir.join("f.glb");
+        write_glb(&file, &[(mat, prim)], &Images::default(), true, "f").unwrap();
+        let b = std::fs::read(&file).unwrap();
+        let js_len = u32::from_le_bytes(b[12..16].try_into().unwrap()) as usize;
+        let doc: Value = serde_json::from_slice(&b[20..20 + js_len]).unwrap();
+        assert_eq!(doc["materials"][0]["extras"]["flow"], json!([0.5, 0.0]));
+        assert_eq!(flow_key(LIQUID_FLOW[0]), [20, 10], "вода дрейфует медленно");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

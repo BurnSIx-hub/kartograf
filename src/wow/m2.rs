@@ -29,6 +29,9 @@ pub struct Batch {
     /// Непрозрачность в покое: вес текстуры × альфа цвета (первый ключ первой анимации).
     /// Ноль у служебных плоскостей эмиттеров частиц: в игре их не видно.
     pub alpha: f32,
+    /// Течение рисунка: на сколько текстур в секунду сдвигается рисунок по U и V (водопад,
+    /// река, лава); `None` — стоит на месте.
+    pub flow: Option<[f32; 2]>,
 }
 
 pub struct Model {
@@ -86,6 +89,34 @@ fn track_first_fixed16(b: &[u8], at: usize) -> Option<f32> {
     None
 }
 
+/// Течение по дорожке переноса текстуры (`M2Track<C3Vector>` 3.x, начало `M2TextureTransform`):
+/// сдвиг от первого ключа до последнего за их время, в текстурах за секунду. Берётся первая
+/// анимация с двумя ключами и больше (у водопада — глобальная петля: 0 → 1 за 2 с). Без
+/// интерполяции, без ключей или без сдвига — `None`.
+fn track_flow(b: &[u8], at: usize) -> Option<[f32; 2]> {
+    let t = b.get(at..at + 20)?;
+    if u16_at(t, 0) == 0 {
+        return None;
+    }
+    let (times, values) = ((u32_at(t, 4) as usize, u32_at(t, 8) as usize), (u32_at(t, 12) as usize, u32_at(t, 16) as usize));
+    for k in 0..times.0.min(values.0).min(64) {
+        let (ta, va) = (b.get(times.1 + k * 8..times.1 + k * 8 + 8)?, b.get(values.1 + k * 8..values.1 + k * 8 + 8)?);
+        let (n, ts, vs) = ((u32_at(ta, 0) as usize).min(u32_at(va, 0) as usize), u32_at(ta, 4) as usize, u32_at(va, 4) as usize);
+        if n < 2 {
+            continue;
+        }
+        let time = |i: usize| b.get(ts + i * 4..ts + i * 4 + 4).map(|s| u32_at(s, 0) as f32);
+        let uv = |i: usize| b.get(vs + i * 12..vs + i * 12 + 8).map(|s| [f32_at(s, 0), f32_at(s, 4)]);
+        let (t0, t1, a, z) = (time(0)?, time(n - 1)?, uv(0)?, uv(n - 1)?);
+        if t1 <= t0 {
+            return None;
+        }
+        let v = [0, 1].map(|c| (z[c] - a[c]) / (t1 - t0) * 1000.0);
+        return (v.iter().all(|c| c.is_finite()) && v.iter().any(|c| c.abs() > 1e-4)).then_some(v);
+    }
+    None
+}
+
 fn string(b: &[u8], (count, ofs): (usize, usize)) -> String {
     b.get(ofs..ofs + count).map(|s| String::from_utf8_lossy(s).trim_end_matches('\0').to_owned()).unwrap_or_default()
 }
@@ -118,13 +149,23 @@ pub fn parse(b: &[u8], skin: Option<&[u8]>) -> Result<Model, String> {
     if version <= 257 {
         r.skip(8);
     }
-    r.skip(8); // сдвиги текстур
+    let transforms = r.arr()?;
     r.skip(8); // поиск подменяемых
     let materials = r.arr()?;
     r.skip(8); // поиск костей
     let tex_lookup = r.arr()?;
     r.skip(8); // поиск текстурных блоков
     let weight_lookup = r.arr()?;
+    let transform_lookup = r.arr()?;
+    // Течение рисунка по номеру в поиске сдвигов текстур (у куска сетки); дорожка переноса — первая
+    // из трёх у `M2TextureTransform` (60 байт). Только у 3.x, как и непрозрачность.
+    let flow_of = |combo: usize| -> Option<[f32; 2]> {
+        if version < 264 {
+            return None;
+        }
+        let i = slice(b, transform_lookup, 2).ok()?.get(combo * 2..combo * 2 + 2).map(|c| u16_at(c, 0) as usize)?;
+        (i < transforms.0).then(|| track_flow(b, transforms.1 + i * 60)).flatten()
+    };
     // Непрозрачность: только у 3.x (у старших дорожки устроены иначе — считаем видимым).
     let alpha_of = |color: usize, weight_combo: usize| -> f32 {
         if version < 264 {
@@ -189,7 +230,8 @@ pub fn parse(b: &[u8], skin: Option<&[u8]>) -> Result<Model, String> {
             .collect();
         let texture = tex_lookup.get(tex_combo).map(|&t| t as usize);
         let alpha = alpha_of(u16_at(bt, 8) as usize, u16_at(bt, 20) as usize);
-        batches.push(Batch { triangles, texture, material, alpha });
+        let flow = flow_of(u16_at(bt, 22) as usize);
+        batches.push(Batch { triangles, texture, material, alpha, flow });
     }
     Ok(Model { vertices, textures, materials, batches })
 }
@@ -319,5 +361,44 @@ pub(crate) mod tests {
         put(&mut m, 0x94, lookup_at as u32);
         let model = parse(&m, Some(&s)).unwrap();
         assert_eq!(model.batches[0].alpha, 0.0);
+    }
+
+    #[test]
+    fn a_scrolling_texture_flows_at_the_game_speed() {
+        // Водопад: перенос рисунка 0 → 1 по U за 2000 мс (глобальная петля) — полтекстуры в секунду.
+        let (mut m, s) = tiny_model();
+        assert_eq!(parse(&m, Some(&s)).unwrap().batches[0].flow, None, "без сдвигов текстур — стоит");
+        let put = |m: &mut Vec<u8>, at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let times_at = m.len();
+        m.extend(0u32.to_le_bytes());
+        m.extend(2000u32.to_le_bytes());
+        let vals_at = m.len();
+        for v in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
+            m.extend(v.to_le_bytes());
+        }
+        // Дорожка: интерполяция, глобальная петля, массивы времён и значений (по одной анимации).
+        let (ts_at, vs_at) = (m.len(), m.len() + 8);
+        m.extend(2u32.to_le_bytes());
+        m.extend((times_at as u32).to_le_bytes());
+        m.extend(2u32.to_le_bytes());
+        m.extend((vals_at as u32).to_le_bytes());
+        let tt_at = m.len();
+        m.extend(1u16.to_le_bytes());
+        m.extend(0i16.to_le_bytes());
+        m.extend(1u32.to_le_bytes());
+        m.extend((ts_at as u32).to_le_bytes());
+        m.extend(1u32.to_le_bytes());
+        m.extend((vs_at as u32).to_le_bytes());
+        m.extend([0u8; 40]); // поворот и масштаб
+        put(&mut m, 0x60, 1);
+        put(&mut m, 0x64, tt_at as u32);
+        let look_at = m.len();
+        m.extend(0u16.to_le_bytes());
+        put(&mut m, 0x98, 1);
+        put(&mut m, 0x9C, look_at as u32);
+        assert_eq!(parse(&m, Some(&s)).unwrap().batches[0].flow, Some([0.5, 0.0]));
+        // Ступенькой (без интерполяции) рисунок прыгает на целую текстуру — это не течение.
+        m[tt_at..tt_at + 2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse(&m, Some(&s)).unwrap().batches[0].flow, None);
     }
 }
