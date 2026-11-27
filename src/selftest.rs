@@ -1642,6 +1642,9 @@ impl SelfTest {
                 map.platforms.push(pl);
                 map.roofs.push(map::Roof::new([2.0, 2.0], [12.0, 8.0], map::RoofShape::Gable, crate::library::DEFAULT_ROOF.into()));
                 app.reset_doc(map, None);
+                // Окно с прошлой карты ещё открыто и давно нарисовало кадры: без закрытия шаг 162
+                // проверял бы его, пока новый снимок не готов (на занятой машине — секунды).
+                app.close_view3d();
                 app.start_view3d();
                 self.deadline = now + 30.0;
                 self.resume_at = now + 0.3;
