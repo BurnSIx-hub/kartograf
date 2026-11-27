@@ -1162,10 +1162,11 @@ impl App {
             pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
         }
         let mut scene = crate::scene3d::build(cells, &storeys);
-        // Створки дверей — модели Blender: их картинки (цвет в цвете двери, карты) — по ключу.
+        // Створки дверей и окна — модели Blender: их картинки (цвет в цвете двери или окна, карты,
+        // стекло) — по ключу.
         for pic in &scene.pictures {
-            if let Some(img) = crate::doors3d::picture(&pic.key) {
-                let bytes = if crate::doors3d::is_map(&pic.key) { export::webp_lossless(&img) } else { export::webp_bytes(&img, 90.0) };
+            if let Some(img) = crate::doors3d::picture(&pic.key).or_else(|| crate::windows3d::picture(&pic.key)) {
+                let bytes = if crate::doors3d::is_map(&pic.key) || crate::windows3d::is_map(&pic.key) { export::webp_lossless(&img) } else { export::webp_bytes(&img, 90.0) };
                 pics.insert(pic.key.clone(), (bytes, "image/webp"));
             }
         }
@@ -1220,7 +1221,7 @@ impl App {
                 .iter()
                 .map(|po| {
                     let (a, b) = (at(po.seg.0), at(po.seg.1));
-                    crate::scene3d::Opening { seg: po.seg, kind: po.kind, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]), art: po.leaf.clone() }
+                    crate::scene3d::Opening { seg: po.seg, kind: po.kind, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]), art: po.leaf.clone().or_else(|| po.sill.clone()) }
                 })
                 .collect();
             let gaps = map.portals.iter().filter(|q| q.kind == PortalKind::Opening).map(|q| (q.a, q.b)).collect();

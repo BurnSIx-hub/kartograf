@@ -385,6 +385,8 @@ pub struct PortalOut {
     pub kind: PortalKind,
     /// Картинка створки — у дверей; без своей — встроенная деревянная.
     pub leaf: Option<String>,
+    /// Рисунок окна на карте (подоконник): по нему вид окна в 3D.
+    pub sill: Option<String>,
 }
 
 /// Картинка створки, уже лежащая рядом со сценой: путь для Foundry и ширина в точках.
@@ -458,6 +460,7 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
             seg: (p.a, p.b),
             kind: p.kind,
             leaf: p.kind.is_door().then(|| p.asset.clone().unwrap_or_else(|| crate::library::DEFAULT_DOOR.into())),
+            sill: if p.kind == PortalKind::Window { p.asset.clone() } else { None },
         })
         .collect();
     let lights = prop_lights(map);
@@ -2931,7 +2934,7 @@ mod tests {
 
     #[test]
     fn a_district_layout_keeps_only_what_is_inside() {
-        let door = |a: [f32; 2], b: [f32; 2]| PortalOut { seg: (a, b), kind: PortalKind::Door, leaf: None };
+        let door = |a: [f32; 2], b: [f32; 2]| PortalOut { seg: (a, b), kind: PortalKind::Door, leaf: None, sill: None };
         let mut lay = Layout {
             tents: vec![([-2.0, 3.0], [2.0, 3.0])],
             // Через левый край, вдоль края, вне района и ломаная, дважды выходящая за верх.

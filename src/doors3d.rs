@@ -84,12 +84,50 @@ pub fn look_of(art: Option<&str>) -> DoorLook {
 /// Средний тон тела створки — такая доля цвета двери: цвет из имени — светлый тон рисунка.
 const BODY: f32 = 0.85;
 
-/// Модель створки, её карты и средний цвет тела в картинке цвета.
-struct Door {
-    model: Model3d,
-    normal: image::RgbaImage,
-    orm: image::RgbaImage,
+/// Модель из Blender с картами (створка двери, рама окна): модель, карты нормалей и ORM и средний
+/// цвет того, что красится, в картинке цвета.
+pub(crate) struct Baked {
+    pub model: Model3d,
+    pub normal: image::RgbaImage,
+    pub orm: image::RgbaImage,
     mean: [f32; 3],
+}
+
+impl Baked {
+    /// Прочитать `.glb` с картами; `paint` — красится ли точка картинки цвета (по точке ORM).
+    pub(crate) fn read(bytes: &[u8], paint: impl Fn(&image::Rgba<u8>) -> bool) -> Option<Baked> {
+        let model = model3d::read_gltf(bytes, None, 1.0).ok()?;
+        let (normal, orm) = model3d::material_maps(bytes).ok()?;
+        let base = model.images.first()?;
+        if base.dimensions() != orm.dimensions() {
+            return None;
+        }
+        let (mut sum, mut n) = ([0.0f64; 3], 0usize);
+        for (p, o) in base.pixels().zip(orm.pixels()) {
+            if paint(o) {
+                (0..3).for_each(|k| sum[k] += p[k] as f64);
+                n += 1;
+            }
+        }
+        let mean = sum.map(|v| (v / n.max(1) as f64).max(1.0) as f32);
+        Some(Baked { model, normal, orm, mean })
+    }
+
+    /// Картинка цвета, где крашеное (`paint`) перекрашено в `tint` с сохранением разброса тонов:
+    /// его средний тон — [`BODY`] от `tint`.
+    pub(crate) fn recolour(&self, tint: [u8; 3], paint: impl Fn(&image::Rgba<u8>) -> bool) -> Option<image::RgbaImage> {
+        let k = [0, 1, 2].map(|c| tint[c] as f32 * BODY / self.mean[c]);
+        let mut img = self.model.images.first()?.clone();
+        for (p, o) in img.pixels_mut().zip(self.orm.pixels()) {
+            if paint(o) {
+                for c in 0..3 {
+                    p[c] = (p[c] as f32 * k[c]).round().min(255.0) as u8;
+                }
+            }
+            p[3] = 255;
+        }
+        Some(img)
+    }
 }
 
 /// Красится ли точка картинки цвета (по точке ORM): у дерева и камня — не металл, у металлической
@@ -99,27 +137,9 @@ fn tinted(kind: Kind, orm: &image::Rgba<u8>) -> bool {
 }
 
 /// Модель створки (один раз на вид).
-fn door(kind: Kind) -> Option<&'static Door> {
-    static DOORS: [OnceLock<Option<Door>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    DOORS[kind as usize]
-        .get_or_init(|| {
-            let model = model3d::read_gltf(kind.bytes(), None, 1.0).ok()?;
-            let (normal, orm) = model3d::material_maps(kind.bytes()).ok()?;
-            let base = model.images.first()?;
-            if base.dimensions() != orm.dimensions() {
-                return None;
-            }
-            let (mut sum, mut n) = ([0.0f64; 3], 0usize);
-            for (p, o) in base.pixels().zip(orm.pixels()) {
-                if tinted(kind, o) {
-                    (0..3).for_each(|k| sum[k] += p[k] as f64);
-                    n += 1;
-                }
-            }
-            let mean = sum.map(|v| (v / n.max(1) as f64).max(1.0) as f32);
-            Some(Door { model, normal, orm, mean })
-        })
-        .as_ref()
+fn door(kind: Kind) -> Option<&'static Baked> {
+    static DOORS: [OnceLock<Option<Baked>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    DOORS[kind as usize].get_or_init(|| Baked::read(kind.bytes(), |o| tinted(kind, o))).as_ref()
 }
 
 /// Створка сцены: сетка в осях створки, картинки — цвет, нормали, ORM (ключ для сцены и размер)
@@ -145,18 +165,7 @@ pub fn picture(key: &str) -> Option<image::RgbaImage> {
         "orm" => return Some(d.orm.clone()),
         t => u32::from_str_radix(t, 16).ok()?,
     };
-    let tint = [(tint >> 16) as u8, (tint >> 8) as u8, tint as u8];
-    let k = [0, 1, 2].map(|c| tint[c] as f32 * BODY / d.mean[c]);
-    let mut img = d.model.images.first()?.clone();
-    for (p, o) in img.pixels_mut().zip(d.orm.pixels()) {
-        if tinted(kind, o) {
-            for c in 0..3 {
-                p[c] = (p[c] as f32 * k[c]).round().min(255.0) as u8;
-            }
-        }
-        p[3] = 255;
-    }
-    Some(img)
+    d.recolour([(tint >> 16) as u8, (tint >> 8) as u8, tint as u8], |o| tinted(kind, o))
 }
 
 /// Створка длиной `len` и высотой `tall` (клетки) от петель вдоль x: модель, растянутая по

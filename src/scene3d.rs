@@ -1,7 +1,8 @@
 //! 3D-сцена из 2D-карты. Карта остаётся одна и рисуется сверху; здесь у её частей появляется
 //! высота: пол этажа — плита с картинкой «пол без стен», стены — выдавленные ломаные толщиной
-//! из вида стены, над дверью и окном — перемычка, под окном — подоконник со стеклом, створка
-//! двери — отдельный узел на петле. Эту сцену пишет выгрузка в `.glb` для 3D Canvas (`glb`),
+//! из вида стены, над дверью и окном — перемычка, под окном — стена до подоконника, в проёме окна
+//! — рама из модели Blender ([`crate::windows3d`]) и стекло, створка двери — отдельный узел на
+//! петле. Эту сцену пишет выгрузка в `.glb` для 3D Canvas (`glb`),
 //! её же рисует тестовая зона — окно 3D в Картографе (`render3d`).
 //!
 //! Земля этажа ([`Ground`]) — рельеф и твёрдые тела на полу: помосты, ступени, пандусы, марши
@@ -67,6 +68,7 @@ const GABLE: [u8; 3] = [112, 92, 72];
 pub enum Part {
     Floor,
     Wall,
+    /// Окно — стекло и рама: сквозь видно, не пройти.
     Glass,
     Door,
     Roof,
@@ -621,6 +623,10 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
 
         let wood = s.material(Material { look: Look::Color(WOOD), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None });
         let glass = s.material(Material { look: Look::Color(GLASS_TINT), alpha: Alpha::Blend, two_sided: true, repeat: true, opacity: 0.3, maps: None });
+        // Рамы окон этажа — по материалу (вид и цвет), стёкла — одной сеткой: узлов немного, а у
+        // каждого один кусок (метки 3D Canvas).
+        let mut frames: Vec<(usize, Mesh)> = Vec::new();
+        let mut panes: Option<(usize, Mesh)> = None;
         for (i, o) in st.openings.iter().enumerate() {
             let (a, b) = o.seg;
             // Створка — на земле у петли.
@@ -649,9 +655,38 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
                 PortalKind::Window => {
                     extrude(&mut walls, &[a, b], half, y0, (y0 + SILL).into(), tiling, &base);
                     extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
-                    let mut pane = Shell::default();
-                    extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, (y0 + DOOR).into(), tiling, &base);
-                    s.nodes.push(Node { name: format!("window_{}_{}", k + 1, i + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(glass, pane.into_one())], door: None });
+                    let look = crate::windows3d::look_of(o.art.as_deref());
+                    // Малое окно — посередине проёма, по бокам — стена.
+                    let (a, b) = match dist(a, b) {
+                        l if look.small && l > crate::windows3d::SMALL + 0.1 => {
+                            let t = (1.0 - crate::windows3d::SMALL / l) / 2.0;
+                            let at = |t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                            for side in [[a, at(t)], [at(1.0 - t), b]] {
+                                extrude(&mut walls, &side, half, y0 + SILL, (y0 + DOOR).into(), tiling, &base);
+                            }
+                            (at(t), at(1.0 - t))
+                        }
+                        _ => (a, b),
+                    };
+                    let (len, tall) = (dist(a, b), DOOR - SILL);
+                    match (crate::windows3d::frame(look, len, tall, half), crate::windows3d::glass_part(len, tall)) {
+                        (Some(f), Some(g)) => {
+                            let at = |m: &Mesh| placed((a, b), y0 + SILL, [base(a), base(b)], m);
+                            let mat = baked(&mut s, f.pictures, f.material, false);
+                            match frames.iter_mut().find(|(m, _)| *m == mat) {
+                                Some((_, m)) => append(m, at(&f.mesh)),
+                                None => frames.push((mat, at(&f.mesh))),
+                            }
+                            let mat = baked(&mut s, g.pictures, g.material, true);
+                            append(&mut panes.get_or_insert_with(|| (mat, Mesh::default())).1, at(&g.mesh));
+                        }
+                        // Без моделей — стекло плитой.
+                        _ => {
+                            let mut pane = Shell::default();
+                            extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, (y0 + DOOR).into(), tiling, &base);
+                            s.nodes.push(Node { name: format!("window_{}_{}", k + 1, i + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(glass, pane.into_one())], door: None });
+                        }
+                    }
                 }
                 PortalKind::Opening => {
                     if dist(a, b) <= LINTEL_MAX {
@@ -659,6 +694,12 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
                     }
                 }
             }
+        }
+        for (j, (mat, m)) in frames.into_iter().enumerate() {
+            s.nodes.push(Node { name: format!("window_{}_frame{}", k + 1, j + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(mat, m)], door: None });
+        }
+        if let Some((mat, m)) = panes {
+            s.nodes.push(Node { name: format!("window_{}_glass", k + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(mat, m)], door: None });
         }
         let prims = if side_mat == wall_mat { vec![(wall_mat, walls.into_one())] } else { vec![(wall_mat, walls.top), (side_mat, walls.side)] };
         let prims: Vec<(usize, Mesh)> = prims.into_iter().filter(|(_, m)| !m.idx.is_empty()).collect();
@@ -929,8 +970,7 @@ fn leaf(s: &mut Scene3d, name: String, storey: usize, (hinge, to): Segment, hang
     let (dx, dz) = (to[0] - hinge[0], to[1] - hinge[1]);
     let len = dx.hypot(dz).max(0.01);
     if let Some(p) = look.and_then(|l| crate::doors3d::leaf_part(l, len, tall, hang.free, hang.mirror)) {
-        let [base, normal, orm] = p.pictures.map(|(key, size)| s.picture(&Picture { key, size, alpha: false }));
-        let material = s.material(Material { look: Look::Picture(base), maps: Some(Maps { normal, orm }), ..p.material });
+        let material = baked(s, p.pictures, p.material, false);
         return Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(material, p.mesh)], door: Some(door) };
     }
     let mut m = Shell::default();
@@ -938,6 +978,39 @@ fn leaf(s: &mut Scene3d, name: String, storey: usize, (hinge, to): Segment, hang
     // Чуть короче проёма и ниже притолоки: не трётся о косяк, когда поворачивается.
     extrude(&mut m, &[[0.02, 0.0], [len - hang.free, 0.0]], LEAF / 2.0, 0.0, (tall - 0.02).into(), tiling, &|_| 0.0);
     Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(mat, m.into_one())], door: Some(door) }
+}
+
+/// Материал модели из Blender: картинка цвета и две карты по ключам `pictures` (у первой —
+/// прозрачность `alpha`), остальное — `m`.
+fn baked(s: &mut Scene3d, pictures: [(String, [u32; 2]); 3], m: Material, alpha: bool) -> usize {
+    let [base, normal, orm] = pictures;
+    let base = s.picture(&Picture { key: base.0, size: base.1, alpha });
+    let [normal, orm] = [normal, orm].map(|(key, size)| s.picture(&Picture { key, size, alpha: false }));
+    s.material(Material { look: Look::Picture(base), maps: Some(Maps { normal, orm }), ..m })
+}
+
+/// Сетка в осях проёма `a`–`b` (x — вдоль, y — вверх, z — поперёк, как у узла створки) — на
+/// место: низ на высоте `y`, поднятый землёй у концов проёма `lift` (на рельефе — по склону).
+fn placed((a, b): Segment, y: f32, lift: [f32; 2], m: &Mesh) -> Mesh {
+    let len = dist(a, b).max(1e-6);
+    let d = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+    let z = [-d[1], d[0]];
+    let v = m
+        .v
+        .iter()
+        .map(|v| {
+            let up = y + lift[0] + (lift[1] - lift[0]) * (v.p[0] / len).clamp(0.0, 1.0);
+            let p = [a[0] + d[0] * v.p[0] + z[0] * v.p[2], up + v.p[1], a[1] + d[1] * v.p[0] + z[1] * v.p[2]];
+            Vertex { p, n: [d[0] * v.n[0] + z[0] * v.n[2], v.n[1], d[1] * v.n[0] + z[1] * v.n[2]], uv: v.uv }
+        })
+        .collect();
+    Mesh { v, idx: m.idx.clone() }
+}
+
+fn append(to: &mut Mesh, m: Mesh) {
+    let base = to.v.len() as u32;
+    to.v.extend(m.v);
+    to.idx.extend(m.idx.into_iter().map(|i| i + base));
 }
 
 fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -1191,10 +1264,27 @@ mod tests {
     fn a_window_has_a_sill_a_lintel_and_glass_between() {
         let win = Opening { seg: ([1.0, 1.0], [2.0, 1.0]), kind: PortalKind::Window, id: "w2".into(), art: None };
         let s = build([4.0, 4.0], &[storey(Vec::new(), vec![win])]);
-        let glass = s.nodes.iter().find(|n| n.part == Part::Glass).unwrap();
-        let ys: Vec<f32> = glass.prims[0].1.v.iter().map(|v| v.p[1]).collect();
-        assert!(ys.iter().all(|&y| (SILL - 1e-5..=DOOR + 1e-5).contains(&y)));
-        assert_eq!(s.materials[glass.prims[0].0].alpha, Alpha::Blend);
+        let glass = s.nodes.iter().find(|n| n.part == Part::Glass && s.materials[n.prims[0].0].alpha == Alpha::Blend).unwrap();
+        assert!(glass.prims[0].1.v.iter().all(|v| (SILL - 1e-5..=DOOR + 1e-5).contains(&v.p[1]) && (v.p[2] - 1.0).abs() < 1e-5 && (1.0 - 1e-5..=2.0 + 1e-5).contains(&v.p[0])), "стекло во весь проём посередине стены");
+        assert!(s.materials[glass.prims[0].0].maps.is_some(), "у стекла рябь и пятна");
+        // Рама (модель окна) — в проёме: от подоконника до верха, откосы до лица стены (толщина
+        // 0,25), подоконник чуть выступает.
+        let frame = s.nodes.iter().find(|n| n.part == Part::Glass && s.materials[n.prims[0].0].alpha == Alpha::Opaque).unwrap();
+        let m = &frame.prims[0].1;
+        assert!(m.v.iter().all(|v| (SILL - 1e-4..=DOOR + 1e-4).contains(&v.p[1]) && (1.0 - 1e-4..=2.0 + 1e-4).contains(&v.p[0])));
+        let (z0, z1) = m.v.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v.p[2]), h.max(v.p[2])));
+        assert!(z0 < 1.0 - 0.125 && z0 > 1.0 - 0.2 && z1 > 1.0 + 0.125 && z1 < 1.2, "{z0} {z1}");
+        assert!(faces_follow_normals(m), "на место — без отражения");
+
+        // Малое окно FA — посередине проёма, по бокам до верха проёма — стена.
+        let art = "pack:FA|textures/portals/Windows/Window_Sills/Window_Sill_Small_Stone_Slate_A1_1x1.webp";
+        let small = Opening { seg: ([1.0, 1.0], [2.0, 1.0]), kind: PortalKind::Window, id: "w3".into(), art: Some(art.into()) };
+        let s = build([4.0, 4.0], &[storey(Vec::new(), vec![small])]);
+        let frame = s.nodes.iter().find(|n| n.part == Part::Glass && s.materials[n.prims[0].0].alpha == Alpha::Opaque).unwrap();
+        let (x0, x1) = frame.prims[0].1.v.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v.p[0]), h.max(v.p[0])));
+        assert!((x0 - 1.25).abs() < 1e-3 && (x1 - 1.75).abs() < 1e-3, "{x0} {x1}");
+        let walls = &s.nodes.iter().find(|n| n.part == Part::Wall).unwrap().prims[0].1;
+        assert!(walls.v.iter().any(|v| (v.p[0] - 1.25).abs() < 1e-4 && (v.p[1] - DOOR).abs() < 1e-4), "стена сбоку до верха проёма");
         let walls = &s.nodes.iter().find(|n| n.part == Part::Wall).unwrap().prims[0].1;
         assert!(walls.v.iter().any(|v| (v.p[1] - SILL).abs() < 1e-6));
         assert!(walls.v.iter().any(|v| (v.p[1] - DOOR).abs() < 1e-6));

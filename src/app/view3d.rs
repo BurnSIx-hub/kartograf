@@ -863,7 +863,7 @@ impl View3d {
                 continue;
             }
             let yaw = n.yaw + n.door.as_ref().map_or(0.0, |(id, swing)| swing * self.doors.get(id).map_or(0.0, |d| d.t));
-            let cut = if self.cut && matches!(n.part, Part::Wall | Part::Door) { Self::floor_y(n.storey) + CUT } else { f32::MAX };
+            let cut = if self.cut && matches!(n.part, Part::Wall | Part::Door | Part::Glass) { Self::floor_y(n.storey) + CUT } else { f32::MAX };
             items.push(Item { node: i, model: render3d::placed(n.at, yaw), storey: n.storey, cut, caps: self.cut && n.part == Part::Wall, bias: 0.0 });
         }
         for p in self.props.iter().filter(|p| self.shown(p)) {
@@ -1548,9 +1548,9 @@ impl App {
         // вверх по слоям.
         let plans = self.plans_3d(&flights);
         let mut scene = scene3d::build(size, &storeys);
-        // Створки дверей — модели Blender: картинки их тел — по ключу.
+        // Створки дверей и окна — модели Blender: их картинки — по ключу.
         for p in &scene.pictures {
-            if let Some(img) = crate::doors3d::picture(&p.key) {
+            if let Some(img) = crate::doors3d::picture(&p.key).or_else(|| crate::windows3d::picture(&p.key)) {
                 pics.insert(p.key.clone(), img);
             }
         }
@@ -1759,7 +1759,7 @@ mod tests {
             walls: vec![vec![[5.5, 6.0], [8.0, 6.0], [8.0, 2.0], [2.0, 2.0], [2.0, 6.0], [4.5, 6.0]]],
             low: Vec::new(),
             cliffs: Vec::new(),
-            portals: vec![PortalOut { seg: ([4.5, 6.0], [5.5, 6.0]), kind: PortalKind::Door, leaf: None }],
+            portals: vec![PortalOut { seg: ([4.5, 6.0], [5.5, 6.0]), kind: PortalKind::Door, leaf: None, sill: None }],
             lights: vec![Light { at: [5.0, 4.0], bright: 2.0, dim: 4.0, color: "#ffffff".into(), animation: String::new(), look: (0.5, 1, 0.0, 0.0), tempo: (5, 5) }],
             zones: Vec::new(),
             passages: Vec::new(),

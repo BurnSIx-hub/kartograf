@@ -337,7 +337,7 @@ mod tests {
         let mut walls = vec![vec![[2.0, 2.0], [6.0, 2.0], [6.0, 3.5]], vec![[6.0, 4.5], [6.0, 6.0], [2.0, 6.0], [2.0, 2.0]]];
         let mut portals = Vec::new();
         if window {
-            portals.push(PortalOut { seg: ([6.0, 3.5], [6.0, 4.5]), kind: PortalKind::Window, leaf: None });
+            portals.push(PortalOut { seg: ([6.0, 3.5], [6.0, 4.5]), kind: PortalKind::Window, leaf: None, sill: None });
         } else {
             walls.push(vec![[6.0, 3.5], [6.0, 4.5]]);
         }
