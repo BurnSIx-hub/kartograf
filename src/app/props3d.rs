@@ -436,7 +436,7 @@ impl App {
                 });
             }
             ui.separator();
-            ui.checkbox(&mut matched, format!("Подбирать модели к рисункам FA по имени (из «CC0/{}»)", crate::fa3d::PACK)).on_hover_text("Бочкам, бочонкам, ящикам, столам, стульям, табуретам, книжным шкафам, вёдрам и фонарям без своей модели — модель с полки по имени рисунка, в размер нарисованного; у полных бочек и ящиков с товаром сверху — сам рисунок. В окне 3D и в выгрузке с 3D-моделью; на карте и в 2D — прежние рисунки");
+            ui.checkbox(&mut matched, format!("Подбирать модели к рисункам FA по имени (из «CC0/{}» и свои кровати)", crate::fa3d::PACK)).on_hover_text("Бочкам, бочонкам, ящикам, столам, стульям, табуретам, книжным шкафам, вёдрам и фонарям без своей модели — модель с полки по имени рисунка, в размер нарисованного; у полных бочек и ящиков с товаром сверху — сам рисунок. Кроватям, гамакам, скаткам, спальникам, матрасам, сену, детским кроваткам и носилкам — свои модели Картографа на месте нарисованного, ткань — цветом самого рисунка, вещи вокруг кровати — рисунком на полу. В окне 3D и в выгрузке с 3D-моделью; на карте и в 2D — прежние рисунки");
             ui.separator();
             ui.heading("Скачать");
             ui.weak("Наборы CC0 с зеркала в выпусках Картографа на GitHub: модели, вид сверху и масштаб уже готовы.");
@@ -564,6 +564,9 @@ impl App {
 
     fn match_model(&mut self, key: &str) -> Option<(PathBuf, PathBuf)> {
         use crate::fa3d;
+        if crate::beds3d::kind_for(key).is_some() {
+            return self.match_bed(key);
+        }
         let rule = fa3d::rule_for(key)?;
         let pack = self.cc0_dir().join(fa3d::PACK);
         let img = self.textures.rgba(key).ok()?;
@@ -597,6 +600,22 @@ impl App {
             std::fs::write(&out, glb).ok()?;
         }
         Some((out, src))
+    }
+
+    /// Своя кровать Картографа к рисунку кровати ([`crate::beds3d`]): записанная `.glb` — и она же
+    /// вместо модели с полки (авторов у неё, кроме рисунка FA, нет).
+    fn match_bed(&mut self, key: &str) -> Option<(PathBuf, PathBuf)> {
+        let img = self.textures.rgba(key).ok()?;
+        let frame = library::picture_size(key, [img.width(), img.height()]);
+        let tag = sha256_hex(format!("{key}|bed|{}x{}|{}", img.width(), img.height(), crate::beds3d::VERSION).as_bytes());
+        let dir = self.data_dir.join("cache").join("fa3d");
+        let out = dir.join(format!("{}_{}.glb", crate::export::asset_stem(key), &tag[..10]));
+        if !out.is_file() {
+            let glb = crate::beds3d::build(key, &img, frame)?;
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::write(&out, glb).ok()?;
+        }
+        Some((out.clone(), out))
     }
 
     /// Ключи картинок `used` и модели с полки, подобранные к ним: авторы моделей — тоже в

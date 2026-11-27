@@ -1,5 +1,5 @@
-"""Общее для моделей Blender Картографа (`doors.py`, `windows.py`): детали, процедурные материалы,
-развёртка, запекание карт PBR и выгрузка в `.glb`.
+"""Общее для моделей Blender Картографа (`doors.py`, `windows.py`, `beds.py`): детали, процедурные
+материалы, развёртка, запекание карт PBR и выгрузка в `.glb`.
 
 Единицы — клетки (1 = 5 футов), z — вверх. Модель — один кусок с одним материалом и тремя картами в
 одной развёртке: цвет, нормали и ORM (затенение, шероховатость, металл в R, G, B, как в glTF). Их
@@ -262,9 +262,12 @@ class Graph:
         return n.outputs["Vector"]
 
     def rotate_y(self, v, angle):
+        return self.rotate(v, (0.0, angle, 0.0))
+
+    def rotate(self, v, euler):
         n = self.node("ShaderNodeMapping", vector_type="POINT")
         self.put(n.inputs["Vector"], v)
-        n.inputs["Rotation"].default_value = (0.0, angle, 0.0)
+        n.inputs["Rotation"].default_value = euler
         return n.outputs["Vector"]
 
     def noise(self, v, scale, detail=4.0, rough=0.5, distortion=0.0, color=False):
@@ -328,14 +331,14 @@ class Graph:
         return self
 
 
-def wood(name, angle=math.pi / 2, rings=False):
+def wood(name, angle=math.pi / 2, rings=False, along_y=False):
     """Дерево: волокна вдоль детали (`angle` — направление детали в плоскости xz от оси x; доски
-    стоят — π/2). Годичные слои — полосами поперёк x (видны на гранях xz: створки дверей) или
-    `rings` — кольцами вокруг оси волокон, как в бревне (видны на всех гранях вдоль волокон:
-    откосы и рама окна)."""
+    стоят — π/2; `along_y` — деталь вдоль y: боковины кровати). Годичные слои — полосами поперёк x
+    (видны на гранях xz: створки дверей) или `rings` — кольцами вокруг оси волокон, как в бревне
+    (видны на всех гранях вдоль волокон: откосы и рама окна)."""
     g = Graph(name)
     isl = g.island
-    p = g.rotate_y(g.pos, angle - math.pi / 2)
+    p = g.rotate(g.pos, (math.pi / 2, 0.0, 0.0)) if along_y else g.rotate_y(g.pos, angle - math.pi / 2)
     p = g.vec(p, add=g.combine(g.mul(isl, 17.3), g.mul(isl, 5.1), g.mul(isl, 11.7)))
     warp = g.vec(g.noise(g.vec(p, (3, 3, 0.5)), 1.0, 3.0, color=True), add=(-0.5, -0.5, -0.5))
     q = g.vec(warp, (0.035, 0.035, 0.0), add=p)
@@ -513,19 +516,21 @@ def gltf_output(nt):
     return n
 
 
-def bake_maps(kind, obj, graphs, prefix):
-    """Развернуть `obj`, запечь каналы материалов `graphs` в цвет, нормали и ORM и поставить ему
-    готовый материал из трёх карт. С папкой снимков — карты в `<prefix>_<вид>_*.png`."""
+def bake_maps(kind, obj, graphs, prefix, size=None):
+    """Развернуть `obj`, запечь каналы материалов `graphs` в цвет, нормали и ORM (по `size` точек,
+    без него — `--tex`) и поставить ему готовый материал из трёх карт. С папкой снимков — карты в
+    `<prefix>_<вид>_*.png`."""
+    size = size or TEX
     unwrap(obj)
-    imgs = {"base": image(f"{kind}_base", True), "normal": image(f"{kind}_normal", False)}
+    imgs = {"base": image(f"{kind}_base", True, size), "normal": image(f"{kind}_normal", False, size)}
     for ch in ("rough", "metal", "ao"):
-        imgs[ch] = image(f"{kind}_{ch}", False)
+        imgs[ch] = image(f"{kind}_{ch}", False, size)
     for ch in ("base", "normal", "rough", "metal", "ao"):
         bake(graphs, ch, imgs[ch])
         print(f"{prefix.upper()} {kind}: baked {ch}", flush=True)
     # ORM: затенение, шероховатость, металл — в одну картинку, как в glTF.
-    orm = image(f"{kind}_orm", False)
-    o = np.stack([pixels(imgs["ao"])[..., 0], pixels(imgs["rough"])[..., 0], pixels(imgs["metal"])[..., 0], np.ones((TEX, TEX), np.float32)], -1)
+    orm = image(f"{kind}_orm", False, size)
+    o = np.stack([pixels(imgs["ao"])[..., 0], pixels(imgs["rough"])[..., 0], pixels(imgs["metal"])[..., 0], np.ones((size, size), np.float32)], -1)
     orm.pixels.foreach_set(o.ravel())
     orm.update()
     if SHOTS:

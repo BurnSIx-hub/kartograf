@@ -469,8 +469,9 @@ pub fn wrap_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32, shift: [f32; 3]) 
 
 /// Модель с полки (`.glb` целиком) — под узел с матрицей `matrix` (glTF, по столбцам) и с рамкой
 /// `frame`: по её углам — точки без площади, чтобы рамка модели была рамкой рисунка (3D Canvas
-/// растягивает модель тайла по тайлу). `lid` — рисунок (PNG) на высоте `y` во всю рамку: у полной
-/// бочки сверху видно, что в ней. Так встаёт модель, подобранная к рисунку ([`crate::fa3d`]).
+/// растягивает модель тайла по тайлу). `lid` — рисунок (PNG или WebP) на высоте `y` во всю рамку:
+/// у полной бочки сверху видно, что в ней, вокруг кровати — вещи на полу. Так встаёт модель,
+/// подобранная к рисунку ([`crate::fa3d`], [`crate::beds3d`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn place_gltf(bytes: &[u8], matrix: [f32; 16], frame: [[f32; 3]; 2], lid: Option<(&[u8], f32)>) -> Result<Vec<u8>, String> {
     wrap(bytes, None, matrix, Some((frame, lid)))
@@ -523,8 +524,18 @@ fn frame_mesh(j: &mut Value, data: &mut Vec<u8>, [lo, hi]: [[f32; 3]; 2], lid: O
         let ta = push_to(j, "accessors", serde_json::json!({"bufferView": t, "componentType": 5126, "count": 4, "type": "VEC2"}));
         let ia = push_to(j, "accessors", serde_json::json!({"bufferView": i, "componentType": 5123, "count": 6, "type": "SCALAR"}));
         let view = push_view(j, data, png);
-        let image = push_to(j, "images", serde_json::json!({"bufferView": view, "mimeType": "image/png"}));
-        let texture = push_to(j, "textures", serde_json::json!({"source": image}));
+        let webp = png.len() > 12 && &png[8..12] == b"WEBP";
+        let image = push_to(j, "images", serde_json::json!({"bufferView": view, "mimeType": if webp { "image/webp" } else { "image/png" }}));
+        let texture = if webp {
+            for key in ["extensionsUsed", "extensionsRequired"] {
+                if !j[key].as_array().is_some_and(|a| a.iter().any(|e| e == "EXT_texture_webp")) {
+                    push_to(j, key, "EXT_texture_webp".into());
+                }
+            }
+            push_to(j, "textures", serde_json::json!({"extensions": {"EXT_texture_webp": {"source": image}}}))
+        } else {
+            push_to(j, "textures", serde_json::json!({"source": image}))
+        };
         let material = push_to(j, "materials", serde_json::json!({"name": "top", "pbrMetallicRoughness": {"baseColorTexture": {"index": texture}, "metallicFactor": 0.0, "roughnessFactor": 1.0}, "alphaMode": "MASK", "alphaCutoff": 0.5}));
         prims.push(serde_json::json!({"attributes": {"POSITION": pa, "NORMAL": na, "TEXCOORD_0": ta}, "indices": ia, "material": material, "mode": 4}));
     }
@@ -629,7 +640,7 @@ fn wrap(bytes: &[u8], dir: Option<&Path>, matrix: [f32; 16], frame: Option<Frame
 }
 
 /// Куски `.glb`: JSON и двоичный; текст `.gltf` — весь JSON.
-fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
+pub(crate) fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
     if bytes.len() < 12 || &bytes[0..4] != b"glTF" {
         return Ok((bytes, None));
     }

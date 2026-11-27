@@ -4,6 +4,8 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports, unused_variables, unused_mut))]
 
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
+mod beds3d;
 mod blend;
 mod boundless;
 mod check;
