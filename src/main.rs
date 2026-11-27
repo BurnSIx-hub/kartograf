@@ -10,6 +10,8 @@ mod check;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
 mod export;
+#[cfg(not(target_arch = "wasm32"))]
+mod fa3d;
 mod generate;
 mod glb;
 mod grid;

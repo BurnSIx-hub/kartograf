@@ -799,6 +799,18 @@ fn is_variant_word(w: &str) -> bool {
     size || (letters <= 1 && (number || digits.is_empty()))
 }
 
+/// Размер картинки ассета `key` в клетках по её точкам `px`. Картинка вдвое крупнее обычной
+/// (512 точек на клетку, как объединённые) узнаётся по размеру в имени: `…_2.5x1.25`.
+pub fn picture_size(key: &str, px: [u32; 2]) -> [f32; 2] {
+    if let Some(s) = size_from_name(&label(key))
+        && s[0] > 0.0
+        && (px[0] as f32 / s[0] - 2.0 * PX_PER_CELL).abs() < 3.0
+    {
+        return s;
+    }
+    [px[0] as f32 / PX_PER_CELL, px[1] as f32 / PX_PER_CELL]
+}
+
 /// Размер в клетках по имени ассета FA: `Oak_Tree_A_3x3.webp` → 3×3.
 pub fn size_from_name(name: &str) -> Option<[f32; 2]> {
     let tail = name.rsplit('_').next()?;

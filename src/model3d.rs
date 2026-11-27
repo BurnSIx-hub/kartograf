@@ -434,6 +434,77 @@ pub fn read_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model3d
 /// в клетки (`scale`) и сдвигает (`shift`, после растяжения) — как [`read_gltf`] и
 /// [`Model3d::normalize`]. Наше окно 3D рисует модель проще, 3D Canvas — как в оригинале.
 pub fn wrap_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32, shift: [f32; 3]) -> Result<Vec<u8>, String> {
+    let s = scale;
+    wrap(bytes, dir, [s, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, s, 0.0, shift[0], shift[1], shift[2], 1.0], None)
+}
+
+/// Модель с полки (`.glb` целиком) — под узел с матрицей `matrix` (glTF, по столбцам) и с рамкой
+/// `frame`: по её углам — точки без площади, чтобы рамка модели была рамкой рисунка (3D Canvas
+/// растягивает модель тайла по тайлу). `lid` — рисунок (PNG) на высоте `y` во всю рамку: у полной
+/// бочки сверху видно, что в ней. Так встаёт модель, подобранная к рисунку ([`crate::fa3d`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn place_gltf(bytes: &[u8], matrix: [f32; 16], frame: [[f32; 3]; 2], lid: Option<(&[u8], f32)>) -> Result<Vec<u8>, String> {
+    wrap(bytes, None, matrix, Some((frame, lid)))
+}
+
+/// Ещё кусок в общий буфер — новым видом буфера; номер вида.
+fn push_view(j: &mut Value, data: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    while !data.len().is_multiple_of(4) {
+        data.push(0);
+    }
+    if j["bufferViews"].is_null() {
+        j["bufferViews"] = serde_json::json!([]);
+    }
+    let views = j["bufferViews"].as_array_mut().unwrap();
+    views.push(serde_json::json!({"buffer": 0, "byteOffset": data.len(), "byteLength": bytes.len()}));
+    data.extend_from_slice(bytes);
+    views.len() - 1
+}
+
+/// Ещё запись в массив `key` верхнего уровня glTF; её номер.
+fn push_to(j: &mut Value, key: &str, item: Value) -> usize {
+    if j[key].is_null() {
+        j[key] = serde_json::json!([]);
+    }
+    let list = j[key].as_array_mut().unwrap();
+    list.push(item);
+    list.len() - 1
+}
+
+fn floats(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+/// Сетка рамки (вне узла с матрицей): два угла — треугольник без площади; с крышкой — ещё
+/// квадрат с рисунком на её высоте, лицом вверх. Номер сетки.
+fn frame_mesh(j: &mut Value, data: &mut Vec<u8>, [lo, hi]: [[f32; 3]; 2], lid: Option<(&[u8], f32)>) -> usize {
+    let at = push_view(j, data, &floats(&[lo, hi].concat()));
+    let idx = push_view(j, data, &[0u16, 0, 1].iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>());
+    let pos = push_to(j, "accessors", serde_json::json!({"bufferView": at, "componentType": 5126, "count": 2, "type": "VEC3", "min": lo, "max": hi}));
+    let ind = push_to(j, "accessors", serde_json::json!({"bufferView": idx, "componentType": 5123, "count": 3, "type": "SCALAR"}));
+    let mut prims = vec![serde_json::json!({"attributes": {"POSITION": pos}, "indices": ind, "mode": 4})];
+    if let Some((png, y)) = lid {
+        let (x0, z0, x1, z1) = (lo[0], lo[2], hi[0], hi[2]);
+        let p = push_view(j, data, &floats(&[x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1]));
+        let n = push_view(j, data, &floats(&[0.0, 1.0, 0.0].repeat(4)));
+        let t = push_view(j, data, &floats(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
+        let i = push_view(j, data, &[0u16, 2, 1, 0, 3, 2].iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>());
+        let pa = push_to(j, "accessors", serde_json::json!({"bufferView": p, "componentType": 5126, "count": 4, "type": "VEC3", "min": [x0, y, z0], "max": [x1, y, z1]}));
+        let na = push_to(j, "accessors", serde_json::json!({"bufferView": n, "componentType": 5126, "count": 4, "type": "VEC3"}));
+        let ta = push_to(j, "accessors", serde_json::json!({"bufferView": t, "componentType": 5126, "count": 4, "type": "VEC2"}));
+        let ia = push_to(j, "accessors", serde_json::json!({"bufferView": i, "componentType": 5123, "count": 6, "type": "SCALAR"}));
+        let view = push_view(j, data, png);
+        let image = push_to(j, "images", serde_json::json!({"bufferView": view, "mimeType": "image/png"}));
+        let texture = push_to(j, "textures", serde_json::json!({"source": image}));
+        let material = push_to(j, "materials", serde_json::json!({"name": "top", "pbrMetallicRoughness": {"baseColorTexture": {"index": texture}, "metallicFactor": 0.0, "roughnessFactor": 1.0}, "alphaMode": "MASK", "alphaCutoff": 0.5}));
+        prims.push(serde_json::json!({"attributes": {"POSITION": pa, "NORMAL": na, "TEXCOORD_0": ta}, "indices": ia, "material": material, "mode": 4}));
+    }
+    push_to(j, "meshes", serde_json::json!({"name": "frame", "primitives": prims}))
+}
+
+type Frame<'a> = ([[f32; 3]; 2], Option<(&'a [u8], f32)>);
+
+fn wrap(bytes: &[u8], dir: Option<&Path>, matrix: [f32; 16], frame: Option<Frame>) -> Result<Vec<u8>, String> {
     let (json, bin) = split_glb(bytes)?;
     let mut j: Value = serde_json::from_slice(json).map_err(|e| format!("glTF: {e}"))?;
     let mut data: Vec<u8> = Vec::new();
@@ -485,6 +556,8 @@ pub fn wrap_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32, shift: [f32; 3]) 
         im.insert("bufferView".into(), view.into());
         im.insert("mimeType".into(), mime.into());
     }
+    // Рамка (и крышка) — отдельной сеткой вне узла с матрицей.
+    let framed = frame.map(|(f, lid)| frame_mesh(&mut j, &mut data, f, lid));
     pad(&mut data);
     j["buffers"] = serde_json::json!([{"byteLength": data.len()}]);
     // Узел сверху: растянуть в клетки и сдвинуть в пространство предмета.
@@ -493,18 +566,22 @@ pub fn wrap_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32, shift: [f32; 3]) 
         Some(r) => r.clone(),
         None => (0..j["nodes"].as_array().map_or(0, |n| n.len())).map(Value::from).collect(),
     };
-    let s = scale;
-    let root = serde_json::json!({"name": "kartograf", "matrix": [s, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, s, 0.0, shift[0], shift[1], shift[2], 1.0], "children": roots});
+    let root = serde_json::json!({"name": "kartograf", "matrix": matrix, "children": roots});
     if j["nodes"].is_null() {
         j["nodes"] = serde_json::json!([]);
     }
     let n = j["nodes"].as_array().map_or(0, |a| a.len());
     j["nodes"].as_array_mut().unwrap().push(root);
+    let mut top = vec![n];
+    if let Some(mesh) = framed {
+        j["nodes"].as_array_mut().unwrap().push(serde_json::json!({"name": "frame", "mesh": mesh}));
+        top.push(n + 1);
+    }
     if j["scenes"].is_null() {
         j["scenes"] = serde_json::json!([{}]);
         j["scene"] = 0.into();
     }
-    j["scenes"][scene]["nodes"] = serde_json::json!([n]);
+    j["scenes"][scene]["nodes"] = serde_json::json!(top);
     let mut text = serde_json::to_vec(&j).map_err(|e| e.to_string())?;
     while !text.len().is_multiple_of(4) {
         text.push(b' ');
@@ -702,6 +779,43 @@ mod tests {
         assert_eq!(back.images[0].get_pixel(1, 1), m.images[0].get_pixel(1, 1));
         assert_eq!(back.parts[1].material.look, Look::Color([200, 40, 40]), "цвет — через линейный и обратно");
         assert!(back.parts[1].material.two_sided);
+    }
+
+    #[test]
+    fn a_placed_model_keeps_its_parts_under_the_matrix_and_spans_the_frame() {
+        let m = crate_box();
+        let bytes = m.write_glb("ящик").unwrap();
+        // Вдвое и на (0,5; 0; −0,25) клетки; рамка рисунка 6 × 3.
+        let matrix = [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.5, 0.0, -0.25, 1.0];
+        let placed = place_gltf(&bytes, matrix, [[-3.0, 0.0, -1.5], [3.0, 0.0, 1.5]], None).unwrap();
+        let back = read_gltf(&placed, None, 1.0).unwrap();
+        assert_eq!(back.triangles(), 4 + 1, "ящик и треугольник рамки без площади");
+        assert_eq!(back.images.len(), 1);
+        let [lo, hi] = back.bounds().unwrap();
+        assert_eq!((lo, hi), ([-3.0, 0.0, -1.5], [3.0, 1.0, 1.5]), "рамка — рисунка, высота — ящика");
+        let body = back.parts.iter().find(|p| p.material.look == Look::Picture(0)).unwrap();
+        let xs: Vec<f32> = body.mesh.v.iter().map(|v| v.p[0]).collect();
+        assert_eq!(xs.iter().copied().fold(f32::MAX, f32::min), -1.5);
+        assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 2.5);
+        assert!(body.mesh.v.iter().all(|v| (v.p[2] + 0.25).abs() <= 1.0 + 1e-5));
+
+        // С крышкой: рисунок во всю рамку на высоте 1,01, лицом вверх, с вырезом по прозрачному.
+        let pic = image::RgbaImage::from_fn(4, 2, |x, _| image::Rgba([200, 30, 30, if x == 0 { 0 } else { 255 }]));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(pic.as_raw(), 4, 2, image::ExtendedColorType::Rgba8).unwrap();
+        let lidded = place_gltf(&bytes, matrix, [[-3.0, 0.0, -1.5], [3.0, 0.0, 1.5]], Some((&png, 1.01))).unwrap();
+        let back = read_gltf(&lidded, None, 1.0).unwrap();
+        assert_eq!(back.triangles(), 4 + 1 + 2);
+        assert_eq!(back.images.len(), 2);
+        let lid = back.parts.iter().find(|p| p.material.alpha == Alpha::Mask).expect("крышка с вырезом");
+        assert!(lid.mesh.v.iter().all(|v| (v.p[1] - 1.01).abs() < 1e-6 && v.n == [0.0, 1.0, 0.0]));
+        let t = &lid.mesh.idx[0..3];
+        let (a, b, c) = (lid.mesh.v[t[0] as usize].p, lid.mesh.v[t[1] as usize].p, lid.mesh.v[t[2] as usize].p);
+        let up = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]);
+        assert!(up > 0.0, "лицом вверх");
+        let corner = lid.mesh.v.iter().find(|v| v.p[0] == -3.0 && v.p[2] == -1.5).unwrap();
+        assert_eq!(corner.uv, [0.0, 0.0], "левый верхний угол рисунка — в левом верхнем углу рамки");
+        assert_eq!(back.bounds().unwrap()[1][1], 1.01);
     }
 
     #[test]

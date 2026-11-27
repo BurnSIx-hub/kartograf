@@ -972,7 +972,10 @@ impl App {
         let mut credited = String::new();
         #[cfg(not(target_arch = "wasm32"))]
         if !chunk {
-            let used: std::collections::BTreeSet<String> = (0..n).flat_map(|k| self.export_level(e, k).used_assets()).collect();
+            let mut used: std::collections::BTreeSet<String> = (0..n).flat_map(|k| self.export_level(e, k).used_assets()).collect();
+            if !models3d.is_empty() {
+                self.with_matched(&mut used);
+            }
             let credits = self.credits_for(&used);
             if !credits.is_empty() {
                 scene["flags"][export::OWN_MODULE]["credits"] = serde_json::to_value(&credits).unwrap_or_default();

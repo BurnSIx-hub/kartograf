@@ -191,15 +191,7 @@ impl App {
             return size;
         }
         if let Some((_, px)) = self.textures.get(key, false) {
-            // Картинка вдвое крупнее обычной (512 точек на клетку, как объединённые)
-            // узнаётся по размеру в имени: `…_2.5x1.25`.
-            if let Some(s) = library::size_from_name(&library::label(key))
-                && s[0] > 0.0
-                && (px[0] as f32 / s[0] - 2.0 * PX_PER_CELL).abs() < 3.0
-            {
-                return s;
-            }
-            return [px[0] as f32 / PX_PER_CELL, px[1] as f32 / PX_PER_CELL];
+            return library::picture_size(key, px);
         }
         library::size_from_name(&library::label(key)).unwrap_or([1.0, 1.0])
     }

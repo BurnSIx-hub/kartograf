@@ -7,6 +7,9 @@
 //!   клиенте по папке и имени картинки;
 //! - **CC0** (`данные/cc0`, на полке «CC0/…»): свободные наборы (`.glb`, `.gltf`) — можно делиться.
 //!   Набор переносится целиком: вид сверху для полки и модель в пространстве предмета.
+//!
+//! Рисункам без своей модели (ассеты FA, свои папки) модель подбирается по имени с полки
+//! «CC0/Poly Haven» ([`crate::fa3d`]) и пишется в `данные/cache/fa3d`.
 
 use super::*;
 use crate::model3d::{self, Model3d};
@@ -402,6 +405,7 @@ impl App {
         let mut packs: Vec<String> = std::fs::read_dir(&cc0).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         packs.sort();
         let wow = library::scan(&self.wow_dir()).len();
+        let mut matched = self.settings.fa_models;
         egui::Window::new("3D-модели: наборы и авторы").open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.heading("На полке");
             if packs.is_empty() && wow == 0 {
@@ -432,6 +436,8 @@ impl App {
                 });
             }
             ui.separator();
+            ui.checkbox(&mut matched, format!("Подбирать модели к рисункам FA по имени (из «CC0/{}»)", crate::fa3d::PACK)).on_hover_text("Бочкам, бочонкам, ящикам, столам, стульям, табуретам, книжным шкафам, вёдрам и фонарям без своей модели — модель с полки по имени рисунка, в размер нарисованного; у полных бочек и ящиков с товаром сверху — сам рисунок. В окне 3D и в выгрузке с 3D-моделью; на карте и в 2D — прежние рисунки");
+            ui.separator();
             ui.heading("Скачать");
             ui.weak("Наборы CC0 с зеркала в выпусках Картографа на GitHub: модели, вид сверху и масштаб уже готовы.");
             for (title, tag) in MIRRORS {
@@ -453,6 +459,12 @@ impl App {
             ui.weak("Авторы того, что стоит на карте, уходят и в выгрузку: в сцену и файлом «…_credits.txt» рядом с ней.");
         });
         self.models_open = open;
+        if matched != self.settings.fa_models {
+            self.settings.fa_models = matched;
+            self.models3d.clear();
+            self.fa3d.clear();
+            self.save_settings();
+        }
         if let Some(tag) = get {
             self.start_mirror(tag);
         }
@@ -502,6 +514,7 @@ impl App {
         let Some(job) = self.cc0.take() else { return };
         self.library.set_cc0(&self.cc0_dir());
         self.models3d.clear();
+        self.fa3d.clear();
         let ok = job.done - job.errors.len();
         self.notice = Some(if job.total == 0 { "CC0: в папке нет моделей .glb и .gltf".into() } else { format!("CC0: на полке {ok} моделей из {} (папка «CC0/…»)", job.total) });
         if !job.errors.is_empty() {
@@ -510,7 +523,8 @@ impl App {
     }
 
     /// Файл модели предмета: `.glb` рядом с картинкой. У картинки полки WoW без него — найти
-    /// модель в клиенте (если он задан) и записать.
+    /// модель в клиенте (если он задан) и записать. У прочих — подобрать по имени рисунка
+    /// ([`crate::fa3d`]).
     fn model_file(&mut self, key: &str) -> Option<PathBuf> {
         let png = Path::new(key);
         let glb = png.with_extension("glb");
@@ -519,15 +533,77 @@ impl App {
         }
         let low = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
         let wow = self.wow_dir();
-        if !low(png).starts_with(&(low(&wow) + "/")) || self.settings.wow_client.is_none() {
-            return None;
+        if !low(png).starts_with(&(low(&wow) + "/")) {
+            let cc0 = low(&self.cc0_dir()) + "/";
+            return if low(png).contains(&cc0) { None } else { self.matched_model(key).map(|(glb, _)| glb) };
         }
+        // Картинка полки WoW: модель — из клиента, если он задан.
+        self.settings.wow_client.as_ref()?;
         let client = self.wow_client_now(None).ok()?;
         let model = crate::wow::model_for(&wow, png, &self.wow.models)?;
         let (m, textures, _) = crate::wow::load(&client, &model).ok()?;
         let stem = png.file_stem()?.to_string_lossy().into_owned();
         crate::wow::write_model(&m, &textures, &glb, &stem).ok()?;
         Some(glb)
+    }
+
+    /// Модель, подобранная к рисунку по имени (с запоминанием): записанная `.glb` и модель с полки,
+    /// из которой она. Подбор выключен, правила нет, набора на полке нет, ни одна модель не
+    /// подходит по сторонам — `None`.
+    pub(super) fn matched_model(&mut self, key: &str) -> Option<(PathBuf, PathBuf)> {
+        if !self.settings.fa_models {
+            return None;
+        }
+        if let Some(hit) = self.fa3d.get(key) {
+            return hit.clone();
+        }
+        let hit = self.match_model(key);
+        self.fa3d.insert(key.to_owned(), hit.clone());
+        hit
+    }
+
+    fn match_model(&mut self, key: &str) -> Option<(PathBuf, PathBuf)> {
+        use crate::fa3d;
+        let rule = fa3d::rule_for(key)?;
+        let pack = self.cc0_dir().join(fa3d::PACK);
+        let img = self.textures.rgba(key).ok()?;
+        let opaque = fa3d::opaque_box(&img)?;
+        let frame = library::picture_size(key, [img.width(), img.height()]);
+        let mut best: Option<(PathBuf, fa3d::Placement)> = None;
+        for name in rule.models {
+            let Some(file) = fa3d::shelf_file(&pack, name) else { continue };
+            let Some(bounds) = model3d::read_file(&file, 1.0).ok().and_then(|m| m.bounds()) else { continue };
+            let p = fa3d::place(bounds, frame, opaque, rule.lying);
+            if best.as_ref().is_none_or(|(_, b)| p.skew < b.skew) {
+                best = Some((file, p));
+            }
+        }
+        let (src, p) = best.filter(|(_, p)| p.skew <= rule.stretch)?;
+        let meta = std::fs::metadata(&src).ok()?;
+        let stamp = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let tag = sha256_hex(format!("{key}|{}|{}|{stamp}|{}", src.display(), meta.len(), fa3d::VERSION).as_bytes());
+        let dir = self.data_dir.join("cache").join("fa3d");
+        let out = dir.join(format!("{}_{}.glb", crate::export::asset_stem(key), &tag[..10]));
+        if !out.is_file() {
+            // Полная бочка, ящик с товаром: сверху — сам рисунок, чуть выше верха модели.
+            use image::ImageEncoder as _;
+            let mut png = Vec::new();
+            if rule.top {
+                image::codecs::png::PngEncoder::new(&mut png).write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8).ok()?;
+            }
+            let lid = rule.top.then_some((png.as_slice(), p.top + 0.01));
+            let glb = model3d::place_gltf(&std::fs::read(&src).ok()?, p.matrix, p.frame, lid).ok()?;
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::write(&out, glb).ok()?;
+        }
+        Some((out, src))
+    }
+
+    /// Ключи картинок `used` и модели с полки, подобранные к ним: авторы моделей — тоже в
+    /// авторы сцены.
+    pub(super) fn with_matched(&self, used: &mut std::collections::BTreeSet<String>) {
+        let extra: Vec<String> = used.iter().filter_map(|k| self.fa3d.get(k).cloned().flatten()).map(|(_, src)| src.to_string_lossy().into_owned()).collect();
+        used.extend(extra);
     }
 
     /// Модель предмета по ключу картинки (с запоминанием, и «нет» тоже).

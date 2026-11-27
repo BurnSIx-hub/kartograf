@@ -324,6 +324,10 @@ pub struct Settings {
     /// Выгрузка: ещё и 3D-модель карты (`.glb`) тайлом для 3D Canvas (`crate::scene3d`).
     #[serde(default)]
     pub export_3d: bool,
+    /// 3D: предметам без своей модели — модель с полки «CC0/Poly Haven» по имени рисунка
+    /// ([`crate::fa3d`]): бочка к бочке, стол к столу.
+    #[serde(default = "yes")]
+    pub fa_models: bool,
     /// Крыши в редакторе: 0 — видно, 1 — сквозь, 2 — скрыть. Запоминается.
     #[serde(default)]
     pub roof_view: u8,
@@ -338,7 +342,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, export_3d: false, roof_view: 0, wow_client: None }
+        Self { textures_dir: None, packs: Vec::new(), snap: true, grid: true, gen_library: false, export_canopies: true, export_3d: false, fa_models: true, roof_view: 0, wow_client: None }
     }
 }
 
@@ -763,6 +767,10 @@ pub struct App {
     /// Модели предметов по ключу картинки (и «нет модели») — [`props3d`].
     #[cfg(not(target_arch = "wasm32"))]
     models3d: std::collections::HashMap<String, Option<std::sync::Arc<crate::model3d::Model3d>>>,
+    /// Подобранные к рисункам модели ([`crate::fa3d`]) по ключу картинки: записанная `.glb` и
+    /// модель с полки, из которой она (для авторов); `None` — не подобралась.
+    #[cfg(not(target_arch = "wasm32"))]
+    fa3d: std::collections::HashMap<String, Option<(PathBuf, PathBuf)>>,
     /// Перенос набора 3D-моделей CC0 на полку, пока идёт.
     #[cfg(not(target_arch = "wasm32"))]
     cc0: Option<props3d::Cc0Job>,
@@ -1046,6 +1054,8 @@ impl App {
             view3d_auto: args.view3d,
             #[cfg(not(target_arch = "wasm32"))]
             models3d: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            fa3d: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cc0: None,
             #[cfg(not(target_arch = "wasm32"))]
