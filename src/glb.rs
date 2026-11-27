@@ -235,8 +235,8 @@ mod tests {
     }
 
     fn sample() -> Scene3d {
-        let door = Opening { seg: ([2.0, 1.0], [3.0, 1.0]), kind: PortalKind::Door, id: "wDoor".into() };
-        let win = Opening { seg: ([0.5, 3.0], [1.5, 3.0]), kind: PortalKind::Window, id: "wWin".into() };
+        let door = Opening { seg: ([2.0, 1.0], [3.0, 1.0]), kind: PortalKind::Door, id: "wDoor".into(), art: None };
+        let win = Opening { seg: ([0.5, 3.0], [1.5, 3.0]), kind: PortalKind::Window, id: "wWin".into(), art: None };
         let st = Storey {
             floor: Some(Picture { key: "floor_1".into(), size: [4, 4], alpha: false }),
             walls: vec![vec![[0.0, 1.0], [2.0, 1.0]], vec![[3.0, 1.0], [4.0, 1.0]]],
@@ -247,6 +247,7 @@ mod tests {
             ground: Default::default(),
             roofs: Vec::new(),
             cover: None,
+            caps: Vec::new(),
         };
         build([4.0, 4.0], &[st])
     }
@@ -254,7 +255,8 @@ mod tests {
     #[test]
     fn doors_and_glass_carry_the_3d_canvas_tags() {
         let s = sample();
-        let glb = write(&s, &[(vec![0xFF, 0xD8, 0xFF], "image/jpeg")], "test").unwrap();
+        // Картинки — пол и тело створки.
+        let glb = write(&s, &vec![(vec![0xFF, 0xD8, 0xFF], "image/jpeg"); s.pictures.len()], "test").unwrap();
         let doc = json_of(&glb);
         let nodes = doc["nodes"].as_array().unwrap();
         let door = nodes.iter().find(|n| n["extras"]["door"] == "wDoor").unwrap();
@@ -276,7 +278,7 @@ mod tests {
     #[test]
     fn the_floor_picture_is_laid_once_and_webp_is_declared() {
         let s = sample();
-        let glb = write(&s, &[(b"RIFF....WEBP".to_vec(), "image/webp")], "test").unwrap();
+        let glb = write(&s, &vec![(b"RIFF....WEBP".to_vec(), "image/webp"); s.pictures.len()], "test").unwrap();
         let doc = json_of(&glb);
         assert_eq!(doc["extensionsRequired"], json!(["EXT_texture_webp"]));
         let tex = &doc["textures"][0];
@@ -293,7 +295,8 @@ mod tests {
 
     #[test]
     fn a_still_animation_keeps_3d_canvas_from_merging_the_leaves() {
-        let doc = json_of(&write(&sample(), &[(vec![0xFF, 0xD8, 0xFF], "image/jpeg")], "test").unwrap());
+        let s = sample();
+        let doc = json_of(&write(&s, &vec![(vec![0xFF, 0xD8, 0xFF], "image/jpeg"); s.pictures.len()], "test").unwrap());
         let anim = &doc["animations"][0];
         let node = anim["channels"][0]["target"]["node"].as_u64().unwrap() as usize;
         // Водит пустой узел, а не створку и не стены.

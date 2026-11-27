@@ -637,7 +637,8 @@ impl App {
             let p = e.px as f32;
             // 3D: земля этажа под крышами и предметами — рельеф и помосты (марши здесь не нужны).
             let ground3d = (e.three_d && !chunk).then(|| crate::ground3d::ground(map, None, &|_| None, &|_| true).0);
-            let eave_at = |g: &crate::scene3d::Ground, c: [f32; 2]| crate::scene3d::STOREY + g.relief.as_ref().map_or(0.0, |f| f.at(c));
+            // Скат — через наружный край стен этажа.
+            let wall = storey_style(map).width / 2.0;
             for (ri, r) in map.roofs.iter().enumerate() {
                 let Some(pic) = pics.remove(&ri) else { continue };
                 let fixtures = r.fixtures();
@@ -646,8 +647,7 @@ impl App {
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
                 let mut tile = export::RoofTile { src: export::foundry_src(&file), rect: [(pic.origin[0] * p).round() as i64, (pic.origin[1] * p).round() as i64, (pic.size[0] as f32 * p / pic.ppc).round() as i64, (pic.size[1] as f32 * p / pic.ppc).round() as i64], rotation: 0.0, shelter: true, fade: true, leaves: false, low: false, wind: 1.0, rope: false, web: None, chest: None, living: None, scuppers: fixtures.iter().filter(|f| f.0.contains("Scupper")).map(|f| [f.1[0] * p, f.1[1] * p, f.2]).collect(), chimneys: smoke, surface: vec![(r.outline().iter().map(|v| [v[0] * p, v[1] * p]).collect(), false)], ..Default::default() };
                 if let Some(g) = &ground3d {
-                    let c = [(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0];
-                    let roof = crate::roof3d::rect(r, eave_at(g, c), roof_picture(&pic), pic.frame());
+                    let roof = crate::roof3d::rect(r, crate::scene3d::eave_over(g, &r.outline()), wall, roof_picture(&pic), pic.frame());
                     roof_model(&mut tile, &roof, &pic.bytes, e.dir.join(format!("{}_roof_{roof_count}_3d.glb", stem(k))), &mut files)?;
                 }
                 files.push((file.clone(), pic.bytes));
@@ -662,10 +662,8 @@ impl App {
                 let file = e.dir.join(format!("{}_roof_{roof_count}.webp", stem(k)));
                 let mut model = export::RoofTile::default();
                 if let Some(g) = &ground3d {
-                    let (lo, hi) = r.bounds();
-                    let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
                     let clip = ([0.0, 0.0], [map.width as f32, map.height as f32]);
-                    if let Some(roof) = crate::roof3d::outline(r, eave_at(g, c), roof_picture(&pic), pic.frame(), clip) {
+                    if let Some(roof) = crate::roof3d::outline(r, crate::scene3d::eave_over(g, &outline_poly(r)), roof_picture(&pic), pic.frame(), clip) {
                         roof_model(&mut model, &roof, &pic.bytes, e.dir.join(format!("{}_roof_{roof_count}_3d.glb", stem(k))), &mut files)?;
                     }
                 }
@@ -1164,6 +1162,12 @@ impl App {
             pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
         }
         let mut scene = crate::scene3d::build(cells, &storeys);
+        // Створки дверей — модели Blender: их картинки (фактура в цвете двери) — по ключу.
+        for pic in &scene.pictures {
+            if let Some(img) = crate::doors3d::picture(&pic.key) {
+                pics.insert(pic.key.clone(), (export::webp_bytes(&img, 90.0), "image/webp"));
+            }
+        }
         let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
         let bounds = scene.bounds().ok_or("3D: модель пустая")?;
         // Начало модели — середина её рамки: 3D Canvas ставит начало в середину тайла, а Foundry
@@ -1190,12 +1194,7 @@ impl App {
         let mut flights = Vec::new();
         for (k, floor) in floors.into_iter().enumerate() {
             let map = self.export_level(e, k);
-            // Вид стен этажа — самый частый у краёв комнат, иначе у нарисованных, иначе вид карты.
-            let mut votes: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
-            for v in map.edge_looks.values() {
-                *votes.entry(*v).or_default() += 1;
-            }
-            let style = votes.into_iter().max_by_key(|&(i, c)| (c, std::cmp::Reverse(i))).and_then(|(i, _)| map.wall_looks.get(i as usize)).or_else(|| map.walls.iter().find_map(|w| w.style.as_ref())).unwrap_or(&map.wall_style);
+            let style = storey_style(map);
             let (strip, side, color) = match &style.paint {
                 map::Paint::Texture(t) => match self.textures.rgba(t) {
                     Ok(rgba) => {
@@ -1220,7 +1219,7 @@ impl App {
                 .iter()
                 .map(|po| {
                     let (a, b) = (at(po.seg.0), at(po.seg.1));
-                    crate::scene3d::Opening { seg: po.seg, kind: po.kind, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]) }
+                    crate::scene3d::Opening { seg: po.seg, kind: po.kind, id: format!("{k}:{},{},{},{}", a[0], a[1], b[0], b[1]), art: po.leaf.clone() }
                 })
                 .collect();
             let gaps = map.portals.iter().filter(|q| q.kind == PortalKind::Opening).map(|q| (q.a, q.b)).collect();
@@ -1254,7 +1253,8 @@ impl App {
             let mut walls = lay.walls.clone();
             walls.extend(facades(map, lay));
             let cover = covers.get(k).cloned().flatten().filter(|_| k > 0);
-            storeys.push(crate::scene3d::Storey { floor, walls, low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color }, ground, roofs: Vec::new(), cover });
+            let caps = roof_caps(map, &ground);
+            storeys.push(crate::scene3d::Storey { floor, walls, low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color }, ground, roofs: Vec::new(), cover, caps });
         }
         (storeys, flights)
     }
@@ -1362,6 +1362,27 @@ pub(super) fn open_flight_exits(below: &Map, up: &crate::scene3d::Cover, lay: &m
 /// Бок стены или кручи — середина полосы: без кромок и бордюра вида сверху.
 pub(super) fn side_band(strip: &image::RgbaImage) -> image::RgbaImage {
     image::imageops::crop_imm(strip, 0, strip.height() / 4, strip.width(), (strip.height() / 2).max(1)).to_image()
+}
+
+/// Вид стен этажа в 3D — самый частый у краёв комнат, иначе у нарисованных, иначе вид карты.
+pub(super) fn storey_style(map: &Map) -> &map::WallStyle {
+    let mut votes: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    for v in map.edge_looks.values() {
+        *votes.entry(*v).or_default() += 1;
+    }
+    votes.into_iter().max_by_key(|&(i, c)| (c, std::cmp::Reverse(i))).and_then(|(i, _)| map.wall_looks.get(i as usize)).or_else(|| map.walls.iter().find_map(|w| w.style.as_ref())).unwrap_or(&map.wall_style)
+}
+
+/// Контур крыши по контуру сверху — наружное кольцо её первого куска (весь дом).
+pub(super) fn outline_poly(r: &map::OutlineRoof) -> Vec<[f32; 2]> {
+    r.pieces.first().and_then(|k| k.rings.first()).cloned().unwrap_or_default()
+}
+
+/// Крыши этажа над его стенами: контур и высота свеса — та же, что у 3D-крыш.
+pub(super) fn roof_caps(map: &Map, ground: &crate::scene3d::Ground) -> Vec<crate::scene3d::Cap> {
+    let rect = map.roofs.iter().map(|r| r.outline());
+    let outline = map.outline_roofs.iter().map(outline_poly);
+    rect.chain(outline).filter(|p| p.len() >= 3).map(|poly| crate::scene3d::Cap { eave: crate::scene3d::eave_over(ground, &poly), poly }).collect()
 }
 
 /// У предмета своя 3D-модель (`.glb` рядом с картинкой на полке).

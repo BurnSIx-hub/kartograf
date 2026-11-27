@@ -154,6 +154,8 @@ pub struct Opening {
     pub seg: Segment,
     pub kind: PortalKind,
     pub id: String,
+    /// Рисунок двери на карте: по нему вид створки в 3D ([`crate::doors3d::look_of`]).
+    pub art: Option<String>,
 }
 
 /// Верх тела: ровный или плоскостью под уклон (пандус).
@@ -385,6 +387,57 @@ pub struct Storey {
     pub roofs: Vec<Roof3>,
     /// Где у этажа пол (выше первого): плита пола — только там, дыры в ней настоящие.
     pub cover: Option<Cover>,
+    /// Где над этажом крыши ([`Cap`]): стены под ними — с ровным верхом на высоте свеса.
+    pub caps: Vec<Cap>,
+}
+
+/// Крыша над стенами этажа: её контур сверху (клетки) и высота свеса над полом этажа
+/// ([`eave_over`]). Стена под ней кончается ровно на этой высоте, а не по земле: на рельефе
+/// иначе стена со стороны подъёма проходила бы сквозь скат, а с другой не доставала бы до него.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cap {
+    pub poly: Vec<[f32; 2]>,
+    pub eave: f32,
+}
+
+impl Cap {
+    /// Точка под крышей (с запасом на толщину стены по её краю).
+    fn covers(&self, p: [f32; 2]) -> bool {
+        crate::platform::contains(&self.poly, p) || self.poly.iter().zip(self.poly.iter().cycle().skip(1)).any(|(&a, &b)| seg_dist(p, a, b) < CAP_EDGE)
+    }
+}
+
+/// Стена у самого края крыши (без свеса) — тоже под ней.
+const CAP_EDGE: f32 = 0.2;
+
+fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 < 1e-12 { 0.0 } else { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) };
+    dist(p, [a[0] + dx * t, a[1] + dy * t])
+}
+
+/// Высота свеса крыши с контуром `poly` над полом этажа: верх стен ([`STOREY`]) над самой высокой
+/// точкой рельефа под ней — ни одна стена под крышей не выйдет сквозь скат.
+pub fn eave_over(ground: &Ground, poly: &[[f32; 2]]) -> f32 {
+    let Some(f) = ground.relief.as_ref().filter(|_| !poly.is_empty()) else { return STOREY };
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in poly {
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    let mut top = poly.iter().map(|&p| f.at(p)).fold(f32::MIN, f32::max);
+    let step = 0.25;
+    let (nx, ny) = (((hi[0] - lo[0]) / step).ceil() as usize, ((hi[1] - lo[1]) / step).ceil() as usize);
+    for j in 0..=ny.min(4000) {
+        for i in 0..=nx.min(4000) {
+            let p = [(lo[0] + i as f32 * step).min(hi[0]), (lo[1] + j as f32 * step).min(hi[1])];
+            if crate::platform::contains(poly, p) {
+                top = top.max(f.at(p));
+            }
+        }
+    }
+    STOREY + top
 }
 
 impl Scene3d {
@@ -525,16 +578,19 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             }
             None => wall_mat,
         };
+        // Верх стен под крышей — ровно на её свесе (над полом этажа), прочих — по земле.
+        let cap = |p: [f32; 2]| st.caps.iter().filter(|c| c.covers(p)).map(|c| y0 + c.eave).reduce(f32::max);
+        let top = WallTop { y: y1, cap: &cap };
         let mut walls = Shell::default();
         for line in &st.walls {
-            extrude(&mut walls, &fine(line), half, y0, y1, tiling, &base);
+            extrude(&mut walls, &fine(line), half, y0, top, tiling, &base);
         }
         for line in &st.low {
-            extrude(&mut walls, &fine(line), half, y0, y0 + LOW, tiling, &base);
+            extrude(&mut walls, &fine(line), half, y0, (y0 + LOW).into(), tiling, &base);
         }
         for g in &st.gaps {
             if dist(g.0, g.1) <= LINTEL_MAX {
-                extrude(&mut walls, &[g.0, g.1], half, y0 + DOOR, y1, tiling, &base);
+                extrude(&mut walls, &fine(&[g.0, g.1]), half, y0 + DOOR, top, tiling, &base);
             }
         }
 
@@ -546,29 +602,35 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             let foot = |p: [f32; 2]| y0 + base(p);
             match o.kind {
                 PortalKind::Door => {
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
-                    s.nodes.push(leaf(format!("door_{}_{}", k + 1, i + 1), k, a, b, foot(a), DOOR, wood, Door { id: o.id.clone(), swing: SWING }));
+                    extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
+                    let look = Some(crate::doors3d::look_of(o.art.as_deref()));
+                    let node = leaf(&mut s, format!("door_{}_{}", k + 1, i + 1), k, (a, b), foot(a), DOOR, (wood, look), Door { id: o.id.clone(), swing: SWING });
+                    s.nodes.push(node);
                 }
                 PortalKind::DoubleDoor => {
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
+                    extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
                     let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-                    s.nodes.push(leaf(format!("door_{}_{}a", k + 1, i + 1), k, a, mid, foot(a), DOOR, wood, Door { id: format!("{}_a", o.id), swing: SWING }));
-                    s.nodes.push(leaf(format!("door_{}_{}b", k + 1, i + 1), k, b, mid, foot(b), DOOR, wood, Door { id: format!("{}_b", o.id), swing: -SWING }));
+                    let look = Some(crate::doors3d::look_of(o.art.as_deref()));
+                    let node = leaf(&mut s, format!("door_{}_{}a", k + 1, i + 1), k, (a, mid), foot(a), DOOR, (wood, look), Door { id: format!("{}_a", o.id), swing: SWING });
+                    s.nodes.push(node);
+                    let node = leaf(&mut s, format!("door_{}_{}b", k + 1, i + 1), k, (b, mid), foot(b), DOOR, (wood, look), Door { id: format!("{}_b", o.id), swing: -SWING });
+                    s.nodes.push(node);
                 }
                 // Тайный ход снаружи неотличим от стены: створка во всю высоту, из стены.
                 PortalKind::Secret => {
-                    s.nodes.push(leaf(format!("secret_{}_{}", k + 1, i + 1), k, a, b, foot(a), STOREY, side_mat, Door { id: o.id.clone(), swing: SWING }));
+                    let node = leaf(&mut s, format!("secret_{}_{}", k + 1, i + 1), k, (a, b), foot(a), STOREY, (side_mat, None), Door { id: o.id.clone(), swing: SWING });
+                    s.nodes.push(node);
                 }
                 PortalKind::Window => {
-                    extrude(&mut walls, &[a, b], half, y0, y0 + SILL, tiling, &base);
-                    extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
+                    extrude(&mut walls, &[a, b], half, y0, (y0 + SILL).into(), tiling, &base);
+                    extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
                     let mut pane = Shell::default();
-                    extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, y0 + DOOR, tiling, &base);
+                    extrude(&mut pane, &[a, b], GLASS / 2.0, y0 + SILL, (y0 + DOOR).into(), tiling, &base);
                     s.nodes.push(Node { name: format!("window_{}_{}", k + 1, i + 1), part: Part::Glass, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(glass, pane.into_one())], door: None });
                 }
                 PortalKind::Opening => {
                     if dist(a, b) <= LINTEL_MAX {
-                        extrude(&mut walls, &[a, b], half, y0 + DOOR, y1, tiling, &base);
+                        extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
                     }
                 }
             }
@@ -836,13 +898,22 @@ pub(crate) fn tri(m: &mut Mesh, p: [[f32; 3]; 3], n: [f32; 3], uv: [[f32; 2]; 3]
 /// Створка от петли `hinge` к `to` на высоте `y0`, высотой `tall`: узел с началом на петле,
 /// сетка вдоль его оси x — так 3D Canvas поворачивает её вокруг петли.
 #[allow(clippy::too_many_arguments)]
-fn leaf(name: String, storey: usize, hinge: [f32; 2], to: [f32; 2], y0: f32, tall: f32, mat: usize, door: Door) -> Node {
+/// Створка от петли `hinge` до `to` высотой `tall` на земле `y0`: модель двери ([`crate::doors3d`])
+/// по виду `look`, растянутая по проёму; без вида (тайный ход) или без модели — доска толщиной
+/// [`LEAF`] материалом `mat`.
+fn leaf(s: &mut Scene3d, name: String, storey: usize, (hinge, to): Segment, y0: f32, tall: f32, (mat, look): (usize, Option<crate::doors3d::DoorLook>), door: Door) -> Node {
     let (dx, dz) = (to[0] - hinge[0], to[1] - hinge[1]);
     let len = dx.hypot(dz).max(0.01);
+    if let Some(p) = look.and_then(|l| crate::doors3d::leaf_part(l, len, tall)) {
+        let (key, size) = p.picture;
+        let pic = s.picture(&Picture { key, size, alpha: false });
+        let material = s.material(Material { look: Look::Picture(pic), ..p.material });
+        return Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(material, p.mesh)], door: Some(door) };
+    }
     let mut m = Shell::default();
     let tiling = Tiling { top: 1.0, side_u: 1.0, side_v: 1.0 };
     // Чуть короче проёма и ниже притолоки: не трётся о косяк, когда поворачивается.
-    extrude(&mut m, &[[0.02, 0.0], [len - 0.02, 0.0]], LEAF / 2.0, 0.0, tall - 0.02, tiling, &|_| 0.0);
+    extrude(&mut m, &[[0.02, 0.0], [len - 0.02, 0.0]], LEAF / 2.0, 0.0, (tall - 0.02).into(), tiling, &|_| 0.0);
     Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(mat, m.into_one())], door: Some(door) }
 }
 
@@ -863,7 +934,26 @@ fn left(d: [f32; 2]) -> [f32; 2] {
 /// Выдавить ломаную в стену толщиной `2·half` от `y0` до `y1`: стороны, верх и торцы у
 /// свободных концов; на изломах — скос (углы без щелей и нахлёстов). Замкнутая — если первая
 /// точка совпадает с последней. `base` поднимает стену в точке оси (земля на рельефе).
-fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Tiling, base: &dyn Fn([f32; 2]) -> f32) {
+/// Верх выдавливаемой стены над полом: `y` (поверх земли в точке) или, где `cap` даёт высоту, —
+/// ровно она (стена под крышей).
+#[derive(Clone, Copy)]
+struct WallTop<'a> {
+    y: f32,
+    cap: &'a dyn Fn([f32; 2]) -> Option<f32>,
+}
+
+fn no_cap(_: [f32; 2]) -> Option<f32> {
+    None
+}
+
+impl From<f32> for WallTop<'static> {
+    fn from(y: f32) -> Self {
+        WallTop { y, cap: &no_cap }
+    }
+}
+
+fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, top: WallTop, t: Tiling, base: &dyn Fn([f32; 2]) -> f32) {
+    let y1 = top.y;
     let mut pts: Vec<[f32; 2]> = Vec::with_capacity(line.len());
     for &p in line {
         if pts.last().is_none_or(|&q| dist(q, p) > 1e-5) {
@@ -907,7 +997,9 @@ fn extrude(m: &mut Shell, line: &[[f32; 2]], half: f32, y0: f32, y1: f32, t: Til
     let r = |i: usize| [pts[i][0] - offs[i][0], pts[i][1] - offs[i][1]];
     // Подъём точек оси: обе стороны стены в точке — на одной высоте, верх ровный поперёк.
     let lift: Vec<f32> = pts.iter().map(|&p| base(p)).collect();
-    let at = |p: [f32; 2], i: usize, y: f32| [p[0], y + lift[i], p[1]];
+    // Верх в точке оси: под крышей — её свес (не ниже низа стены), иначе — над землёй.
+    let tops: Vec<Option<f32>> = pts.iter().enumerate().map(|(i, &p)| (top.cap)(p).map(|e| e.max(y0 + lift[i] + 0.05))).collect();
+    let at = |p: [f32; 2], i: usize, y: f32| [p[0], if y == y1 && let Some(c) = tops[i] { c } else { y + lift[i] }, p[1]];
     let segs = if closed { n } else { n - 1 };
     let mut run = 0.0;
     for s in 0..segs {
@@ -961,7 +1053,7 @@ mod tests {
     }
 
     fn storey(walls: Vec<Vec<[f32; 2]>>, openings: Vec<Opening>) -> Storey {
-        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25), ground: Ground::default(), roofs: Vec::new(), cover: None }
+        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25), ground: Ground::default(), roofs: Vec::new(), cover: None, caps: Vec::new() }
     }
 
     /// Все треугольники сетки смотрят лицом по нормалям своих вершин.
@@ -1013,7 +1105,7 @@ mod tests {
 
     #[test]
     fn a_door_gets_a_lintel_and_a_leaf_on_its_hinge() {
-        let door = Opening { seg: ([2.0, 1.0], [3.0, 1.0]), kind: PortalKind::Door, id: "w7".into() };
+        let door = Opening { seg: ([2.0, 1.0], [3.0, 1.0]), kind: PortalKind::Door, id: "w7".into(), art: None };
         let s = build([4.0, 4.0], &[storey(vec![vec![[0.0, 1.0], [2.0, 1.0]], vec![[3.0, 1.0], [4.0, 1.0]]], vec![door])]);
         let leaf = s.nodes.iter().find(|n| n.part == Part::Door).unwrap();
         assert_eq!(leaf.at, [2.0, 0.0, 1.0]);
@@ -1035,18 +1127,19 @@ mod tests {
 
     #[test]
     fn a_leaf_along_the_map_y_axis_turns_to_face_it() {
-        let door = Opening { seg: ([1.0, 1.0], [1.0, 2.0]), kind: PortalKind::Door, id: "w1".into() };
+        let door = Opening { seg: ([1.0, 1.0], [1.0, 2.0]), kind: PortalKind::Door, id: "w1".into(), art: None };
         let s = build([4.0, 4.0], &[storey(Vec::new(), vec![door])]);
         let leaf = s.nodes.iter().find(|n| n.part == Part::Door).unwrap();
         // Створка от петли (1, 1) вниз по карте до (1, 2): после поворота узла она там и лежит.
         assert!((leaf.yaw + std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         let pts = placed(leaf);
-        assert!(pts.iter().all(|p| p[2] > 1.0 && p[2] < 2.0 && (p[0] - 1.0).abs() <= LEAF), "{pts:?}");
+        // Толщина — доски створки с железом поверх (петли, кольцо).
+        assert!(pts.iter().all(|p| p[2] > 0.95 && p[2] < 2.0 && (p[0] - 1.0).abs() <= 0.1), "{pts:?}");
     }
 
     #[test]
     fn a_double_door_swings_both_leaves_the_same_way() {
-        let door = Opening { seg: ([0.0, 1.0], [2.0, 1.0]), kind: PortalKind::DoubleDoor, id: "w3".into() };
+        let door = Opening { seg: ([0.0, 1.0], [2.0, 1.0]), kind: PortalKind::DoubleDoor, id: "w3".into(), art: None };
         let s = build([4.0, 4.0], &[storey(Vec::new(), vec![door])]);
         let leaves: Vec<&Node> = s.nodes.iter().filter(|n| n.part == Part::Door).collect();
         assert_eq!(leaves.len(), 2);
@@ -1059,7 +1152,7 @@ mod tests {
 
     #[test]
     fn a_window_has_a_sill_a_lintel_and_glass_between() {
-        let win = Opening { seg: ([1.0, 1.0], [2.0, 1.0]), kind: PortalKind::Window, id: "w2".into() };
+        let win = Opening { seg: ([1.0, 1.0], [2.0, 1.0]), kind: PortalKind::Window, id: "w2".into(), art: None };
         let s = build([4.0, 4.0], &[storey(Vec::new(), vec![win])]);
         let glass = s.nodes.iter().find(|n| n.part == Part::Glass).unwrap();
         let ys: Vec<f32> = glass.prims[0].1.v.iter().map(|v| v.p[1]).collect();
@@ -1162,7 +1255,7 @@ mod tests {
         let strip = Picture { key: "stone".into(), size: [1024, 256], alpha: false };
         let side = Picture { key: "stone#side".into(), size: [1024, 128], alpha: false };
         let look = WallLook { width: 0.25, strip: Some(strip), side: Some(side), color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None, caps: Vec::new() };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         assert_eq!(walls.prims.len(), 2);
@@ -1178,7 +1271,7 @@ mod tests {
     #[test]
     fn the_wall_strip_lies_along_the_top_like_on_the_2d_map() {
         let look = WallLook { width: 0.25, strip: Some(Picture { key: "stone".into(), size: [1024, 256], alpha: false }), side: None, color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None, caps: Vec::new() };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         let m = &walls.prims[0].1;
@@ -1229,9 +1322,32 @@ mod tests {
     }
 
     #[test]
+    fn under_a_roof_on_a_slope_walls_end_level_at_its_eave() {
+        // Дом 0..3 по x на склоне к востоку (0,25 на клетку), крыша со свесом 0,25; стена сада — вне.
+        let mut st = storey(vec![vec![[0.0, 1.0], [3.0, 1.0], [3.0, 3.0], [0.0, 3.0], [0.0, 1.0]], vec![[3.0, 3.5], [4.0, 3.5]]], Vec::new());
+        st.ground.relief = s_field();
+        let poly = vec![[-0.25, 0.75], [3.25, 0.75], [3.25, 3.25], [-0.25, 3.25]];
+        let eave = eave_over(&st.ground, &poly);
+        assert!((eave - (STOREY + 0.8125)).abs() < 1e-4, "свес — над самой высокой землёй под крышей: {eave}");
+        st.caps = vec![Cap { poly, eave }];
+        let s = build([4.0, 4.0], &[st]);
+        let walls = &s.nodes.iter().find(|n| n.part == Part::Wall).unwrap().prims[0].1;
+        let tops = |inside: bool| walls.v.iter().filter(|v| v.p[1] > 1.0 && (v.p[2] < 3.3) == inside).map(|v| v.p[1]).fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        let (lo, hi) = tops(true);
+        assert!((hi - eave).abs() < 1e-4 && (lo - eave).abs() < 1e-4, "верх дома ровный, на свесе: {lo}..{hi}");
+        // Низ — по земле: на западе на нуле, на востоке выше.
+        assert!(walls.v.iter().any(|v| v.p[1].abs() < 1e-4) && walls.v.iter().any(|v| (v.p[1] - 0.75).abs() < 1e-4));
+        // Стена сада не под крышей — верх по земле.
+        let (glo, ghi) = tops(false);
+        assert!((glo - (STOREY + 0.75)).abs() < 1e-4 && (ghi - (STOREY + 1.0)).abs() < 1e-4, "{glo}..{ghi}");
+        // Без рельефа свес — просто верх стен.
+        assert_eq!(eave_over(&Ground::default(), &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]), STOREY);
+    }
+
+    #[test]
     fn a_roof_for_its_own_tile_fills_the_picture_frame_from_zero_up() {
         let r = crate::map::Roof::new([1.0, 1.0], [5.0, 4.0], crate::map::RoofShape::Gable, "x".into());
-        let roof = crate::roof3d::rect(&r, STOREY, Picture { key: "roof".into(), size: [10, 10], alpha: true }, [0.5, 0.5, 5.0, 4.0]);
+        let roof = crate::roof3d::rect(&r, STOREY, 0.0, Picture { key: "roof".into(), size: [10, 10], alpha: true }, [0.5, 0.5, 5.0, 4.0]);
         let (scene, [lo, hi]) = roof_scene(&roof).unwrap();
         let [a, b] = scene.bounds().unwrap();
         assert!((a[0] + 2.5).abs() < 1e-4 && (b[0] - 2.5).abs() < 1e-4 && (a[2] + 2.0).abs() < 1e-4 && (b[2] - 2.0).abs() < 1e-4, "{a:?} {b:?}");

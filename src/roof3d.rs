@@ -66,11 +66,14 @@ fn away(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> [f32; 2] {
     if dot(n, sub(m, c)) < 0.0 { [-n[0], -n[1]] } else { n }
 }
 
-/// Прямоугольная крыша на стенах высотой `eave` (верх стен над полом этажа).
-pub fn rect(r: &Roof, eave: f32, picture: Picture, frame: [f32; 4]) -> Roof3 {
+/// Прямоугольная крыша на стенах высотой `eave` (верх стен над полом этажа) и толщиной
+/// `2 × half`: скат проходит через внешний верхний край стены, а не через её ось — иначе
+/// наружная половина стены выходила бы сквозь свес.
+pub fn rect(r: &Roof, eave: f32, half: f32, picture: Picture, frame: [f32; 4]) -> Roof3 {
     let outline = r.outline();
     let c = centroid(&outline);
-    let o = r.overhang.max(0.0);
+    // Свес от наружной стороны стены.
+    let o = r.overhang.max(0.0) - half.max(0.0);
     let (mut cover, mut gables) = (Mesh::default(), Mesh::default());
     let on_edge = |p: [f32; 2]| convex_depth(&outline, p).abs() < 1e-3;
     let p3 = |p: [f32; 2], y: f32| [p[0], y, p[1]];
@@ -238,7 +241,7 @@ mod tests {
         let mut r = Roof::new([0.0, 0.0], [6.0, 4.0], RoofShape::Gable, "x".into());
         r.overhang = 0.25;
         let frame = [-0.25, -0.25, 6.5, 4.5];
-        let roof = rect(&r, 2.0, pic(), frame);
+        let roof = rect(&r, 2.0, 0.0, pic(), frame);
         let (lo, hi) = ys(&roof.cover);
         // Конёк — над серединой на полширины по стенам × уклон; свес — ниже верха стен.
         assert!((hi - (2.0 + PITCH * 2.0)).abs() < 1e-4, "{hi}");
@@ -252,12 +255,33 @@ mod tests {
         assert!(roof.gables.v.iter().all(|v| v.p[0].abs() < 0.26 || (v.p[0] - 6.0).abs() < 0.26), "щипцы только на торцах");
         // Картинка — по рамке: углы крыши в углах картинки.
         assert!(roof.cover.v.iter().all(|v| (0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1])));
+
+        // Стена толщиной 0,25: скат — через её наружный верхний край, не через ось. Иначе
+        // наружная половина стены выходит сквозь свес (в 3D Canvas — полосой поверх края ската).
+        let thick = rect(&r, 2.0, 0.125, pic(), frame);
+        let (tlo, thi) = ys(&thick.cover);
+        assert!((thi - (2.0 + PITCH * 2.125)).abs() < 1e-4, "{thi}");
+        assert!((tlo - (2.0 - PITCH * 0.125)).abs() < 1e-4, "{tlo}");
+        // Высота ската над наружной стороной стены (z = −0,125) — верх стены.
+        let n = &thick.cover;
+        let at = |z: f32| {
+            let t = n.idx.chunks(3).find_map(|t| {
+                let (a, b, c) = (n.v[t[0] as usize].p, n.v[t[1] as usize].p, n.v[t[2] as usize].p);
+                let (z0, z1) = (a[2].min(b[2]).min(c[2]), a[2].max(b[2]).max(c[2]));
+                (z0 <= z && z <= z1 && a[0].min(b[0]).min(c[0]) <= 3.0 && a[0].max(b[0]).max(c[0]) >= 3.0).then_some((a, b, c))
+            })?;
+            // Скат плоский: высота линейна по z вдоль ската.
+            let (p, q) = if (t.0[2] - t.1[2]).abs() > 1e-6 { (t.0, t.1) } else { (t.0, t.2) };
+            Some(p[1] + (q[1] - p[1]) * (z - p[2]) / (q[2] - p[2]))
+        };
+        let face = at(-0.125).unwrap();
+        assert!((face - 2.0).abs() < 1e-4, "над наружной стороной стены — {face}");
     }
 
     #[test]
     fn a_flat_roof_is_a_thin_slab_on_the_walls() {
         let r = Roof::new([0.0, 0.0], [4.0, 4.0], RoofShape::Flat, "x".into());
-        let roof = rect(&r, 2.0, pic(), [-0.25, -0.25, 4.5, 4.5]);
+        let roof = rect(&r, 2.0, 0.0, pic(), [-0.25, -0.25, 4.5, 4.5]);
         let (lo, hi) = ys(&roof.cover);
         assert!((lo - hi).abs() < 1e-6 && (hi - 2.0 - FLAT_RISE).abs() < 1e-6);
         assert!(crate::scene3d::inside(&roof.outline, [2.0, 2.0]) && !crate::scene3d::inside(&roof.outline, [6.0, 2.0]));
@@ -266,7 +290,7 @@ mod tests {
     #[test]
     fn a_tent_comes_to_one_apex() {
         let r = Roof::new([0.0, 0.0], [4.0, 3.0], RoofShape::Tent, "x".into());
-        let roof = rect(&r, 2.0, pic(), [-0.5, -0.5, 5.0, 4.0]);
+        let roof = rect(&r, 2.0, 0.0, pic(), [-0.5, -0.5, 5.0, 4.0]);
         let apex: Vec<f32> = roof.cover.v.iter().filter(|v| (v.p[0] - 2.0).abs() < 1e-4 && (v.p[2] - 1.5).abs() < 1e-4).map(|v| v.p[1]).collect();
         assert!(apex.len() >= 8);
         assert!(apex.iter().all(|&y| (y - apex[0]).abs() < 1e-3), "{apex:?}");

@@ -1520,19 +1520,20 @@ impl App {
             let map = self.export_level(e, k);
             let Ok(mut roof_pics) = self.roof_pictures(map, e.px, None) else { continue };
             let rects = map.roofs.len();
-            let relief = st.ground.relief.clone();
-            let eave = |c: [f32; 2]| STOREY + relief.as_ref().map_or(0.0, |f| f.at(c));
+            // Свес — как у стен под крышей ([`scene3d::Cap`]), скат — через наружный край стен.
+            let ground = st.ground.clone();
+            let eave = |poly: &[[f32; 2]]| scene3d::eave_over(&ground, poly);
+            let wall = st.look.width / 2.0;
             for id in 0..rects + map.outline_roofs.len() {
                 let Some(pic) = roof_pics.remove(&id) else { continue };
                 let Ok(img) = image::load_from_memory(&pic.bytes) else { continue };
                 let key = format!("roof_{}_{}", k + 1, id + 1);
                 let picture = scene3d::Picture { key: key.clone(), size: pic.size, alpha: true };
                 let roof = match map.roofs.get(id) {
-                    Some(r) => Some(crate::roof3d::rect(r, eave([(r.a[0] + r.b[0]) / 2.0, (r.a[1] + r.b[1]) / 2.0]), picture, pic.frame())),
+                    Some(r) => Some(crate::roof3d::rect(r, eave(&r.outline()), wall, picture, pic.frame())),
                     None => {
                         let r = &map.outline_roofs[id - rects];
-                        let (lo, hi) = r.bounds();
-                        crate::roof3d::outline(r, eave([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]), picture, pic.frame(), ([0.0, 0.0], size))
+                        crate::roof3d::outline(r, eave(&super::exporting::outline_poly(r)), picture, pic.frame(), ([0.0, 0.0], size))
                     }
                 };
                 if let Some(roof) = roof {
@@ -1547,6 +1548,12 @@ impl App {
         // вверх по слоям.
         let plans = self.plans_3d(&flights);
         let mut scene = scene3d::build(size, &storeys);
+        // Створки дверей — модели Blender: картинки их тел — по ключу.
+        for p in &scene.pictures {
+            if let Some(img) = crate::doors3d::picture(&p.key) {
+                pics.insert(p.key.clone(), img);
+            }
+        }
         let mut images = Vec::new();
         for p in &scene.pictures {
             match pics.remove(&p.key) {
