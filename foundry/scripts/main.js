@@ -156,6 +156,10 @@ function inspectGate(scene) {
   if (cinema?.active && CONFIG.RegionBehavior.dataModels[INSPECT]) {
     if (foundry.utils.isNewerVersion("1.3.1", cinema.version)) {
       ui.notifications.warn(`Картограф: зонам осмотра нужен 🔥 Cinema 1.3.1, а включён ${cinema.version} — тексты не покажутся`, { permanent: true });
+    } else if (foundry.utils.isNewerVersion("1.3.2", cinema.version) && zones.some((r) => r.flags?.[MODULE_ID]?.inspect?.tile)) {
+      // Мост осмотра в 3D Canvas работает через открытый API 🔥 Cinema 1.3.2; без него в 3D
+      // осмотр молчит, а в 2D всё как было.
+      ui.notifications.warn(`Картограф: в 3D-виде предметы осматриваются с 🔥 Cinema 1.3.2, а включён ${cinema.version} — в 2D осмотр работает`, { permanent: true });
     }
     return;
   }
