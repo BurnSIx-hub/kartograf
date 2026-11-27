@@ -49,6 +49,8 @@ pub enum Tool {
     Shade,
     Relief,
     Text,
+    /// Зоны осмотра (🔥 Cinema): предмет, который можно осмотреть, или нарисованное место.
+    Inspect,
     Roof,
     /// Пипетка: берёт картинку или цвет того, что под курсором.
     Pick,
@@ -77,7 +79,7 @@ impl ReliefMode {
 }
 
 impl Tool {
-    const ALL: [Tool; 14] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Relief, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text, Tool::Pick];
+    const ALL: [Tool; 15] = [Tool::Select, Tool::Dungeon, Tool::Floor, Tool::Path, Tool::Shade, Tool::Relief, Tool::Erase, Tool::Wall, Tool::Door, Tool::Object, Tool::Scatter, Tool::Roof, Tool::Text, Tool::Inspect, Tool::Pick];
 
     fn label(self) -> &'static str {
         match self {
@@ -93,6 +95,7 @@ impl Tool {
             Tool::Shade => "Тень",
             Tool::Relief => "Рельеф",
             Tool::Text => "Подпись",
+            Tool::Inspect => "Осмотр",
             Tool::Roof => "Крыша",
             Tool::Pick => "Пипетка",
         }
@@ -114,6 +117,7 @@ impl Tool {
             Tool::Shade => Key::N,
             Tool::Relief => Key::M,
             Tool::Text => Key::T,
+            Tool::Inspect => Key::J,
             Tool::Roof => Key::K,
             // I — пипетка в Photoshop и GIMP.
             Tool::Pick => Key::I,
@@ -144,7 +148,7 @@ impl Group {
             Group::Roof => tool == Tool::Roof,
             Group::Object => matches!(tool, Tool::Object | Tool::Scatter),
             Group::Path => tool == Tool::Path,
-            Group::Text => tool == Tool::Text,
+            Group::Text => matches!(tool, Tool::Text | Tool::Inspect),
         }
     }
 
@@ -204,6 +208,9 @@ impl Scatter {
     }
 }
 
+/// Протяжка зоны осмотра: номер зоны, вершина (нет — вся зона), откуда тянут и контур до протяжки.
+type InspectGrab = (usize, Option<usize>, [f32; 2], Vec<[f32; 2]>);
+
 /// Что выбрано на карте.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sel {
@@ -223,6 +230,8 @@ pub enum Sel {
     PlatformEdge(usize, usize),
     /// Кусок местности: сам кусок — в `App::ground`.
     Ground,
+    /// Нарисованная зона осмотра (`Map::inspects`).
+    Inspect(usize),
 }
 
 /// Как видны крыши в редакторе.
@@ -608,6 +617,10 @@ pub struct App {
     /// Образец новой подписи; тащат подпись — откуда взяли.
     pub label_style: map::Label,
     label_grab: Option<(usize, [f32; 2])>,
+    /// Тащат зону осмотра: её номер, вершина (нет — вся зона), откуда и контур до протяжки.
+    inspect_grab: Option<InspectGrab>,
+    /// Протяжка рамки новой зоны осмотра: откуда.
+    inspect_from: Option<[f32; 2]>,
     /// Образец новой крыши, вид крыш, протяжка новой и перенос стоящей.
     pub roof_style: map::Roof,
     pub roof_view: RoofView,
@@ -964,6 +977,8 @@ impl App {
             sketch_view: (1.0, egui::Vec2::ZERO),
             label_style: map::Label::new("Комната".into(), [0.0, 0.0]),
             label_grab: None,
+            inspect_grab: None,
+            inspect_from: None,
             roof_style: map::Roof::new([0.0, 0.0], [1.0, 1.0], map::RoofShape::Gable, library::DEFAULT_ROOF.into()),
             roof_view: match settings.roof_view {
                 1 => RoofView::Ghost,
@@ -1687,7 +1702,7 @@ mod tests {
     fn baked_prop_lands_rotated_where_the_map_shows_it() {
         // Картинка 2×1 клетки: левая половина красная, правая синяя.
         let img = image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
-        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let p = Prop { asset: String::new(), pos: [1.0, 1.0], size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         let mut out = image::RgbaImage::new(64, 64);
         bake_prop(&mut out, &img, &p, [0.0, 0.0], 32.0);
         // Поворот по часовой на 90°: левый (красный) конец уходит вверх.

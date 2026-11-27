@@ -245,6 +245,8 @@ impl App {
             "preview_assets" => self.tool_preview_assets(a),
             "batch" => self.tool_batch(a),
             "add_label" => self.tool_add_label(a),
+            "add_inspect_zone" => self.tool_add_inspect_zone(a),
+            "edit_inspect_zone" => self.tool_edit_inspect_zone(a),
             "edit_label" => self.tool_edit_label(a),
             "add_path" => self.tool_add_path(a),
             "set_wall_style" => self.tool_wall_style(a),
@@ -386,6 +388,7 @@ impl App {
                 "shadows": {"on": m.shadows.on, "angle": m.shadows.angle, "dist": m.shadows.dist, "blur": m.shadows.blur, "opacity": m.shadows.opacity, "fade": m.shadows.fade}},
             "objects": m.props.len(), "walls": m.walls.len(), "doors": m.portals.len(),
             "labels": m.labels.len(), "paths": m.paths.len(), "roofs": m.roofs.len() + m.outline_roofs.len(), "platforms": m.platforms.len(),
+            "inspect_zones": m.inspects.len(), "inspect_objects": m.props.iter().filter(|p| p.inspect.is_some()).count(),
             "relief": m.relief.as_ref().map(|r| {
                 let (lo, hi) = r.data.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
                 json!({"lowest": (lo * 100.0).round() / 100.0, "highest": (hi * 100.0).round() / 100.0, "face": r.face_key(), "ridge": r.ridge_key(), "under": r.under_key(), "natural": r.natural})
@@ -449,6 +452,10 @@ impl App {
         if want("doors") {
             let list: Vec<Value> = m.portals.iter().enumerate().filter(|(_, d)| inside(area, d.center())).take(limit).map(|(i, d)| door_json(i, d)).collect();
             out.insert("doors".into(), json!(list));
+        }
+        if want("inspect_zones") {
+            let list: Vec<Value> = m.inspects.iter().enumerate().filter(|(_, z)| inside(area, z.center())).take(limit).map(|(i, z)| inspect_zone_row(i, z)).collect();
+            out.insert("inspect_zones".into(), json!(list));
         }
         if want("labels") {
             let list: Vec<Value> = m.labels.iter().enumerate().filter(|(_, l)| inside(area, l.pos)).take(limit).map(|(i, l)| json!({"index": i, "text": l.text, "x": l.pos[0], "y": l.pos[1], "size": l.size})).collect();
@@ -566,14 +573,22 @@ impl App {
         let tint = color_of(a, "tint")?.flatten();
         let glow = glow_tune_of(a, None)?.flatten();
         let sunk = sunk_of(a)?.flatten();
+        let inspect = inspect_of(a.get("inspect"), None)?.flatten();
         let scale = f(a, "scale").unwrap_or(1.0).clamp(0.05, 20.0);
         let (pos, rot, wall) = self.facing(a, &asset, size, scale, [x, y], 0.0)?;
         self.checkpoint();
-        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None, glow, sunk, flip: a["flip"].as_bool().unwrap_or(false) });
+        if inspect.is_some() {
+            self.ensure_inspect_file();
+        }
+        self.map.props.push(Prop { asset, pos, size, rot, scale, shadow, light, canopy, layer, tint, open: None, glow, sunk, flip: a["flip"].as_bool().unwrap_or(false), inspect });
         let i = self.map.props.len() - 1;
         self.sel = Some(Sel::Prop(i));
         let p = &self.map.props[i];
-        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "size_cells": size, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
+        let mut out = json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "size_cells": size, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall});
+        if let Some(ins) = &p.inspect {
+            out["inspect"] = json!(ins);
+        }
+        Ok(out)
     }
 
     fn tool_edit_object(&mut self, a: &Value) -> Res {
@@ -594,15 +609,22 @@ impl App {
         let recolor = color_of(a, "recolor")?;
         let glow = glow_tune_of(a, self.map.props[i].glow.as_ref())?;
         let sunk = sunk_of(a)?;
+        let inspect = inspect_of(a.get("inspect"), self.map.props[i].inspect.as_ref())?;
         let now = &self.map.props[i];
         let pos = [f(a, "x").unwrap_or(now.pos[0]), f(a, "y").unwrap_or(now.pos[1])];
         let scale = f(a, "scale").map_or(now.scale, |s| s.clamp(0.05, 20.0));
         let (key, sz, rot0) = (asset.clone().unwrap_or_else(|| now.asset.clone()), size.unwrap_or(now.size), now.rot);
         let (pos, rot, wall) = self.facing(a, &key, sz, scale, pos, rot0)?;
         self.checkpoint();
+        if matches!(inspect, Some(Some(_))) {
+            self.ensure_inspect_file();
+        }
         let p = &mut self.map.props[i];
         p.pos = pos;
         p.rot = rot;
+        if let Some(ins) = inspect {
+            p.inspect = ins;
+        }
         if let Some(g) = light {
             p.light = g;
         }
@@ -638,7 +660,11 @@ impl App {
             None => {}
         }
         self.sel = Some(Sel::Prop(i));
-        Ok(json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall}))
+        let mut out = json!({"index": i, "x": r3(p.pos[0]), "y": r3(p.pos[1]), "rotation": r3(p.rot), "scale": p.scale, "asset": p.asset, "light": glow_name(p.light()), "light_own": p.glow, "shadow": p.casts_shadow(), "tint": p.tint, "recolor": library::untint(&p.asset).0, "wall": wall});
+        if let Some(ins) = &p.inspect {
+            out["inspect"] = json!(ins);
+        }
+        Ok(out)
     }
 
     /// Где встанет предмет и как повернётся: `look_at` — лицом (`front`) к точке,
@@ -773,7 +799,8 @@ impl App {
             "paths" => self.map.paths.len(),
             "roofs" => self.map.roofs.len() + self.map.outline_roofs.len(),
             "platforms" => self.map.platforms.len(),
-            _ => return Err("what: objects, walls, doors, labels, paths, roofs или platforms".into()),
+            "inspect_zones" => self.map.inspects.len(),
+            _ => return Err("what: objects, walls, doors, labels, paths, roofs, platforms или inspect_zones".into()),
         };
         if let Some(&bad) = idx.iter().find(|&&i| i >= len) {
             return Err(format!("{what}: номера {bad} нет, их {len}"));
@@ -788,6 +815,7 @@ impl App {
                 "roofs" if i >= self.map.roofs.len() => drop(self.map.outline_roofs.remove(i - self.map.roofs.len())),
                 "roofs" => drop(self.map.roofs.remove(i)),
                 "platforms" => drop(self.map.platforms.remove(i)),
+                "inspect_zones" => drop(self.map.inspects.remove(i)),
                 _ => drop(self.map.paths.remove(i)),
             }
         }
@@ -1173,6 +1201,37 @@ impl App {
             return Err(format!("{e} — пачка откатана, карта как была"));
         }
         Ok(json!({"done": results.len(), "results": results, "undo_steps": touched.len()}))
+    }
+
+    /// Нарисованная зона осмотра: место, а не предмет.
+    fn tool_add_inspect_zone(&mut self, a: &Value) -> Res {
+        let points = zone_points(a)?.ok_or("нужен area или points")?;
+        let mut inspect = map::Inspect::default();
+        inspect_fields(a, &mut inspect)?;
+        self.checkpoint();
+        self.ensure_inspect_file();
+        self.map.inspects.push(map::InspectZone { points, inspect });
+        let i = self.map.inspects.len() - 1;
+        self.sel = Some(Sel::Inspect(i));
+        Ok(inspect_zone_row(i, &self.map.inspects[i]))
+    }
+
+    fn tool_edit_inspect_zone(&mut self, a: &Value) -> Res {
+        let i = a["index"].as_u64().ok_or("нужен index")? as usize;
+        if i >= self.map.inspects.len() {
+            return Err(format!("зоны осмотра {i} нет: их {}", self.map.inspects.len()));
+        }
+        let points = zone_points(a)?;
+        let mut inspect = self.map.inspects[i].inspect.clone();
+        inspect_fields(a, &mut inspect)?;
+        self.checkpoint();
+        let z = &mut self.map.inspects[i];
+        if let Some(p) = points {
+            z.points = p;
+        }
+        z.inspect = inspect;
+        self.sel = Some(Sel::Inspect(i));
+        Ok(inspect_zone_row(i, &self.map.inspects[i]))
     }
 
     fn tool_add_label(&mut self, a: &Value) -> Res {
@@ -1874,6 +1933,97 @@ fn platform_row(i: usize, p: &crate::platform::Platform) -> Value {
     json!({"index": i, "corners": p.points.len(), "bounds": [r2(lo[0]), r2(lo[1]), r2(hi[0]), r2(hi[1])], "height": r2(p.height), "color": p.color, "strength": r2(p.strength), "side": p.side, "stairs": stairs, "rail": p.rail, "lights": p.lights, "grates": grates, "open": p.open})
 }
 
+/// Осмотр предмета из `inspect`: объект — его поля поверх `now`, true — как есть (или
+/// новый), false и null — убрать. Нет поля — не менять (`None`).
+fn inspect_of(v: Option<&Value>, now: Option<&map::Inspect>) -> Result<Option<Option<map::Inspect>>, String> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null | Value::Bool(false)) => Ok(Some(None)),
+        Some(Value::Bool(true)) => Ok(Some(Some(now.cloned().unwrap_or_default()))),
+        Some(obj @ Value::Object(_)) => {
+            let mut i = now.cloned().unwrap_or_default();
+            inspect_fields(obj, &mut i)?;
+            Ok(Some(Some(i)))
+        }
+        Some(_) => Err("inspect: объект с полями, true или false".into()),
+    }
+}
+
+/// Поля осмотра из аргументов поверх `i`: только те, что даны.
+fn inspect_fields(a: &Value, i: &mut map::Inspect) -> Result<(), String> {
+    let s = |k: &str| a.get(k).and_then(Value::as_str);
+    if let Some(v) = s("key") {
+        if !map::Inspect::key_ok(v) {
+            return Err(format!("key «{v}»: 8–64 знака из A–Z a–z 0–9 _ -"));
+        }
+        i.key = v.to_owned();
+    }
+    if let Some(v) = s("title") {
+        i.title = v.trim().to_owned();
+    }
+    if let Some(v) = s("text") {
+        i.text = v.to_owned();
+    }
+    if let Some(v) = s("fail").or_else(|| s("text_fail")) {
+        i.fail = v.to_owned();
+    }
+    if let Some(v) = s("gm_note") {
+        i.gm_note = v.to_owned();
+    }
+    if let Some(v) = s("check") {
+        i.check = map::InspectCheck::ALL.into_iter().find(|c| c.word() == v).ok_or(format!("check «{v}»: none, roll или passive"))?;
+    }
+    if let Some(v) = s("skill") {
+        i.skill = if v.trim().is_empty() { "prc".into() } else { v.trim().to_owned() };
+    }
+    if let Some(v) = a.get("dc").and_then(Value::as_f64) {
+        i.dc = v.round().clamp(0.0, 40.0) as u8;
+    }
+    if let Some(v) = s("show").or_else(|| s("visibility")) {
+        i.show = map::InspectShow::ALL.into_iter().find(|c| c.word() == v).ok_or(format!("show «{v}»: self, all или chat"))?;
+    }
+    if let Some(v) = f(a, "range") {
+        i.range = v.max(0.0);
+    }
+    if let Some(v) = s("repeat") {
+        i.repeat = map::InspectRepeat::ALL.into_iter().find(|c| c.word() == v).ok_or(format!("repeat «{v}»: remember, always или once"))?;
+    }
+    if let Some(v) = s("sound") {
+        i.sound = v.trim().to_owned();
+    }
+    if let Some(v) = f(a, "duration") {
+        i.duration = v.max(0.0);
+    }
+    Ok(())
+}
+
+/// Контур нарисованной зоны: `area` или `points`; нет ни того, ни другого — `None`.
+fn zone_points(a: &Value) -> Result<Option<Vec<[f32; 2]>>, String> {
+    if let Some(r) = area_of(a) {
+        let (x0, y0, x1, y1) = (r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3]));
+        if x1 - x0 < 0.1 || y1 - y0 < 0.1 {
+            return Err("area: слишком мала".into());
+        }
+        return Ok(Some(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]));
+    }
+    if a.get("points").is_some() {
+        let p = points_of(a);
+        if p.len() < 3 {
+            return Err("points: нужно не меньше трёх точек [x, y]".into());
+        }
+        return Ok(Some(p));
+    }
+    Ok(None)
+}
+
+fn inspect_zone_row(i: usize, z: &map::InspectZone) -> Value {
+    let r2 = |v: f32| (v * 100.0).round() / 100.0;
+    let mut row = json!(z.inspect);
+    row["index"] = json!(i);
+    row["points"] = json!(z.points.iter().map(|p| [r2(p[0]), r2(p[1])]).collect::<Vec<_>>());
+    row
+}
+
 fn points_of(a: &Value) -> Vec<[f32; 2]> {
     a["points"].as_array().map(|l| l.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect()).unwrap_or_default()
 }
@@ -2133,6 +2283,9 @@ fn object_row(i: usize, p: &map::Prop) -> Value {
     if p.sunk() > 0.0 {
         row["sunk"] = json!((p.sunk() as f64 * 100.0).round() / 100.0);
     }
+    if let Some(ins) = &p.inspect {
+        row["inspect"] = json!(ins);
+    }
     row
 }
 
@@ -2291,7 +2444,7 @@ mod tests {
 
     #[test]
     fn describe_tells_canopies_and_low_walls() {
-        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str, canopy: Option<bool>| map::Prop { asset: asset.into(), pos: [1.0, 1.0], size: [14.0, 3.0], rot: 180.0, scale: 1.0, shadow: None, light: None, canopy, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         assert_eq!(object_row(0, &prop("objects/Sail_Yard_Light_Tan_A1_14x3.webp", Some(true)))["canopy"], json!(true), "парус, отмеченный кроной");
         assert_eq!(object_row(1, &prop("objects/Crate_Wood_Dark_A_1x1.webp", None))["canopy"], json!(false));
         // Видимая часть — в клетках: холст 2×1 в масштабе 1,5, картинка занимает его середину.

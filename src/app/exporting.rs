@@ -594,6 +594,15 @@ impl App {
                 tents.extend(export::tent_walls(p, Some(&hulls[&p.asset])));
             }
             lay.tents = tents;
+            // Зона осмотра предмета — по контуру нарисованного, как полог палатки.
+            for z in lay.inspects.iter_mut() {
+                let Some(p) = z.prop.and_then(|i| map.props.get(i)) else { continue };
+                if !hulls.contains_key(&p.asset) {
+                    let hull = self.textures.bytes(&p.asset).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| export::alpha_hull(&i.to_rgba8())).unwrap_or_default();
+                    hulls.insert(p.asset.clone(), hull);
+                }
+                z.outline = export::inspect_outline(p, Some(&hulls[&p.asset]), seen(&p.asset));
+            }
             if e.district.is_some() {
                 lay.clip_to(map.width as f32, map.height as f32);
             }
@@ -605,6 +614,7 @@ impl App {
             layouts.push(lay);
             laps.lap("layout");
         }
+        export::unique_inspect_keys(&mut layouts);
         // Створки — отдельными картинками рядом со сценой: Foundry их двигает.
         let mut leaves = std::collections::HashMap::new();
         for key in layouts.iter().flat_map(|l| l.portals.iter()).filter_map(|p| p.leaf.clone()) {
@@ -983,6 +993,9 @@ impl App {
         }
         let scene_path = e.dir.join(format!("{base}.json"));
         files.push((scene_path, serde_json::to_string_pretty(&scene).unwrap_or_default().into_bytes()));
+        // Тексты осмотра — не в сцене: в файл рядом с данными Foundry. Кусок мира Boundless
+        // их не пишет: в нём только часть зон, и файл карты потерял бы остальные.
+        let inspected = if chunk { String::new() } else { self.inspect_texts(e, &layouts, &mut files) };
         laps.lap("scene");
         #[cfg(not(target_arch = "wasm32"))]
         if chunk {
@@ -1108,7 +1121,7 @@ impl App {
             (all, wow) => format!(", предметов моделями 3D {all} (WoW — {wow}: только для своего стола)"),
         };
         Ok(format!(
-            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}{models}{credited}",
+            "{} {}: {}{}картинка {w}×{h}, стен {walls}, крыш {roof_count}, проёмов {}, огней {}{models}{credited}{inspected}",
             if cfg!(target_arch = "wasm32") { "На сцену —" } else { "Выгружено в" },
             e.dir.display(),
             e.district.as_ref().map_or_else(String::new, |d| format!("район {},{}–{},{}, ", d.area[0], d.area[1], d.area[2], d.area[3])),
@@ -1116,6 +1129,68 @@ impl App {
             layouts.iter().map(|l| l.portals.len()).sum::<usize>(),
             layouts.iter().map(|l| l.lights.len()).sum::<usize>()
         ))
+    }
+
+    /// Случайная часть имени файла текстов осмотра карты (`Map::inspect_file`): с первого
+    /// этажа, у которого она есть; пусто — ещё нет.
+    pub(super) fn inspect_file_name(&self) -> String {
+        let level = |k: usize| if k == self.level { &self.map } else { &self.levels[k] };
+        (0..self.levels.len().max(1)).map(level).map(|m| m.inspect_file.clone()).find(|f| f.len() == 32 && f.bytes().all(|b| b.is_ascii_hexdigit())).unwrap_or_default()
+    }
+
+    /// Имя файла текстов осмотра — у первого этажа; нет — заводится (128 бит случайности).
+    pub(super) fn ensure_inspect_file(&mut self) -> String {
+        let name = self.inspect_file_name();
+        if !name.is_empty() {
+            return name;
+        }
+        let name = map::random_hex(16);
+        if self.level == 0 || self.levels.is_empty() {
+            self.map.inspect_file = name.clone();
+        } else {
+            self.levels[0].inspect_file = name.clone();
+        }
+        name
+    }
+
+    /// Тексты зон осмотра (🔥 Cinema) — файлом `kartograf-<32 hex>.json` прямо в
+    /// `burn-inspect-secret/` данных Foundry (FORMAT.md модуля): в сцене и в папке карты их
+    /// получил бы каждый игрок. Имя файла у карты одно (`Map::inspect_file`), в сцене его нет.
+    /// Зон не осталось — файл пишется пустым, старые тексты не висят. Строка — в отчёт.
+    fn inspect_texts(&mut self, e: &Export, layouts: &[export::Layout], files: &mut Vec<(PathBuf, Vec<u8>)>) -> String {
+        let zones: Vec<&export::InspectOut> = layouts.iter().flat_map(|l| l.inspects.iter()).collect();
+        if zones.is_empty() && self.inspect_file_name().is_empty() {
+            return String::new();
+        }
+        let file = format!("kartograf-{}.json", self.ensure_inspect_file());
+        let body = serde_json::to_string_pretty(&export::inspect_store(&zones)).unwrap_or_default().into_bytes();
+        let count = if zones.is_empty() { String::new() } else { format!("; зон осмотра {}", zones.len()) };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = e;
+            files.push((PathBuf::from(export::INSPECT_STORE).join(&file), body));
+            count
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let root = export::data_root(&e.dir);
+            let dir = root.as_ref().map_or_else(|| e.dir.join(export::INSPECT_STORE), |r| r.join(export::INSPECT_STORE));
+            let keys: std::collections::HashSet<&str> = zones.iter().map(|z| z.inspect.key.as_str()).collect();
+            export::purge_inspect_keys(&dir, &file, &keys);
+            files.push((dir.join(&file), body));
+            if zones.is_empty() {
+                return count;
+            }
+            let warn = match &root {
+                None => format!(" — тексты в {}: эту папку Foundry не видит, файл нужно положить в Data/{}/", dir.display(), export::INSPECT_STORE),
+                Some(r) => match export::module_version(r, "burn-cinema") {
+                    None => " — модуля 🔥 Cinema в данных Foundry нет, без него зоны не работают".to_owned(),
+                    Some(v) if !export::version_at_least(&v, [1, 3, 1]) => format!(" — нужен 🔥 Cinema 1.3.1, а стоит {v}"),
+                    Some(_) => " (работают, если в мире включён 🔥 Cinema)".to_owned(),
+                },
+            };
+            format!("{count}{warn}")
+        }
     }
 
     /// Картинка ассета для общей папки: WebP пака как есть, если его не перекрашивали и

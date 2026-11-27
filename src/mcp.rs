@@ -54,6 +54,23 @@ fn tools() -> Value {
     let inset = json!({"type": "number", "minimum": 0, "maximum": 1, "description": "With against_wall: how deep, in cells, the back sinks into the wall — a wall lamp, a wall panel sit in the wall instead of standing by it; default 0"});
     let lighting = json!({"type": "string", "enum": ["day", "dusk", "night"], "description": "day (default): the picture as is. dusk / night: the objects' lights glow with soft wall shadows, windows let light out onto the ground, roofs hide light under them; cool ambient outside, dim indoors. Bright light shows the floor as by day and never brighter, however many lights overlap (as in Foundry)"});
     let door_kind = json!({"type": "string", "enum": ["door", "double", "window", "opening", "secret"], "description": "Default door"});
+    // Осмотр (🔥 Cinema): одни поля у предмета и у нарисованной зоны.
+    let inspect_fields = json!({
+        "title": {"type": "string", "description": "Public name: shown on hover and as the plaque header — no spoilers"},
+        "text": {"type": "string", "description": "What the player learns (with a check — on success). Plain text (blank line — new paragraph) or HTML"},
+        "fail": {"type": "string", "description": "Text on a failed check; empty — «Nothing remarkable»"},
+        "gm_note": {"type": "string", "description": "Only for the GM: pops up on the GM's screen when someone inspects"},
+        "check": {"type": "string", "enum": ["none", "roll", "passive"], "description": "none (default) — no check; roll — the player rolls the skill; passive — passive skill against dc, no roll"},
+        "skill": {"type": "string", "description": "dnd5e skill key: prc (Perception, default), inv (Investigation), ins, arc, his, nat, rel, sur, med…"},
+        "dc": {"type": "integer", "minimum": 0, "maximum": 40, "description": "Difficulty, default 12"},
+        "show": {"type": "string", "enum": ["self", "all", "chat"], "description": "Who sees the plaque: self (default) — the one who inspected; all — every player; chat — the inspector plus a public chat line"},
+        "range": {"type": "number", "description": "Feet from the token to the zone edge; 0 (default) — from anywhere"},
+        "repeat": {"type": "string", "enum": ["remember", "always", "once"], "description": "remember (default) — a second click shows the same result without a roll; always — anew every click; once — the zone goes dark for that character after the first look"},
+        "sound": {"type": "string", "description": "Sound for those who get the plaque, a path in Foundry data"},
+        "duration": {"type": "number", "description": "Seconds the plaque stays; 0 (default) — until closed"},
+        "key": {"type": "string", "description": "Text key (8–64 of A–Z a–z 0–9 _ -). Set automatically and kept for the zone's life — the GM's edits in Foundry survive a new export; give it only to keep a zone's key when rebuilding a map from a script"}
+    });
+    let inspect = json!({"type": ["object", "boolean", "null"], "properties": inspect_fields.clone(), "description": "Make the object inspectable (🔥 Cinema «Осмотр предметов»): a player clicks it in Foundry and a plaque with the GM's text appears over it. The zone follows the outline of the picture. Object — the fields (on edit only those given change); true — inspectable with what it has; false or null — not inspectable. The texts go to Foundry in a separate file the players cannot list, never into the scene"});
     json!([
         tool("list_prefabs", "Prefabs saved in the data folder: name, number of objects, size in cells.", json!({}), &[]),
         tool("save_prefab", "Save objects of the map (indices from describe) as a prefab under a name: a set that is placed again in one go — a table with chairs, a kitchen corner, a console with its chair. The person sees it on the shelf, tab «Префабы».", json!({
@@ -66,7 +83,7 @@ fn tools() -> Value {
             "reset_frames": {"type": "boolean", "description": "Forget the frame times after this answer: the next map_info shows only frames drawn since"}
         }), &[]),
         tool("describe", "List what is on the map, with indices for editing: objects, walls, doors, labels, paths (roads, rivers), roofs. Optionally only inside an area.", json!({
-            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "room_walls", "visible"]}, "description": "Sections to list; default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},
+            "include": {"type": "array", "items": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "inspect_zones", "room_walls", "visible"]}, "description": "Sections to list (an inspectable object has inspect in its row; drawn inspect zones are inspect_zones); default all except room_walls (the automatic walls along painted rooms as segments [[x, y], [x, y]], asked for by name) and visible (adds vis to each object: the opaque part of its picture in cells from its centre before rotation, [left, top, right, bottom]; slower, the pictures are decoded)"},
             "area": area, "limit": int("Max items per section, default 200")
         }), &[]),
         tool("check_map", "Check the current level for what will look or play wrong in Foundry (the same list as the «Проверка» window): roof-only things off roofs and non-roof things on them, anything above roofs over a house (hides the room), vertical things lying flat, pipe ends to nowhere, objects inside each other, blocked doors, objects across house walls, street things indoors and indoor things outside, objects past the map edge, labels on objects, wall lamps off walls, lamp posts not against a wall or in the middle of a passage, objects that block a passage for a one-cell token. Returns count and issues: kind, text, line ('[kind] text'), at [x, y] — where to look, objects — their indices.", json!({}), &[]),
@@ -84,14 +101,27 @@ fn tools() -> Value {
             "asset": text("Asset key from find_assets"), "x": num("Centre x, cells"), "y": num("Centre y, cells"),
             "rotation": num("Degrees clockwise, default 0"), "scale": num("Default 1"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy.clone(), "flip": {"type": "boolean", "description": "Mirror the picture left to right (Dungeondraft: hold A while placing); rotation applies after"},  "tint": tint, "recolor": recolor,
             "light_radius": light_radius.clone(), "light_color": light_color.clone(), "light_animation": light_animation.clone(), "light_speed": light_speed.clone(), "light_intensity": light_intensity.clone(), "sunk": sunk.clone(),
-            "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone(), "inset": inset.clone()
+            "front": front.clone(), "look_at": look_at.clone(), "against_wall": against_wall.clone(), "inset": inset.clone(), "inspect": inspect.clone()
         }), &["asset", "x", "y"]),
         tool("edit_object", "Move, rotate, scale, light, shade, tint or swap the picture of an object by index (see describe).", json!({
             "index": int("Object index"), "x": num("New centre x"), "y": num("New centre y"),
             "rotation": num("Degrees clockwise"), "scale": num("Scale"), "asset": text("New asset key"), "light": light, "layer": layer, "shadow": shadow, "canopy": canopy, "flip": {"type": "boolean", "description": "Mirror the picture left to right (Dungeondraft: hold A while placing); rotation applies after"},  "tint": tint, "recolor": recolor,
             "light_radius": light_radius, "light_color": light_color, "light_animation": light_animation, "light_speed": light_speed, "light_intensity": light_intensity, "sunk": sunk,
-            "front": front, "look_at": look_at, "against_wall": against_wall, "inset": inset
+            "front": front, "look_at": look_at, "against_wall": against_wall, "inset": inset, "inspect": inspect
         }), &["index"]),
+        tool("add_inspect_zone", "Draw an inspect zone (🔥 Cinema «Осмотр предметов») that is a place, not an object: a stain on a wall, a loose floorboard, writing on a stone. In Foundry a player clicks it and a plaque with the GM's text appears. Give area or points. Returns its index (see describe, section inspect_zones). For an object, use inspect in add_object / edit_object instead.", {
+            let mut p = inspect_fields.clone();
+            p["area"] = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "Rectangle [x0, y0, x1, y1] in cells"});
+            p["points"] = json!({"type": "array", "items": point.clone(), "minItems": 3, "description": "Polygon corners in cells, instead of area"});
+            p
+        }, &[]),
+        tool("edit_inspect_zone", "Change a drawn inspect zone by index: its shape (area or points) and any of its fields.", {
+            let mut p = inspect_fields.clone();
+            p["index"] = int("Zone index");
+            p["area"] = json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "New rectangle [x0, y0, x1, y1] in cells"});
+            p["points"] = json!({"type": "array", "items": point.clone(), "minItems": 3, "description": "New polygon corners in cells"});
+            p
+        }, &["index"]),
         tool("set_scene", "What lives in the Foundry scene (Wild Canvas): place sound, scene light, what flies from tree crowns, weather, and the water current. A ship underway stands still while the water runs past it: set current and drift, paint the sea as water and the deck as anything else.", json!({
             "ambience": text("Place sound key, '' for none: forest-summer, forest-spring, forest-autumn, forest-winter, forest-magic, cave-1..3, dungeon-1..3, town-1, town-2, station-1 (ventilation hum), station-2 (reactor hum), tavern, house"),
             "light": {"type": "string", "enum": ["", "day", "dim", "dark"], "description": "Scene light in Foundry, apart from the place sound: day — global light, everything in sight is lit; dim — global light with the scene darkened (tokens see everything in their line of sight, lamps stand out: a station on emergency power, a dusk street); dark — no global light, tokens see only near light sources (place lamps so there are no black gaps between them, or use dim); '' — by the place sound: forest and town are day, everything else dark"},
@@ -153,8 +183,8 @@ fn tools() -> Value {
             "rail": {"type": "boolean"}, "lights": {"type": ["boolean", "array", "null"], "items": {"type": "integer"}}, "grates": {"type": "array", "items": {"type": "object"}},
             "open": open_edges
         }), &["index"]),
-        tool("remove", "Remove items by indices: objects, walls, doors, labels, paths, roofs or platforms. Indices of later items shift down.", json!({
-            "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms"]},
+        tool("remove", "Remove items by indices: objects, walls, doors, labels, paths, roofs, platforms or inspect_zones (drawn inspect zones). Indices of later items shift down.", json!({
+            "what": {"type": "string", "enum": ["objects", "walls", "doors", "labels", "paths", "roofs", "platforms", "inspect_zones"]},
             "indices": {"type": "array", "items": {"type": "integer"}}
         }), &["what", "indices"]),
         tool("paint", "Paint floor over a rectangle, oval or polygon. Edges are exact to a quarter cell, so fractional areas line up with add_wall (a room [4, 3, 9.5, 7.5] gets walls on x=9.5 and y=7.5). target 'terrain' paints ground; 'room' paints a room floor and puts walls all around it by itself (room_edges) — so open terraces, balconies, porches and wooden piers are terrain with feather 0, edged with add_wall low: true where needed.", json!({

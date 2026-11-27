@@ -163,6 +163,7 @@ impl App {
             Sel::PlatformEdge(i, k) => self.map.platforms.get(i).is_some_and(|p| k < crate::platform::tidy(&p.points).len()),
             // Местность после отмены другая: кусок выбирают заново.
             Sel::Ground => false,
+            Sel::Inspect(i) => i < self.map.inspects.len(),
         }
     }
 }

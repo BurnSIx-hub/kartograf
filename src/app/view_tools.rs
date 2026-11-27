@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn mirrored_prop_swaps_left_and_right() {
-        let p = Prop { asset: "x".into(), pos: [3.0, 3.0], size: [2.0, 1.0], rot: 30.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let p = Prop { asset: "x".into(), pos: [3.0, 3.0], size: [2.0, 1.0], rot: 30.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         let q = Prop { flip: true, ..p.clone() };
         let (a, b) = (p.corners(), q.corners());
         assert_eq!(b, [a[1], a[0], a[3], a[2]], "левый край картинки — справа");

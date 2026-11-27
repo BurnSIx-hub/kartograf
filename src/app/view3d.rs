@@ -1724,6 +1724,13 @@ impl App {
         }
     }
 
+    /// Закрыть окно 3D, как крестиком: память видеокарты отдаётся на следующем кадре.
+    pub(crate) fn close_view3d(&mut self) {
+        if let Some(v) = &mut self.view3d {
+            v.open = false;
+        }
+    }
+
     /// Окно 3D, если открыто; закрытое отдаёт видеокарте память.
     pub(super) fn view3d_window(&mut self, ctx: &egui::Context) {
         let Some(mut v) = self.view3d.take() else { return };
@@ -1764,6 +1771,7 @@ mod tests {
             zones: Vec::new(),
             passages: Vec::new(),
             stairs: Vec::new(),
+            inspects: Vec::new(),
         };
         let floor = Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0, scene3d::Ground::default(), None);
         let mut v = View3d::fresh(Renderer::default(), Vec::new(), vec![floor], [10.0, 10.0], Time::Night);
@@ -1872,7 +1880,7 @@ mod tests {
 
     #[test]
     fn a_flight_takes_the_token_upstairs_and_back_down() {
-        let lay = Layout { tents: Vec::new(), walls: Vec::new(), low: Vec::new(), cliffs: Vec::new(), portals: Vec::new(), lights: Vec::new(), zones: Vec::new(), passages: Vec::new(), stairs: Vec::new() };
+        let lay = Layout { tents: Vec::new(), walls: Vec::new(), low: Vec::new(), cliffs: Vec::new(), portals: Vec::new(), lights: Vec::new(), zones: Vec::new(), passages: Vec::new(), stairs: Vec::new(), inspects: Vec::new() };
         // Марш с юга (y = 6) на север (y = 3) по x 4..6: семь ступеней до пола второго этажа.
         let steps: Vec<scene3d::Block> = (0..7).map(|i| rect(4.0, 6.0 - (i + 1) as f32 * 3.0 / 7.0, 6.0, 6.0 - i as f32 * 3.0 / 7.0, STOREY * (i + 1) as f32 / 7.0)).collect();
         let ground = scene3d::Ground { relief: None, blocks: steps, cliff: None };
@@ -1959,7 +1967,7 @@ mod tests {
     #[test]
     fn moving_furniture_needs_no_new_shot_but_moving_a_rug_does() {
         let mut map = Map::new(10, 10);
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         map.props.push(prop("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
         map.props.push(prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp"));
         let base = still(&map);

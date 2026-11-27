@@ -239,6 +239,100 @@ impl App {
         if released { self.tap_from.take() } else { None }
     }
 
+    /// «Осмотр»: щелчок по предмету делает его осматриваемым и выбирает, по зоне — выбирает
+    /// её; протяжка по пустому месту — рамка новой зоны, за зону — двигает её, за вершину
+    /// выбранной — вершину. Двойной щелчок у края выбранной — новая вершина, по вершине —
+    /// убрать её (пока их больше трёх).
+    fn inspect_input(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: Rect, pointer: Option<Pos2>, alt: bool) {
+        let reach = 8.0 / self.cam.scale.max(1.0);
+        let vertex_at = |app: &Self, w: [f32; 2]| match app.sel {
+            Some(Sel::Inspect(i)) => app.map.inspects.get(i).and_then(|z| z.points.iter().position(|p| (p[0] - w[0]).hypot(p[1] - w[1]) <= reach)).map(|k| (i, k)),
+            _ => None,
+        };
+        if resp.drag_started_by(PointerButton::Primary)
+            && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+        {
+            let w = self.cam.to_world(rect, o);
+            if let Some((i, k)) = vertex_at(self, w) {
+                self.checkpoint();
+                self.inspect_grab = Some((i, Some(k), w, self.map.inspects[i].points.clone()));
+            } else if let Some(i) = self.map.inspects.iter().rposition(|z| z.contains(w)) {
+                self.checkpoint();
+                self.inspect_grab = Some((i, None, w, self.map.inspects[i].points.clone()));
+                self.sel = Some(Sel::Inspect(i));
+            } else {
+                self.inspect_from = Some(w);
+            }
+        }
+        if let (Some((i, k, w0, pts)), Some(p)) = (self.inspect_grab.clone(), pointer)
+            && resp.dragged_by(PointerButton::Primary)
+            && i < self.map.inspects.len()
+        {
+            let w = self.cam.to_world(rect, p);
+            match k {
+                Some(k) => {
+                    let at = self.snap_pos(w, alt);
+                    self.map.inspects[i].points[k] = at;
+                }
+                None => {
+                    let d = [w[0] - w0[0], w[1] - w0[1]];
+                    // С привязкой зона едет по полклетки — углы остаются на узлах.
+                    let d = if self.snap_now(alt) { [(d[0] * 2.0).round() / 2.0, (d[1] * 2.0).round() / 2.0] } else { d };
+                    self.map.inspects[i].points = pts.iter().map(|q| [q[0] + d[0], q[1] + d[1]]).collect();
+                }
+            }
+        }
+        if resp.drag_stopped_by(PointerButton::Primary) {
+            self.inspect_grab = None;
+            if let (Some(a), Some(p)) = (self.inspect_from.take(), pointer) {
+                let (a, b) = (self.snap_pos(a, alt), self.snap_pos(self.cam.to_world(rect, p), alt));
+                let (x0, y0, x1, y1) = (a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1]));
+                if x1 - x0 >= 0.2 && y1 - y0 >= 0.2 {
+                    self.checkpoint();
+                    self.ensure_inspect_file();
+                    self.map.inspects.push(map::InspectZone { points: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]], inspect: map::Inspect::default() });
+                    self.sel = Some(Sel::Inspect(self.map.inspects.len() - 1));
+                }
+            }
+        } else if resp.double_clicked()
+            && let Some(p) = pointer
+            && let Some(Sel::Inspect(i)) = self.sel
+            && i < self.map.inspects.len()
+        {
+            let w = self.cam.to_world(rect, p);
+            let pts = &self.map.inspects[i].points;
+            let n = pts.len();
+            if let Some((_, k)) = vertex_at(self, w) {
+                if n > 3 {
+                    self.checkpoint();
+                    self.map.inspects[i].points.remove(k);
+                }
+            } else if let Some((k, d)) = (0..n).map(|k| (k, map::segment_distance(w, pts[k], pts[(k + 1) % n]))).min_by(|a, b| a.1.total_cmp(&b.1))
+                && d <= reach
+            {
+                self.checkpoint();
+                let at = self.snap_pos(w, alt);
+                self.map.inspects[i].points.insert(k + 1, at);
+            }
+        } else if resp.clicked()
+            && let Some(p) = pointer
+        {
+            let w = self.cam.to_world(rect, p);
+            if let Some(i) = self.map.inspects.iter().rposition(|z| z.contains(w)) {
+                self.sel = Some(Sel::Inspect(i));
+            } else if let Some(i) = self.prop_under(w) {
+                if self.map.props[i].inspect.is_none() {
+                    self.checkpoint();
+                    self.ensure_inspect_file();
+                    self.map.props[i].inspect = Some(map::Inspect::default());
+                }
+                self.sel = Some(Sel::Prop(i));
+            } else {
+                self.sel = None;
+            }
+        }
+    }
+
     pub(super) fn handle_tool(&mut self, ui: &egui::Ui, resp: &egui::Response) {
         let rect = self.canvas;
         let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
@@ -400,6 +494,7 @@ impl App {
                     }
                 }
             }
+            Tool::Inspect => self.inspect_input(ui, resp, rect, pointer, alt),
             Tool::Path => {
                 if resp.drag_started_by(PointerButton::Primary)
                     && let Some(o) = ui.input(|i| i.pointer.press_origin()).or(pointer)

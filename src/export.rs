@@ -32,6 +32,162 @@ pub struct Layout {
     /// Из них — лестницы маршем ([`crate::ground3d::flight_by_name`]): в 3D Canvas по ним идут
     /// ногами, переход у них помечен для модуля.
     pub stairs: Vec<[f32; 4]>,
+    /// Зоны осмотра (🔥 Cinema): предметы с осмотром и нарисованные зоны этажа.
+    pub inspects: Vec<InspectOut>,
+}
+
+/// Поведение области «🔥 Осмотр» модуля 🔥 Cinema.
+pub const INSPECT_BEHAVIOR: &str = "burn-cinema.inspect";
+/// Папка файлов текстов осмотра в данных Foundry: список файлов в ней сервер отдаёт только
+/// с правом FILES_BROWSE (у игрока его нет), а имя нашего файла нигде в мире не записано.
+pub const INSPECT_STORE: &str = "burn-inspect-secret";
+
+/// Зона осмотра в выгрузке.
+pub struct InspectOut {
+    /// Контур в клетках, без повтора первой точки.
+    pub outline: Vec<[f32; 2]>,
+    /// Номер предмета этажа, если зона — его (`Prop::inspect`); нет — нарисованная. По нему
+    /// 3D-выгрузка может взять зону у модели предмета.
+    pub prop: Option<usize>,
+    pub inspect: map::Inspect,
+}
+
+/// Контур предмета для зоны осмотра, в клетках: выпуклая оболочка нарисованного (`hull`,
+/// доли картинки, [`alpha_hull`]), без неё — видимая рамка (`visible`, доли холста от
+/// середины), а без рамки — 90 % холста.
+pub fn inspect_outline(p: &map::Prop, hull: Option<&[[f32; 2]]>, visible: Option<[f32; 4]>) -> Vec<[f32; 2]> {
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let fx = if p.flip { -1.0 } else { 1.0 };
+    let local: Vec<[f32; 2]> = match hull {
+        Some(hl) if hl.len() >= 3 => hl.iter().map(|v| [(v[0] - 0.5) * w * fx, (v[1] - 0.5) * h]).collect(),
+        _ => {
+            let [l, t, r, b] = visible.unwrap_or([-0.45, -0.45, 0.45, 0.45]);
+            [[l, t], [r, t], [r, b], [l, b]].iter().map(|v| [v[0] * w * fx, v[1] * h]).collect()
+        }
+    };
+    let (s, c) = p.rot.to_radians().sin_cos();
+    local.iter().map(|v| [p.pos[0] + v[0] * c - v[1] * s, p.pos[1] + v[0] * s + v[1] * c]).collect()
+}
+
+/// Открытая часть зоны — `system` поведения `burn-cinema.inspect` (FORMAT.md модуля). Текстов
+/// здесь нет: регион уходит каждому игроку.
+pub fn inspect_system(i: &map::Inspect) -> Value {
+    let r2 = |v: f32| ((v.max(0.0) as f64) * 100.0).round() / 100.0;
+    json!({
+        "textKey": i.key, "title": i.title.trim(), "checkMode": i.check.word(), "skill": i.skill.trim(), "dc": i.dc.min(40),
+        "visibility": i.show.word(), "range": r2(i.range), "repeat": i.repeat.word(), "sound": i.sound.trim(), "duration": r2(i.duration)
+    })
+}
+
+/// Область зоны осмотра: контур видят только на слое «Области» (`visibility` 0), игрок —
+/// подсветкой модуля при наведении.
+fn inspect_region(n: usize, z: &InspectOut, px: u32) -> Value {
+    let p = px as f32;
+    let pts: Vec<i64> = z.outline.iter().flat_map(|v| [(v[0] * p).round() as i64, (v[1] * p).round() as i64]).collect();
+    let title = z.inspect.title.trim();
+    json!({
+        "_id": doc_id('r', n), "name": if title.is_empty() { "🔍 Осмотр".to_owned() } else { format!("🔍 {title}") },
+        "color": "#f3c76b", "visibility": 0,
+        "shapes": [{"type": "polygon", "points": pts, "hole": false}],
+        "elevation": {"bottom": null, "top": null},
+        "behaviors": [{"_id": doc_id('i', n), "type": INSPECT_BEHAVIOR, "name": "🔥 Осмотр", "disabled": false, "system": inspect_system(&z.inspect)}],
+        "flags": {OWN_MODULE: {"inspect": z.prop.map_or_else(|| json!({}), |i| json!({"prop": i}))}}
+    })
+}
+
+/// Файл текстов осмотра (FORMAT.md, «Файл текстов»): ключ → текст, провал, заметка ГМа.
+pub fn inspect_store(zones: &[&InspectOut]) -> Value {
+    let mut out = serde_json::Map::new();
+    for z in zones {
+        let i = &z.inspect;
+        out.insert(i.key.clone(), json!({"text": html_text(&i.text), "textFail": html_text(&i.fail), "gmNote": html_text(&i.gm_note)}));
+    }
+    json!({"version": 1, "zones": out})
+}
+
+/// Простой текст — абзацами HTML (пустая строка — новый абзац, перевод строки — `<br>`);
+/// HTML (начинается с `<`) — как есть.
+pub fn html_text(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('<') {
+        return t.to_owned();
+    }
+    let esc = |x: &str| x.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let t = t.replace("\r\n", "\n");
+    let mut out = String::new();
+    for para in t.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+        out.push_str(&format!("<p>{}</p>", esc(para).replace('\n', "<br>")));
+    }
+    out
+}
+
+/// Ключи зон всех этажей — разные. Копия предмета уносит ключ оригинала, а у зоны из
+/// файла, написанного руками, ключа может не быть: такие получают ключ из своего и номера
+/// повтора (или из названия и места) — тот же при каждой выгрузке, пока порядок тот же.
+pub fn unique_inspect_keys(layouts: &mut [Layout]) {
+    use sha2::{Digest, Sha256};
+    let derive = |seed: &str| Sha256::digest(seed.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect::<String>();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for z in layouts.iter_mut().flat_map(|l| l.inspects.iter_mut()) {
+        if !map::Inspect::key_ok(&z.inspect.key) {
+            let at = z.outline.first().copied().unwrap_or_default();
+            z.inspect.key = derive(&format!("{}|{:.2}|{:.2}", z.inspect.title, at[0], at[1]));
+        }
+        let n = seen.entry(z.inspect.key.clone()).or_insert(0);
+        if *n > 0 {
+            z.inspect.key = derive(&format!("{}#{n}", z.inspect.key));
+        }
+        *n += 1;
+    }
+}
+
+/// Папка данных Foundry (`Data`), в которой лежит папка выгрузки: ближайшая сверху, где есть
+/// `modules` и `worlds`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn data_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    dir.ancestors().find(|a| a.join("modules").is_dir() && a.join("worlds").is_dir()).map(|a| a.to_path_buf())
+}
+
+/// Версия модуля в данных Foundry (`modules/<id>/module.json`), если он там есть.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn module_version(root: &std::path::Path, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("modules").join(id).join("module.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("version")?.as_str().map(str::to_owned)
+}
+
+/// Версия `v` («1.3.1», «v1.10») не ниже `min`.
+pub fn version_at_least(v: &str, min: [u32; 3]) -> bool {
+    let mut parts = v.trim().trim_start_matches('v').split('.').map(|x| x.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().unwrap_or(0));
+    let have = [parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0)];
+    have >= min
+}
+
+/// Наши ключи — из других выгрузок Картографа в папке текстов (`kartograf-*.json`, кроме
+/// `keep`): там они устарели, а модуль сводит файлы по имени, и старый текст мог бы взять
+/// верх. Опустевший файл удаляется. Файлы мира (`world-*`) — правки ГМа, их не трогаем.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn purge_inspect_keys(dir: &std::path::Path, keep: &str, keys: &std::collections::HashSet<&str>) {
+    let Ok(list) = std::fs::read_dir(dir) else { return };
+    for f in list.flatten() {
+        let name = f.file_name().to_string_lossy().into_owned();
+        if name == keep || !name.starts_with("kartograf-") || !name.ends_with(".json") {
+            continue;
+        }
+        let path = f.path();
+        let Some(mut v) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
+        let Some(zones) = v.get_mut("zones").and_then(Value::as_object_mut) else { continue };
+        let before = zones.len();
+        zones.retain(|k, _| !keys.contains(k.as_str()));
+        if zones.len() == before {
+            continue;
+        }
+        if zones.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+    }
 }
 
 /// Прорезать в стенах раскладки проходы `gaps` — как пустые проёмы на карте (отрезок на
@@ -542,7 +698,16 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
     };
     let passages = map.props.iter().filter(|p| map::passage_by_name(&p.asset)).map(frame).collect();
     let stairs = map.props.iter().filter(|p| crate::ground3d::flight_by_name(&p.asset)).map(frame).collect();
-    Layout { walls, low, cliffs, portals, lights, zones, tents, passages, stairs }
+    // Зоны осмотра: у предмета — по видимой рамке картинки (выгрузка уточняет её контуром
+    // нарисованного), нарисованные — как есть.
+    let mut inspects: Vec<InspectOut> = map
+        .props
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.inspect.as_ref().map(|ins| InspectOut { outline: inspect_outline(p, None, seen(&p.asset)), prop: Some(i), inspect: ins.clone() }))
+        .collect();
+    inspects.extend(map.inspects.iter().filter(|z| z.points.len() >= 3).map(|z| InspectOut { outline: z.points.clone(), prop: None, inspect: z.inspect.clone() }));
+    Layout { walls, low, cliffs, portals, lights, zones, tents, passages, stairs, inspects }
 }
 
 /// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
@@ -1735,6 +1900,11 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
             }
             regions.push(tag(region));
         }
+        // Зоны осмотра этажа (🔥 Cinema). У одного этажа — без `levels`: на всех.
+        for z in lv.layout.inspects.iter().filter(|z| z.outline.len() >= 3) {
+            let region = inspect_region(regions.len(), z, px);
+            regions.push(tag(region));
+        }
         let mut doc = json!({"_id": level_id(k), "name": lv.name, "background": {"src": lv.image_src, "color": "#999999"}});
         // Верх этажа — явно и у одного этажа: у уровня без него верх бесконечный, и
         // `foreground` со стенами лёг бы выше крыш.
@@ -2239,6 +2409,102 @@ mod tests {
         assert!(!covered([6.0, 5.0]), "настил вырезан");
     }
 
+    fn inspect_prop(asset: &str, pos: [f32; 2], inspect: crate::map::Inspect) -> crate::map::Prop {
+        crate::map::Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: Some(inspect) }
+    }
+
+    #[test]
+    fn inspect_zones_become_regions_and_their_texts_stay_out_of_the_scene() {
+        let mut m = Map::new(12, 10);
+        let bed = crate::map::Inspect { title: "Кровать".into(), text: "Изодрана когтями.".into(), fail: "Старая кровать.".into(), gm_note: "Оборотень.".into(), check: crate::map::InspectCheck::Roll, dc: 14, ..Default::default() };
+        m.props.push(inspect_prop("Bed_A", [3.0, 4.0], bed.clone()));
+        let spot = crate::map::Inspect { title: "Пятно".into(), text: "Бурое & <липкое>.".into(), show: crate::map::InspectShow::All, range: 10.0, repeat: crate::map::InspectRepeat::Once, ..Default::default() };
+        m.inspects.push(crate::map::InspectZone { points: vec![[7.0, 7.0], [9.0, 7.0], [9.0, 9.0], [7.0, 9.0]], inspect: spot.clone() });
+        let lay = layout(&m, &[]);
+        assert_eq!(lay.inspects.len(), 2);
+        // Кровать 2×1 повёрнута на 90°: по видимой рамке (без картинки — 90 % холста) стоит поперёк.
+        let o = &lay.inspects[0].outline;
+        let (xs, ys): (Vec<f32>, Vec<f32>) = o.iter().map(|p| (p[0], p[1])).unzip();
+        let span = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((span(&xs) - 0.9).abs() < 1e-4 && (span(&ys) - 1.8).abs() < 1e-4, "контур кровати: {o:?}");
+        assert_eq!(lay.inspects[0].prop, Some(0));
+        let scene = foundry_levels(&m, "Спальня", &[SceneLevel { name: "Спальня".into(), image_src: "s.jpg".into(), layout: &lay, roofs: Vec::new() }], 100, &Default::default());
+        let regions = scene["regions"].as_array().unwrap();
+        let zones: Vec<&Value> = regions.iter().filter(|r| r["behaviors"][0]["type"] == INSPECT_BEHAVIOR).collect();
+        assert_eq!(zones.len(), 2);
+        let b = &zones[0]["behaviors"][0];
+        assert_eq!(b["system"]["textKey"], json!(bed.key));
+        assert_eq!((b["system"]["checkMode"].clone(), b["system"]["dc"].clone(), b["system"]["title"].clone()), (json!("roll"), json!(14), json!("Кровать")));
+        assert_eq!(zones[0]["visibility"], 0, "контур — только на слое областей");
+        assert_eq!(b["_id"].as_str().unwrap().len(), 16);
+        let s = &zones[1]["behaviors"][0]["system"];
+        assert_eq!((s["visibility"].clone(), s["range"].clone(), s["repeat"].clone()), (json!("all"), json!(10.0), json!("once")));
+        assert_eq!(zones[1]["shapes"][0]["points"], json!([700, 700, 900, 700, 900, 900, 700, 900]));
+        assert!(zones[1].get("levels").is_none(), "у одного этажа — на всех этажах");
+        // Тексты — ни в одном поле сцены: её получает каждый игрок.
+        let all = scene.to_string();
+        for secret in ["Изодрана", "Старая кровать", "Оборотень", "Бурое"] {
+            assert!(!all.contains(secret), "в сцене текст «{secret}»");
+        }
+        for k in ["text", "textFail", "gmNote"] {
+            assert!(b["system"].get(k).is_none(), "{k} в регионе");
+        }
+        // А в файле текстов — всё, простым текстом в HTML.
+        let refs: Vec<&InspectOut> = lay.inspects.iter().collect();
+        let store = inspect_store(&refs);
+        assert_eq!(store["version"], 1);
+        assert_eq!(store["zones"][&bed.key], json!({"text": "<p>Изодрана когтями.</p>", "textFail": "<p>Старая кровать.</p>", "gmNote": "<p>Оборотень.</p>"}));
+        assert_eq!(store["zones"][&spot.key]["text"], "<p>Бурое &amp; &lt;липкое&gt;.</p>");
+    }
+
+    #[test]
+    fn copied_inspect_zones_get_their_own_keys_and_keep_them() {
+        let mut m = Map::new(10, 10);
+        let ins = crate::map::Inspect { title: "Бочка".into(), ..Default::default() };
+        // Копия предмета уносит ключ оригинала; у зоны из файла, написанного руками, ключа нет.
+        m.props.push(inspect_prop("Barrel_A", [2.0, 2.0], ins.clone()));
+        m.props.push(inspect_prop("Barrel_A", [5.0, 2.0], ins.clone()));
+        m.inspects.push(crate::map::InspectZone { points: vec![[1.0, 6.0], [3.0, 6.0], [3.0, 8.0]], inspect: crate::map::Inspect { key: String::new(), ..ins.clone() } });
+        let keys = || {
+            let mut lays = vec![layout(&m, &[])];
+            unique_inspect_keys(&mut lays);
+            lays[0].inspects.iter().map(|z| z.inspect.key.clone()).collect::<Vec<_>>()
+        };
+        let a = keys();
+        assert_eq!(a[0], ins.key, "первый — со своим ключом");
+        assert!(a.iter().all(|k| crate::map::Inspect::key_ok(k)));
+        assert_eq!(a.iter().collect::<std::collections::HashSet<_>>().len(), 3, "ключи разные: {a:?}");
+        assert_eq!(keys(), a, "та же карта — те же ключи при каждой выгрузке");
+    }
+
+    #[test]
+    fn plain_inspect_text_becomes_paragraphs_and_html_stays() {
+        assert_eq!(html_text("  "), "");
+        assert_eq!(html_text("Раз\nдва\r\n\r\nтри"), "<p>Раз<br>два</p><p>три</p>");
+        assert_eq!(html_text("<p>Уже <b>HTML</b></p>"), "<p>Уже <b>HTML</b></p>");
+        assert!(version_at_least("1.3.1", [1, 3, 1]) && version_at_least("v1.10.0", [1, 3, 1]) && !version_at_least("1.3.0", [1, 3, 1]));
+    }
+
+    #[test]
+    fn our_keys_leave_older_kartograf_files_and_world_files_stay() {
+        let dir = std::env::temp_dir().join(format!("kartograf-inspect-{}", crate::map::random_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, keys: &[&str]| {
+            let zones: serde_json::Map<String, Value> = keys.iter().map(|k| (k.to_string(), json!({"text": "старое"}))).collect();
+            std::fs::write(dir.join(name), json!({"version": 1, "zones": zones}).to_string()).unwrap();
+        };
+        file("kartograf-old1.json", &["aaaaaaaa"]);
+        file("kartograf-old2.json", &["aaaaaaaa", "cccccccc"]);
+        file("kartograf-mine.json", &["aaaaaaaa"]);
+        file("world-beftest-x.json", &["aaaaaaaa"]);
+        purge_inspect_keys(&dir, "kartograf-mine.json", &["aaaaaaaa"].into_iter().collect());
+        assert!(!dir.join("kartograf-old1.json").exists(), "опустевший файл удалён");
+        let left: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("kartograf-old2.json")).unwrap()).unwrap();
+        assert_eq!(left["zones"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["cccccccc"]);
+        assert!(dir.join("kartograf-mine.json").exists() && dir.join("world-beftest-x.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn water_becomes_living_region_with_island_hole() {
         let mut m = Map::new(12, 12);
@@ -2289,7 +2555,7 @@ mod tests {
         let hold = Map::new(10, 10);
         let mut deck = hold.new_level();
         let mut hold = hold;
-        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |name: &str, x: f32, y: f32| crate::map::Prop { asset: format!("objects/{name}"), pos: [x, y], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 5.0, 5.0));
         hold.props.push(prop("Ladder_Wood_Dark_A1_1x2.webp", 8.0, 2.0));
         deck.props.push(prop("Trapdoor_Wood_Ashen_A2_Open_1x1.webp", 5.2, 4.6));
@@ -2407,7 +2673,7 @@ mod tests {
     fn bridge_pieces_cut_water_end_to_end() {
         use crate::map::Prop;
         let mut m = Map::new(12, 14);
-        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let piece = |y: f32, rot: f32| Prop { asset: "objects/bridges/Bridge_Boardwalk_Straight_A_3x4.webp".into(), pos: [6.0, y], size: [3.0, 4.0], rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         m.props.push(piece(4.0, 0.0));
         m.props.push(piece(8.0, 180.0));
         // Кусок нарисован во всю длину холста, по ширине — настил со сваями.
@@ -2437,7 +2703,7 @@ mod tests {
         assert_eq!(m.materials[floor].live(), Live::Neon);
         let all = crate::mask::cells(m.rooms.w, m.rooms.h, (1, 1), (8, 6));
         m.paint(crate::map::Layer::Rooms, floor, &all);
-        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str, pos: [f32; 2]| Prop { asset: asset.into(), pos, size: [2.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         m.props.push(prop("pack:cp|textures/objects/Armchair_Neon_A_2x1.webp", [4.0, 4.0]));
         m.props.push(prop("pack:cp|textures/objects/Neon_Lamp_Floor_A_1x1.webp", [6.0, 3.0]));
         m.props.push(prop("pack:cp|textures/objects/Floor_Vent_Grate_A_1x1.webp", [3.0, 3.0]));
@@ -2778,7 +3044,7 @@ mod tests {
     fn alarm_light_blinks_slowly() {
         use crate::map::Prop;
         let mut m = Map::new(6, 6);
-        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str, at: [f32; 2]| Prop { asset: asset.into(), pos: at, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         m.props.push(prop("set:scifi/objects/Alarm_Light_Red_A_1x1.webp", [2.0, 2.0]));
         m.props.push(prop("pack:fa|textures/objects/Lantern_Metal_A_1x1.webp", [4.0, 4.0]));
         let lay = layout(&m, &[]);
@@ -2947,6 +3213,7 @@ mod tests {
             zones: Vec::new(),
             passages: Vec::new(),
             stairs: Vec::new(),
+            inspects: Vec::new(),
         };
         lay.clip_to(26.0, 22.0);
         assert_eq!(lay.walls, vec![vec![[0.0, 9.0], [2.0, 9.0]], vec![[0.0, 2.0], [0.0, 5.0]], vec![[2.0, 1.0], [2.0, 0.0]], vec![[4.0, 0.0], [4.0, 1.0], [6.0, 1.0]]]);
@@ -2975,9 +3242,9 @@ mod tests {
         // Двойная дверь в нижней стене и пустой проём в левой.
         m.portals.push(Portal { a: [2.0, 4.0], b: [4.0, 4.0], kind: PortalKind::DoubleDoor, asset: None, frame: None });
         m.portals.push(Portal { a: [1.0, 2.0], b: [1.0, 3.0], kind: PortalKind::Opening, asset: None, frame: None });
-        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [3.0, 2.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         // Чужая жаровня светит по имени, выключенный рукой костёр — нет, бочка с огнём по выбору — да.
-        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let other = |asset: &str, light| Prop { asset: asset.into(), pos: [5.0, 5.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Brazier_Iron_A_1x1.webp", None));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Campfire_B_1x1.webp", Some(crate::map::Glow::Off)));
         m.props.push(other("pack:fa.dungeondraft_pack|textures/objects/Barrel_Fire_A_1x1.webp", Some(crate::map::Glow::Lamp)));
@@ -3060,7 +3327,7 @@ mod tests {
         let hull = alpha_hull(&img);
         assert!((3..=8).contains(&hull.len()), "{hull:?}");
         assert!(hull.iter().all(|v| v[0] >= 0.09 && v[0] <= 0.91 && v[1] >= 0.09 && v[1] <= 0.91), "{hull:?}");
-        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2), glow: None, sunk: None, flip: false };
+        let p = crate::map::Prop { asset: "x".into(), pos: [10.0, 10.0], size: [4.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: Some(2), glow: None, sunk: None, flip: false, inspect: None };
         let walls = tent_walls(&p, Some(&hull));
         assert!(!walls.is_empty() && walls.len() < hull.len());
         for (a, b) in &walls {
@@ -3072,7 +3339,7 @@ mod tests {
     }
 
     fn thing(asset: &str, pos: [f32; 2], size: [f32; 2], rot: f32) -> crate::map::Prop {
-        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false }
+        crate::map::Prop { asset: asset.into(), pos, size, rot, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None }
     }
 
     #[test]

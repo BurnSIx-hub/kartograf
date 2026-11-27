@@ -80,6 +80,10 @@ export function close() {
 // Тьма и общий свет берутся из выгрузки в одном случае: на карте сменили «Свет сцены»
 // (флаг `light`) — иначе выбор карты не дошёл бы до уже стоящей сцены.
 const KEEP = ["tokens", "notes", "sounds", "drawings", "templates"];
+// Зоны осмотра 🔥 Cinema («🔥 Осмотр предметов»): область с этим поведением. Тексты — не в
+// сцене, а файлом в INSPECT_STORE данных Foundry (FORMAT.md модуля): сцену получает каждый игрок.
+const INSPECT = "burn-cinema.inspect";
+const INSPECT_STORE = "burn-inspect-secret";
 const KEEP_FIELDS = ["name", "navigation", "navName", "navOrder", "environment", "playlist", "playlistSound", "journal", "journalEntryPage", "fog"];
 const FOLDER = "Картограф";
 
@@ -101,8 +105,10 @@ async function toScene(files, update) {
   for (const f of files) {
     const name = f.path.split("/").pop();
     const dir = f.path.split("/").slice(0, -1).join("/");
-    if (name.endsWith(".json")) { scene = JSON.parse(new TextDecoder().decode(f.bytes)); continue; }
-    const type = name.endsWith(".webp") ? "image/webp" : name.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
+    // Файл текстов осмотра — не сцена: ложится в свою папку как есть.
+    const secret = dir === INSPECT_STORE;
+    if (name.endsWith(".json") && !secret) { scene = JSON.parse(new TextDecoder().decode(f.bytes)); continue; }
+    const type = secret ? "application/json" : name.endsWith(".webp") ? "image/webp" : name.endsWith(".jpg") ? "image/jpeg" : "application/octet-stream";
     const body = type === "image/webp" ? await lossy(f.bytes) : f.bytes;
     await FP.upload("data", dir, new File([body], name, { type }), {}, { notify: false });
   }
@@ -116,6 +122,7 @@ async function toScene(files, update) {
 // импорте той же выгрузки сцена находится сама.
 async function applyScene(scene, old, { source } = {}) {
   delete scene._id;
+  inspectGate(scene);
   scene.flags ??= {};
   scene.flags[MODULE_ID] = { ...(scene.flags[MODULE_ID] ?? {}), ...(source ? { source } : {}) };
   let doc;
@@ -129,6 +136,7 @@ async function applyScene(scene, old, { source } = {}) {
     ui.notifications.info(`Картограф: сцена «${doc.name}» создана`);
   }
   await game.settings.set(MODULE_ID, "lastScene", doc.id);
+  await inspectStore(doc);
   await chests(doc).catch((err) => console.error(`${MODULE_ID} | сундуки`, err));
   await credits(doc).catch((err) => console.error(`${MODULE_ID} | авторы`, err));
   try {
@@ -136,6 +144,60 @@ async function applyScene(scene, old, { source } = {}) {
     await doc.update({ thumb: t.thumb });
   } catch (err) { console.warn(`${MODULE_ID} | миниатюра`, err); }
   return doc;
+}
+
+// Без включённого 🔥 Cinema Foundry не создаёт сцену с поведением осмотра вовсе («is not a
+// valid type for the RegionBehavior»): такие зоны пропускаются, Мастеру — предупреждение.
+// 🔥 Cinema 1.3.0 читал тексты из самой области — с файлом текстов ему показать нечего.
+function inspectGate(scene) {
+  const zones = (scene.regions ?? []).filter((r) => r.behaviors?.some((b) => b.type === INSPECT));
+  if (!zones.length) return;
+  const cinema = game.modules.get("burn-cinema");
+  if (cinema?.active && CONFIG.RegionBehavior.dataModels[INSPECT]) {
+    if (foundry.utils.isNewerVersion("1.3.1", cinema.version)) {
+      ui.notifications.warn(`Картограф: зонам осмотра нужен 🔥 Cinema 1.3.1, а включён ${cinema.version} — тексты не покажутся`, { permanent: true });
+    }
+    return;
+  }
+  scene.regions = scene.regions.filter((r) => !zones.includes(r));
+  ui.notifications.warn(`Картограф: зон осмотра ${zones.length} пропущено — в мире не включён 🔥 Cinema. Включи модуль и обнови сцену из выгрузки.`, { permanent: true });
+}
+
+// Память осмотров (флаг `inspectSeen` поведения, его ведёт 🔥 Cinema) — состояние игры: при
+// обновлении сцены она переходит к зоне с тем же ключом текстов, иначе «один раз» и «помнить
+// итог» начались бы заново.
+function keepInspectMemory(old, scene) {
+  const seen = new Map();
+  for (const r of old.regions) {
+    for (const b of r.behaviors) {
+      const mem = b.type === INSPECT && b.flags?.["burn-cinema"]?.inspectSeen;
+      if (mem && b.system?.textKey) seen.set(b.system.textKey, mem);
+    }
+  }
+  if (!seen.size) return;
+  for (const r of scene.regions ?? []) {
+    for (const b of r.behaviors ?? []) {
+      const mem = b.type === INSPECT && seen.get(b.system?.textKey);
+      if (mem) foundry.utils.setProperty(b, "flags.burn-cinema.inspectSeen", mem);
+    }
+  }
+}
+
+// Тексты осмотра 🔥 Cinema читает у ГМа один раз, при входе: файл, который программа положила
+// потом, он увидел бы только после перезагрузки, и зоны новой сцены показывали бы «Ничего
+// примечательного». Перечитываем у себя (тот же модуль хранилища, что у 🔥 Cinema) и у других ГМов.
+async function inspectStore(doc) {
+  if (!game.modules.get("burn-cinema")?.active) return;
+  if (!doc.regions.some((r) => r.behaviors.some((b) => b.type === INSPECT))) return;
+  try {
+    const api = game.burnCinema?.inspect;
+    if (typeof api?.reloadStore === "function") await api.reloadStore();
+    else await (await import(foundry.utils.getRoute("modules/burn-cinema/inspect/scripts/store.mjs"))).loadStore?.({ force: true });
+  } catch (err) {
+    console.warn(`${MODULE_ID} | тексты осмотра не перечитаны`, err);
+  }
+  const gms = game.users.filter((u) => u.isGM && u.active && u.id !== game.user.id).map((u) => u.id);
+  if (gms.length) game.socket.emit("module.burn-cinema", { type: "inspect.storeChanged" }, { recipients: gms });
 }
 
 // Авторы того, что в сцене (флаг `credits` выгрузки: наборы 3D-моделей, ассеты паков, WoW) —
@@ -177,6 +239,7 @@ async function credits(doc) {
 // импорте само бережёт id, папку, права, сортировку и «активна».
 async function refresh(old, scene) {
   const mine = old.toObject();
+  keepInspectMemory(old, scene);
   for (const k of KEEP) scene[k] = mine[k] ?? [];
   const moved = relocate(old, scene);
   const relit = (scene.flags?.[MODULE_ID]?.light ?? "") !== (old.flags?.[MODULE_ID]?.light ?? "");

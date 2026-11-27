@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn a_flight_climbs_to_the_floor_above_towards_the_end_with_floor_up_there() {
         let mut m = map(10, 10);
-        m.props.push(Prop { asset: "Stairs_Stone_A_2x4".into(), pos: [5.0, 5.0], size: [2.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "Stairs_Stone_A_2x4".into(), pos: [5.0, 5.0], size: [2.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         // Наверху пол только к югу от марша (y > 7): подъём — на юг, хотя картинка смотрит на север.
         let cover = Cover { w: 10, h: 10, per: 1.0, data: (0..100).map(|k| k / 10 >= 7).collect() };
         let (g, flights) = ground(&m, Some(&cover), &none, &no);
@@ -318,7 +318,7 @@ mod tests {
     fn a_flight_reaches_the_floor_edge_by_a_landing_and_its_wall_opens_over_the_top() {
         let mut m = map(12, 10);
         // Марш 2×1 с запада на восток (x 4..6), дыра наверху шире: x 3.5..6.5, y 3..7.
-        m.props.push(Prop { asset: "Stairs_Stone_A_2x1".into(), pos: [5.0, 5.0], size: [2.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "Stairs_Stone_A_2x1".into(), pos: [5.0, 5.0], size: [2.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         let cover = Cover { w: 48, h: 40, per: 4.0, data: (0..48 * 40).map(|k| !((14..26).contains(&(k % 48)) && (12..28).contains(&(k / 48)))).collect() };
         let (g, _) = ground(&m, Some(&cover), &none, &no);
         // От верхней ступени до края пола — площадка чуть ниже пола: нога не проваливается.

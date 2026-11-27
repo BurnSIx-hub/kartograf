@@ -473,7 +473,7 @@ mod tests {
         m.shadows.on = true;
         for i in 0..40 {
             let pos = [5.0 + (i % 10) as f32 * 19.0, 5.0 + (i / 10) as f32 * 28.0];
-            m.props.push(crate::map::Prop { asset: format!("Crate_{i}"), pos, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+            m.props.push(crate::map::Prop { asset: format!("Crate_{i}"), pos, size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         }
         m
     }

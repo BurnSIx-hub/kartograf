@@ -523,6 +523,258 @@ pub struct Prop {
     /// Отражён слева направо (в Dungeondraft — A при постановке). Поворот — уже после.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flip: bool,
+    /// Предмет можно осмотреть (🔥 Cinema): зона — по контуру его картинки.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect: Option<Inspect>,
+}
+
+/// Проверка навыка у зоны осмотра (`checkMode` поведения «🔥 Осмотр»).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InspectCheck {
+    /// Без проверки: текст видит каждый, кто осмотрел.
+    #[default]
+    None,
+    /// Игрок кидает навык.
+    Roll,
+    /// Пассивное значение навыка против СЛ, без броска.
+    Passive,
+}
+
+impl InspectCheck {
+    pub const ALL: [InspectCheck; 3] = [InspectCheck::None, InspectCheck::Roll, InspectCheck::Passive];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InspectCheck::None => "без проверки",
+            InspectCheck::Roll => "бросок навыка",
+            InspectCheck::Passive => "пассивный навык",
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            InspectCheck::None => "none",
+            InspectCheck::Roll => "roll",
+            InspectCheck::Passive => "passive",
+        }
+    }
+}
+
+/// Кому показать плашку осмотра (`visibility` поведения).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InspectShow {
+    /// Только осмотревшему.
+    #[default]
+    #[serde(rename = "self")]
+    Own,
+    /// Всем игрокам.
+    All,
+    /// Осмотревшему и открытой записью в чат.
+    Chat,
+}
+
+impl InspectShow {
+    pub const ALL: [InspectShow; 3] = [InspectShow::Own, InspectShow::All, InspectShow::Chat];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InspectShow::Own => "только осмотревшему",
+            InspectShow::All => "всем игрокам",
+            InspectShow::Chat => "осмотревшему и в чат",
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            InspectShow::Own => "self",
+            InspectShow::All => "all",
+            InspectShow::Chat => "chat",
+        }
+    }
+}
+
+/// Повторный осмотр (`repeat` поведения).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InspectRepeat {
+    /// Итог запоминается за персонажем: снова — тот же текст без броска.
+    #[default]
+    Remember,
+    /// Каждый щелчок заново.
+    Always,
+    /// После первого осмотра зона гаснет для этого персонажа.
+    Once,
+}
+
+impl InspectRepeat {
+    pub const ALL: [InspectRepeat; 3] = [InspectRepeat::Remember, InspectRepeat::Always, InspectRepeat::Once];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InspectRepeat::Remember => "помнить итог",
+            InspectRepeat::Always => "каждый раз заново",
+            InspectRepeat::Once => "один раз",
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            InspectRepeat::Remember => "remember",
+            InspectRepeat::Always => "always",
+            InspectRepeat::Once => "once",
+        }
+    }
+}
+
+/// Навыки dnd5e для проверки осмотра: ключ и название.
+pub const INSPECT_SKILLS: [(&str, &str); 9] = [
+    ("prc", "Восприятие"),
+    ("inv", "Анализ"),
+    ("ins", "Проницательность"),
+    ("arc", "Магия"),
+    ("his", "История"),
+    ("nat", "Природа"),
+    ("rel", "Религия"),
+    ("sur", "Выживание"),
+    ("med", "Медицина"),
+];
+
+/// Осмотр предмета или места — «🔥 Осмотр предметов» модуля 🔥 Cinema: игрок щёлкает,
+/// и над предметом всплывает плашка с текстом ГМа. В Foundry это область с поведением
+/// `burn-cinema.inspect` — форма и открытые настройки; тексты уходят отдельным файлом в
+/// `burn-inspect-secret/`: всё, что лежит в мире, получает каждый игрок. Формат —
+/// `burn-cinema/inspect/FORMAT.md`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Inspect {
+    /// Ключ текстов (`textKey`): случайный, на всю жизнь зоны. С ним правки ГМа в Foundry
+    /// (файл мира главнее выгрузки) переживают новую выгрузку.
+    pub key: String,
+    /// Название — открытое: видно при наведении и шапкой плашки. Без спойлеров.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Текст осмотра, при проверке — текст успеха. Простой текст или HTML.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Текст провала; пусто — «Ничего примечательного».
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fail: String,
+    /// Заметка только для ГМа: всплывает у него, когда игрок осматривает.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub gm_note: String,
+    pub check: InspectCheck,
+    /// Ключ навыка dnd5e (`prc`, `inv`…).
+    pub skill: String,
+    /// Сложность, 0–40.
+    pub dc: u8,
+    pub show: InspectShow,
+    /// Дистанция в футах от токена до края зоны; 0 — откуда угодно.
+    pub range: f32,
+    pub repeat: InspectRepeat,
+    /// Звук для тех, кому показана плашка (путь в данных Foundry); пусто — без звука.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sound: String,
+    /// Сколько секунд висит плашка; 0 — пока не закроют.
+    pub duration: f32,
+}
+
+impl Default for Inspect {
+    fn default() -> Self {
+        Self {
+            key: random_hex(8),
+            title: String::new(),
+            text: String::new(),
+            fail: String::new(),
+            gm_note: String::new(),
+            check: InspectCheck::None,
+            skill: "prc".into(),
+            dc: 12,
+            show: InspectShow::Own,
+            range: 0.0,
+            repeat: InspectRepeat::Remember,
+            sound: String::new(),
+            duration: 0.0,
+        }
+    }
+}
+
+impl Inspect {
+    /// Ключ годится модулю: 8–64 знака из латиницы, цифр, `_` и `-`.
+    pub fn key_ok(key: &str) -> bool {
+        (8..=64).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
+    /// Название навыка по ключу.
+    pub fn skill_label(&self) -> &str {
+        INSPECT_SKILLS.iter().find(|s| s.0 == self.skill).map_or(self.skill.as_str(), |s| s.1)
+    }
+}
+
+/// Нарисованная зона осмотра: место, а не предмет — пятно на стене, тайник под половицей,
+/// надпись на камне.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InspectZone {
+    /// Контур в клетках, не меньше трёх точек.
+    pub points: Vec<[f32; 2]>,
+    #[serde(flatten)]
+    pub inspect: Inspect,
+}
+
+impl InspectZone {
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        let n = self.points.len();
+        let mut c = false;
+        for i in 0..n {
+            let (a, b) = (self.points[i], self.points[(i + 1) % n]);
+            if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+                c = !c;
+            }
+        }
+        c
+    }
+
+    pub fn center(&self) -> [f32; 2] {
+        let n = self.points.len().max(1) as f32;
+        let s = self.points.iter().fold([0.0, 0.0], |s, p| [s[0] + p[0], s[1] + p[1]]);
+        [s[0] / n, s[1] / n]
+    }
+}
+
+/// Случайные `bytes` байт шестнадцатеричной строкой: ключи зон осмотра и имя файла их
+/// текстов. В программе — SipHash с ключом из генератора системы (`RandomState`), в модуле
+/// Foundry — `crypto.getRandomValues` браузера.
+pub fn random_hex(bytes: usize) -> String {
+    random_bytes(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn random_bytes(n: usize) -> Vec<u8> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(COUNT.fetch_add(1, Ordering::Relaxed));
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        out.extend(h.finish().to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
+#[cfg(target_arch = "wasm32")]
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    let ok = web_sys::window().and_then(|w| w.crypto().ok()).is_some_and(|c| c.get_random_values_with_u8_array(&mut out).is_ok());
+    if !ok {
+        for b in &mut out {
+            *b = (js_sys::Math::random() * 256.0) as u8;
+        }
+    }
+    out
 }
 
 /// Слои высоты объектов — числа те же, что в Dungeondraft. Внутри слоя выше тот,
@@ -1947,6 +2199,14 @@ pub struct Map {
     /// Эскиз: картинка в окошке сбоку, для сверки.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sketch: String,
+    /// Нарисованные зоны осмотра этажа; предметы с осмотром — `Prop::inspect`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inspects: Vec<InspectZone>,
+    /// Случайная часть имени файла текстов осмотра (`kartograf-<она>.json` в
+    /// `burn-inspect-secret/` данных Foundry), 32 hex. Одна у карты: новая выгрузка пишет
+    /// тот же файл. Только у первого этажа; в Foundry её никто не видит.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inspect_file: String,
 }
 
 /// Образец под обводку ([`Map::trace`]).
@@ -2110,6 +2370,8 @@ impl Map {
             relief: None,
             trace: None,
             sketch: String::new(),
+            inspects: Vec::new(),
+            inspect_file: String::new(),
             labels: Vec::new(),
             roofs: Vec::new(),
             outline_roofs: Vec::new(),
@@ -2457,6 +2719,9 @@ impl Map {
         for l in &mut self.labels {
             mv(&mut l.pos);
         }
+        for z in &mut self.inspects {
+            z.points.iter_mut().for_each(mv);
+        }
         for r in &mut self.roofs {
             mv(&mut r.a);
             mv(&mut r.b);
@@ -2507,6 +2772,7 @@ impl Map {
             });
             m.portals.retain(|p| inside(p.a) && inside(p.b));
             m.labels.retain(|l| inside(l.pos));
+            m.inspects.retain(|z| inside(z.center()));
             m
         };
         let mut m = one(self);
@@ -2562,6 +2828,10 @@ impl Map {
         m.labels.retain_mut(|l| {
             mv(&mut l.pos);
             near([l.pos[0], l.pos[1], l.pos[0], l.pos[1]])
+        });
+        m.inspects.retain_mut(|z| {
+            z.points.iter_mut().for_each(mv);
+            near(grid::bounds(&z.points))
         });
         m.roofs.retain_mut(|r| {
             mv(&mut r.a);
@@ -2795,14 +3065,14 @@ mod tests {
         // за край и возвращается, — двумя кусками.
         m.walls.push(Wall { points: vec![[1.0, 0.5], [1.0, 8.0]], closed: false, bends: vec![0.0], low: true, style: None });
         m.walls.push(Wall { points: vec![[3.0, 7.0], [3.0, 2.0], [5.0, 2.0], [5.0, 7.0]], closed: false, bends: vec![0.0, 0.3, 0.0], low: false, style: None });
-        m.props.push(Prop { asset: "x".into(), pos: [2.5, 6.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "x".into(), pos: [2.5, 6.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
         let mut deck = m.new_level();
         deck.props.push(m.props[0].clone());
         m.levels.push(deck);
         // Верёвка для белья серединой выше полосы — уходит, фонарь серединой в полосе — остаётся.
-        m.props.push(Prop { asset: "line".into(), pos: [4.0, 4.6], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
-        m.props.push(Prop { asset: "lamp".into(), pos: [4.0, 5.3], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "line".into(), pos: [4.0, 4.6], size: [1.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
+        m.props.push(Prop { asset: "lamp".into(), pos: [4.0, 5.3], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         let c = m.crop_all(0, 5, 6, 3);
         assert_eq!((c.width, c.height), (6, 3));
         assert_eq!(c.props.iter().map(|p| (p.asset.as_str(), (p.pos[1] * 10.0).round())).collect::<Vec<_>>(), vec![("x", 15.0), ("lamp", 3.0)]);
@@ -2825,7 +3095,7 @@ mod tests {
         m.rooms.set(crate::mask::RES + 1, crate::mask::RES * 1 + 1, 255);
         m.walls.push(Wall { points: vec![[0.0, 0.0], [4.0, 0.0]], closed: false, bends: Vec::new(), low: false, style: None });
         m.portals.push(Portal { a: [1.0, 3.0], b: [2.0, 3.0], kind: PortalKind::Door, asset: None, frame: None });
-        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        m.props.push(Prop { asset: "x".into(), pos: [3.5, 1.5], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
         m.roofs.push(Roof::new([1.0, 1.0], [3.0, 2.0], RoofShape::Flat, "r".into()));
         m.edge_looks.insert((64, 0), 1);
         let mut deck = m.new_level();
@@ -2977,7 +3247,7 @@ mod tests {
         assert!(afloat_by_name("pack:fa|textures/objects/Paper_Sheet_A_White_1x1.webp") && !afloat_by_name("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"));
         // Вентилятор в полу плоский, но живой: своим тайлом (иначе «Wild Canvas» нечего
         // крутить), без своей тени. Ковёр — плоский и неживой: остаётся в картинке карты.
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         let fan = prop("set:cyberpunk/objects/Floor_Fan_Industrial_A_2x2.webp");
         assert!(flat_by_name(&fan.asset) && fan.own_tile() && !fan.carries_shadow());
         assert!(!prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp").own_tile());
@@ -2992,7 +3262,7 @@ mod tests {
 
     #[test]
     fn bridges_are_baked_under_walls_not_own_tiles() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [3.0, 4.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         assert!(!prop("C:/a/objects/bridges/Bridge_Boardwalk_Platform_A_5x4.webp").own_tile());
         assert!(!prop("pack:fa|textures/objects/Log_Bridge_Wood_Dark_A1_11x4.webp").own_tile());
         // Мост тень бросает, как раньше.
@@ -3099,7 +3369,7 @@ mod tests {
 
     #[test]
     fn lights_and_canopies_by_name_and_by_hand() {
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [0.0, 0.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         assert_eq!(prop("builtin:campfire").light(), Some(Glow::Campfire));
         assert_eq!(prop("builtin:street_lamp").light(), Some(Glow::Lamp));
         assert_eq!(prop("pack:fa.dungeondraft_pack|textures/objects/Fire_Pit_Stone_A_1x1.webp").light(), Some(Glow::Campfire));
@@ -3281,7 +3551,7 @@ mod tests {
 
     #[test]
     fn rotated_prop_hit_test() {
-        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let p = Prop { asset: "x".into(), pos: [5.0, 5.0], size: [4.0, 1.0], rot: 90.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         assert!(p.contains([5.0, 6.8]), "повёрнут на 90°: длинная сторона по вертикали");
         assert!(!p.contains([6.8, 5.0]));
         let c = p.corners();
@@ -3361,4 +3631,30 @@ mod tests {
         assert!(m.rooms.area() < grown - 4.0);
         assert_eq!(m.room_at(2, 4), 0, "вогнутая стена вырезала пол");
     }
+
+    #[test]
+    fn inspect_zones_survive_the_file_and_old_maps_have_none() {
+        let mut m = Map::new(8, 8);
+        let ins = Inspect { title: "Тайник".into(), text: "Под половицей.".into(), check: InspectCheck::Passive, show: InspectShow::Chat, ..Default::default() };
+        assert!(Inspect::key_ok(&ins.key) && ins.key.len() == 16);
+        m.inspects.push(InspectZone { points: vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0]], inspect: ins.clone() });
+        m.inspect_file = random_hex(16);
+        let text = serde_json::to_string(&m).unwrap();
+        let back: Map = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.inspects, m.inspects);
+        assert_eq!(back.inspect_file, m.inspect_file);
+        assert!(text.contains("\"check\":\"passive\"") && text.contains("\"show\":\"chat\""), "{text}");
+        // Карта без зон — без новых полей в файле, старая карта читается.
+        let plain = serde_json::to_string(&Map::new(4, 4)).unwrap();
+        assert!(!plain.contains("inspect"));
+        let old: Map = serde_json::from_str(&plain).unwrap();
+        assert!(old.inspects.is_empty() && old.inspect_file.is_empty());
+        // Ключи случайные: два подряд не совпадают.
+        assert_ne!(Inspect::default().key, Inspect::default().key);
+        // Район и рост карты двигают зону вместе со всем.
+        let mut g = m.clone();
+        g.grow(2, 1, 0, 0);
+        assert_eq!(g.inspects[0].points[0], [3.0, 2.0]);
+    }
+
 }

@@ -960,6 +960,7 @@ impl SelfTest {
                     glow: Some(own),
                     sunk: None,
                     flip: false,
+                    inspect: None,
                 });
                 app.sel = Some(Sel::Prop(app.map.props.len() - 1));
                 self.resume_at = now + 0.3;
@@ -1276,7 +1277,7 @@ impl SelfTest {
             123 => {
                 self.key(Key::Escape, Modifiers::NONE);
                 // L — свет поверх вида.
-                app.map.props.push(crate::map::Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [12.0, 6.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                app.map.props.push(crate::map::Prop { asset: format!("{}campfire", crate::library::BUILTIN), pos: [12.0, 6.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
                 app.touch();
                 self.key(Key::L, Modifiers::NONE);
                 self.resume_at = now + 0.5;
@@ -1330,7 +1331,7 @@ impl SelfTest {
                 // «Проверка»: бочка за краем карты попадает в список, щелчок по строке ведёт к ней.
                 let barrel = app.library.assets[app.library.filter(Kind::Object, "barrel test")[0]].key.clone();
                 let w = app.map.width as f32;
-                app.map.props.push(crate::map::Prop { asset: barrel, pos: [w - 0.1, 4.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                app.map.props.push(crate::map::Prop { asset: barrel, pos: [w - 0.1, 4.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
                 app.touch();
                 app.set_tool(Tool::Wall);
                 app.check.open = true;
@@ -1529,7 +1530,7 @@ impl SelfTest {
                 match test_crate(&app.data_dir.join("cc0").join("Проба")) {
                     Ok((png, size)) => {
                         app.library.set_cc0(&app.data_dir.join("cc0"));
-                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [3.5, 6.5], size, rot: 30.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [3.5, 6.5], size, rot: 30.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
                     }
                     Err(e) => self.check("ящик CC0 для 3D собрался", false, &e),
                 }
@@ -1708,7 +1709,7 @@ impl SelfTest {
                 match test_crate(&app.data_dir.join("cc0").join("Проба")) {
                     Ok((png, size)) => {
                         app.library.set_cc0(&app.data_dir.join("cc0"));
-                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [6.0, 5.0], size, rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+                        map.props.push(map::Prop { asset: png.to_string_lossy().into_owned(), pos: [6.0, 5.0], size, rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
                     }
                     Err(e) => self.check("ящик CC0 для правки в 3D собрался", false, &e),
                 }
@@ -1785,6 +1786,68 @@ impl SelfTest {
                 let second = app.map.props.get(1).map(|q| q.pos);
                 self.check("щелчок по полу в правке поставил предмет с полки, в 3D он моделью", app.map.props.len() == 2 && p.props == 2 && p.modelled == 2 && second.is_some_and(|q| q[0] < 5.5), &format!("{second:?}, в 3D {} / моделями {}", p.props, p.modelled));
                 self.snap(ctx, "правка в 3D");
+                app.set_tool(Tool::Select);
+            }
+            // Этап 6, зоны осмотра (🔥 Cinema): протяжка «Осмотром» по пустому месту рисует зону,
+            // щелчок по предмету делает его осматриваемым; зону тащат, Delete убирает, Ctrl+Z возвращает.
+            #[cfg(not(target_arch = "wasm32"))]
+            177 => {
+                app.close_view3d();
+                let mut map = Map::new(12, 10);
+                map.props.push(map::Prop { asset: crate::library::TREE.into(), pos: [8.0, 5.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: Some(false), layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });
+                app.reset_doc(map, None);
+                app.set_tool(Tool::Inspect);
+                self.resume_at = now + 0.4;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            178 => {
+                let (a, b) = (at(app, [1.5, 1.5]), at(app, [3.5, 3.5]));
+                self.drag(a, b, PointerButton::Primary);
+                self.resume_at = now + CLICK_GAP;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            179 => {
+                let z = app.map.inspects.first().map(|z| z.points.clone());
+                let rect = z.as_ref().is_some_and(|p| p.len() == 4 && (p[0][0] - 1.5).abs() < 0.3 && (p[2][1] - 3.5).abs() < 0.3);
+                let file = app.map.inspect_file.len() == 32;
+                self.check("протяжка «Осмотром» нарисовала зону, у карты — имя файла текстов", rect && app.sel == Some(Sel::Inspect(0)) && file, &format!("{z:?}, выбрано {:?}, файл {}", app.sel, app.map.inspect_file));
+                self.click(at(app, [8.0, 5.0]));
+                self.resume_at = now + CLICK_GAP;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            180 => {
+                let on = app.map.props.first().and_then(|p| p.inspect.clone());
+                self.check("щелчок «Осмотром» по предмету сделал его осматриваемым и выбрал", on.as_ref().is_some_and(|i| map::Inspect::key_ok(&i.key)) && app.sel == Some(Sel::Prop(0)), &format!("{on:?}, выбрано {:?}", app.sel));
+                if let Some(i) = app.map.props[0].inspect.as_mut() {
+                    i.title = "Старый дуб".into();
+                    i.text = "В дупле — свёрток.".into();
+                    i.check = map::InspectCheck::Roll;
+                }
+                self.resume_at = now + 0.3;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            181 => self.snap(ctx, "осмотр в редакторе"),
+            #[cfg(not(target_arch = "wasm32"))]
+            182 => {
+                let (a, b) = (at(app, [2.5, 2.5]), at(app, [4.5, 2.5]));
+                self.drag(a, b, PointerButton::Primary);
+                self.resume_at = now + CLICK_GAP;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            183 => {
+                let x0 = app.map.inspects.first().map_or(0.0, |z| z.points[0][0]);
+                self.check("протяжка за зону сдвинула её на две клетки", (x0 - 3.5).abs() < 0.3 && app.sel == Some(Sel::Inspect(0)), &format!("левый край {x0}, выбрано {:?}", app.sel));
+                self.key(Key::Delete, Modifiers::NONE);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            184 => {
+                self.check("Delete убрал выбранную зону", app.map.inspects.is_empty(), &format!("зон {}", app.map.inspects.len()));
+                self.key(Key::Z, Modifiers::COMMAND);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            185 => {
+                let back = app.map.inspects.first().map_or(0.0, |z| z.points[0][0]);
+                self.check("Ctrl+Z вернул зону на новое место", app.map.inspects.len() == 1 && (back - 3.5).abs() < 0.3, &format!("зон {}, левый край {back}", app.map.inspects.len()));
                 app.set_tool(Tool::Select);
             }
             _ => return false,

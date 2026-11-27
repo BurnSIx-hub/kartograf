@@ -332,6 +332,7 @@ impl App {
             Tool::Roof if self.platform_mode => "Протяжка по пустому месту ставит помост, щелчок по помосту выбирает его, протяжка за выбранный двигает. Лестницу и решётку — кнопкой в строке над картой и щелчком у края; их можно вести вдоль края протяжкой. Delete удаляет помост.",
             Tool::Roof => "Протяжка рамкой по стенам дома ставит крышу; протяжка за крышу двигает её. Колесо — конёк поперёк, у односкатной — куда скат. Покрытие — на полке. С другими инструментами крыши полупрозрачны.",
             Tool::Text => "Щелчок по пустому месту ставит подпись, по подписи — выбирает её; протяжка двигает. Текст, размер и цвет — в строке над картой.",
+            Tool::Inspect => "Что игрок может осмотреть в Foundry (🔥 Cinema): щелчок по предмету делает его осматриваемым, зона — по его контуру. Протяжка по пустому месту рисует зону-место: пятно, тайник, надпись. Зону тащат целиком и за вершины; двойной щелчок у края — новая вершина, по вершине — убрать. Тексты — в строке над картой; игрокам они уходят только при осмотре.",
             Tool::Shade => "Темнит пол: углы, ниши, под навесом. Ступени — как тени-узоры FA: повторный мазок не темнее ступени. Alt — стирать.",
             Tool::Relief => "Ярусы по 5 футов. Жёсткая кисть поднимает плато с обрывом — полоса скалы, в Foundry стена; мягкая — пологий склон уступами-гребнями. Нижние ярусы темнее. «Выровнять» тянет к ярусу, с которого начат мазок. Alt — наоборот.",
             Tool::Path => "Щелчки ставят точки — линия через них плавная; протяжка рисует от руки; Shift — ровная линия. Enter, двойной щелчок или правая кнопка — закончить. Материал — в строке над картой: земля — тропа, вода — ручей, ткань — ковёр.",
@@ -404,6 +405,7 @@ impl App {
             Group::Select => [Tool::Select, Tool::Pick].map(tool).to_vec(),
             Group::Brush => [Tool::Dungeon, Tool::Floor, Tool::Shade, Tool::Relief, Tool::Erase].map(tool).to_vec(),
             Group::Object => [Tool::Object, Tool::Scatter].map(tool).to_vec(),
+            Group::Text => [Tool::Text, Tool::Inspect].map(tool).to_vec(),
             Group::Wall => std::iter::once(tool(Tool::Wall)).chain(PortalKind::ALL.map(|k| (k.label().to_owned(), Mode::Door(k)))).collect(),
             Group::Roof => map::RoofShape::ALL.map(|s| (s.label().to_owned(), Mode::Roof(s))).to_vec(),
             _ => Vec::new(),
@@ -799,6 +801,30 @@ impl App {
                             None => self.roof_style = st,
                         }
                     }
+                    Tool::Inspect => {
+                        let objects = self.map.props.iter().filter(|p| p.inspect.is_some()).count();
+                        ui.label(format!("Предметов с осмотром: {objects}, зон-мест: {}", self.map.inspects.len()));
+                        if let Some(Sel::Inspect(i)) = self.sel
+                            && i < self.map.inspects.len()
+                        {
+                            ui.strong("Зона осмотра");
+                            let before = self.map.inspects[i].inspect.clone();
+                            let mut ins = before.clone();
+                            if inspect_fields_ui(ui, &mut ins) {
+                                self.checkpoint();
+                            }
+                            if ins != before {
+                                self.map.inspects[i].inspect = ins;
+                            }
+                            if ui.button("Удалить зону   Delete").clicked() {
+                                self.checkpoint();
+                                self.map.inspects.remove(i);
+                                self.sel = None;
+                            }
+                        } else if !matches!(self.sel, Some(Sel::Prop(_))) {
+                            ui.weak("Щёлкните предмет или протяните рамку по пустому месту.");
+                        }
+                    }
                     Tool::Text => {
                         let chosen = match self.sel {
                             Some(Sel::Label(i)) => Some(i),
@@ -1054,6 +1080,25 @@ impl App {
                         self.checkpoint();
                         self.map.props[i].canopy = Some(canopy);
                     }
+                    // Осмотр (🔥 Cinema): игрок щёлкает предмет в Foundry — плашка с текстом ГМа.
+                    let mut on = self.map.props[i].inspect.is_some();
+                    if ui.checkbox(&mut on, "Можно осмотреть").on_hover_text("В Foundry игрок щёлкает предмет — над ним всплывает плашка с текстом (модуль 🔥 Cinema). Зона — по контуру картинки. Тексты уходят отдельным файлом: со сценой игроки их не получают.").changed() {
+                        self.checkpoint();
+                        if on {
+                            self.ensure_inspect_file();
+                        }
+                        self.map.props[i].inspect = on.then(map::Inspect::default);
+                    }
+                    if let Some(before) = self.map.props[i].inspect.clone() {
+                        let mut ins = before.clone();
+                        let start = egui::CollapsingHeader::new("Осмотр").id_salt("prop_inspect").default_open(true).show(ui, |ui| inspect_fields_ui(ui, &mut ins)).body_returned.unwrap_or(false);
+                        if start {
+                            self.checkpoint();
+                        }
+                        if ins != before {
+                            self.map.props[i].inspect = Some(ins);
+                        }
+                    }
                 }
 
                 if self.tool == Tool::Wall || matches!(self.sel, Some(Sel::Wall(_) | Sel::Edge(..))) {
@@ -1152,4 +1197,65 @@ impl App {
             self.share_scene();
         }
     }
+}
+
+/// Поля осмотра. Правда — пора положить шаг отмены: поле текста только что взяло фокус или
+/// сменился выбор (правки текста до потери фокуса — один шаг отмены).
+fn inspect_fields_ui(ui: &mut egui::Ui, i: &mut map::Inspect) -> bool {
+    let mut start = false;
+    let text = |ui: &mut egui::Ui, s: &mut String, rows: usize, hint: &str| {
+        let r = if rows > 1 {
+            ui.add(egui::TextEdit::multiline(s).desired_rows(rows).desired_width(f32::INFINITY).hint_text(hint))
+        } else {
+            ui.add(egui::TextEdit::singleline(s).desired_width(f32::INFINITY).hint_text(hint))
+        };
+        r.gained_focus()
+    };
+    ui.label("Название");
+    start |= text(ui, &mut i.title, 1, "видно игрокам при наведении — без спойлеров");
+    ui.label(if i.check == map::InspectCheck::None { "Текст" } else { "Текст при успехе" });
+    start |= text(ui, &mut i.text, 3, "что увидит игрок; пустая строка — новый абзац");
+    let check = i.check;
+    egui::ComboBox::from_label("проверка").selected_text(check.label()).show_ui(ui, |ui| {
+        for c in map::InspectCheck::ALL {
+            ui.selectable_value(&mut i.check, c, c.label());
+        }
+    });
+    start |= i.check != check;
+    if i.check != map::InspectCheck::None {
+        let skill = i.skill.clone();
+        egui::ComboBox::from_label("навык").selected_text(i.skill_label().to_owned()).show_ui(ui, |ui| {
+            for (k, name) in map::INSPECT_SKILLS {
+                ui.selectable_value(&mut i.skill, k.to_owned(), name);
+            }
+        });
+        start |= i.skill != skill;
+        let dc = ui.add(egui::Slider::new(&mut i.dc, 0..=30).text("СЛ"));
+        start |= dc.drag_started() || (dc.changed() && !dc.dragged());
+        ui.label("Текст при провале");
+        start |= text(ui, &mut i.fail, 2, "пусто — «Ничего примечательного»");
+    }
+    ui.label("Заметка ГМа");
+    start |= text(ui, &mut i.gm_note, 2, "видна только ГМу, всплывает у него при осмотре");
+    let (show, repeat) = (i.show, i.repeat);
+    egui::ComboBox::from_label("кому").selected_text(show.label()).show_ui(ui, |ui| {
+        for c in map::InspectShow::ALL {
+            ui.selectable_value(&mut i.show, c, c.label());
+        }
+    });
+    egui::ComboBox::from_label("повтор").selected_text(repeat.label()).show_ui(ui, |ui| {
+        for c in map::InspectRepeat::ALL {
+            ui.selectable_value(&mut i.repeat, c, c.label());
+        }
+    });
+    start |= i.show != show || i.repeat != repeat;
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::DragValue::new(&mut i.range).range(0.0..=300.0).speed(1.0).suffix(" фт"));
+        ui.label("дистанция").on_hover_text("От токена до края зоны; 0 — откуда угодно");
+        start |= r.drag_started() || (r.changed() && !r.dragged());
+        let d = ui.add(egui::DragValue::new(&mut i.duration).range(0.0..=120.0).speed(0.5).suffix(" с"));
+        ui.label("висит").on_hover_text("Сколько секунд висит плашка; 0 — пока не закроют");
+        start |= d.drag_started() || (d.changed() && !d.dragged());
+    });
+    start
 }

@@ -551,7 +551,7 @@ impl App {
                     let alt = painter.ctx().input(|i| i.modifiers.alt);
                     let pos = self.snap_pos(w, alt);
                     let size = self.asset_size(&asset);
-                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: self.object_layer, tint: None, open: None, glow: None, sunk: None, flip: self.mirror_held };
+                    let ghost = Prop { asset, pos, size, rot: self.object_rot, scale: self.object_scale, shadow: None, light: None, canopy: None, layer: self.object_layer, tint: None, open: None, glow: None, sunk: None, flip: self.mirror_held, inspect: None };
                     self.draw_prop(painter, canvas, &ghost, Color32::from_white_alpha(150));
                 }
             }
@@ -688,6 +688,11 @@ impl App {
                     .collect();
                 painter.add(Shape::closed_line(q, Stroke::new(1.5, Color32::from_rgb(120, 180, 255))));
             }
+        }
+
+        // Зоны осмотра — только в редакторе: в картинку карты и в выгрузку не идут.
+        if !exporting && ui && !walls_only {
+            self.draw_inspects(painter, canvas);
         }
 
         // Выбранная дорога — осевой линией; начатая — линией до курсора.
@@ -1061,6 +1066,57 @@ impl App {
                 ring.push(pts[0]);
                 painter.extend(Shape::dashed_line(&ring, Stroke::new(1.5, ACCENT), 5.0, 4.0));
             }
+        }
+    }
+}
+
+impl App {
+    /// Зоны осмотра: нарисованные — янтарным контуром (с инструментом «Осмотр» — ярче, у
+    /// выбранной — ручки вершин), предметы с осмотром — рамкой и лупой при «Осмотре» или выборе.
+    fn draw_inspects(&self, painter: &egui::Painter, canvas: Rect) {
+        let cam = &self.cam;
+        let amber = Color32::from_rgb(243, 199, 107);
+        let on = self.tool == Tool::Inspect;
+        let ink = if on { amber } else { amber.gamma_multiply(0.55) };
+        let blue = Color32::from_rgb(120, 180, 255);
+        let glass = |c: Pos2, r: f32, color: Color32| {
+            painter.circle_stroke(c, r, Stroke::new(2.0, color));
+            painter.line_segment([c + vec2(r * 0.7, r * 0.7), c + vec2(r * 1.6, r * 1.6)], Stroke::new(2.5, color));
+        };
+        for (i, z) in self.map.inspects.iter().enumerate() {
+            if z.points.len() < 3 {
+                continue;
+            }
+            let sel = self.sel == Some(Sel::Inspect(i));
+            let pts: Vec<Pos2> = z.points.iter().map(|&p| cam.to_screen(canvas, p)).collect();
+            let mut ring = pts.clone();
+            ring.push(pts[0]);
+            let color = if sel { blue } else { ink };
+            if on || sel {
+                painter.add(Shape::closed_line(pts.clone(), Stroke::new(2.0, color)));
+            } else {
+                painter.extend(Shape::dashed_line(&ring, Stroke::new(1.5, color), 6.0, 4.0));
+            }
+            let c = cam.to_screen(canvas, z.center());
+            glass(c + vec2(-5.0, -5.0), 5.0, color);
+            if (on || sel) && !z.inspect.title.is_empty() {
+                painter.text(c + vec2(0.0, 12.0), egui::Align2::CENTER_TOP, &z.inspect.title, egui::FontId::proportional(12.0), color);
+            }
+            if sel {
+                for p in &pts {
+                    painter.circle_filled(*p, 4.0, blue);
+                }
+            }
+        }
+        for (i, p) in self.map.props.iter().enumerate() {
+            if p.inspect.is_none() || !(on || self.sel == Some(Sel::Prop(i))) {
+                continue;
+            }
+            let q: Vec<Pos2> = p.corners().iter().map(|&w| cam.to_screen(canvas, w)).collect();
+            let mut ring = q.clone();
+            ring.push(q[0]);
+            painter.extend(Shape::dashed_line(&ring, Stroke::new(1.5, amber), 6.0, 4.0));
+            glass(cam.to_screen(canvas, p.pos) + vec2(-5.0, -5.0), 5.0, amber);
         }
     }
 }

@@ -1904,6 +1904,7 @@ pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt:
             glow: None,
             sunk: None,
             flip: false,
+            inspect: None,
         });
     }
     // Карта материалов каждого этажа (4 точки на клетку) и подписи номеров — по ним пол можно
@@ -2008,6 +2009,7 @@ pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt:
                 glow: Some(GlowTune { radius: Some(radius * d.scale.clamp(0.7, 2.0)), color, animation: (kind == Glow::Arcane).then(|| "pulse".to_owned()), speed: (kind == Glow::Arcane).then_some(2), intensity: None }),
                 sunk: None,
                 flip: false,
+                inspect: None,
             });
             lights += 1;
             continue;
@@ -2032,6 +2034,7 @@ pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt:
             glow: None,
             sunk: None,
             flip: false,
+            inspect: None,
         });
         objects += 1;
     }
@@ -2064,6 +2067,7 @@ pub fn build(client: &Client, path: &str, out_tiles: &Path, out_wow: &Path, opt:
                     glow: None,
                     sunk: None,
                     flip: false,
+                    inspect: None,
                 });
             }
         }

@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn furniture_is_lifted_out_of_the_floor_and_a_rug_stays_in_it() {
         let map = Map::new(10, 10);
-        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false };
+        let prop = |asset: &str| Prop { asset: asset.into(), pos: [3.0, 3.0], size: [1.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None };
         assert_eq!(lift(&prop("pack:fa|textures/objects/Barrel_Wood_Dark_A_1x1.webp"), &map), Some(Lift::Floor));
         assert_eq!(lift(&prop("pack:fa|textures/objects/Rug_Rectangle_C1_Colorable_3x2.webp"), &map), None);
         let mut tree = prop("pack:fa|textures/objects/Tree_Oak_A_6x6.webp");
