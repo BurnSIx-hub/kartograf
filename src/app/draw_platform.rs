@@ -1,6 +1,9 @@
 //! Отрисовка помостов: тень у подножия, боковая стенка, площадка, решётки, ребро,
 //! лестницы, огоньки и перила. Геометрия — [`crate::platform`]. Всё ложится на пол, под
 //! предметы и стены, и в выгрузке остаётся в картинке карты.
+//!
+//! Снимок для 3D (выгрузка с 3D-моделью, окно 3D) — без стенки, тени и боков лестниц: там помост
+//! — тело со своими боками, а нарисованная стенка легла бы на пол у его подножия.
 
 use super::*;
 use crate::platform::{self, Platform, TREAD};
@@ -117,8 +120,9 @@ impl App {
         let room = |q: [f32; 2]| rooms.get((q[0] * res).floor() as isize, (q[1] * res).floor() as isize) > 127;
         let mut sheet = Sheet { mesh: egui::Mesh::default(), cam: self.cam, canvas };
         let outlines: Vec<Vec<[f32; 2]>> = self.map.platforms.iter().map(|pl| platform::tidy(&pl.points)).collect();
+        let solid = self.export.as_ref().is_some_and(|e| e.solid());
         for (i, pl) in self.map.platforms.iter().enumerate() {
-            platform_mesh(&mut sheet, pl, &room, &outlines[i + 1..]);
+            platform_mesh(&mut sheet, pl, &room, &outlines[i + 1..], solid);
         }
         if !sheet.mesh.is_empty() {
             painter.add(Shape::mesh(sheet.mesh));
@@ -149,8 +153,9 @@ pub fn free_edges(p: &[[f32; 2]], room: &dyn Fn([f32; 2]) -> bool) -> Vec<bool> 
 }
 
 /// `above` — контуры помостов, положенных позже (выше): по общему с ними краю огоньки
-/// рисует только верхний — ярусы зала делят внешние края.
-fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bool, above: &[Vec<[f32; 2]>]) {
+/// рисует только верхний — ярусы зала делят внешние края. `solid` — снимок для 3D: только то,
+/// что на верху помоста и ступеней.
+fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bool, above: &[Vec<[f32; 2]>], solid: bool) {
     let p = platform::tidy(&pl.points);
     if p.len() < 3 {
         return;
@@ -166,7 +171,7 @@ fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bo
     let reach = (3.0 * h).min(1.0);
     let (foot, mid, far) = (at(h), at(h + reach * 0.3), at(h + reach));
     let n = p.len();
-    for i in (0..n).filter(|&i| free[i]) {
+    for i in (0..n).filter(|&i| free[i] && !solid) {
         let j = (i + 1) % n;
         let a = |q: [f32; 2], v: f32| if lit(q) { tone([0, 0, 0], 1.0, v) } else { Color32::TRANSPARENT };
         sheet.quad([foot[i], foot[j], mid[j], mid[i]], [a(foot[i], 0.5), a(foot[j], 0.5), a(mid[j], 0.24), a(mid[i], 0.24)]);
@@ -174,11 +179,13 @@ fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bo
     }
 
     // 2. Боковая стенка: от ребра площадки наружу, к полу темнее; по подножию — тёмная линия.
-    sheet.band(&p, &foot, &free, tone(pl.side, 1.0, 1.0), tone(pl.side, 0.45, 1.0));
     let hair = (0.016f32).min(h * 0.25);
-    sheet.line(&at(h - hair), &foot, &free, tone(INK, 1.0, 0.9));
+    if !solid {
+        sheet.band(&p, &foot, &free, tone(pl.side, 1.0, 1.0), tone(pl.side, 0.45, 1.0));
+        sheet.line(&at(h - hair), &foot, &free, tone(INK, 1.0, 0.9));
+    }
     // Швы панелей поперёк стенки — через каждые 0,62 клетки пути вдоль края.
-    if h >= 0.15 {
+    if h >= 0.15 && !solid {
         let nrm = platform::normals(&p);
         let seam = tone(pl.side, 0.42, 0.8);
         let (mut walked, mut next) = (0.0f32, 0.31f32);
@@ -248,9 +255,11 @@ fn platform_mesh(sheet: &mut Sheet, pl: &Platform, room: &dyn Fn([f32; 2]) -> bo
         let across = |s0: f32, s1: f32| [g.pt(s0, -1.0), g.pt(s0, 1.0), g.pt(s1, 1.0), g.pt(s1, -1.0)];
         // Тень на полу перед нижней ступенью.
         let (dusk, clear) = (tone([0, 0, 0], 1.0, 0.4), Color32::TRANSPARENT);
-        sheet.quad(across(run, run + 0.3), [dusk, dusk, clear, clear]);
+        if !solid {
+            sheet.quad(across(run, run + 0.3), [dusk, dusk, clear, clear]);
+        }
         // Боковые стенки лестницы: у помоста — во всю его высоту, к нижней ступени сходят на нет.
-        for side in [-1.0f32, 1.0] {
+        for side in [-1.0f32, 1.0].into_iter().filter(|_| !solid) {
             let top_out = [g.pt(0.0, side)[0] + g.tan[0] * side * h, g.pt(0.0, side)[1] + g.tan[1] * side * h];
             let (light, dark) = (tone(pl.side, 1.0, 1.0), tone(pl.side, 0.45, 1.0));
             sheet.quad([g.pt(0.0, side), top_out, g.pt(run, side), g.pt(run, side)], [light, dark, dark, light]);

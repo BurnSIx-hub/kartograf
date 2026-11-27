@@ -29,6 +29,27 @@ pub struct Layout {
     /// Лестницы и люки: рамки [x0, y0, x1, y1] в клетках. Совпали на соседних
     /// этажах — в Foundry между уровнями переход.
     pub passages: Vec<[f32; 4]>,
+    /// Из них — лестницы маршем ([`crate::ground3d::flight_by_name`]): в 3D Canvas по ним идут
+    /// ногами, переход у них помечен для модуля.
+    pub stairs: Vec<[f32; 4]>,
+}
+
+/// Прорезать в стенах раскладки проходы `gaps` — как пустые проёмы на карте (отрезок на
+/// прямой стены).
+pub fn open_walls(lay: &mut Layout, gaps: &[Segment]) {
+    if gaps.is_empty() {
+        return;
+    }
+    let portals: Vec<map::Portal> = gaps.iter().map(|&(a, b)| map::Portal { a, b, kind: PortalKind::Opening, asset: None, frame: None }).collect();
+    let segs: Vec<Segment> = lay.walls.iter().flat_map(|l| l.windows(2).map(|w| (w[0], w[1]))).collect();
+    lay.walls = mask::join(map::cut_portals(&segs, &portals))
+        .into_iter()
+        .map(|line| {
+            let closed = line.len() > 3 && line[0] == line[line.len() - 1];
+            simplify(&line, closed, 0.03)
+        })
+        .filter(|l| l.len() >= 2)
+        .collect();
 }
 
 /// Стоячая вода в «Wild Canvas»: зыбь, блики на дне, искры и скорость — доли обычных.
@@ -510,18 +531,15 @@ pub fn layout_seen(map: &Map, room_edges: &[Segment], seen: &dyn Fn(&str) -> Opt
                 .collect()
         })
         .unwrap_or_default();
-    let passages = map
-        .props
-        .iter()
-        .filter(|p| map::passage_by_name(&p.asset))
-        .map(|p| {
-            let (s, c) = p.rot.to_radians().sin_cos();
-            let (hw, hh) = (p.size[0] * p.scale / 2.0, p.size[1] * p.scale / 2.0);
-            let (ex, ey) = (hw * c.abs() + hh * s.abs(), hw * s.abs() + hh * c.abs());
-            [p.pos[0] - ex, p.pos[1] - ey, p.pos[0] + ex, p.pos[1] + ey]
-        })
-        .collect();
-    Layout { walls, low, cliffs, portals, lights, zones, tents, passages }
+    let frame = |p: &map::Prop| {
+        let (s, c) = p.rot.to_radians().sin_cos();
+        let (hw, hh) = (p.size[0] * p.scale / 2.0, p.size[1] * p.scale / 2.0);
+        let (ex, ey) = (hw * c.abs() + hh * s.abs(), hw * s.abs() + hh * c.abs());
+        [p.pos[0] - ex, p.pos[1] - ey, p.pos[0] + ex, p.pos[1] + ey]
+    };
+    let passages = map.props.iter().filter(|p| map::passage_by_name(&p.asset)).map(frame).collect();
+    let stairs = map.props.iter().filter(|p| crate::ground3d::flight_by_name(&p.asset)).map(frame).collect();
+    Layout { walls, low, cliffs, portals, lights, zones, tents, passages, stairs }
 }
 
 /// Контур картинки: выпуклая оболочка того, что нарисовано (непрозрачно), в долях
@@ -1761,13 +1779,19 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
                 let r = [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
                 let p = px as f32;
                 let pts: Vec<i64> = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]].iter().flat_map(|v| [(v[0] * p).round() as i64, (v[1] * p).round() as i64]).collect();
-                regions.push(json!({
+                let mut region = json!({
                     "_id": doc_id('r', regions.len()), "name": format!("{} ↔ {}", levels[k].name, levels[k + 1].name), "color": "#c9a24a",
                     "shapes": [{"type": "polygon", "points": pts, "hole": false}],
                     "elevation": {"bottom": null, "top": null},
                     "levels": [level_id(k), level_id(k + 1)],
                     "behaviors": [{"_id": doc_id('c', regions.len()), "type": "changeLevel", "system": {"movementActions": []}}]
-                }));
+                });
+                // Лестница маршем: в 3D Canvas по ней идут ногами — модуль не спрашивает «Move Up?»,
+                // а меняет уровень, когда фишка дошла до пола этажа выше.
+                if levels[k].layout.stairs.contains(a) {
+                    region["flags"] = json!({"burn-kartograf": {"stairs": true}});
+                }
+                regions.push(region);
             }
         }
     }
@@ -2059,10 +2083,11 @@ pub fn model_tile(scene: &mut Value, src: &str, bounds: [[f32; 3]; 2], px: u32, 
     let [lo, hi] = bounds;
     let p = px as f64;
     let pts = |cells: f32| (cells as f64 * p).round();
-    // Как у тайлов модели макроса «Ярусы 3D»: без картинки, `x`/`y` — угол рамки модели.
+    // `x`/`y` — середина рамки (якорь тайла 0,5, как у тайлов предметов и крыш): там и начало
+    // модели. Рамка тайла в Foundry тогда совпадает с моделью в 3D Canvas.
     let tile = json!({
         "_id": doc_id('m', 0),
-        "x": pts(lo[0]), "y": pts(lo[2]),
+        "x": pts((lo[0] + hi[0]) / 2.0), "y": pts((lo[2] + hi[2]) / 2.0),
         "width": pts(hi[0] - lo[0]), "height": pts(hi[2] - lo[2]),
         "elevation": (lo[1] as f64 * 5.0 * 100.0).round() / 100.0,
         "levels": (0..levels.max(1)).map(level_id).collect::<Vec<_>>(),
@@ -2911,6 +2936,7 @@ mod tests {
             lights: Vec::new(),
             zones: Vec::new(),
             passages: Vec::new(),
+            stairs: Vec::new(),
         };
         lay.clip_to(26.0, 22.0);
         assert_eq!(lay.walls, vec![vec![[0.0, 9.0], [2.0, 9.0]], vec![[0.0, 2.0], [0.0, 5.0]], vec![[2.0, 1.0], [2.0, 0.0]], vec![[4.0, 0.0], [4.0, 1.0], [6.0, 1.0]]]);
@@ -3140,13 +3166,13 @@ mod tests {
         let mut scene = json!({"tiles": [], "flags": {}});
         model_tile(&mut scene, "kartograf/x/x_3d.glb", [[-0.125, 0.0, -0.125], [20.125, 4.0, 10.0]], 100, 2);
         let t = &scene["tiles"][0];
-        assert_eq!((t["x"].as_f64(), t["y"].as_f64(), t["width"].as_f64(), t["height"].as_f64()), (Some(-13.0), Some(-13.0), Some(2025.0), Some(1013.0)));
+        assert_eq!((t["x"].as_f64(), t["y"].as_f64(), t["width"].as_f64(), t["height"].as_f64()), (Some(1000.0), Some(494.0), Some(2025.0), Some(1013.0)));
         assert_eq!(t["elevation"], 0.0);
         assert_eq!(t["levels"], json!([LEVEL_ID, level_id(1)]));
         let f = &t["flags"][CANVAS3D];
         assert_eq!((f["model3d"].as_str(), f["fillType"].as_str(), f["depth"].as_f64()), (Some("kartograf/x/x_3d.glb"), Some("stretch"), Some(400.0)));
         assert_eq!(scene["flags"][CANVAS3D]["showSceneWalls"], false);
         assert_eq!(scene["flags"][CANVAS3D]["renderBackground"], false);
-        assert!(t.get("texture").is_none(), "угол рамки, как у тайлов модели макроса");
+        assert!(t.get("texture").is_none(), "середина рамки — якорь по умолчанию, 0,5");
     }
 }

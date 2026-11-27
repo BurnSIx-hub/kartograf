@@ -329,7 +329,7 @@ mod tests {
     }
 
     fn layout(walls: Vec<Vec<[f32; 2]>>, portals: Vec<PortalOut>, lights: Vec<crate::export::Light>) -> Layout {
-        Layout { tents: Vec::new(), walls, low: Vec::new(), cliffs: Vec::new(), portals, lights, zones: Vec::new(), passages: Vec::new() }
+        Layout { tents: Vec::new(), walls, low: Vec::new(), cliffs: Vec::new(), portals, lights, zones: Vec::new(), passages: Vec::new(), stairs: Vec::new() }
     }
 
     fn room_scene(window: bool) -> Scene {

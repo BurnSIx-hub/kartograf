@@ -1062,6 +1062,101 @@ async function decodeOne({ key, thumb, name, offset, size, side, blur, ppcBase }
   }
 }
 
+// --- Марш между этажами в 3D Canvas ---------------------------------------------------------
+// Лестницу маршем (у области перехода метка `stairs` из выгрузки) в 3D Canvas проходят ногами,
+// без вопроса «Move Up?»: снизу фишка поднимается по ступеням и, дойдя до пола этажа выше,
+// оказывается на его уровне; сверху, шагнув в проём над маршем, — на уровне ниже, на ступени под
+// собой (3D Canvas не пускает фишку ниже пола показанного уровня, спуститься сама она не может).
+// Без 3D Canvas — как в ядре: область спрашивает.
+
+/** 3D Canvas рисует сцену у этого клиента. */
+function walking3d() {
+  return !!game.Levels3DPreview?._active;
+}
+
+/** В сцене есть марш из выгрузки Картографа. */
+function stairsScene(scene) {
+  return !!scene?.regions?.some((r) => r.getFlag(MODULE_ID, "stairs"));
+}
+
+/** Уровень, на полу которого стоит высота `elevation`: самый высокий с низом не выше её. */
+function levelAt(scene, elevation) {
+  let best = null;
+  for (const l of scene.levels ?? []) {
+    const bottom = l.elevation?.bottom;
+    if (!Number.isFinite(bottom) || bottom > elevation + 0.01) continue;
+    if (!best || bottom > best.elevation.bottom) best = l;
+  }
+  return best;
+}
+
+/** Высота земли 3D Canvas под фишкой (луч вниз от её макушки); не нашлось — нет. */
+function groundUnder(doc) {
+  const L = game.Levels3DPreview;
+  const c = doc.getCenterPoint?.(doc._source) ?? doc.object?.center;
+  if (!L?.interactionManager || !c) return null;
+  const hit = L.interactionManager.computeSightCollision({ x: c.x, y: c.y, z: doc.elevation + 1 }, { x: c.x, y: c.y, z: -100000 }, "move");
+  if (!hit) return null;
+  const d = canvas.scene.dimensions;
+  return Math.round(((hit.y * L.factor) / (d.size / d.distance)) * 100) / 100;
+}
+
+/** Перевести фишку на уровень `to` на высоту `elevation`, когда её шаг доиграл; Мастеру — и вид
+ * (ему ядро вид не переключает, как у области «Сменить уровень»). */
+async function toLevel(doc, to, elevation) {
+  const from = doc._source.level;
+  await doc.object?.movementAnimationPromise;
+  if (doc._source.level !== from) return;
+  await doc.move({ elevation, level: to.id, action: doc.movementAction }, { animate: false, constrainOptions: { ignoreWalls: true } });
+  const scene = doc.parent;
+  if (game.user.isGM && scene.isView && canvas.level?.id === from && doc._source.level === to.id) await scene.view({ level: to.id, controlledTokens: [doc.id] });
+}
+
+/** Области перехода над маршем в 3D Canvas не спрашивают: обработчик ядра берётся из `events`
+ * поведения в момент события, его и обернуть. Сверху вход в проём — спуск на уровень ниже. */
+function quietStairs() {
+  const cls = CONFIG.RegionBehavior?.dataModels?.changeLevel;
+  const IN = CONST.REGION_EVENTS?.TOKEN_MOVE_IN;
+  const orig = cls?.events?.[IN];
+  if (!orig || orig.kartografStairs) return;
+  const wrapped = async function (event) {
+    if (!walking3d() || !this.region?.getFlag(MODULE_ID, "stairs")) return orig.call(this, event);
+    const doc = event.data?.token;
+    if (!event.user?.isSelf || !doc) return;
+    const scene = doc.parent;
+    const here = scene.levels.get(doc._source.level);
+    const bottom = here?.elevation?.bottom;
+    if (!Number.isFinite(bottom)) return;
+    const lower = [...scene.levels].filter((l) => Number.isFinite(l.elevation?.bottom) && l.elevation.bottom < bottom && (!this.region.levels?.size || this.region.levels.has(l.id))).sort((a, b) => b.elevation.bottom - a.elevation.bottom)[0];
+    // Снизу — подъём ногами: уровень сменит `followStairs`, когда ступни дойдут до пола наверху.
+    if (!lower) return;
+    // Как ядро: шаг — на паузу, иначе он, доигрывая, вернёт фишку на её уровень.
+    doc.pauseMovement?.();
+    const ground = groundUnder(doc);
+    await toLevel(doc, lower, ground !== null && ground < bottom ? ground : doc.elevation);
+  };
+  wrapped.kartografStairs = true;
+  cls.events[IN] = wrapped;
+}
+
+/** Фишка, которую подвинул этот клиент, поднялась по маршу до пола этажа выше — на его уровень
+ * (после хода: посреди него ядро смену уровня отбрасывает). */
+function followStairs(doc, movement, operation, user) {
+  if (!user?.isSelf || movement?.pending?.waypoints?.length || !walking3d()) return;
+  const scene = doc.parent;
+  if (!stairsScene(scene)) return;
+  // На самом марше (в проёме над ним) — ещё не наверху: сверху сюда входят, спускаясь.
+  if ([...(doc.regions ?? [])].some((r) => r.getFlag(MODULE_ID, "stairs"))) return;
+  const to = levelAt(scene, doc.elevation);
+  const here = scene.levels.get(doc._source.level);
+  if (!to || !here || to.elevation.bottom <= here.elevation.bottom) return;
+  toLevel(doc, to, doc.elevation).catch((err) => console.warn(`${MODULE_ID} | уровень по маршу`, err));
+}
+
+Hooks.once("init", quietStairs);
+Hooks.once("ready", quietStairs);
+Hooks.on("moveToken", followStairs);
+
 Hooks.once("init", () => {
   window.kartografDecode = (key, thumb, name, offset, size, side, blur = 0, ppcBase = 256) => {
     if (blur > 0 && !canBlur()) return false;

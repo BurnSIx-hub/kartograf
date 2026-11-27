@@ -473,6 +473,11 @@ enum Shot {
 }
 
 impl Export {
+    /// Снимок для 3D (выгрузка с 3D-моделью, окно 3D): помост — тело, его стенки на полу нет.
+    fn solid(&self) -> bool {
+        (self.three_d || self.view3d) && !self.picture
+    }
+
     /// Проходы снимка этажа по порядку.
     fn shots(&self) -> &'static [Shot] {
         if self.view3d {

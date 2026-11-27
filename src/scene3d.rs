@@ -201,7 +201,8 @@ impl Skin {
 
 /// Твёрдое тело на полу этажа: помост, ступень, пандус, ступень марша. Бока — отвесно от
 /// `base` до верха; верх — картинка пола этажа (помост и ступени на ней уже нарисованы сверху)
-/// или своя (`skin`).
+/// или своя (`skin`). Бока — цветом `side` или картинкой `face`: по ширине — повтор через
+/// [`PANEL`] клетки пути вдоль края, по высоте — от верха до низа один раз.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
     pub poly: Vec<[f32; 2]>,
@@ -209,6 +210,35 @@ pub struct Block {
     pub top: Top,
     pub side: [u8; 3],
     pub skin: Option<Skin>,
+    pub face: Option<Picture>,
+}
+
+/// Шаг панелей на боку помоста, клетки пути вдоль края: те же швы, что на 2D-карте.
+pub const PANEL: f32 = 0.62;
+
+/// Ключ картинки бока помоста цвета `c` ([`panel_side`]).
+pub fn panel_key(c: [u8; 3]) -> String {
+    format!("panel_side#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// Бок помоста — как его стенка на 2D-карте: от светлого верха к низу темнее, светлая кромка
+/// сверху, тёмная линия у пола, шов панели у левого края. Одна панель ([`PANEL`] клетки).
+pub fn panel_side(c: [u8; 3]) -> image::RgbaImage {
+    let (w, h) = (64u32, 128u32);
+    let tone = |k: f32| c.map(|v| (v as f32 * k).round().clamp(0.0, 255.0) as u8);
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let f = y as f32 / (h - 1) as f32;
+        let rgb = if y < 3 {
+            [236, 240, 244]
+        } else if y >= h - 4 {
+            [24, 28, 34]
+        } else if x < 2 {
+            tone(0.42)
+        } else {
+            tone(1.0 - 0.55 * f)
+        };
+        image::Rgba([rgb[0], rgb[1], rgb[2], 255])
+    })
 }
 
 /// Высоты земли по сетке: `w × h` точек через `step` клеток, первая — в левом верхнем углу карты.
@@ -239,11 +269,13 @@ impl Field {
     }
 }
 
-/// Земля этажа над его полом: рельеф и тела на нём.
+/// Земля этажа над его полом: рельеф и тела на нём. `cliff` — картинка круч рельефа (середина
+/// полосы кромки обрыва, как у боков стен); нет — кручи в картинке пола.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ground {
     pub relief: Option<Field>,
     pub blocks: Vec<Block>,
+    pub cliff: Option<Picture>,
 }
 
 impl Ground {
@@ -351,6 +383,8 @@ pub struct Storey {
     pub ground: Ground,
     /// Крыши этажа. Выгрузка кладёт их не в общую модель, а каждую в свой тайл крыши.
     pub roofs: Vec<Roof3>,
+    /// Где у этажа пол (выше первого): плита пола — только там, дыры в ней настоящие.
+    pub cover: Option<Cover>,
 }
 
 impl Scene3d {
@@ -442,17 +476,31 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             }
             None => s.material(Material { look: Look::Color([96, 90, 84]), alpha: Alpha::Opaque, two_sided: true, repeat: false, opacity: 1.0 }),
         };
-        // На рельефе пол — сетка высот, иначе плита.
-        let floor = match &st.ground.relief {
-            Some(f) => field_mesh(f, size, y0),
-            None => {
+        // На рельефе пол — сетка высот (кручи — своей картинкой), выше первого этажа — плита
+        // там, где пол есть, иначе плита во всю карту.
+        let mut prims = Vec::new();
+        match (&st.ground.relief, st.cover.as_ref().filter(|_| k > 0)) {
+            (Some(f), _) => {
+                let cliff = st.ground.cliff.as_ref().map(|p| {
+                    let pic = s.picture(p);
+                    let mat = s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 });
+                    (mat, p.size[0] as f32 / p.size[1].max(1) as f32)
+                });
+                let (gentle, steep) = field_mesh(f, size, y0, cliff.map(|c| c.1));
+                prims.push((floor_mat, gentle));
+                if !steep.idx.is_empty() {
+                    prims.push((cliff.map_or(floor_mat, |c| c.0), steep));
+                }
+            }
+            (None, Some(c)) => prims.push((floor_mat, holed_mesh(c, size, y0))),
+            (None, None) => {
                 let mut m = Mesh::default();
                 let (w, h) = (size[0], size[1]);
                 quad(&mut m, [[0.0, y0, 0.0], [w, y0, 0.0], [w, y0, h], [0.0, y0, h]], [0.0, 1.0, 0.0], [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
-                m
+                prims.push((floor_mat, m));
             }
-        };
-        s.nodes.push(Node { name: format!("floor_{}", k + 1), part: Part::Floor, storey: k, at: [0.0; 3], yaw: 0.0, prims: vec![(floor_mat, floor)], door: None });
+        }
+        s.nodes.push(Node { name: format!("floor_{}", k + 1), part: Part::Floor, storey: k, at: [0.0; 3], yaw: 0.0, prims, door: None });
         blocks_node(&mut s, k, &st.ground.blocks, size, y0, floor_mat);
         // Низ стен и створок — по земле: на рельефе стена стоит на склоне.
         let relief = st.ground.relief.as_ref();
@@ -575,9 +623,17 @@ pub fn roof_scene(r: &Roof3) -> Option<(Scene3d, [[f32; 3]; 2])> {
     Some((s, [lo, hi]))
 }
 
-/// Пол на рельефе: сетка высот поля во всю карту, картинка пола — по рамке карты.
-fn field_mesh(f: &Field, size: [f32; 2], y0: f32) -> Mesh {
+/// Круча рельефа: треугольник сетки высот круче этого (косинус наклона) — бок обрыва.
+const STEEP: f32 = 0.6;
+/// Картинка кручи повторяется по высоте через столько клеток.
+const CLIFF_PERIOD: f32 = 1.0;
+
+/// Пол на рельефе: сетка высот поля во всю карту, картинка пола — по рамке карты. С картинкой
+/// круч (`cliff` — отношение её сторон) кручи отдельно: по ширине — вдоль склона, по высоте —
+/// по высоте, а не растянутый сверху пол.
+fn field_mesh(f: &Field, size: [f32; 2], y0: f32, cliff: Option<f32>) -> (Mesh, Mesh) {
     let mut m = Mesh::default();
+    let mut steep = Mesh::default();
     let h = |i: isize, j: isize| f.get(i, j);
     for j in 0..f.h {
         for i in 0..f.w {
@@ -592,8 +648,79 @@ fn field_mesh(f: &Field, size: [f32; 2], y0: f32) -> Mesh {
             let a = (j * f.w + i) as u32;
             let (b, c, d) = (a + 1, a + 1 + f.w as u32, a + f.w as u32);
             // Лицом вверх: x — вправо, z — на юг.
-            m.idx.extend([a, d, c, a, c, b]);
+            for t in [[a, d, c], [a, c, b]] {
+                let p = t.map(|i| m.v[i as usize].p);
+                let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+                let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+                let n = norm3([e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]]);
+                let n = if n[1] < 0.0 { n.map(|v| -v) } else { n };
+                match cliff.filter(|_| n[1] < STEEP) {
+                    // Круча: по ширине — по той оси карты, вдоль которой склон тянется.
+                    Some(aspect) => {
+                        let along = |q: [f32; 3]| if n[0].abs() > n[2].abs() { q[2] } else { q[0] };
+                        let uv = p.map(|q| [along(q) / (CLIFF_PERIOD * aspect), -(q[1] - y0) / CLIFF_PERIOD]);
+                        tri(&mut steep, p, n, uv);
+                    }
+                    None => m.idx.extend(t),
+                }
+            }
         }
+    }
+    (m, steep)
+}
+
+/// Пол верхнего этажа там, где он есть (`cover`), прямоугольниками: дыры — настоящие, лучи 3D
+/// Canvas (ход фишки по маршу, взгляд вниз) проходят в них, а не упираются в плиту. Пол раздут
+/// на точку карты пола: край дыры в картинке — вырез по прозрачности, щели у края нет.
+fn holed_mesh(c: &Cover, size: [f32; 2], y0: f32) -> Mesh {
+    let (w, h) = (c.w, c.h);
+    let at = |i: isize, j: isize| i >= 0 && j >= 0 && (i as usize) < w && (j as usize) < h && c.data[j as usize * w + i as usize];
+    let solid: Vec<bool> = (0..w * h)
+        .map(|k| {
+            let (i, j) = ((k % w) as isize, (k / w) as isize);
+            at(i, j) || at(i - 1, j) || at(i + 1, j) || at(i, j - 1) || at(i, j + 1)
+        })
+        .collect();
+    let cell = 1.0 / c.per;
+    let mut m = Mesh::default();
+    let mut emit = |i0: usize, i1: usize, j0: usize, j1: usize| {
+        let (x0, x1) = (i0 as f32 * cell, (i1 as f32 * cell).min(size[0]));
+        let (z0, z1) = (j0 as f32 * cell, (j1 as f32 * cell).min(size[1]));
+        let uv = |x: f32, z: f32| [x / size[0].max(1e-6), z / size[1].max(1e-6)];
+        quad(&mut m, [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]], [0.0, 1.0, 0.0], [uv(x0, z0), uv(x1, z0), uv(x1, z1), uv(x0, z1)]);
+    };
+    // Отрезки пола по строкам; одинаковые отрезки соседних строк — один прямоугольник.
+    let mut open: Vec<(usize, usize, usize)> = Vec::new();
+    for j in 0..=h {
+        let mut runs = Vec::new();
+        if j < h {
+            let mut i = 0;
+            while i < w {
+                if solid[j * w + i] {
+                    let i0 = i;
+                    while i < w && solid[j * w + i] {
+                        i += 1;
+                    }
+                    runs.push((i0, i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut next = Vec::new();
+        for (i0, i1, j0) in open.drain(..) {
+            if runs.contains(&(i0, i1)) {
+                next.push((i0, i1, j0));
+            } else {
+                emit(i0, i1, j0, j);
+            }
+        }
+        for (i0, i1) in runs {
+            if !next.iter().any(|o| (o.0, o.1) == (i0, i1)) {
+                next.push((i0, i1, j));
+            }
+        }
+        open = next;
     }
     m
 }
@@ -622,7 +749,13 @@ fn blocks_node(s: &mut Scene3d, k: usize, blocks: &[Block], size: [f32; 2], y0: 
             }
             None => floor_mat,
         };
-        let side_mat = s.material(Material { look: Look::Color(b.side), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 });
+        let side_mat = match &b.face {
+            Some(p) => {
+                let pic = s.picture(p);
+                s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 })
+            }
+            None => s.material(Material { look: Look::Color(b.side), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 }),
+        };
         let uv = |p: [f32; 2]| match &b.skin {
             Some(sk) => sk.uv(p),
             None => [p[0] / size[0].max(1e-6), p[1] / size[1].max(1e-6)],
@@ -648,7 +781,12 @@ fn blocks_node(s: &mut Scene3d, k: usize, blocks: &[Block], size: [f32; 2], y0: 
                 continue;
             }
             let n = [nrm[e][0], 0.0, nrm[e][1]];
-            quad(&mut by_mat[sd].1, [at(a, b.base), at(c, b.base), at(c, hc), at(a, ha)], n, [[u0, ha - b.base], [u1, hc - b.base], [u1, 0.0], [u0, 0.0]]);
+            // Картинка бока — панелями вдоль края, по высоте — от верха до низа один раз.
+            let (u0, u1, va, vc) = match b.face {
+                Some(_) => (u0 / PANEL, u1 / PANEL, 1.0, 1.0),
+                None => (u0, u1, ha - b.base, hc - b.base),
+            };
+            quad(&mut by_mat[sd].1, [at(a, b.base), at(c, b.base), at(c, hc), at(a, ha)], n, [[u0, va], [u1, vc], [u1, 0.0], [u0, 0.0]]);
         }
     }
     let prims: Vec<(usize, Mesh)> = by_mat.into_iter().filter(|(_, m)| !m.idx.is_empty()).collect();
@@ -823,7 +961,7 @@ mod tests {
     }
 
     fn storey(walls: Vec<Vec<[f32; 2]>>, openings: Vec<Opening>) -> Storey {
-        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25), ground: Ground::default(), roofs: Vec::new() }
+        Storey { floor: None, walls, low: Vec::new(), openings, gaps: Vec::new(), look: plain(0.25), ground: Ground::default(), roofs: Vec::new(), cover: None }
     }
 
     /// Все треугольники сетки смотрят лицом по нормалям своих вершин.
@@ -944,12 +1082,87 @@ mod tests {
         assert_eq!(hi[1], 2.0 * STOREY);
     }
 
+    /// Луч сверху вниз в точке `p` попадает в сетку.
+    fn hits_from_above(m: &Mesh, p: [f32; 2]) -> bool {
+        m.idx.chunks(3).any(|t| {
+            let q = [0, 1, 2].map(|k| m.v[t[k] as usize].p);
+            let s = |a: [f32; 3], b: [f32; 3]| (b[0] - a[0]) * (p[1] - a[2]) - (b[2] - a[2]) * (p[0] - a[0]);
+            let (d1, d2, d3) = (s(q[0], q[1]), s(q[1], q[2]), s(q[2], q[0]));
+            (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0) || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0)
+        })
+    }
+
+    #[test]
+    fn an_upper_floor_has_real_holes_where_its_picture_has_them() {
+        // Второй этаж 8×6, дыра 2×3 клетки над маршем: x 3..5, y 1..4.
+        let cover = Cover { w: 32, h: 24, per: 4.0, data: (0..32 * 24).map(|k| !((12..20).contains(&(k % 32)) && (4..16).contains(&(k / 32)))).collect() };
+        let mut up = storey(Vec::new(), Vec::new());
+        up.cover = Some(cover.clone());
+        // У первого этажа та же карта пола ничего не режет.
+        let mut ground = storey(Vec::new(), Vec::new());
+        ground.cover = Some(cover);
+        let s = build([8.0, 6.0], &[ground, up]);
+        let floor = |name: &str| s.nodes.iter().find(|n| n.name == name).unwrap().prims[0].1.clone();
+        let (f1, f2) = (floor("floor_1"), floor("floor_2"));
+        assert!(hits_from_above(&f1, [4.0, 2.5]));
+        assert!(!hits_from_above(&f2, [4.0, 2.5]), "в дыре луч проходит вниз");
+        assert!(hits_from_above(&f2, [1.0, 1.0]) && hits_from_above(&f2, [7.5, 5.5]) && hits_from_above(&f2, [4.0, 5.0]));
+        // Край дыры раздут на точку карты пола: у самого края пол есть, глубже — нет.
+        assert!(hits_from_above(&f2, [2.9, 2.5]) && !hits_from_above(&f2, [3.4, 2.5]));
+        assert!(faces_follow_normals(&f2));
+        assert!(f2.v.iter().all(|v| v.p[1] == STOREY && (v.uv[0] - v.p[0] / 8.0).abs() < 1e-6 && (v.uv[1] - v.p[2] / 6.0).abs() < 1e-6));
+        // Прямоугольниками, а не по точке: вокруг одной дыры — горстка.
+        assert!(f2.idx.len() / 6 <= 4, "{} прямоугольников", f2.idx.len() / 6);
+    }
+
+    #[test]
+    fn a_cliff_wears_its_own_picture_upright_and_gentle_ground_the_floor() {
+        // Ровно, потом обрыв в клетку высотой на полклетки пути, потом ровно.
+        let f = Field { w: 9, h: 3, step: 0.5, data: (0..27).map(|k| if k % 9 >= 5 { 1.0 } else { 0.0 }).collect() };
+        let mut st = storey(Vec::new(), Vec::new());
+        st.ground.relief = Some(f);
+        st.ground.cliff = Some(Picture { key: "cliff#side".into(), size: [512, 128], alpha: false });
+        let s = build([4.0, 1.0], &[st]);
+        let node = s.nodes.iter().find(|n| n.name == "floor_1").unwrap();
+        assert_eq!(node.prims.len(), 2);
+        let (mat, steep) = &node.prims[1];
+        assert!(matches!(s.materials[*mat].look, Look::Picture(i) if s.pictures[i].key == "cliff#side"));
+        // Круча — от низа до верха, по высоте картинка на клетку: v от 0 до −1.
+        let (lo, hi) = steep.v.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.p[1]), hi.max(v.p[1])));
+        assert!(lo.abs() < 1e-6 && (hi - 1.0).abs() < 1e-6);
+        assert!(steep.v.iter().all(|v| (v.uv[1] + v.p[1]).abs() < 1e-5));
+        assert!(faces_follow_normals(steep));
+        // Ровное — картинкой пола; без картинки круч всё — одной сеткой.
+        assert!(!node.prims[0].1.idx.is_empty());
+        let mut plain = storey(Vec::new(), Vec::new());
+        plain.ground.relief = Some(Field { w: 9, h: 3, step: 0.5, data: (0..27).map(|k| if k % 9 >= 5 { 1.0 } else { 0.0 }).collect() });
+        assert_eq!(build([4.0, 1.0], &[plain]).nodes.iter().find(|n| n.name == "floor_1").unwrap().prims.len(), 1);
+    }
+
+    #[test]
+    fn a_dais_side_is_panels_along_the_edge_and_dark_at_the_foot() {
+        let mut st = storey(Vec::new(), Vec::new());
+        let face = Picture { key: panel_key([98, 106, 116]), size: [64, 128], alpha: false };
+        st.ground.blocks.push(Block { poly: vec![[1.0, 1.0], [3.48, 1.0], [3.48, 2.0], [1.0, 2.0]], base: 0.0, top: Top::Flat(0.6), side: [98, 106, 116], skin: None, face: Some(face) });
+        let s = build([4.0, 4.0], &[st]);
+        let g = s.nodes.iter().find(|n| n.name == "ground_1").unwrap();
+        let (mat, sides) = g.prims.iter().find(|(m, _)| matches!(s.materials[*m].look, Look::Picture(i) if s.pictures[i].key.starts_with("panel_side#"))).unwrap();
+        assert!(s.materials[*mat].repeat);
+        // Северный край 2,48 клетки — четыре панели; низ — v = 1, верх — 0.
+        assert!(sides.v.iter().any(|v| (v.uv[0] - 4.0).abs() < 1e-4));
+        assert!(sides.v.iter().all(|v| (v.p[1] < 1e-6) == ((v.uv[1] - 1.0).abs() < 1e-6)));
+        // Картинка: светлая кромка сверху, тёмная линия у пола, к полу темнее.
+        let img = panel_side([98, 106, 116]);
+        let luma = |y: u32| img.get_pixel(32, y).0[..3].iter().map(|&c| c as u32).sum::<u32>();
+        assert!(luma(1) > luma(10) && luma(10) > luma(100) && luma(100) > luma(126));
+    }
+
     #[test]
     fn the_sides_get_their_own_picture_when_there_is_one() {
         let strip = Picture { key: "stone".into(), size: [1024, 256], alpha: false };
         let side = Picture { key: "stone#side".into(), size: [1024, 128], alpha: false };
         let look = WallLook { width: 0.25, strip: Some(strip), side: Some(side), color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new() };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         assert_eq!(walls.prims.len(), 2);
@@ -965,7 +1178,7 @@ mod tests {
     #[test]
     fn the_wall_strip_lies_along_the_top_like_on_the_2d_map() {
         let look = WallLook { width: 0.25, strip: Some(Picture { key: "stone".into(), size: [1024, 256], alpha: false }), side: None, color: [0; 3] };
-        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new() };
+        let st = Storey { floor: None, walls: vec![vec![[0.0, 1.0], [2.0, 1.0]]], low: Vec::new(), openings: Vec::new(), gaps: Vec::new(), look, ground: Ground::default(), roofs: Vec::new(), cover: None };
         let s = build([4.0, 4.0], &[st]);
         let walls = s.nodes.iter().find(|n| n.part == Part::Wall).unwrap();
         let m = &walls.prims[0].1;
@@ -980,7 +1193,7 @@ mod tests {
     #[test]
     fn a_block_stands_on_the_floor_and_wears_the_floor_picture_on_top() {
         let mut st = storey(Vec::new(), Vec::new());
-        st.ground.blocks.push(Block { poly: vec![[1.0, 1.0], [3.0, 1.0], [3.0, 2.0], [1.0, 2.0]], base: 0.0, top: Top::Flat(0.6), side: [90, 90, 90], skin: None });
+        st.ground.blocks.push(Block { poly: vec![[1.0, 1.0], [3.0, 1.0], [3.0, 2.0], [1.0, 2.0]], base: 0.0, top: Top::Flat(0.6), side: [90, 90, 90], skin: None, face: None });
         let s = build([4.0, 4.0], &[st]);
         let floor_mat = s.nodes.iter().find(|n| n.name == "floor_1").unwrap().prims[0].0;
         let g = s.nodes.iter().find(|n| n.name == "ground_1").unwrap();
@@ -1008,7 +1221,7 @@ mod tests {
         let span = |x: f32| walls.v.iter().filter(|v| (v.p[0] - x).abs() < 1e-4).fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.p[1]), hi.max(v.p[1])));
         assert_eq!(span(0.0), (0.0, STOREY));
         assert_eq!(span(4.0), (1.0, 1.0 + STOREY));
-        assert!((Ground { relief: s_field(), blocks: Vec::new() }.at([2.0, 1.0]) - 0.5).abs() < 1e-6);
+        assert!((Ground { relief: s_field(), blocks: Vec::new(), cliff: None }.at([2.0, 1.0]) - 0.5).abs() < 1e-6);
     }
 
     fn s_field() -> Option<Field> {

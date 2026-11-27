@@ -253,7 +253,7 @@ impl App {
         let used = self.map.used_assets();
         let keys = used.iter().map(String::as_str).chain(e.stumps.iter().map(String::as_str));
         (shotcache::program_stamp(), shotcache::assets_stamp(keys, &self.textures.sources)).hash(&mut h);
-        (e.shot() as u8, e.pass(), e.void(), e.px, ppp.to_bits(), shotcache::CELL, e.canopies, &e.stumps).hash(&mut h);
+        (e.shot() as u8, e.pass(), e.void(), e.px, ppp.to_bits(), shotcache::CELL, e.canopies, &e.stumps, e.solid()).hash(&mut h);
         // Стёкла подоконников и пни берутся из библиотеки: другая библиотека — другие.
         self.library.assets.len().hash(&mut h);
         for a in &self.library.assets {
@@ -596,6 +596,11 @@ impl App {
             lay.tents = tents;
             if e.district.is_some() {
                 lay.clip_to(map.width as f32, map.height as f32);
+            }
+            // С марша лестницы этажа ниже — выход в стене края дыры.
+            if k > 0 {
+                let cover = covers_of(open[k].as_ref(), [map.width as f32, map.height as f32]);
+                open_flight_exits(self.export_level(e, k - 1), &cover, &mut lay);
             }
             layouts.push(lay);
             laps.lap("layout");
@@ -1155,9 +1160,18 @@ impl App {
         for (key, rgba) in walls {
             pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
         }
-        let scene = crate::scene3d::build(cells, &storeys);
+        let mut scene = crate::scene3d::build(cells, &storeys);
         let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;
         let bounds = scene.bounds().ok_or("3D: модель пустая")?;
+        // Начало модели — середина её рамки: 3D Canvas ставит начало в середину тайла, а Foundry
+        // считает рамку тайла от его середины (якорь 0,5) — по этой рамке 3D Canvas и ищет, обо
+        // что идёт фишка. Модель от угла карты требовала тайл со сдвигом на полкарты, и в дальней
+        // половине карты ступени и пол для хода пропадали.
+        let mid = [(bounds[0][0] + bounds[1][0]) / 2.0, (bounds[0][2] + bounds[1][2]) / 2.0];
+        for n in &mut scene.nodes {
+            n.at[0] -= mid[0];
+            n.at[2] -= mid[1];
+        }
         Ok((crate::glb::write(&scene, &images, &e.name)?, bounds))
     }
 
@@ -1184,10 +1198,9 @@ impl App {
                     Ok(rgba) => {
                         let alpha = rgba.pixels().any(|px| px[3] < 250);
                         let size = [rgba.width(), rgba.height()];
-                        // Бок — середина полосы: без кромок и бордюра вида сверху.
-                        let (sw, sh) = (rgba.width(), (rgba.height() / 2).max(1));
-                        let mid = image::imageops::crop_imm(&rgba, 0, rgba.height() / 4, sw, sh).to_image();
-                        let side_key = format!("{t}#side");
+                        let mid = side_band(&rgba);
+                        let (sw, sh) = (mid.width(), mid.height());
+                        let side_key = crate::ground3d::side_key(t);
                         let side_alpha = mid.pixels().any(|px| px[3] < 250);
                         pics.entry(side_key.clone()).or_insert(mid);
                         pics.entry(t.clone()).or_insert(rgba);
@@ -1221,10 +1234,24 @@ impl App {
                     pics.insert(sk.picture.key.clone(), solid_under(img));
                 }
             }
+            // Бока помостов — их стенкой с 2D-карты, кручи — серединой полосы кромки обрыва.
+            for b in &ground.blocks {
+                if b.face.is_some() {
+                    pics.entry(crate::scene3d::panel_key(b.side)).or_insert_with(|| crate::scene3d::panel_side(b.side));
+                }
+            }
+            if let Some(cl) = &ground.cliff
+                && !pics.contains_key(&cl.key)
+                && let Some(r) = map.relief.as_ref()
+                && let Ok(img) = self.textures.rgba(&r.face_key())
+            {
+                pics.insert(cl.key.clone(), side_band(&img));
+            }
             flights.push(up);
             let mut walls = lay.walls.clone();
             walls.extend(facades(map, lay));
-            storeys.push(crate::scene3d::Storey { floor, walls, low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color }, ground, roofs: Vec::new() });
+            let cover = covers.get(k).cloned().flatten().filter(|_| k > 0);
+            storeys.push(crate::scene3d::Storey { floor, walls, low: lay.low.clone(), openings, gaps, look: crate::scene3d::WallLook { width: style.width, strip, side, color }, ground, roofs: Vec::new(), cover });
         }
         (storeys, flights)
     }
@@ -1318,6 +1345,20 @@ impl<T: Send + 'static> Pending<T> {
             Self::Thread(h) => h.join().map_err(|_| "поток выгрузки упал".to_owned()),
         }
     }
+}
+
+/// Проходы с маршей этажа ниже (`below`) на этаж выше: в его стенах края дыры над верхним концом
+/// каждой лестницы — проём во всю её ширину ([`crate::ground3d::flight_exit`]). Иначе фишка,
+/// поднявшись по маршу (в 3D) или областью «Сменить уровень» (в 2D), стоит в запертой дыре.
+pub(super) fn open_flight_exits(below: &Map, up: &crate::scene3d::Cover, lay: &mut export::Layout) {
+    let walls: Vec<map::Segment> = lay.walls.iter().flat_map(|l| l.windows(2).map(|w| (w[0], w[1]))).collect();
+    let gaps: Vec<map::Segment> = below.props.iter().filter(|p| crate::ground3d::flight_by_name(&p.asset)).filter_map(|p| crate::ground3d::flight_exit(p, up, &walls)).collect();
+    export::open_walls(lay, &gaps);
+}
+
+/// Бок стены или кручи — середина полосы: без кромок и бордюра вида сверху.
+pub(super) fn side_band(strip: &image::RgbaImage) -> image::RgbaImage {
+    image::imageops::crop_imm(strip, 0, strip.height() / 4, strip.width(), (strip.height() / 2).max(1)).to_image()
 }
 
 /// У предмета своя 3D-модель (`.glb` рядом с картинкой на полке).

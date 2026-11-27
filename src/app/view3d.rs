@@ -1508,6 +1508,12 @@ impl App {
             floors.push(Some(scene3d::Picture { key: key.clone(), size: [rgba.width(), rgba.height()], alpha }));
             pics.insert(key, rgba);
         }
+        // С маршей — выходы в стенах края дыры этажа выше, как в выгрузке.
+        for k in 1..layouts.len() {
+            if let Some(c) = covers[k].as_ref() {
+                super::exporting::open_flight_exits(self.export_level(e, k - 1), c, &mut layouts[k]);
+            }
+        }
         let (mut storeys, flights) = self.storeys_3d(e, &layouts, floors, &covers, &mut pics);
         // Крыши — с картинками, как у тайлов крыш в выгрузке, на верху стен своего этажа.
         for (k, st) in storeys.iter_mut().enumerate() {
@@ -1750,6 +1756,7 @@ mod tests {
             lights: vec![Light { at: [5.0, 4.0], bright: 2.0, dim: 4.0, color: "#ffffff".into(), animation: String::new(), look: (0.5, 1, 0.0, 0.0), tempo: (5, 5) }],
             zones: Vec::new(),
             passages: Vec::new(),
+            stairs: Vec::new(),
         };
         let floor = Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0, scene3d::Ground::default(), None);
         let mut v = View3d::fresh(Renderer::default(), Vec::new(), vec![floor], [10.0, 10.0], Time::Night);
@@ -1842,7 +1849,7 @@ mod tests {
     }
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32, top: f32) -> scene3d::Block {
-        scene3d::Block { poly: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]], base: 0.0, top: scene3d::Top::Flat(top), side: [90, 90, 90], skin: None }
+        scene3d::Block { poly: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]], base: 0.0, top: scene3d::Top::Flat(top), side: [90, 90, 90], skin: None, face: None }
     }
 
     #[test]
@@ -1858,10 +1865,10 @@ mod tests {
 
     #[test]
     fn a_flight_takes_the_token_upstairs_and_back_down() {
-        let lay = Layout { tents: Vec::new(), walls: Vec::new(), low: Vec::new(), cliffs: Vec::new(), portals: Vec::new(), lights: Vec::new(), zones: Vec::new(), passages: Vec::new() };
+        let lay = Layout { tents: Vec::new(), walls: Vec::new(), low: Vec::new(), cliffs: Vec::new(), portals: Vec::new(), lights: Vec::new(), zones: Vec::new(), passages: Vec::new(), stairs: Vec::new() };
         // Марш с юга (y = 6) на север (y = 3) по x 4..6: семь ступеней до пола второго этажа.
         let steps: Vec<scene3d::Block> = (0..7).map(|i| rect(4.0, 6.0 - (i + 1) as f32 * 3.0 / 7.0, 6.0, 6.0 - i as f32 * 3.0 / 7.0, STOREY * (i + 1) as f32 / 7.0)).collect();
-        let ground = scene3d::Ground { relief: None, blocks: steps };
+        let ground = scene3d::Ground { relief: None, blocks: steps, cliff: None };
         // Наверху над маршем — дыра.
         let cover = scene3d::Cover { w: 10, h: 10, per: 1.0, data: (0..100).map(|k| !((4..6).contains(&(k % 10)) && (3..6).contains(&(k / 10)))).collect() };
         let floors = vec![Floor3::new(0, &lay, Mask::for_cells(10, 10), 0.1, 100.0, ground, None), Floor3::new(1, &lay, Mask::for_cells(10, 10), 0.1, 100.0, scene3d::Ground::default(), Some(cover))];

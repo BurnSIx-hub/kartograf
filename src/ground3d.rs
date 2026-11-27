@@ -9,7 +9,7 @@
 //! Лестница-предмет между этажами (ступени из пака, не стремянка и не люк) — марш до пола
 //! этажа выше: подступёнок ниже шага фишки 3D Canvas, верх — к тому концу, где наверху пол.
 
-use crate::map::{Map, Prop};
+use crate::map::{Map, Prop, Segment};
 use crate::platform::{self, Stair, StairGeo, TREAD};
 use crate::scene3d::{Block, Cover, Field, Ground, Picture, STOREY, Skin, Top};
 
@@ -25,8 +25,20 @@ const FLIGHT_RISE: f32 = 0.3;
 const FLIGHT_SIDE: [u8; 3] = [92, 80, 68];
 /// Пол наверху ищется на столько за концом марша, клетки.
 const FLIGHT_PROBE: f32 = 0.35;
+/// Верхний конец марша дальше этого от края пола (клетки) — не выход: площадка и проём — до него.
+const LANDING: f32 = 1.0;
 
 /// Лестница-предмет, по которой ходят между этажами: марш ступеней — не стремянка и не люк.
+/// Бок помоста и его ступеней — как его стенка на 2D-карте ([`crate::scene3d::panel_side`]).
+fn panel(c: [u8; 3]) -> Picture {
+    Picture { key: crate::scene3d::panel_key(c), size: [64, 128], alpha: false }
+}
+
+/// Ключ середины полосы `key` — картинки бока (у стен и круч): `<ключ>#side`.
+pub fn side_key(key: &str) -> String {
+    format!("{key}#side")
+}
+
 pub fn flight_by_name(key: &str) -> bool {
     let k = crate::library::label(key).to_lowercase();
     crate::map::passage_by_name(key) && ["stair", "лестниц"].iter().any(|w| k.contains(w)) && !["ladder", "стремян"].iter().any(|w| k.contains(w))
@@ -42,7 +54,9 @@ pub fn over_flight(p: &Prop, below: &Map, skip: &dyn Fn(&Prop) -> bool) -> bool 
 /// (этажа выше нет — маршей нет). `picture(key)` — картинка предмета для верха марша (нет —
 /// марш без рисунка, цветом); `skip(prop)` — у предмета своя 3D-модель, марш ему не нужен.
 pub fn ground(map: &Map, upper: Option<&Cover>, picture: &dyn Fn(&str) -> Option<Picture>, skip: &dyn Fn(&Prop) -> bool) -> (Ground, Vec<usize>) {
-    let mut g = Ground { relief: field(map), blocks: Vec::new() };
+    // Кручи рельефа — серединой полосы кромки обрыва, как бока стен: середина без кромок.
+    let cliff = map.relief.as_ref().filter(|r| !r.is_flat()).and_then(|r| picture(&r.face_key())).map(|p| Picture { key: side_key(&p.key), size: [p.size[0], (p.size[1] / 2).max(1)], alpha: false });
+    let mut g = Ground { relief: field(map), blocks: Vec::new(), cliff };
     for pl in &map.platforms {
         let poly = platform::tidy(&pl.points);
         if poly.len() < 3 || pl.height <= 0.0 {
@@ -60,7 +74,7 @@ pub fn ground(map: &Map, upper: Option<&Cover>, picture: &dyn Fn(&str) -> Option
                 stairs.extend(stair_blocks(&geo, st, top, foot, pl.side));
             }
         }
-        g.blocks.push(Block { poly, base: lo, top: Top::Flat(top), side: pl.side, skin: None });
+        g.blocks.push(Block { poly, base: lo, top: Top::Flat(top), side: pl.side, skin: None, face: Some(panel(pl.side)) });
         g.blocks.extend(stairs);
     }
     let mut flights = Vec::new();
@@ -92,21 +106,36 @@ fn field(map: &Map) -> Option<Field> {
 fn stair_blocks(g: &StairGeo, st: &Stair, top: f32, foot: f32, side: [u8; 3]) -> Vec<Block> {
     if st.ramp {
         let k = (top - foot) / g.run.max(1e-3);
-        return vec![Block { poly: g.outline().to_vec(), base: foot, top: Top::Slope { at: g.o, h: top, rise: [-g.nrm[0] * k, -g.nrm[1] * k] }, side, skin: None }];
+        return vec![Block { poly: g.outline().to_vec(), base: foot, top: Top::Slope { at: g.o, h: top, rise: [-g.nrm[0] * k, -g.nrm[1] * k] }, side, skin: None, face: Some(panel(side)) }];
     }
     let n = st.steps.clamp(1, 16) as usize;
     (0..n)
         .map(|k| {
             let (s0, s1) = (k as f32 * TREAD, (k + 1) as f32 * TREAD);
             let h = foot + (top - foot) * (n - k) as f32 / (n + 1) as f32;
-            Block { poly: vec![g.pt(s0, -1.0), g.pt(s0, 1.0), g.pt(s1, 1.0), g.pt(s1, -1.0)], base: foot, top: Top::Flat(h), side, skin: None }
+            Block { poly: vec![g.pt(s0, -1.0), g.pt(s0, 1.0), g.pt(s1, 1.0), g.pt(s1, -1.0)], base: foot, top: Top::Flat(h), side, skin: None, face: Some(panel(side)) }
         })
         .collect()
 }
 
-/// Марш лестницы-предмета до пола этажа выше: вдоль длинной стороны картинки, наверх — к концу,
-/// за которым наверху пол (не понять — к верху картинки). Ступени несут рисунок предмета.
-fn flight(p: &Prop, g: &Ground, up: &Cover, picture: Option<Picture>) -> Option<Vec<Block>> {
+/// Марш на карте: низ, направление подъёма, поперёк, длина и полуширина.
+struct Run {
+    bottom: [f32; 2],
+    fwd: [f32; 2],
+    across: [f32; 2],
+    len: f32,
+    hw: f32,
+}
+
+impl Run {
+    fn pt(&self, t: f32, x: f32) -> [f32; 2] {
+        [self.bottom[0] + self.fwd[0] * t + self.across[0] * x, self.bottom[1] + self.fwd[1] * t + self.across[1] * x]
+    }
+}
+
+/// Марш лестницы-предмета: вдоль длинной стороны картинки, наверх — к концу, за которым наверху
+/// пол (не понять — к верху картинки).
+fn run(p: &Prop, up: &Cover) -> Option<Run> {
     let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
     if w.min(h) < 0.1 {
         return None;
@@ -125,24 +154,76 @@ fn flight(p: &Prop, g: &Ground, up: &Cover, picture: Option<Picture>) -> Option<
     };
     let fwd = [along[0] * dir, along[1] * dir];
     let bottom = [p.pos[0] - fwd[0] * len / 2.0, p.pos[1] - fwd[1] * len / 2.0];
-    let base = g.at(bottom);
+    Some(Run { bottom, fwd, across, len, hw: wide / 2.0 })
+}
+
+/// Марш лестницы-предмета до пола этажа выше. Ступени несут рисунок предмета. Между верхней
+/// ступенью и краем пола этажа выше (дыра обычно шире лестницы) — площадка: иначе в щель
+/// провалилась бы нога и фишка 3D Canvas.
+fn flight(p: &Prop, g: &Ground, up: &Cover, picture: Option<Picture>) -> Option<Vec<Block>> {
+    let r = run(p, up)?;
+    let (w, h) = (p.size[0] * p.scale, p.size[1] * p.scale);
+    let (s, c) = p.rot.to_radians().sin_cos();
+    let (ux, uy) = ([c, s], [-s, c]);
+    let base = g.at(r.bottom);
     let n = (STOREY / FLIGHT_RISE).ceil() as usize;
-    let tread = len / n as f32;
+    let tread = r.len / n as f32;
     let skin = picture.map(|picture| {
         let corner = [p.pos[0] - ux[0] * w / 2.0 - uy[0] * h / 2.0, p.pos[1] - ux[1] * w / 2.0 - uy[1] * h / 2.0];
         let (origin, u) = if p.flip { ([corner[0] + ux[0] * w, corner[1] + ux[1] * w], [-ux[0] * w, -ux[1] * w]) } else { (corner, [ux[0] * w, ux[1] * w]) };
         Skin { picture, origin, u, v: [uy[0] * h, uy[1] * h] }
     });
-    let pt = |t: f32, x: f32| [bottom[0] + fwd[0] * t + across[0] * x, bottom[1] + fwd[1] * t + across[1] * x];
-    let hw = wide / 2.0;
-    Some(
-        (0..n)
-            .map(|i| {
-                let (t0, t1) = (i as f32 * tread, (i + 1) as f32 * tread);
-                Block { poly: vec![pt(t0, -hw), pt(t0, hw), pt(t1, hw), pt(t1, -hw)], base, top: Top::Flat(base.max(STOREY * (i + 1) as f32 / n as f32)), side: FLIGHT_SIDE, skin: skin.clone() }
-            })
-            .collect(),
-    )
+    let hw = r.hw;
+    let mut blocks: Vec<Block> = (0..n)
+        .map(|i| {
+            let (t0, t1) = (i as f32 * tread, (i + 1) as f32 * tread);
+            Block { poly: vec![r.pt(t0, -hw), r.pt(t0, hw), r.pt(t1, hw), r.pt(t1, -hw)], base, top: Top::Flat(base.max(STOREY * (i + 1) as f32 / n as f32)), side: FLIGHT_SIDE, skin: skin.clone(), face: None }
+        })
+        .collect();
+    if let Some(gap) = (0..=(LANDING / 0.05) as usize).map(|k| k as f32 * 0.05).find(|&t| up.has(r.pt(r.len + t, 0.0)))
+        && gap > 0.02
+    {
+        // Чуть ниже пола наверху: край пола заходит на площадку, а мерцать им незачем.
+        let (t0, t1) = (r.len, r.len + gap);
+        blocks.push(Block { poly: vec![r.pt(t0, -hw), r.pt(t0, hw), r.pt(t1, hw), r.pt(t1, -hw)], base, top: Top::Flat(STOREY - 0.02), side: FLIGHT_SIDE, skin: None, face: None });
+    }
+    Some(blocks)
+}
+
+/// Выход с марша лестницы `p` на пол этажа выше: стена этажа выше (край дыры), в которую
+/// упирается верхний конец марша не дальше [`LANDING`], — её отрезок во всю ширину марша. Его
+/// выгрузка вырезает проёмом: поднявшись, фишка выходит на пол, а не стоит в запертой дыре.
+pub fn flight_exit(p: &Prop, up: &Cover, walls: &[Segment]) -> Option<Segment> {
+    let r = run(p, up)?;
+    let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+    // Где луч вдоль подъёма от верхнего конца (сдвинутый поперёк на `x`) встречает прямую стены.
+    let meet = |x: f32, a: [f32; 2], e: [f32; 2]| -> Option<([f32; 2], f32, f32)> {
+        let o = r.pt(r.len, x);
+        let den = cross(r.fwd, e);
+        if den.abs() < 1e-6 {
+            return None;
+        }
+        let wv = [a[0] - o[0], a[1] - o[1]];
+        let (t, u) = (cross(wv, e) / den, cross(wv, r.fwd) / den);
+        Some(([o[0] + r.fwd[0] * t, o[1] + r.fwd[1] * t], t, u))
+    };
+    let mut best: Option<(f32, Segment)> = None;
+    for &(a, b) in walls {
+        let e = [b[0] - a[0], b[1] - a[1]];
+        let el = e[0].hypot(e[1]);
+        // Только поперёк подъёма.
+        if el < 1e-4 || (e[0] * r.fwd[0] + e[1] * r.fwd[1]).abs() / el > 0.35 {
+            continue;
+        }
+        let Some((_, t, u)) = meet(0.0, a, e) else { continue };
+        if !(-0.1..=LANDING).contains(&t) || !(-0.05..=1.05).contains(&u) || best.is_some_and(|(bt, _)| bt <= t) {
+            continue;
+        }
+        if let (Some((pa, ..)), Some((pb, ..))) = (meet(-r.hw, a, e), meet(r.hw, a, e)) {
+            best = Some((t, (pa, pb)));
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 #[cfg(test)]
@@ -231,6 +312,36 @@ mod tests {
         assert!((feet - STOREY).abs() < 1e-4 && STOREY / 7.0 < STEP);
         // Без этажа выше марша нет.
         assert!(ground(&m, None, &none, &no).1.is_empty());
+    }
+
+    #[test]
+    fn a_flight_reaches_the_floor_edge_by_a_landing_and_its_wall_opens_over_the_top() {
+        let mut m = map(12, 10);
+        // Марш 2×1 с запада на восток (x 4..6), дыра наверху шире: x 3.5..6.5, y 3..7.
+        m.props.push(Prop { asset: "Stairs_Stone_A_2x1".into(), pos: [5.0, 5.0], size: [2.0, 1.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: None, layer: None, tint: None, open: None, glow: None, sunk: None, flip: false });
+        let cover = Cover { w: 48, h: 40, per: 4.0, data: (0..48 * 40).map(|k| !((14..26).contains(&(k % 48)) && (12..28).contains(&(k / 48)))).collect() };
+        let (g, _) = ground(&m, Some(&cover), &none, &no);
+        // От верхней ступени до края пола — площадка чуть ниже пола: нога не проваливается.
+        let mut feet = 0.0;
+        let mut x = 3.6;
+        while x < 6.4 {
+            x += 0.1;
+            feet = g.step([x, 5.0], feet).expect("марш и площадка — не выше шага");
+        }
+        assert!(feet > STOREY - 0.05, "у края пола — на высоте пола: {feet}");
+        // Стены края дыры наверху: выход — восточная, во всю ширину марша.
+        let walls = [([3.5, 3.0], [6.5, 3.0]), ([6.5, 3.0], [6.5, 7.0]), ([6.5, 7.0], [3.5, 7.0]), ([3.5, 7.0], [3.5, 3.0])];
+        let gap = flight_exit(&m.props[0], &cover, &walls).expect("выход");
+        let (lo, hi) = (gap.0[1].min(gap.1[1]), gap.0[1].max(gap.1[1]));
+        assert!((gap.0[0] - 6.5).abs() < 1e-4 && (gap.1[0] - 6.5).abs() < 1e-4 && (lo - 4.5).abs() < 1e-4 && (hi - 5.5).abs() < 1e-4, "{gap:?}");
+        // Проём режет стену в раскладке выгрузки.
+        let mut lay = crate::export::layout(&Map::new(12, 10), &[]);
+        lay.walls = vec![vec![[3.5, 3.0], [6.5, 3.0], [6.5, 7.0], [3.5, 7.0], [3.5, 3.0]]];
+        crate::export::open_walls(&mut lay, &[gap]);
+        let east: Vec<_> = lay.walls.iter().flat_map(|l| l.windows(2).map(|w| (w[0], w[1]))).filter(|(a, b)| (a[0] - 6.5).abs() < 1e-4 && (b[0] - 6.5).abs() < 1e-4).collect();
+        assert!(east.iter().all(|(a, b)| a[1].max(b[1]) <= 4.5 + 1e-4 || a[1].min(b[1]) >= 5.5 - 1e-4) && east.len() == 2, "{east:?}");
+        // Стена далеко от верхнего конца — не выход.
+        assert!(flight_exit(&m.props[0], &cover, &[([9.0, 3.0], [9.0, 7.0])]).is_none());
     }
 
     #[test]
