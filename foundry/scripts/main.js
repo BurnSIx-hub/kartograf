@@ -1220,6 +1220,222 @@ Hooks.once("init", quietStairs);
 Hooks.once("ready", quietStairs);
 Hooks.on("moveToken", followStairs);
 
+// --- Осмотр 🔥 Cinema в 3D Canvas -------------------------------------------------------------
+// 🔥 Cinema ловит мышь на 2D-холсте, а 3D Canvas его прячет и ловит мышь своим. Мост — на холсте
+// 3D Canvas: предмет с осмотром ищется лучом по его модели (флаг зоны `inspect.tile` из
+// выгрузки; стена или пол ближе — загорожен), мимо моделей — точка пола под курсором. Дальше —
+// открытый API 🔥 Cinema: наведение, осмотр, а подпись и плашка встают над верхом модели и идут
+// за камерой. Подсветка — золотой контур зоны на полу: 2D-подсветки 🔥 Cinema в 3D не видно.
+
+/** Что нужно мосту от 🔥 Cinema; чего-то нет (модуль старее) — в 3D осмотра нет, как и было. */
+const LOOK_API = ["zoneAt", "zoneOf", "inspectZone", "hover", "setAnchor", "reposition", "closePlaque"];
+const look = { el: null, on: false, hover: null, move: null, down: null, ray: null, ring: null, loop: 0 };
+
+function lookApi() {
+  const api = game.burnCinema?.inspect;
+  return api && LOOK_API.every((k) => typeof api[k] === "function") ? api : null;
+}
+
+/** Футы над нулём сцены → высота 3D Canvas. */
+function lookY(feet) {
+  const d = canvas.scene.dimensions;
+  return (feet * d.size) / (d.distance * game.Levels3DPreview.factor);
+}
+
+/** Модель предмета зоны в 3D Canvas (тайл из флага выгрузки), если видна. */
+function lookModel(region) {
+  const id = region.getFlag(MODULE_ID, "inspect")?.tile;
+  const mesh = id ? game.Levels3DPreview?.tiles?.[id]?.mesh : null;
+  return mesh?.visible === false ? null : mesh ?? null;
+}
+
+/** Точка 3D → экран; за камерой — далеко за краем (плашка уйдёт, а не закроется). */
+function lookScreen(v) {
+  const r = look.el.getBoundingClientRect();
+  const p = v.clone().project(game.Levels3DPreview.camera);
+  if (p.z > 1) return { x: -10000, y: -10000 };
+  return { x: r.left + ((p.x + 1) / 2) * r.width, y: r.top + ((1 - p.y) / 2) * r.height };
+}
+
+/** Пол зоны: низ модели предмета, иначе пол показанного этажа. */
+function lookFloor(region) {
+  const T = game.Levels3DPreview.THREE;
+  const mesh = lookModel(region);
+  if (mesh) {
+    const box = new T.Box3().setFromObject(mesh);
+    if (!box.isEmpty()) return { box, y: box.min.y };
+  }
+  return { box: null, y: lookY(canvas.level?.elevation?.bottom ?? 0) };
+}
+
+/** Где на экране подпись и плашка зоны: над верхом модели, у места — над серединой на полу. */
+function lookAnchor(region) {
+  if (!look.on || !look.el) return null;
+  const T = game.Levels3DPreview.THREE;
+  const { box, y } = lookFloor(region);
+  let top, bottom;
+  if (box) {
+    const c = box.getCenter(new T.Vector3());
+    top = new T.Vector3(c.x, box.max.y, c.z);
+    bottom = new T.Vector3(c.x, box.min.y, c.z);
+  } else {
+    const b = region.bounds;
+    if (!b) return null;
+    const f = game.Levels3DPreview.factor;
+    top = bottom = new T.Vector3((b.x + b.width / 2) / f, y, (b.y + b.height / 2) / f);
+  }
+  return { top: lookScreen(top), bottom: lookScreen(bottom) };
+}
+
+/** Можно ли сейчас осматривать: слой фишек, мышь не тащит камеру или фишку, под ней не фишка.
+ * `pressed` — нажатие: кнопка уже зажата, это не протяжка. */
+function lookEligible(ev, pressed = false) {
+  const im = game.Levels3DPreview?.interactionManager;
+  if (!look.on || !canvas.ready || canvas.activeLayer !== canvas.tokens) return false;
+  if ((ev.buttons && !pressed) || im?.draggable || im?._tokenDrag) return false;
+  return im?.currentHover?.embeddedName !== "Token";
+}
+
+/** Зона под курсором и точка сцены: модель предмета лучом (если её не загораживает стена или
+ * пол), иначе зона под точкой пола, которую видит 3D Canvas. */
+function lookAt(ev) {
+  const L = game.Levels3DPreview, api = lookApi(), T = L.THREE;
+  const r = look.el.getBoundingClientRect();
+  const ndc = new T.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  const ray = (look.ray ??= new T.Raycaster());
+  ray.setFromCamera(ndc, L.camera);
+  const floor = L.interactionManager.findMouseIntersect(ev);
+  const near = floor?.intersectData?.distance ?? Infinity;
+  let best = null;
+  for (const region of canvas.scene.regions) {
+    const mesh = lookModel(region);
+    const hit = mesh && ray.intersectObject(mesh, true)[0];
+    if (!hit || hit.distance > near + 1e-3 || (best && hit.distance >= best.distance)) continue;
+    const zone = api.zoneOf(region);
+    if (zone) best = { zone, distance: hit.distance, point: { x: hit.point.x * L.factor, y: hit.point.z * L.factor } };
+  }
+  if (best) return best;
+  if (!floor?.point) return null;
+  const point = { x: floor.point.x * L.factor, y: floor.point.z * L.factor };
+  const zone = api.zoneAt(point);
+  return zone ? { zone, point } : null;
+}
+
+/** Золотой контур зоны на её полу (и заливка, чуть видная вокруг модели). */
+function lookRing(zone) {
+  const L = game.Levels3DPreview, T = L?.THREE;
+  if (look.ring) {
+    look.ring.parent?.remove(look.ring);
+    look.ring.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); });
+    look.ring = null;
+  }
+  if (!zone || !T) return;
+  const y = lookFloor(zone.region).y + 0.002;
+  const group = new T.Group();
+  for (const poly of zone.region.polygons ?? []) {
+    const pts = [];
+    for (let i = 0; i + 1 < poly.points.length; i += 2) pts.push(new T.Vector3(poly.points[i] / L.factor, y, poly.points[i + 1] / L.factor));
+    if (pts.length < 3) continue;
+    const line = new T.LineLoop(new T.BufferGeometry().setFromPoints(pts), new T.LineBasicMaterial({ color: 0xffe2a0, transparent: true, depthTest: false }));
+    // Плоская фигура лежит в XY: поворот на 90° вокруг X кладёт её на пол (y → z).
+    const fill = new T.Mesh(new T.ShapeGeometry(new T.Shape(pts.map((p) => new T.Vector2(p.x, p.z)))), new T.MeshBasicMaterial({ color: 0xf3c76b, transparent: true, opacity: 0.12, depthWrite: false, side: T.DoubleSide }));
+    fill.rotation.x = Math.PI / 2;
+    fill.position.y = y;
+    line.renderOrder = fill.renderOrder = 999;
+    group.add(fill, line);
+  }
+  group.traverse((o) => Object.assign(o.userData, { noIntersect: true, ignoreHover: true, ignoreIntersect: true }));
+  L.scene.add(group);
+  look.ring = group;
+}
+
+function lookHover(zone) {
+  if (zone?.behavior.id === look.hover?.behavior.id) return;
+  look.hover = zone;
+  lookApi()?.hover(zone, { element: look.el });
+  lookRing(zone);
+}
+
+/** Раз в кадр: наведение по последнему движению мыши, плашка и подпись — за камерой, контур мерцает. */
+function lookFrame() {
+  look.loop = 0;
+  if (!look.on) return;
+  const api = lookApi();
+  if (api && look.move) {
+    const ev = look.move;
+    look.move = null;
+    lookHover(lookEligible(ev) ? lookAt(ev)?.zone ?? null : null);
+  }
+  api?.reposition();
+  if (look.ring) {
+    const a = 0.55 + 0.35 * Math.sin(performance.now() / 200);
+    look.ring.traverse((o) => { if (o.material) o.material.opacity = o.isLine ? a : 0.12 * a; });
+  }
+  look.loop = requestAnimationFrame(lookFrame);
+}
+
+/** Нажатие: зона под ним — сразу, не дожидаясь кадра с наведением. */
+function lookDown(ev) {
+  if (ev.button !== 0 || !look.on || !lookApi()) return;
+  look.down = { x: ev.clientX, y: ev.clientY, t: performance.now(), zone: lookEligible(ev, true) ? lookAt(ev)?.zone ?? null : null };
+}
+
+/** Щелчок (не протяжка камеры) по той же зоне, что под нажатием, — осмотр; мимо — закрыть плашку. */
+function lookUp(ev) {
+  const d = look.down;
+  look.down = null;
+  const api = lookApi();
+  if (!look.on || !api || !d || ev.button !== 0) return;
+  if (Math.hypot(ev.clientX - d.x, ev.clientY - d.y) > 6 || performance.now() - d.t > 700) return;
+  const hit = lookEligible(ev) ? lookAt(ev) : null;
+  if (!hit || !d.zone || hit.zone.behavior.id !== d.zone.behavior.id) return api.closePlaque();
+  api.inspectZone(hit.zone, { point: hit.point, event: ev }).catch((err) => console.error(`${MODULE_ID} | осмотр в 3D`, err));
+}
+
+function lookMove(ev) {
+  look.move = ev;
+}
+
+function lookLeave() {
+  look.move = null;
+  lookHover(null);
+}
+
+/** Мост включён, пока 3D Canvas рисует сцену и 🔥 Cinema умеет нужное; выключен — 🔥 Cinema
+ * снова сам, по 2D-холсту. */
+function lookSync() {
+  const api = lookApi();
+  const el = game.Levels3DPreview?.renderer?.domElement ?? null;
+  const on = !!api && !!el && walking3d() && !!canvas.ready;
+  if (el && el !== look.el) {
+    for (const [type, fn] of [["pointermove", lookMove], ["pointerdown", lookDown], ["pointerup", lookUp], ["pointerleave", lookLeave]]) {
+      look.el?.removeEventListener(type, fn);
+      el.addEventListener(type, fn);
+    }
+    look.el = el;
+  }
+  lookHover(null);
+  if (on === look.on) return;
+  look.on = on;
+  if (on) {
+    api.setAnchor(lookAnchor);
+    look.loop ||= requestAnimationFrame(lookFrame);
+  } else {
+    api?.setAnchor(null);
+  }
+}
+
+Hooks.once("ready", lookSync);
+Hooks.on("canvasReady", lookSync);
+Hooks.on("3DCanvasSceneReady", lookSync);
+// Хук зовут до того, как 3D Canvas откроется или закроется.
+Hooks.on("3DCanvasToggleMode", () => setTimeout(lookSync, 0));
+Hooks.on("canvasTearDown", () => {
+  look.on = false;
+  lookHover(null);
+  lookApi()?.setAnchor(null);
+});
+
 Hooks.once("init", () => {
   window.kartografDecode = (key, thumb, name, offset, size, side, blur = 0, ppcBase = 256) => {
     if (blur > 0 && !canBlur()) return false;

@@ -318,18 +318,28 @@ impl App {
             && let Some(p) = pointer
         {
             let w = self.cam.to_world(rect, p);
-            if let Some(i) = self.map.inspects.iter().rposition(|z| z.contains(w)) {
-                self.sel = Some(Sel::Inspect(i));
-            } else if let Some(i) = self.prop_under(w) {
-                if self.map.props[i].inspect.is_none() {
-                    self.checkpoint();
-                    self.ensure_inspect_file();
-                    self.map.props[i].inspect = Some(map::Inspect::default());
+            self.inspect_click(None, w);
+        }
+    }
+
+    /// Щелчок «Осмотром» в точке `w` (на холсте или в окне 3D, где `prop` — предмет под лучом):
+    /// зона-место — выбрать; предмет — сделать осматриваемым и выбрать; мимо — снять выбор.
+    /// Предмет под лучом 3D важнее места на полу за ним.
+    pub(super) fn inspect_click(&mut self, prop: Option<usize>, w: [f32; 2]) {
+        let zone = self.map.inspects.iter().rposition(|z| z.contains(w));
+        match (prop, zone) {
+            (None, Some(i)) => self.sel = Some(Sel::Inspect(i)),
+            _ => match prop.or_else(|| self.prop_under(w)) {
+                Some(i) => {
+                    if self.map.props[i].inspect.is_none() {
+                        self.checkpoint();
+                        self.ensure_inspect_file();
+                        self.map.props[i].inspect = Some(map::Inspect::default());
+                    }
+                    self.sel = Some(Sel::Prop(i));
                 }
-                self.sel = Some(Sel::Prop(i));
-            } else {
-                self.sel = None;
-            }
+                None => self.sel = None,
+            },
         }
     }
 

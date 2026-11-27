@@ -1789,12 +1789,18 @@ impl SelfTest {
                 let second = app.map.props.get(1).map(|q| q.pos);
                 self.check("щелчок по полу в правке поставил предмет с полки, в 3D он моделью", app.map.props.len() == 2 && p.props == 2 && p.modelled == 2 && second.is_some_and(|q| q[0] < 5.5), &format!("{second:?}, в 3D {} / моделями {}", p.props, p.modelled));
                 self.snap(ctx, "правка в 3D");
-                app.set_tool(Tool::Select);
+                // «Осмотр» (J) в правке 3D: щелчок по первому ящику делает его осматриваемым, как на холсте.
+                app.set_tool(Tool::Inspect);
+                let spot = p.spots.iter().find(|s| s.1 == 0).map_or(p.rect.center(), |s| s.2);
+                self.click(spot);
             }
             // Этап 6, зоны осмотра (🔥 Cinema): протяжка «Осмотром» по пустому месту рисует зону,
             // щелчок по предмету делает его осматриваемым; зону тащат, Delete убирает, Ctrl+Z возвращает.
             #[cfg(not(target_arch = "wasm32"))]
             177 => {
+                let first = app.map.props.first().and_then(|q| q.inspect.as_ref()).is_some();
+                self.check("щелчок «Осмотром» в 3D сделал ящик осматриваемым и выбрал его", first && app.sel == Some(Sel::Prop(0)) && app.tool == Tool::Inspect, &format!("{:?}, {:?}", app.sel, app.tool));
+                app.set_tool(Tool::Select);
                 app.close_view3d();
                 let mut map = Map::new(12, 10);
                 map.props.push(map::Prop { asset: crate::library::TREE.into(), pos: [8.0, 5.0], size: [2.0, 2.0], rot: 0.0, scale: 1.0, shadow: None, light: None, canopy: Some(false), layer: None, tint: None, open: None, glow: None, sunk: None, flip: false, inspect: None });

@@ -802,6 +802,7 @@ impl App {
                 };
                 let src = save(&prop.asset, &mut files)?;
                 let mut tile = export::canopy_tile(src.clone(), prop.pos, size, prop.rot, e.px);
+                tile.prop = map.props.iter().position(|q| std::ptr::eq(q, prop));
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     // Клетка — 5 футов.

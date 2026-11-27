@@ -160,6 +160,21 @@ enum Edit3 {
     Delete(usize, usize),
     /// Поставить, что выбрано у «Объекта», в точку этажа; `alt` — привязка наоборот.
     Place(usize, [f32; 2], bool),
+    /// Щелчок «Осмотром» (J) по этажу: предмет под лучом (номер на карте) или точка на земле —
+    /// как щелчок на холсте: зона-место выбирается, предмет становится осматриваемым.
+    Inspect(usize, Option<usize>, [f32; 2]),
+}
+
+/// Зона осмотра (🔥 Cinema) в окне 3D: предмет с осмотром или нарисованная зона-место.
+struct Look3 {
+    storey: usize,
+    /// Контур на земле, клетки: у предмета — его рамка, у места — нарисованный.
+    ring: Vec<[f32; 2]>,
+    /// Номер предмета на карте; нет — зона-место.
+    prop: Option<usize>,
+    title: String,
+    /// Выбран на карте.
+    sel: bool,
 }
 
 /// Что поставит щелчок в правке: рамка предмета с полки (клетки, с размером) и поворот.
@@ -286,6 +301,9 @@ pub(super) struct View3d {
     picked: Option<Picked>,
     ghost: Option<Ghost>,
     snap: bool,
+    /// Зоны осмотра всех этажей и выбран ли инструмент «Осмотр» — от карты, на кадр.
+    looks: Vec<Look3>,
+    inspecting: bool,
     /// Правки этого кадра — карте.
     edits: Vec<Edit3>,
     /// Вид прошлого кадра — для выбора и самопроверки.
@@ -435,6 +453,8 @@ impl View3d {
             picked: None,
             ghost: None,
             snap: false,
+            looks: Vec::new(),
+            inspecting: false,
             edits: Vec::new(),
             vp: None,
         }
@@ -1074,11 +1094,20 @@ impl View3d {
         let size = self.size;
         let inside = move |p: &[f32; 2]| p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= size[0] && p[1] <= size[1];
         if self.edit {
-            // Щелчок: предмет — выбрать; мимо — поставить с полки или снять выбор.
+            // Щелчок: предмет — выбрать; мимо — поставить с полки или снять выбор. С «Осмотром» —
+            // как на холсте: предмет под лучом или точка на земле (место, плоский предмет пола).
             if resp.clicked()
                 && let Some(p) = at
             {
-                match self.pick(rect, p) {
+                let under = self.pick(rect, p);
+                match under {
+                    _ if self.inspecting => {
+                        let picked = under.map(|j| (self.props[j].storey, self.props[j].index, [self.props[j].at[0], self.props[j].at[2]]));
+                        let storey = picked.map_or(self.top, |(k, _, _)| k);
+                        if let Some(w) = self.ground_hit(rect, p, storey).filter(inside).or(picked.map(|(_, _, at)| at)) {
+                            self.edits.push(Edit3::Inspect(storey, picked.map(|(_, i, _)| i), w));
+                        }
+                    }
                     Some(j) => self.edits.push(Edit3::Select(Some((self.props[j].storey, self.props[j].index)))),
                     None => match self.ground_hit(rect, p, self.top).filter(|w| inside(w) && self.ghost.is_some()) {
                         Some(w) => self.edits.push(Edit3::Place(self.top, w, alt)),
@@ -1227,6 +1256,7 @@ impl View3d {
                 None => ring(pk.storey, pk.corners, blue),
             }
         }
+        self.overlay_looks(painter, rect, &vp);
         if !self.edit {
             return;
         }
@@ -1244,6 +1274,63 @@ impl View3d {
             let (s, co) = g.rot.to_radians().sin_cos();
             let corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [c[0] + x * co - y * s, c[1] + x * s + y * co]);
             ring(self.top, corners, Stroke::new(1.5, ACCENT));
+        }
+    }
+
+    /// Зоны осмотра, как на холсте: места — янтарным контуром на земле всегда (тускло, пока не
+    /// выбран «Осмотр»), предметы — рамкой модели (или рамкой на полу) при «Осмотре» и у выбранного;
+    /// над каждой — лупа, с «Осмотром» — и название. Так в Foundry их увидит мост осмотра.
+    fn overlay_looks(&self, painter: &egui::Painter, rect: Rect, vp: &render3d::Mat4) {
+        let amber = Color32::from_rgb(243, 199, 107);
+        let on_ground = |k: usize, c: [f32; 2]| {
+            let ground = self.floors.get(k).map(|f| &f.ground);
+            [c[0], Self::floor_y(k) + ground.map_or(0.0, |g| g.at(c)) + 0.02, c[1]]
+        };
+        for l in self.looks.iter().filter(|l| l.storey <= self.top) {
+            let bright = self.inspecting || l.sel;
+            if l.prop.is_some() && !bright {
+                continue;
+            }
+            let ink = if bright { amber } else { amber.gamma_multiply(0.55) };
+            let stroke = Stroke::new(if bright { 2.0 } else { 1.2 }, ink);
+            let model = l.prop.and_then(|i| self.prop_of(l.storey, i)).filter(|p| self.shown(p));
+            // Выбранный предмет уже в синей рамке — ему только лупа.
+            match model {
+                Some(p) if !l.sel => {
+                    for (a, b) in p.edges() {
+                        if let (Some(a), Some(b)) = (render3d::project(vp, rect, a), render3d::project(vp, rect, b)) {
+                            painter.line_segment([a, b], stroke);
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let pts: Vec<Pos2> = l.ring.iter().filter_map(|&c| render3d::project(vp, rect, on_ground(l.storey, c))).collect();
+                    if pts.len() == l.ring.len() && pts.len() >= 3 {
+                        painter.add(egui::Shape::closed_line(pts, stroke));
+                    }
+                }
+            }
+            // Лупа — над верхом модели, у места и плоского предмета — над серединой контура.
+            let top = match model {
+                Some(p) => {
+                    let [lo, hi] = p.bounds;
+                    render3d::apply(&p.model, [(lo[0] + hi[0]) / 2.0, hi[1], (lo[2] + hi[2]) / 2.0])
+                }
+                None => {
+                    let n = l.ring.len().max(1) as f32;
+                    let c = l.ring.iter().fold([0.0, 0.0], |s, v| [s[0] + v[0] / n, s[1] + v[1] / n]);
+                    on_ground(l.storey, c)
+                }
+            };
+            if let Some(c) = render3d::project(vp, rect, top) {
+                let c = c + egui::vec2(0.0, -12.0);
+                painter.circle_stroke(c, 5.0, Stroke::new(2.0, ink));
+                painter.line_segment([c + egui::vec2(3.5, 3.5), c + egui::vec2(8.0, 8.0)], Stroke::new(2.5, ink));
+                if self.inspecting && !l.title.is_empty() {
+                    painter.text(c + egui::vec2(0.0, -9.0), egui::Align2::CENTER_BOTTOM, &l.title, egui::FontId::proportional(12.0), ink);
+                }
+            }
         }
     }
 }
@@ -1640,6 +1727,21 @@ impl App {
             }
             _ => None,
         };
+        // Зоны осмотра — как на холсте: у предмета его рамка, у места — нарисованный контур.
+        v.inspecting = self.tool == Tool::Inspect;
+        v.looks.clear();
+        for k in 0..n.min(self.levels.len()) {
+            let m = self.level_ref(k);
+            let here = k == self.level;
+            for (i, p) in m.props.iter().enumerate() {
+                if let Some(ins) = &p.inspect {
+                    v.looks.push(Look3 { storey: k, ring: p.corners().to_vec(), prop: Some(i), title: ins.title.trim().to_owned(), sel: here && self.sel == Some(Sel::Prop(i)) });
+                }
+            }
+            for (i, z) in m.inspects.iter().enumerate().filter(|(_, z)| z.points.len() >= 3) {
+                v.looks.push(Look3 { storey: k, ring: z.points.clone(), prop: None, title: z.inspect.title.trim().to_owned(), sel: here && self.sel == Some(Sel::Inspect(i)) });
+            }
+        }
         // Другие этажи или размер — другая карта: только снимком.
         if self.levels.len() != n || [self.map.width as f32, self.map.height as f32] != v.size {
             v.stale = true;
@@ -1718,6 +1820,10 @@ impl App {
                             self.place_prop(p, alt);
                         }
                     }
+                }
+                Edit3::Inspect(k, prop, w) => {
+                    self.switch_level(k);
+                    self.inspect_click(prop.filter(|&i| i < self.map.props.len()), w);
                 }
                 _ => {}
             }

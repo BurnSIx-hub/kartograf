@@ -80,8 +80,9 @@ pub fn inspect_system(i: &map::Inspect) -> Value {
 }
 
 /// Область зоны осмотра: контур видят только на слое «Области» (`visibility` 0), игрок —
-/// подсветкой модуля при наведении.
-fn inspect_region(n: usize, z: &InspectOut, px: u32) -> Value {
+/// подсветкой модуля при наведении. У предмета с 3D-моделью флаг называет и тайл модели
+/// (`tile`): в 3D Canvas мост осмотра модуля ищет предмет лучом по ней.
+fn inspect_region(n: usize, z: &InspectOut, px: u32, tile: Option<&str>) -> Value {
     let p = px as f32;
     let pts: Vec<i64> = z.outline.iter().flat_map(|v| [(v[0] * p).round() as i64, (v[1] * p).round() as i64]).collect();
     let title = z.inspect.title.trim();
@@ -91,7 +92,11 @@ fn inspect_region(n: usize, z: &InspectOut, px: u32) -> Value {
         "shapes": [{"type": "polygon", "points": pts, "hole": false}],
         "elevation": {"bottom": null, "top": null},
         "behaviors": [{"_id": doc_id('i', n), "type": INSPECT_BEHAVIOR, "name": "🔥 Осмотр", "disabled": false, "system": inspect_system(&z.inspect)}],
-        "flags": {OWN_MODULE: {"inspect": z.prop.map_or_else(|| json!({}), |i| json!({"prop": i}))}}
+        "flags": {OWN_MODULE: {"inspect": match (z.prop, tile) {
+            (Some(i), Some(t)) => json!({"prop": i, "tile": t}),
+            (Some(i), None) => json!({"prop": i}),
+            _ => json!({}),
+        }}}
     })
 }
 
@@ -1212,6 +1217,9 @@ pub struct RoofTile {
     pub model_base: Option<f32>,
     /// В 3D-виде не виден (лестница над маршем этажа ниже: там сам марш), в 2D — как есть.
     pub hide3d: bool,
+    /// Номер предмета этажа, чей это тайл: зона осмотра предмета называет тайл его модели
+    /// (мост осмотра в 3D ищет предмет лучом по ней).
+    pub prop: Option<usize>,
 }
 
 /// Сколько потоков брать на картинку: у программы — по ядрам (не больше восьми), в
@@ -1688,10 +1696,16 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
         let (b, t) = level_span(k, multi);
         // Над крышами: у одного этажа с запасом, у нескольких — в зазоре под полом следующего.
         let over = if multi { json!(t as f64 + 0.5) } else { json!(t + 5) };
+        // Тайл модели у предмета этажа: его называет зона осмотра предмета.
+        let mut model_tiles: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         for r in &lv.roofs {
             let [x, y, w, h] = r.rect;
+            let id = doc_id('t', tiles.len());
+            if let (Some(i), Some(_)) = (r.prop, &r.model) {
+                model_tiles.insert(i, id.clone());
+            }
             let mut tile = json!({
-                "_id": doc_id('t', tiles.len()), "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
+                "_id": id, "texture": {"src": r.src, "anchorX": 0.5, "anchorY": 0.5}, "x": x + w / 2, "y": y + h / 2, "width": w, "height": h,
                 "elevation": if r.low { (b + 10).min(t) } else { t }, "sort": tiles.len(), "rotation": r.rotation,
                 "occlusion": {"modes": if r.fade { json!([1]) } else { json!([]) }, "alpha": 0},
                 "restrictions": {"light": r.shelter, "weather": r.shelter}
@@ -1902,7 +1916,8 @@ pub fn foundry_layered(map: &Map, name: &str, levels: &[SceneLevel], layers: &[L
         }
         // Зоны осмотра этажа (🔥 Cinema). У одного этажа — без `levels`: на всех.
         for z in lv.layout.inspects.iter().filter(|z| z.outline.len() >= 3) {
-            let region = inspect_region(regions.len(), z, px);
+            let tile = z.prop.and_then(|i| model_tiles.get(&i)).map(String::as_str);
+            let region = inspect_region(regions.len(), z, px, tile);
             regions.push(tag(region));
         }
         let mut doc = json!({"_id": level_id(k), "name": lv.name, "background": {"src": lv.image_src, "color": "#999999"}});
@@ -2730,6 +2745,27 @@ mod tests {
         assert_eq!(t["texture"]["src"], "k/chair.webp", "в 2D — картинка");
         assert_eq!((t["rotation"].as_f64(), t["elevation"].as_i64()), (Some(30.0), Some(0)), "на полу и повёрнут, как картинка");
         assert_eq!(t["flags"][CANVAS3D], json!({"model3d": "k/chair_ab12cd34.glb", "fillType": "stretch", "depth": 80.0, "collision": false}));
+    }
+
+    #[test]
+    fn an_inspect_zone_names_the_tile_of_its_props_model() {
+        // Кровать (предмет 1) — с моделью, сундук (предмет 0) — картинкой: мост осмотра в 3D ищет
+        // лучом только модель, у сундука хватит точки пола.
+        let mut m = Map::new(10, 8);
+        let ins = crate::map::Inspect { title: "Кровать".into(), ..Default::default() };
+        m.props.push(inspect_prop("Chest_A", [2.0, 2.0], crate::map::Inspect { title: "Сундук".into(), ..Default::default() }));
+        m.props.push(inspect_prop("Bed_A", [6.0, 4.0], ins));
+        let lay = layout(&m, &[]);
+        let chest = RoofTile { item: true, prop: Some(0), ..canopy_tile("k/chest.webp".into(), [2.0, 2.0], [2.0, 1.0], 90.0, 100) };
+        let bed = RoofTile { item: true, prop: Some(1), model: Some(("k/bed_ab12cd34.glb".into(), 0.5)), ..canopy_tile("k/bed.webp".into(), [6.0, 4.0], [2.0, 1.0], 90.0, 100) };
+        let one = [SceneLevel { name: "Спальня".into(), image_src: "k/a.webp".into(), layout: &lay, roofs: vec![chest, bed] }];
+        let walls = [LevelLayers { foreground: None, solid: None }];
+        let scene = foundry_layered(&m, "Спальня", &one, &walls, 100, &Default::default());
+        let bed_tile = scene["tiles"].as_array().unwrap().iter().find(|t| t["flags"][CANVAS3D]["model3d"].is_string()).unwrap()["_id"].clone();
+        let zones: Vec<&Value> = scene["regions"].as_array().unwrap().iter().filter(|r| r["behaviors"][0]["type"] == INSPECT_BEHAVIOR).collect();
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0]["flags"][OWN_MODULE]["inspect"], json!({"prop": 0}), "у картинки тайла модели нет");
+        assert_eq!(zones[1]["flags"][OWN_MODULE]["inspect"], json!({"prop": 1, "tile": bed_tile}));
     }
 
     #[test]
