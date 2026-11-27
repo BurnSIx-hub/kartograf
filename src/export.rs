@@ -750,6 +750,13 @@ pub fn webp_bytes(img: &image::RgbaImage, quality: f32) -> Vec<u8> {
     webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height()).encode(quality).to_vec()
 }
 
+/// WebP без потерь: карты нормалей и ORM — в сжатии с потерями их каналы перемешиваются.
+pub fn webp_lossless(img: &image::RgbaImage) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8);
+    out
+}
+
 /// WebP картинки карты или `None`, если libwebp не справился. У Красной площади
 /// (16 128 точек по стороне, миллион блоков 16×16) переполнялся первый раздел
 /// кадра (`VP8_ENC_ERROR_PARTITION0_OVERFLOW`), и `encode` ронял программу. Влезает

@@ -3,16 +3,20 @@
 //! (лист в раме с заклёпками, ручка-рычаг) и каменная (плита с резной рамой, кольцо).
 //!
 //! Модель — створка в клетках: петли на x = 0, другой край на x = 1, низ на y = 0, верх на
-//! y = 1,4 (дверь 7 футов), толщина по z. Тело — серая запечённая фактура, её красит цвет породы
-//! или камня из имени рисунка двери (`Door_Wood_Walnut…`, `Door_Stone_Sandstone…`); железо — своим
-//! цветом. Створка растягивается по проёму ([`leaf_part`]).
+//! y = 1,4 (дверь 7 футов), толщина по z. Створка растягивается по проёму ([`leaf_part`]).
 //!
-//! В сцене створка — один кусок с одной картинкой: фактура тела, под ней полоса цвета железа.
-//! 3D Canvas читает метки узла (нетвёрдая, не загораживает обзор) только у узла из одного куска —
-//! из двух открытая створка стала бы для фишки стеной.
+//! Модель — один кусок с одним материалом и тремя картами, запечёнными в Blender: цвет, нормали
+//! (волокна, вмятины, сколы, скруглённые рёбра) и ORM (затенение, шероховатость, металл). 3D Canvas
+//! читает метки узла (нетвёрдая, не загораживает обзор) только у узла из одного куска — из двух
+//! открытая створка стала бы для фишки стеной.
+//!
+//! Цвет тела — по рисунку двери на карте: порода или камень из имени (`Door_Wood_Walnut…`,
+//! `Door_Stone_Sandstone…`) перекрашивает его с сохранением разброса тонов (грязь, износ,
+//! волокна). У дерева и камня красится всё, что не металл, — железо остаётся своим; у
+//! металлической — вся створка.
 
 use crate::model3d::{self, Model3d};
-use crate::scene3d::{Look, Material, Mesh};
+use crate::scene3d::{Material, Mesh};
 use std::sync::OnceLock;
 
 /// Ширина и высота створки в модели (клетки).
@@ -48,7 +52,8 @@ impl Kind {
     }
 }
 
-/// Вид створки: модель и цвет её тела (светлый конец фактуры).
+/// Вид створки: модель и цвет её тела (светлый тон, как на рисунке двери: средний тон тела —
+/// [`BODY`] от него).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DoorLook {
     pub kind: Kind,
@@ -76,80 +81,100 @@ pub fn look_of(art: Option<&str>) -> DoorLook {
     DoorLook { kind, tint }
 }
 
-/// Модель створки (один раз на вид).
-fn model(kind: Kind) -> Option<&'static Model3d> {
-    static MODELS: [OnceLock<Option<Model3d>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    MODELS[kind as usize].get_or_init(|| model3d::read_gltf(kind.bytes(), None, 1.0).ok()).as_ref()
+/// Средний тон тела створки — такая доля цвета двери: цвет из имени — светлый тон рисунка.
+const BODY: f32 = 0.85;
+
+/// Модель створки, её карты и средний цвет тела в картинке цвета.
+struct Door {
+    model: Model3d,
+    normal: image::RgbaImage,
+    orm: image::RgbaImage,
+    mean: [f32; 3],
 }
 
-/// Полоса цветов под фактурой тела в картинке створки (точки).
-const STRIP: u32 = 16;
+/// Красится ли точка картинки цвета (по точке ORM): у дерева и камня — не металл, у металлической
+/// двери — всё. Пустое место развёртки (шероховатость 0) — нет.
+fn tinted(kind: Kind, orm: &image::Rgba<u8>) -> bool {
+    orm[1] > 8 && (kind == Kind::Metal || orm[2] < 40)
+}
 
-/// Створка сцены: сетка в осях створки, картинка (ключ для сцены и размер) и материал.
+/// Модель створки (один раз на вид).
+fn door(kind: Kind) -> Option<&'static Door> {
+    static DOORS: [OnceLock<Option<Door>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    DOORS[kind as usize]
+        .get_or_init(|| {
+            let model = model3d::read_gltf(kind.bytes(), None, 1.0).ok()?;
+            let (normal, orm) = model3d::material_maps(kind.bytes()).ok()?;
+            let base = model.images.first()?;
+            if base.dimensions() != orm.dimensions() {
+                return None;
+            }
+            let (mut sum, mut n) = ([0.0f64; 3], 0usize);
+            for (p, o) in base.pixels().zip(orm.pixels()) {
+                if tinted(kind, o) {
+                    (0..3).for_each(|k| sum[k] += p[k] as f64);
+                    n += 1;
+                }
+            }
+            let mean = sum.map(|v| (v / n.max(1) as f64).max(1.0) as f32);
+            Some(Door { model, normal, orm, mean })
+        })
+        .as_ref()
+}
+
+/// Створка сцены: сетка в осях створки, картинки — цвет, нормали, ORM (ключ для сцены и размер)
+/// и материал (картинку и карты ему ставит сцена).
 pub struct LeafPart {
     pub mesh: Mesh,
-    pub picture: (String, [u32; 2]),
+    pub pictures: [(String, [u32; 2]); 3],
     pub material: Material,
 }
 
-/// Тело модели (её картинка) и цвета прочих частей — по порядку частей.
-fn body_and_colors(m: &Model3d) -> Option<(usize, Vec<[u8; 3]>)> {
-    let body = m.parts.iter().find_map(|p| match p.material.look {
-        Look::Picture(i) => Some(i),
-        Look::Color(_) => None,
-    })?;
-    let mut colors = Vec::new();
-    for p in &m.parts {
-        if let Look::Color(c) = p.material.look
-            && !colors.contains(&c)
-        {
-            colors.push(c);
-        }
-    }
-    Some((body, colors))
+/// Ключ — карта (нормали, ORM): её пишут без потерь.
+pub fn is_map(key: &str) -> bool {
+    key.starts_with("door3d:") && (key.ends_with(":normal") || key.ends_with(":orm"))
 }
 
-/// Картинка для ключа из [`leaf_part`]: фактура тела модели, окрашенная в цвет, и под ней полоса
-/// цветов железа (не окрашенных), по столбцу на цвет.
+/// Картинка для ключа из [`leaf_part`]: цвет створки, перекрашенный в цвет двери, или её карта.
 pub fn picture(key: &str) -> Option<image::RgbaImage> {
     let mut it = key.strip_prefix("door3d:")?.split(':');
-    let (kind, tint) = (Kind::of(it.next()?)?, it.next()?);
-    let c = u32::from_str_radix(tint, 16).ok()?;
-    let tint = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-    let m = model(kind)?;
-    let (body, colors) = body_and_colors(m)?;
-    let src = m.images.get(body)?;
-    let (w, h) = src.dimensions();
-    let mut img = image::RgbaImage::new(w, h + STRIP);
-    for (x, y, p) in src.enumerate_pixels() {
-        let c = [0, 1, 2].map(|k| (p[k] as u32 * tint[k] as u32 / 255) as u8);
-        img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
-    }
-    let n = colors.len().max(1) as u32;
-    for y in h..h + STRIP {
-        for x in 0..w {
-            let c = colors.get((x * n / w) as usize).copied().unwrap_or([0; 3]);
-            img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+    let kind = Kind::of(it.next()?)?;
+    let d = door(kind)?;
+    let tint = match it.next()? {
+        "normal" => return Some(d.normal.clone()),
+        "orm" => return Some(d.orm.clone()),
+        t => u32::from_str_radix(t, 16).ok()?,
+    };
+    let tint = [(tint >> 16) as u8, (tint >> 8) as u8, tint as u8];
+    let k = [0, 1, 2].map(|c| tint[c] as f32 * BODY / d.mean[c]);
+    let mut img = d.model.images.first()?.clone();
+    for (p, o) in img.pixels_mut().zip(d.orm.pixels()) {
+        if tinted(kind, o) {
+            for c in 0..3 {
+                p[c] = (p[c] as f32 * k[c]).round().min(255.0) as u8;
+            }
         }
+        p[3] = 255;
     }
     Some(img)
 }
 
 /// Створка длиной `len` и высотой `tall` (клетки) от петель вдоль x: модель, растянутая по
-/// проёму (с зазором у косяков и у верха, как у прежней доски), одним куском. Нет модели — `None`.
-pub fn leaf_part(look: DoorLook, len: f32, tall: f32) -> Option<LeafPart> {
-    let m = model(look.kind)?;
-    let (body, colors) = body_and_colors(m)?;
-    let (w, h) = m.images.get(body)?.dimensions();
-    let size = [w, h + STRIP];
-    // Доля высоты картинки под фактурой тела; середина полосы цвета `i` в картинке.
-    let vk = h as f32 / (h + STRIP) as f32;
-    let n = colors.len().max(1) as f32;
-    let spot = |i: usize| [(i as f32 + 0.5) / n, (h as f32 + STRIP as f32 / 2.0) / (h + STRIP) as f32];
-    let (sx, sy) = (((len - 0.04) / W).max(0.01), ((tall - 0.02) / H).max(0.01));
+/// проёму (с зазором у петель и у верха, у свободного края — `free`), одним куском; `mirror` —
+/// отражённая по толщине (вторая створка двойной двери: лицом в ту же сторону, что и первая).
+/// Нет модели — `None`.
+pub fn leaf_part(look: DoorLook, len: f32, tall: f32, free: f32, mirror: bool) -> Option<LeafPart> {
+    let d = door(look.kind)?;
+    let size = |img: &image::RgbaImage| [img.width(), img.height()];
+    let name = look.kind.name();
+    let pictures = [
+        (format!("door3d:{name}:{:02x}{:02x}{:02x}", look.tint[0], look.tint[1], look.tint[2]), size(d.model.images.first()?)),
+        (format!("door3d:{name}:normal"), size(&d.normal)),
+        (format!("door3d:{name}:orm"), size(&d.orm)),
+    ];
+    let (sx, sy) = (((len - 0.02 - free) / W).max(0.01), ((tall - 0.02) / H).max(0.01));
     let mut mesh = Mesh::default();
-    let mut material = None;
-    for p in &m.parts {
+    for p in &d.model.parts {
         let base = mesh.v.len() as u32;
         for v in &p.mesh.v {
             let mut v = *v;
@@ -158,19 +183,20 @@ pub fn leaf_part(look: DoorLook, len: f32, tall: f32) -> Option<LeafPart> {
             let nn = [v.n[0] / sx, v.n[1] / sy, v.n[2]];
             let l = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]).sqrt().max(1e-9);
             v.n = [nn[0] / l, nn[1] / l, nn[2] / l];
-            v.uv = match p.material.look {
-                Look::Picture(_) => [v.uv[0], v.uv[1] * vk],
-                Look::Color(c) => spot(colors.iter().position(|&q| q == c).unwrap_or(0)),
-            };
+            if mirror {
+                v.p[2] = -v.p[2];
+                v.n[2] = -v.n[2];
+            }
             mesh.v.push(v);
         }
-        mesh.idx.extend(p.mesh.idx.iter().map(|i| i + base));
-        if let Look::Picture(_) = p.material.look {
-            material = Some(p.material.clone());
+        // Отражение выворачивает обход треугольников — обратно.
+        for t in p.mesh.idx.chunks_exact(3) {
+            let t = if mirror { [t[0], t[2], t[1]] } else { [t[0], t[1], t[2]] };
+            mesh.idx.extend(t.map(|i| i + base));
         }
     }
-    let material = Material { repeat: false, ..material? };
-    Some(LeafPart { mesh, picture: (format!("door3d:{}:{:02x}{:02x}{:02x}", look.kind.name(), look.tint[0], look.tint[1], look.tint[2]), size), material })
+    let material = Material { repeat: false, alpha: crate::scene3d::Alpha::Opaque, opacity: 1.0, ..d.model.parts.first()?.material.clone() };
+    Some(LeafPart { mesh, pictures, material })
 }
 
 #[cfg(test)]
@@ -191,26 +217,64 @@ mod tests {
     }
 
     #[test]
-    fn each_model_is_a_leaf_with_a_tinted_body_and_iron() {
+    fn each_model_is_one_leaf_with_colour_normal_and_orm_maps() {
         for kind in [Kind::Wood, Kind::Metal, Kind::Stone] {
-            let m = model(kind).unwrap_or_else(|| panic!("{kind:?}: модель не читается"));
-            let [lo, hi] = m.bounds().unwrap();
+            let d = door(kind).unwrap_or_else(|| panic!("{kind:?}: модель не читается"));
+            assert_eq!(d.model.parts.len(), 1, "{kind:?}: один кусок — иначе 3D Canvas не прочтёт метки створки");
+            let [lo, hi] = d.model.bounds().unwrap();
             assert!(lo[0] > -0.06 && lo[0] < 0.02 && (hi[0] - W).abs() < 0.06, "{kind:?}: по x от петель до края: {lo:?} {hi:?}");
             assert!(lo[1].abs() < 0.01 && (hi[1] - H).abs() < 0.02, "{kind:?}: по высоте 0..1,4: {lo:?} {hi:?}");
             assert!(hi[2] - lo[2] < 0.2, "{kind:?}: тонкая: {lo:?} {hi:?}");
-            let look = DoorLook { kind, tint: [100, 50, 25] };
-            let part = leaf_part(look, 2.0, 1.2).unwrap();
-            let (key, size) = part.picture.clone();
+            assert!(d.model.triangles() < 12_000, "{kind:?}: лёгкая: {}", d.model.triangles());
+            // Нормали — в среднем «прямо из поверхности», но с рельефом; металл — у железа.
+            let used: Vec<_> = d.normal.pixels().zip(d.orm.pixels()).filter(|(_, o)| o[1] > 8).collect();
+            assert!(used.len() > d.normal.pixels().len() / 2, "{kind:?}: развёртка занимает картинку");
+            let blue = used.iter().map(|(n, _)| n[2] as f32).sum::<f32>() / used.len() as f32;
+            assert!(blue > 200.0, "{kind:?}: нормали в осях поверхности: синий {blue}");
+            assert!(used.iter().filter(|(n, _)| n[0].abs_diff(128) > 12 || n[1].abs_diff(128) > 12).count() > used.len() / 20, "{kind:?}: в нормалях есть рельеф");
+            assert!(used.iter().any(|(_, o)| o[2] > 200), "{kind:?}: есть металл");
+        }
+    }
+
+    #[test]
+    fn the_body_takes_the_door_colour_and_the_iron_keeps_its_own() {
+        for kind in [Kind::Wood, Kind::Stone, Kind::Metal] {
+            let d = door(kind).unwrap();
+            let look = DoorLook { kind, tint: [200, 100, 50] };
+            let part = leaf_part(look, 2.0, 1.2, 0.02, false).unwrap();
+            // Отражённая: та же створка с другим лицом, треугольники смотрят наружу как и были.
+            let back = leaf_part(look, 2.0, 1.2, 0.02, true).unwrap();
+            assert!(part.mesh.v.iter().zip(&back.mesh.v).all(|(a, b)| a.p[2] == -b.p[2] && a.p[0] == b.p[0]));
+            let tri = |m: &Mesh, k: usize| {
+                let [a, b, c] = [0, 1, 2].map(|j| m.v[m.idx[k * 3 + j] as usize]);
+                let (e1, e2) = ([0, 1, 2].map(|q| b.p[q] - a.p[q]), [0, 1, 2].map(|q| c.p[q] - a.p[q]));
+                let g = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                g[0] * a.n[0] + g[1] * a.n[1] + g[2] * a.n[2]
+            };
+            let agree = |m: &Mesh| (0..m.idx.len() / 3).filter(|&k| tri(m, k) > 0.0).count() as f32 / (m.idx.len() / 3) as f32;
+            assert!((agree(&part.mesh) - agree(&back.mesh)).abs() < 0.01, "обход как у исходной: {} {}", agree(&part.mesh), agree(&back.mesh));
+            let [(key, size), (nk, _), (ok, _)] = part.pictures.clone();
+            assert!(!is_map(&key) && is_map(&nk) && is_map(&ok));
             let img = picture(&key).unwrap();
             assert_eq!([img.width(), img.height()], size);
-            let body = img.height() - STRIP;
-            assert!((0..body).all(|y| img.get_pixel(7, y)[0] <= 100 && img.get_pixel(7, y)[2] <= 25), "тело окрашено не светлее цвета");
-            let iron = img.get_pixel(3, body + STRIP / 2);
-            assert!(iron[0] < 90 && iron[0].abs_diff(iron[2]) < 12, "железо — своим цветом, тёмным и серым: {iron:?}");
-            // Вершины железа — в его полосе картинки, тела — выше неё.
-            let split = body as f32 / size[1] as f32;
-            assert!(part.mesh.v.iter().any(|v| v.uv[1] > split) && part.mesh.v.iter().any(|v| v.uv[1] < split));
+            assert_eq!(picture(&nk).unwrap().dimensions(), d.normal.dimensions());
+            // Средний цвет тела — доля BODY цвета двери, разброс тонов сохранён.
+            let body: Vec<_> = img.pixels().zip(d.orm.pixels()).filter(|(_, o)| tinted(kind, o)).map(|(p, _)| *p).collect();
+            let mean = [0, 1, 2].map(|c| body.iter().map(|p| p[c] as f32).sum::<f32>() / body.len() as f32);
+            for c in 0..3 {
+                let want = look.tint[c] as f32 * BODY;
+                assert!((mean[c] - want).abs() < want * 0.08 + 3.0, "{kind:?}: средний цвет {mean:?} ≈ {want}");
+            }
+            let spread = body.iter().map(|p| p[0]).max().unwrap() - body.iter().map(|p| p[0]).min().unwrap();
+            assert!(spread > 60, "{kind:?}: тона разные: {spread}");
+            // Железо деревянной и каменной — своим цветом: тёмное, не рыжее от цвета двери.
+            if kind != Kind::Metal {
+                let iron: Vec<_> = img.pixels().zip(d.orm.pixels()).filter(|(_, o)| o[1] > 8 && o[2] > 200).map(|(p, _)| *p).collect();
+                let r = iron.iter().map(|p| p[0] as f32).sum::<f32>() / iron.len().max(1) as f32;
+                assert!(!iron.is_empty() && r < 90.0, "{kind:?}: железо тёмное: {r}");
+            }
             let (plo, phi) = part.mesh.v.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(l, h), v| ([0, 1, 2].map(|k| l[k].min(v.p[k])), [0, 1, 2].map(|k| h[k].max(v.p[k]))));
+            let [_, hi] = d.model.bounds().unwrap();
             assert!((phi[0] - (hi[0] - W) * 1.96 - 1.98).abs() < 0.05 && phi[1] < 1.2, "растянута по проёму 2 × 1,2: {plo:?} {phi:?}");
             assert!(part.mesh.idx.iter().all(|&i| (i as usize) < part.mesh.v.len()));
             assert!(part.mesh.v.iter().all(|v| ((v.n[0] * v.n[0] + v.n[1] * v.n[1] + v.n[2] * v.n[2]) - 1.0).abs() < 1e-3));

@@ -763,7 +763,7 @@ mod tests {
         let (x, z) = (0.762, 0.381);
         m.parts.push(model3d::Part3 {
             mesh: crate::scene3d::Mesh { v: vec![v([-x, 0.3, -z], [0.0, 1.0, 0.0]), v([x, 0.3, -z], [0.0, 1.0, 0.0]), v([x, 0.3, z], [0.0, 1.0, 0.0]), v([-x, -0.3, z], [0.0, 1.0, 0.0])], idx: vec![0, 2, 1, 0, 3, 2] },
-            material: crate::scene3d::Material { look: crate::scene3d::Look::Color([120, 80, 40]), alpha: crate::scene3d::Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 },
+            material: crate::scene3d::Material { look: crate::scene3d::Look::Color([120, 80, 40]), alpha: crate::scene3d::Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0, maps: None },
         });
         std::fs::write(pack.join("props").join("crateSmall.gltf.glb"), m.write_glb("crate").unwrap()).unwrap();
         let mut taken = std::collections::HashSet::new();

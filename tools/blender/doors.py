@@ -1,45 +1,60 @@
-"""Створки дверей для 3D-карт — модели Blender.
+"""Створки дверей для 3D-карт — модели Blender с картами PBR.
 
-    blender --background --factory-startup --python tools/blender/doors.py -- <папка вывода> [<папка снимков>]
+    blender --background --factory-startup --python tools/blender/doors.py -- <папка вывода> [<папка снимков>] [--only=wood] [--tex=1024] [--samples=32]
 
 Пишет `door_wood.glb`, `door_metal.glb`, `door_stone.glb`: створка в клетках (Blender: 1 = клетка,
 5 футов) — петли на x = 0, другой край на x = 1, низ на z = 0, верх на z = 1,4 (дверь 7 футов),
 толщина 0,08 по y вокруг нуля. Картограф растягивает створку по проёму (`src/doors3d.rs`).
 
-Две части: тело с серой запечённой фактурой (дерево, металл, камень — Картограф красит её в цвет
-породы из имени рисунка двери) и железо одним цветом (петли, кольцо, заклёпки). С папкой снимков —
-ещё по снимку каждой створки спереди и сзади для проверки глазами.
+Створка — один кусок с одним материалом (3D Canvas читает метки только у такого узла), у него три
+карты в одной развёртке: цвет, нормали и ORM (затенение, шероховатость, металл в R, G, B, как в
+glTF). Их запекает Cycles из процедурных материалов деталей: дерево с волокнами, сучками и
+износом, кованое железо с вмятинами и ржавчиной, листовая сталь, тёсаный камень со сколами;
+грязь в углах — по затенению, стёртые рёбра — по скруглению (узел Bevel). Картинки в `.glb` —
+WebP без потерь: в сжатии с потерями каналы карт перемешиваются.
+
+Картограф красит тело (у дерева и камня — всё, что не металл; у металлической — всю створку) в
+цвет двери с карты, сохраняя разброс тонов; железо — как есть. С папкой снимков — ещё снимки
+каждой створки и сами карты для проверки глазами.
 """
 import math
 import os
+import random
 import sys
-import tempfile
 
+import bmesh
 import bpy
 import mathutils
+import numpy as np
 
 W, H, T = 1.0, 1.4, 0.08
-TEX = 512
 
-argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-OUT = os.path.abspath(argv[0] if argv else "assets/doors3d")
-SHOTS = os.path.abspath(argv[1]) if len(argv) > 1 else None
+args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+opts = dict(a[2:].split("=", 1) for a in args if a.startswith("--") and "=" in a)
+pos = [a for a in args if not a.startswith("--")]
+OUT = os.path.abspath(pos[0] if pos else "assets/doors3d")
+SHOTS = os.path.abspath(pos[1]) if len(pos) > 1 else None
+TEX = int(opts.get("tex", 1024))
+SAMPLES = int(opts.get("samples", 32))
+ONLY = opts.get("only")
 os.makedirs(OUT, exist_ok=True)
+if SHOTS:
+    os.makedirs(SHOTS, exist_ok=True)
 
 
 def reset():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     s = bpy.context.scene
     s.unit_settings.system = "NONE"
+    s.render.engine = "CYCLES"
+    s.cycles.device = "CPU"
     return s
 
 
-def box(name, x0, x1, y0, y1, z0, z1, bevel=0.0, seg=2):
-    bpy.ops.mesh.primitive_cube_add(size=1.0, location=((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2))
-    o = bpy.context.active_object
-    o.name = name
-    o.scale = (x1 - x0, y1 - y0, z1 - z0)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+# --- Детали -----------------------------------------------------------------------------------
+
+def finish(o, mat, bevel=0.0, seg=2):
+    o.data.materials.append(mat.m)
     if bevel > 0:
         m = o.modifiers.new("bevel", "BEVEL")
         m.width = bevel
@@ -48,39 +63,67 @@ def box(name, x0, x1, y0, y1, z0, z1, bevel=0.0, seg=2):
     return o
 
 
-def cyl(name, at, r, depth, axis="Y", verts=16):
+def box(name, mat, x0, x1, y0, y1, z0, z1, bevel=0.0, seg=2):
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2))
+    o = bpy.context.active_object
+    o.name = name
+    o.scale = (x1 - x0, y1 - y0, z1 - z0)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    return finish(o, mat, bevel, seg)
+
+
+def cyl(name, mat, at, r, depth, axis="Y", verts=16, bevel=0.0):
     rot = {"X": (0, math.pi / 2, 0), "Y": (math.pi / 2, 0, 0), "Z": (0, 0, 0)}[axis]
     bpy.ops.mesh.primitive_cylinder_add(vertices=verts, radius=r, depth=depth, location=at, rotation=rot)
     o = bpy.context.active_object
     o.name = name
-    return o
+    return finish(o, mat, bevel, 1)
 
 
-def dome(name, at, r, face=-1, verts=8):
-    """Шляпка гвоздя, заклёпка: полусфера лицом по ±y."""
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=verts, ring_count=4, radius=r, location=at)
+def dome(name, mat, at, r, verts=10):
+    """Шляпка гвоздя, заклёпка: приплюснутый шар лицом по ±y."""
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=verts, ring_count=4 if verts < 10 else 5, radius=r, location=at)
     o = bpy.context.active_object
     o.name = name
-    o.scale = (1, 0.5, 1)
+    o.scale = (1, 0.45, 1)
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    return o
+    return finish(o, mat)
 
 
-def ring(name, at, major, minor):
+def ring(name, mat, at, major, minor):
     """Кольцо ручки: тор в плоскости xz (висит на створке)."""
-    bpy.ops.mesh.primitive_torus_add(major_radius=major, minor_radius=minor, major_segments=20, minor_segments=6, location=at, rotation=(math.pi / 2, 0, 0))
+    bpy.ops.mesh.primitive_torus_add(major_radius=major, minor_radius=minor, major_segments=28, minor_segments=8, location=at, rotation=(math.pi / 2, 0, 0))
     o = bpy.context.active_object
     o.name = name
-    return o
+    return finish(o, mat)
 
 
-def bar(name, a, b, width, y0, y1):
+def plate(name, mat, pts, y0, y1, bevel=0.0):
+    """Плоская деталь по контуру `pts` (x, z) толщиной от `y0` до `y1`: полоса петли с наконечником."""
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    face = bm.faces.new([bm.verts.new((x, y0, z)) for x, z in pts])
+    top = bmesh.ops.extrude_face_region(bm, geom=[face])
+    bmesh.ops.translate(bm, vec=(0, y1 - y0, 0), verts=[v for v in top["geom"] if isinstance(v, bmesh.types.BMVert)])
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(me)
+    bm.free()
+    o = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(o)
+    return finish(o, mat, bevel, 1)
+
+
+def bar(name, mat, a, b, width, y0, y1):
     """Брусок от точки `a` до `b` в плоскости xz (раскос двери)."""
     (ax, az), (bx, bz) = a, b
     length = math.hypot(bx - ax, bz - az)
-    o = box(name, -length / 2, length / 2, y0, y1, -width / 2, width / 2, bevel=0.004)
+    o = box(name, mat, -length / 2, length / 2, y0, y1, -width / 2, width / 2, bevel=0.005)
     o.rotation_euler = (0, -math.atan2(bz - az, bx - ax), 0)
-    o.location = ((ax + bx) / 2, 0, (az + bz) / 2)
+    # Только по x и z: по толщине брусок остаётся, где его поставили (иначе уходит внутрь досок).
+    o.location = ((ax + bx) / 2, o.location.y, (az + bz) / 2)
+    bpy.ops.object.select_all(action="DESELECT")
+    o.select_set(True)
+    bpy.context.view_layer.objects.active = o
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
     return o
 
@@ -96,244 +139,542 @@ def join(objs, name):
     bpy.ops.object.join()
     o = bpy.context.active_object
     o.name = name
+    # Начало — в нуле: материалы берут место точки в осях створки.
+    bpy.context.scene.cursor.location = (0, 0, 0)
+    bpy.ops.object.origin_set(type="ORIGIN_CURSOR")
+    bpy.ops.object.shade_smooth_by_angle(angle=math.radians(35))
     return o
 
 
-def node(nodes, kind, x, y):
-    n = nodes.new(kind)
-    n.location = (x, y)
-    return n
+# --- Материалы: узлы ---------------------------------------------------------------------------
+
+class Graph:
+    """Процедурный материал: каналы `base`, `rough`, `metal` и рельеф (через Bump в нормаль BSDF)."""
+
+    def __init__(self, name):
+        self.m = bpy.data.materials.new(name)
+        self.m.use_nodes = True
+        self.nt = self.m.node_tree
+        self.nt.nodes.clear()
+        self.out = self.node("ShaderNodeOutputMaterial")
+        self.bsdf = self.node("ShaderNodeBsdfPrincipled")
+        self.link(self.bsdf.outputs["BSDF"], self.out.inputs["Surface"])
+        geo = self.node("ShaderNodeNewGeometry")
+        self.pos, self.gnormal, self.island = geo.outputs["Position"], geo.outputs["Normal"], geo.outputs["Random Per Island"]
+        self.z = self.node("ShaderNodeSeparateXYZ")
+        self.link(self.pos, self.z.inputs[0])
+        self.z = self.z.outputs["Z"]
+        self.ch = {}
+
+    def node(self, kind, **props):
+        n = self.nt.nodes.new(kind)
+        for k, v in props.items():
+            setattr(n, k, v)
+        return n
+
+    def link(self, a, b):
+        self.nt.links.new(a, b)
+
+    def put(self, sock, v):
+        if isinstance(v, bpy.types.NodeSocket):
+            self.link(v, sock)
+        elif isinstance(v, (int, float)) and sock.type in ("RGBA", "VECTOR"):
+            sock.default_value = (v, v, v, 1.0)[: len(sock.default_value)]
+        elif sock.type == "RGBA" and len(v) == 3:
+            sock.default_value = (*v, 1.0)
+        else:
+            sock.default_value = v
+
+    @staticmethod
+    def sock(n, ident, out=False):
+        socks = n.outputs if out else n.inputs
+        for s in socks:
+            if s.identifier == ident and s.enabled:
+                return s
+        return next(s for s in socks if s.name == ident and s.enabled)
+
+    def math(self, op, a, b=0.0, clamp=False):
+        n = self.node("ShaderNodeMath", operation=op, use_clamp=clamp)
+        self.put(n.inputs[0], a)
+        self.put(n.inputs[1], b)
+        return n.outputs[0]
+
+    def add(self, *xs):
+        acc = xs[0]
+        for x in xs[1:]:
+            acc = self.math("ADD", acc, x)
+        return acc
+
+    def mul(self, a, b):
+        return self.math("MULTIPLY", a, b)
+
+    def clamp(self, x):
+        return self.math("ADD", x, 0.0, clamp=True)
+
+    def smooth(self, x, lo, hi, to=(0.0, 1.0)):
+        n = self.node("ShaderNodeMapRange", interpolation_type="SMOOTHSTEP", clamp=True)
+        self.put(n.inputs["Value"], x)
+        n.inputs["From Min"].default_value, n.inputs["From Max"].default_value = lo, hi
+        n.inputs["To Min"].default_value, n.inputs["To Max"].default_value = to
+        return n.outputs["Result"]
+
+    def lerp(self, t, a, b):
+        n = self.node("ShaderNodeMix", data_type="FLOAT", clamp_factor=True)
+        self.put(self.sock(n, "Factor_Float"), t)
+        self.put(self.sock(n, "A_Float"), a)
+        self.put(self.sock(n, "B_Float"), b)
+        return self.sock(n, "Result_Float", out=True)
+
+    def mixc(self, t, a, b, blend="MIX"):
+        n = self.node("ShaderNodeMix", data_type="RGBA", blend_type=blend, clamp_factor=True)
+        self.put(self.sock(n, "Factor_Float"), t)
+        self.put(self.sock(n, "A_Color"), a)
+        self.put(self.sock(n, "B_Color"), b)
+        return self.sock(n, "Result_Color", out=True)
+
+    def scalec(self, c, k):
+        n = self.node("ShaderNodeVectorMath", operation="SCALE")
+        self.put(n.inputs[0], c)
+        self.put(self.sock(n, "Scale"), k)
+        return n.outputs["Vector"]
+
+    def ramp(self, fac, stops):
+        n = self.node("ShaderNodeValToRGB")
+        els = n.color_ramp.elements
+        while len(els) > 1:
+            els.remove(els[-1])
+        els[0].position, els[0].color = stops[0][0], (*stops[0][1], 1.0)
+        for p, c in stops[1:]:
+            e = els.new(p)
+            e.color = (*c, 1.0)
+        self.put(n.inputs["Fac"], fac)
+        return n.outputs["Color"]
+
+    def vec(self, v, scale=(1, 1, 1), add=None):
+        n = self.node("ShaderNodeVectorMath", operation="MULTIPLY")
+        self.put(n.inputs[0], v)
+        n.inputs[1].default_value = scale
+        out = n.outputs["Vector"]
+        if add is not None:
+            a = self.node("ShaderNodeVectorMath", operation="ADD")
+            self.put(a.inputs[0], out)
+            self.put(a.inputs[1], add)
+            out = a.outputs["Vector"]
+        return out
+
+    def combine(self, x, y, z):
+        n = self.node("ShaderNodeCombineXYZ")
+        for i, v in enumerate((x, y, z)):
+            self.put(n.inputs[i], v)
+        return n.outputs["Vector"]
+
+    def rotate_y(self, v, angle):
+        n = self.node("ShaderNodeMapping", vector_type="POINT")
+        self.put(n.inputs["Vector"], v)
+        n.inputs["Rotation"].default_value = (0.0, angle, 0.0)
+        return n.outputs["Vector"]
+
+    def noise(self, v, scale, detail=4.0, rough=0.5, distortion=0.0, color=False):
+        n = self.node("ShaderNodeTexNoise", noise_dimensions="3D")
+        self.put(n.inputs["Vector"], v)
+        n.inputs["Scale"].default_value = scale
+        n.inputs["Detail"].default_value = detail
+        n.inputs["Roughness"].default_value = rough
+        n.inputs["Distortion"].default_value = distortion
+        return n.outputs["Color" if color else "Fac"]
+
+    def voronoi(self, v, scale, rand=1.0, feature="F1"):
+        n = self.node("ShaderNodeTexVoronoi", voronoi_dimensions="3D", feature=feature)
+        self.put(n.inputs["Vector"], v)
+        n.inputs["Scale"].default_value = scale
+        n.inputs["Randomness"].default_value = rand
+        return n.outputs["Distance"], n.outputs["Color"]
+
+    def wave(self, v, scale, distortion, detail=3.0, dscale=1.0, direction="X"):
+        n = self.node("ShaderNodeTexWave", wave_type="BANDS", bands_direction=direction)
+        self.put(n.inputs["Vector"], v)
+        n.inputs["Scale"].default_value = scale
+        n.inputs["Distortion"].default_value = distortion
+        n.inputs["Detail"].default_value = detail
+        n.inputs["Detail Scale"].default_value = dscale
+        return n.outputs["Fac"]
+
+    def ao(self, distance):
+        n = self.node("ShaderNodeAmbientOcclusion", samples=16, only_local=False)
+        n.inputs["Distance"].default_value = distance
+        return n.outputs["AO"]
+
+    def edge(self, radius, reach=0.02):
+        """Скруглённая нормаль рёбер (радиус `radius`) и маска рёбер (0 — плоскость, 1 — ребро):
+        отличие нормали, сглаженной на `reach`, от настоящей — так видны и рёбра, скруглённые
+        самой моделью."""
+        b = self.node("ShaderNodeBevel", samples=8)
+        b.inputs["Radius"].default_value = radius
+        wide = self.node("ShaderNodeBevel", samples=8)
+        wide.inputs["Radius"].default_value = reach
+        d = self.node("ShaderNodeVectorMath", operation="DOT_PRODUCT")
+        self.link(wide.outputs["Normal"], d.inputs[0])
+        self.link(self.gnormal, d.inputs[1])
+        return b.outputs["Normal"], self.smooth(self.math("SUBTRACT", 1.0, d.outputs["Value"]), 0.01, 0.12)
+
+    def done(self, base, rough, metal, height, strength, distance, normal):
+        bump = self.node("ShaderNodeBump")
+        bump.inputs["Strength"].default_value = strength
+        bump.inputs["Distance"].default_value = distance
+        self.put(bump.inputs["Height"], height)
+        self.put(bump.inputs["Normal"], normal)
+        self.link(bump.outputs["Normal"], self.bsdf.inputs["Normal"])
+        self.put(self.bsdf.inputs["Base Color"], base)
+        self.put(self.bsdf.inputs["Roughness"], rough)
+        self.put(self.bsdf.inputs["Metallic"], metal)
+        self.ch = {"base": base, "rough": rough, "metal": metal, "ao": self.ao(0.12)}
+        return self
 
 
-def grain(kind):
-    """Процедурная фактура тела (серая, 0,55–1): выход «цвет» узла смешения."""
-    m = bpy.data.materials.new(f"{kind}_grain")
-    m.use_nodes = True
-    nt = m.node_tree
-    nodes, links = nt.nodes, nt.links
-    for n in list(nodes):
-        nodes.remove(n)
-    coord = node(nodes, "ShaderNodeTexCoord", -900, 0)
-    out = node(nodes, "ShaderNodeOutputMaterial", 600, 0)
-    emit = node(nodes, "ShaderNodeEmission", 400, 0)
-    ramp = node(nodes, "ShaderNodeValToRGB", 150, 0)
-    if kind == "wood":
-        # Волокна вдоль досок (по z): полосы по x, искривлённые шумом, и мелкая рябь.
-        mapping = node(nodes, "ShaderNodeMapping", -700, 0)
-        mapping.inputs["Scale"].default_value = (1.0, 1.0, 0.08)
-        wave = node(nodes, "ShaderNodeTexWave", -450, 100)
-        wave.wave_type = "BANDS"
-        wave.bands_direction = "X"
-        wave.inputs["Scale"].default_value = 9.0
-        wave.inputs["Distortion"].default_value = 6.0
-        wave.inputs["Detail"].default_value = 4.0
-        wave.inputs["Detail Scale"].default_value = 1.5
-        fine = node(nodes, "ShaderNodeTexNoise", -450, -150)
-        fine.inputs["Scale"].default_value = 140.0
-        fine.inputs["Detail"].default_value = 6.0
-        mix = node(nodes, "ShaderNodeMix", -150, 0)
-        mix.data_type = "FLOAT"
-        mix.inputs["Factor"].default_value = 0.3
-        links.new(coord.outputs["Object"], mapping.inputs["Vector"])
-        links.new(mapping.outputs["Vector"], wave.inputs["Vector"])
-        links.new(coord.outputs["Object"], fine.inputs["Vector"])
-        links.new(wave.outputs["Fac"], mix.inputs["A"])
-        links.new(fine.outputs["Fac"], mix.inputs["B"])
-        src = mix.outputs["Result"]
-        stops = [(0.0, 0.3), (0.55, 0.62), (1.0, 1.0)]
-    elif kind == "metal":
-        # Кованый лист: крупные пятна и мелкая шероховатость.
-        big = node(nodes, "ShaderNodeTexNoise", -450, 100)
-        big.inputs["Scale"].default_value = 7.0
-        big.inputs["Detail"].default_value = 8.0
-        big.inputs["Roughness"].default_value = 0.65
-        fine = node(nodes, "ShaderNodeTexNoise", -450, -150)
-        fine.inputs["Scale"].default_value = 220.0
-        mix = node(nodes, "ShaderNodeMix", -150, 0)
-        mix.data_type = "FLOAT"
-        mix.inputs["Factor"].default_value = 0.35
-        links.new(coord.outputs["Object"], big.inputs["Vector"])
-        links.new(coord.outputs["Object"], fine.inputs["Vector"])
-        links.new(big.outputs["Fac"], mix.inputs["A"])
-        links.new(fine.outputs["Fac"], mix.inputs["B"])
-        src = mix.outputs["Result"]
-        stops = [(0.25, 0.42), (0.55, 0.7), (0.8, 1.0)]
-    else:
-        # Тёсаный камень: ячейки и зернистость.
-        vor = node(nodes, "ShaderNodeTexVoronoi", -450, 100)
-        vor.inputs["Scale"].default_value = 14.0
-        fine = node(nodes, "ShaderNodeTexNoise", -450, -150)
-        fine.inputs["Scale"].default_value = 90.0
-        fine.inputs["Detail"].default_value = 8.0
-        mix = node(nodes, "ShaderNodeMix", -150, 0)
-        mix.data_type = "FLOAT"
-        mix.inputs["Factor"].default_value = 0.55
-        links.new(coord.outputs["Object"], vor.inputs["Vector"])
-        links.new(coord.outputs["Object"], fine.inputs["Vector"])
-        links.new(vor.outputs["Distance"], mix.inputs["A"])
-        links.new(fine.outputs["Fac"], mix.inputs["B"])
-        src = mix.outputs["Result"]
-        stops = [(0.2, 0.42), (0.5, 0.7), (0.85, 1.0)]
-    els = ramp.color_ramp.elements
-    while len(els) > 1:
-        els.remove(els[-1])
-    els[0].position = stops[0][0]
-    els[0].color = (stops[0][1],) * 3 + (1,)
-    for pos, v in stops[1:]:
-        e = els.new(pos)
-        e.color = (v, v, v, 1)
-    links.new(src, ramp.inputs["Fac"])
-    links.new(ramp.outputs["Color"], emit.inputs["Color"])
-    links.new(emit.outputs["Emission"], out.inputs["Surface"])
-    return m
+def wood(name, angle=math.pi / 2):
+    """Дерево: волокна вдоль детали (`angle` — направление детали в плоскости xz от оси x; доски
+    стоят — π/2)."""
+    g = Graph(name)
+    isl = g.island
+    p = g.rotate_y(g.pos, angle - math.pi / 2)
+    p = g.vec(p, add=g.combine(g.mul(isl, 17.3), g.mul(isl, 5.1), g.mul(isl, 11.7)))
+    warp = g.vec(g.noise(g.vec(p, (3, 3, 0.5)), 1.0, 3.0, color=True), add=(-0.5, -0.5, -0.5))
+    q = g.vec(warp, (0.035, 0.035, 0.0), add=p)
+    rings = g.wave(g.vec(q, (1, 1, 0.06)), 14.0, 7.0, 4.0, 1.4)
+    late = g.smooth(rings, 0.6, 0.97)
+    pores = g.noise(g.vec(q, (1, 1, 0.025)), 260.0, 2.0)
+    broad = g.noise(g.vec(q, (1, 1, 0.15)), 6.0, 4.0)
+    # Сучки: редкие ячейки, вытянутые вдоль волокон.
+    kd, kc = g.voronoi(g.vec(q, (1, 1, 0.35)), 4.0)
+    knot = g.mul(g.smooth(kd, 0.07, 0.02), g.smooth(kc, 0.8, 0.84))
+    grain = g.add(g.mul(g.math("SUBTRACT", 1.0, late), 0.55), g.mul(pores, 0.25), g.mul(broad, 0.3))
+    base = g.ramp(grain, [(0.15, (0.1, 0.05, 0.021)), (0.5, (0.2, 0.1, 0.042)), (0.9, (0.31, 0.17, 0.077))])
+    # Доска к доске — свой тон.
+    base = g.scalec(base, g.add(0.78, g.mul(isl, 0.4)))
+    base = g.mixc(g.mul(g.math("FRACT", g.mul(isl, 7.7)), 0.35), base, (0.24, 0.1, 0.05))
+    base = g.mixc(g.mul(knot, 0.85), base, (0.05, 0.025, 0.012))
+    normal, e = g.edge(0.006, 0.015)
+    wear = g.mul(e, g.smooth(g.noise(g.pos, 35.0, 5.0), 0.38, 0.62))
+    base = g.mixc(g.mul(wear, 0.55), base, g.scalec(base, 1.7))
+    dirt = g.ao(0.05)
+    base = g.mixc(g.math("SUBTRACT", 1.0, dirt), base, g.scalec(base, 0.4))
+    grime = g.mul(g.smooth(g.z, 0.32, 0.0), g.smooth(g.noise(g.pos, 9.0, 6.0), 0.3, 0.7))
+    base = g.mixc(g.mul(grime, 0.6), base, (0.045, 0.04, 0.032))
+    rough = g.clamp(g.add(0.66, g.mul(late, 0.14), g.mul(grime, 0.08), g.mul(wear, -0.16), g.mul(knot, 0.06)))
+    height = g.add(g.mul(grain, 0.6), g.mul(pores, 0.5), g.mul(knot, -0.4))
+    return g.done(base, rough, 0.0, height, 0.6, 0.0015, normal)
 
 
-def bake_body(body, kind):
-    """Развёртка тела и запекание фактуры в картинку; материал — картинка в основном цвете."""
-    bpy.ops.object.select_all(action="DESELECT")
-    body.select_set(True)
-    bpy.context.view_layer.objects.active = body
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.01)
-    bpy.ops.object.mode_set(mode="OBJECT")
-    img = bpy.data.images.new(f"door_{kind}", TEX, TEX, alpha=False)
-    img.colorspace_settings.name = "sRGB"
-    m = grain(kind)
-    target = m.node_tree.nodes.new("ShaderNodeTexImage")
-    target.image = img
-    m.node_tree.nodes.active = target
-    body.data.materials.clear()
-    body.data.materials.append(m)
-    s = bpy.context.scene
-    s.render.engine = "CYCLES"
-    s.cycles.device = "CPU"
-    s.cycles.samples = 1
-    s.render.bake.margin = 8
-    bpy.ops.object.bake(type="EMIT")
-    # Картинка — внутрь .glb; файлом — только рядом со снимками (для проверки глазами).
-    img.filepath_raw = os.path.join(SHOTS or tempfile.gettempdir(), f"door_{kind}_grain.png")
-    img.file_format = "PNG"
-    img.save()
-    img.pack()
-    # Готовый материал: картинка — основной цвет.
-    final = bpy.data.materials.new(f"{kind}")
-    final.use_nodes = True
-    nt = final.node_tree
-    bsdf = nt.nodes["Principled BSDF"]
-    tex = nt.nodes.new("ShaderNodeTexImage")
-    tex.image = img
-    nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-    bsdf.inputs["Roughness"].default_value = {"wood": 0.8, "metal": 0.45, "stone": 0.9}[kind]
-    bsdf.inputs["Metallic"].default_value = 0.6 if kind == "metal" else 0.0
-    body.data.materials.clear()
-    body.data.materials.append(final)
-    bpy.data.materials.remove(m)
+def iron():
+    """Кованое железо: вмятины от молота, ржавчина в углах и пятнами, стёртые до блеска рёбра."""
+    g = Graph("iron")
+    p = g.pos
+    dent, _ = g.voronoi(p, 70.0)
+    fine = g.noise(p, 300.0, 4.0)
+    rn = g.noise(p, 14.0, 8.0, 0.6)
+    occl = g.ao(0.03)
+    rust = g.clamp(g.mul(g.add(g.smooth(rn, 0.56, 0.68), g.mul(g.math("SUBTRACT", 1.0, occl), 0.45)), 0.85))
+    normal, e = g.edge(0.004, 0.008)
+    wear = g.mul(e, g.smooth(g.noise(p, 40.0, 4.0), 0.35, 0.6))
+    base = g.ramp(fine, [(0.3, (0.022, 0.021, 0.02)), (0.7, (0.05, 0.048, 0.045))])
+    rustc = g.ramp(g.noise(p, 60.0, 6.0), [(0.3, (0.05, 0.02, 0.007)), (0.7, (0.16, 0.062, 0.022))])
+    base = g.mixc(rust, base, rustc)
+    base = g.mixc(g.mul(wear, 0.8), base, (0.3, 0.29, 0.28))
+    metal = g.math("SUBTRACT", 1.0, g.mul(rust, 0.7))
+    rough = g.clamp(g.add(0.48, g.mul(fine, 0.15), g.mul(rust, 0.38), g.mul(wear, -0.22)))
+    height = g.add(g.mul(g.smooth(dent, 0.0, 0.5), 0.6), g.mul(rust, g.mul(g.noise(p, 120.0, 3.0), 0.5)), g.mul(fine, 0.2))
+    return g.done(base, rough, metal, height, 0.5, 0.0008, normal)
 
 
-def iron_material():
-    m = bpy.data.materials.new("iron")
-    m.use_nodes = True
-    b = m.node_tree.nodes["Principled BSDF"]
-    b.inputs["Base Color"].default_value = (0.045, 0.042, 0.04, 1)
-    b.inputs["Metallic"].default_value = 0.85
-    b.inputs["Roughness"].default_value = 0.5
-    return m
+def steel():
+    """Листовая сталь: пятна, потёки ржавчины снизу, царапины, светлые рёбра."""
+    g = Graph("steel")
+    p = g.pos
+    smudge = g.noise(p, 3.0, 6.0)
+    streak = g.noise(g.vec(p, (1, 1, 0.06)), 40.0, 3.0)
+    rn = g.noise(p, 10.0, 8.0, 0.6)
+    occl = g.ao(0.04)
+    low = g.smooth(g.z, 0.4, 0.0)
+    rust = g.clamp(g.add(g.mul(g.smooth(rn, 0.6, 0.7), 0.7), g.mul(low, g.mul(g.smooth(streak, 0.45, 0.7), 0.8)), g.mul(g.math("SUBTRACT", 1.0, occl), 0.6)))
+    scratch = g.mul(g.smooth(g.wave(p, 25.0, 15.0, 2.0, 1.0, "DIAGONAL"), 0.96, 1.0), g.smooth(g.noise(p, 5.0, 2.0), 0.5, 0.7))
+    normal, e = g.edge(0.005, 0.015)
+    wear = g.mul(e, g.smooth(g.noise(p, 35.0, 4.0), 0.35, 0.6))
+    base = g.ramp(smudge, [(0.3, (0.2, 0.205, 0.215)), (0.7, (0.34, 0.345, 0.355))])
+    base = g.mixc(g.mul(rust, 0.85), base, g.ramp(g.noise(p, 50.0, 5.0), [(0.3, (0.08, 0.03, 0.01)), (0.7, (0.22, 0.09, 0.035))]))
+    base = g.mixc(g.clamp(g.add(g.mul(wear, 0.8), g.mul(scratch, 0.5))), base, (0.55, 0.55, 0.56))
+    metal = g.math("SUBTRACT", 0.8, g.mul(rust, 0.55))
+    rough = g.clamp(g.add(0.56, g.mul(smudge, 0.22), g.mul(rust, 0.3), g.mul(wear, -0.2), g.mul(scratch, -0.15)))
+    dents, _ = g.voronoi(p, 18.0)
+    height = g.add(g.mul(g.smooth(dents, 0.0, 0.6), 0.3), g.mul(rust, 0.3), g.mul(scratch, -0.4))
+    return g.done(base, rough, metal, height, 0.4, 0.001, normal)
 
 
-def ring_handle(x, z, side=-1):
-    """Кольцо ручки с накладкой и замочная накладка ниже; `side` −1 — спереди (−y), 1 — сзади."""
+def stone():
+    """Тёсаный камень: зерно, крапины, тонкие жилы, следы резца, сколы на рёбрах, грязь внизу."""
+    g = Graph("stone")
+    p = g.pos
+    big = g.noise(p, 2.5, 8.0, 0.55)
+    mid = g.noise(p, 12.0, 8.0, 0.65)
+    fine = g.noise(p, 90.0, 5.0, 0.6)
+    grit = g.noise(p, 420.0, 2.0)
+    sd, sc = g.voronoi(p, 160.0)
+    speck = g.mul(g.smooth(sd, 0.3, 0.0), g.smooth(sc, 0.62, 0.68))
+    vein = g.mul(g.smooth(g.wave(p, 1.2, 18.0, 6.0, 1.0, "DIAGONAL"), 0.975, 1.0), 0.25)
+    chisel = g.noise(g.vec(g.rotate_y(p, 0.6), (1.0, 1.0, 0.12)), 70.0, 3.0)
+    normal, e = g.edge(0.006, 0.03)
+    _, cc = g.voronoi(p, 22.0)
+    chip = g.mul(g.smooth(e, 0.15, 0.5), g.mul(g.smooth(cc, 0.45, 0.55), g.smooth(g.noise(p, 30.0, 4.0), 0.5, 0.6)))
+    occl = g.ao(0.05)
+    tone = g.add(g.mul(mid, 0.5), g.mul(big, 0.3), g.mul(fine, 0.2))
+    base = g.ramp(tone, [(0.3, (0.12, 0.115, 0.105)), (0.5, (0.22, 0.21, 0.195)), (0.7, (0.32, 0.31, 0.29))])
+    base = g.mixc(g.mul(grit, 0.35), base, g.scalec(base, 0.7))
+    base = g.mixc(g.mul(speck, 0.85), base, (0.05, 0.05, 0.048))
+    base = g.mixc(vein, base, (0.4, 0.39, 0.37))
+    base = g.mixc(g.math("SUBTRACT", 1.0, occl), base, g.scalec(base, 0.4))
+    grime = g.mul(g.smooth(g.z, 0.35, 0.0), g.smooth(g.noise(p, 8.0, 6.0), 0.3, 0.7))
+    base = g.mixc(g.mul(grime, 0.55), base, (0.06, 0.065, 0.05))
+    base = g.mixc(g.mul(chip, 0.8), base, (0.31, 0.3, 0.285))
+    rough = g.clamp(g.add(0.82, g.mul(fine, 0.12), g.mul(chip, -0.06)))
+    height = g.add(g.mul(mid, 0.45), g.mul(fine, 0.45), g.mul(grit, 0.35), g.mul(chisel, 0.2), g.mul(chip, -1.4), g.mul(speck, -0.15))
+    return g.done(base, rough, 0.0, height, 1.0, 0.003, normal)
+
+
+def hole():
+    g = Graph("hole")
+    return g.done((0.004, 0.004, 0.004), 0.9, 0.0, 0.0, 0.0, 0.001, g.gnormal)
+
+
+# --- Створки -----------------------------------------------------------------------------------
+
+def ring_handle(m, x, z, side=-1):
+    """Кольцо на розетке и накладка с замочной скважиной ниже; `side` −1 — спереди (−y), 1 — сзади."""
     y = side * T / 2
     out = lambda d: y + side * d
-    return [
-        cyl("plate", (x, out(0.004), z), 0.05, 0.008, verts=20),
-        cyl("pin", (x, out(0.014), z), 0.012, 0.02, verts=10),
-        ring("ring", (x, out(0.024), z - 0.045), 0.045, 0.0075),
-        box("keyplate", x - 0.018, x + 0.018, min(y, out(0.006)), max(y, out(0.006)), z - 0.2, z - 0.12, bevel=0.003),
+    lo, hi = sorted((y, out(0.006)))
+    parts = [
+        cyl("rosette", m["iron"], (x, out(0.004), z), 0.05, 0.008, verts=24, bevel=0.003),
+        cyl("pin", m["iron"], (x, out(0.014), z), 0.012, 0.02, verts=12),
+        ring("ring", m["iron"], (x, out(0.024), z - 0.045), 0.045, 0.0075),
+        plate("keyplate", m["iron"], [(x - 0.02, z - 0.215), (x + 0.02, z - 0.215), (x + 0.022, z - 0.17), (x + 0.02, z - 0.115), (x - 0.02, z - 0.115), (x - 0.022, z - 0.17)], lo, hi, 0.0025),
     ]
+    k0, k1 = sorted((out(0.006), out(0.0065)))
+    parts.append(cyl("keyhole", m["hole"], (x, (k0 + k1) / 2, z - 0.15), 0.0075, k1 - k0, verts=12))
+    parts.append(box("keyslot", m["hole"], x - 0.004, x + 0.004, k0, k1, z - 0.185, z - 0.15))
+    return parts
 
 
 def wood_door():
-    planks, iron = [], []
-    n = 5
-    pw = W / n
-    for i in range(n):
-        planks.append(box(f"plank{i}", i * pw + 0.003, (i + 1) * pw - 0.003, -T / 2, T / 2 - 0.022, 0.0, H, bevel=0.007))
+    rnd = random.Random(7)
+    m = {"plank": wood("wood"), "batten": wood("wood_h", 0.0), "iron": iron(), "hole": hole()}
+    parts = []
+    # Пять досок разной ширины с зазорами, концы чуть неровные.
+    widths = [0.205, 0.19, 0.212, 0.196, 0.197]
+    k = W / sum(widths)
+    x = 0.0
+    for i, w in enumerate(widths):
+        w *= k
+        parts.append(box(f"plank{i}", m["plank"], x + 0.003, x + w - 0.003, -T / 2, T / 2 - 0.022, rnd.uniform(0.0, 0.006), H - rnd.uniform(0.0, 0.008), bevel=0.006))
+        x += w
     # Сзади — две поперечины и раскос (дверь держится на них).
     yb0, yb1 = T / 2 - 0.022, T / 2
-    planks.append(box("batten_low", 0.05, 0.95, yb0, yb1, 0.18, 0.31, bevel=0.006))
-    planks.append(box("batten_high", 0.05, 0.95, yb0, yb1, 1.09, 1.22, bevel=0.006))
-    planks.append(bar("brace", (0.12, 0.30), (0.88, 1.10), 0.1, yb0, yb1 - 0.003))
-    # Спереди — железные полосы петель с гвоздями и петли у края.
+    parts.append(box("batten_low", m["batten"], 0.05, 0.95, yb0, yb1, 0.18, 0.31, bevel=0.006))
+    parts.append(box("batten_high", m["batten"], 0.05, 0.95, yb0, yb1, 1.09, 1.22, bevel=0.006))
+    a, b = (0.12, 0.30), (0.88, 1.10)
+    m["brace"] = wood("wood_b", math.atan2(b[1] - a[1], b[0] - a[0]))
+    parts.append(bar("brace", m["brace"], a, b, 0.1, yb0, yb1 - 0.003))
+    # Спереди — железные полосы петель с наконечником-пикой, гвозди; петли у края.
     y = -T / 2
     for zc in (0.245, 1.155):
-        iron.append(box("strap", 0.0, 0.64, y - 0.007, y, zc - 0.026, zc + 0.026, bevel=0.003))
-        iron.append(cyl("strap_end", (0.64, y - 0.0035, zc), 0.036, 0.007, verts=16))
-        for xn in (0.08, 0.22, 0.36, 0.5, 0.64):
-            iron.append(dome("nail", (xn, y - 0.007, zc), 0.011))
-        iron.append(cyl("knuckle", (0.0, 0.0, zc), 0.022, 0.11, axis="Z", verts=12))
-    iron += ring_handle(0.84, 0.74)
+        strap = [(0.0, -0.026), (0.54, -0.026), (0.59, -0.044), (0.672, 0.0), (0.59, 0.044), (0.54, 0.026), (0.0, 0.026)]
+        parts.append(plate("strap", m["iron"], [(sx, zc + sz) for sx, sz in strap], y - 0.007, y, 0.0025))
+        for xn in (0.07, 0.2, 0.33, 0.46, 0.6):
+            parts.append(dome("nail", m["iron"], (xn, y - 0.007, zc), 0.011))
+        parts.append(cyl("knuckle", m["iron"], (0.0, 0.0, zc), 0.022, 0.11, axis="Z", verts=14, bevel=0.003))
+    # Гвозди раскоса — по доске.
+    x = 0.0
+    for w in widths:
+        w *= k
+        cx = x + w / 2
+        t = (cx - a[0]) / (b[0] - a[0])
+        if 0.05 < t < 0.95:
+            parts.append(dome("nail", m["iron"], (cx, y, a[1] + t * (b[1] - a[1])), 0.01))
+        x += w
+    parts += ring_handle(m, 0.84, 0.74)
     # Сзади — скоба.
-    iron.append(box("grip", 0.82, 0.86, T / 2 + 0.008, T / 2 + 0.022, 0.62, 0.86, bevel=0.004))
-    iron.append(box("grip_a", 0.82, 0.86, T / 2, T / 2 + 0.022, 0.62, 0.65))
-    iron.append(box("grip_b", 0.82, 0.86, T / 2, T / 2 + 0.022, 0.83, 0.86))
-    return planks, iron
+    parts.append(box("grip", m["iron"], 0.82, 0.86, T / 2 + 0.008, T / 2 + 0.022, 0.62, 0.86, bevel=0.004))
+    parts.append(box("grip_a", m["iron"], 0.82, 0.86, T / 2, T / 2 + 0.022, 0.62, 0.65, bevel=0.002))
+    parts.append(box("grip_b", m["iron"], 0.82, 0.86, T / 2, T / 2 + 0.022, 0.83, 0.86, bevel=0.002))
+    return parts, m
 
 
 def metal_door():
-    body, iron = [], []
-    body.append(box("sheet", 0.004, W - 0.004, -T / 2 + 0.008, T / 2 - 0.008, 0.0, H, bevel=0.01))
+    m = {"steel": steel(), "iron": iron(), "hole": hole()}
+    parts = [box("sheet", m["steel"], 0.004, W - 0.004, -T / 2 + 0.008, T / 2 - 0.008, 0.0, H, bevel=0.01)]
     for side in (-1, 1):
         y_out = side * (T / 2)
         y_in = side * (T / 2 - 0.008)
         ys = (min(y_in, y_out), max(y_in, y_out))
-        # Рама по краю и две филёнки.
-        # Бруски рамы не заходят друг в друга: в местах наложения грани спорили бы (чёрные углы).
-        body.append(box("rim_l", 0.004, 0.08, *ys, 0.0, H, bevel=0.006))
-        body.append(box("rim_r", W - 0.08, W - 0.004, *ys, 0.0, H, bevel=0.006))
-        body.append(box("rim_t", 0.082, W - 0.082, *ys, H - 0.08, H, bevel=0.006))
-        body.append(box("rim_b", 0.082, W - 0.082, *ys, 0.0, 0.08, bevel=0.006))
-        body.append(box("rim_m", 0.082, W - 0.082, *ys, 0.66, 0.74, bevel=0.006))
+        # Рама по краю и две филёнки; бруски рамы не заходят друг в друга (иначе чёрные стыки).
+        parts.append(box("rim_l", m["steel"], 0.004, 0.08, *ys, 0.0, H, bevel=0.006))
+        parts.append(box("rim_r", m["steel"], W - 0.08, W - 0.004, *ys, 0.0, H, bevel=0.006))
+        parts.append(box("rim_t", m["steel"], 0.082, W - 0.082, *ys, H - 0.08, H, bevel=0.006))
+        parts.append(box("rim_b", m["steel"], 0.082, W - 0.082, *ys, 0.0, 0.08, bevel=0.006))
+        parts.append(box("rim_m", m["steel"], 0.082, W - 0.082, *ys, 0.66, 0.74, bevel=0.006))
         for zc in (0.04, 0.7, H - 0.04):
             for xr in [0.04 + k * 0.0915 for k in range(11)]:
-                iron.append(dome("rivet", (xr, y_out + side * 0.002, zc), 0.012))
+                parts.append(dome("rivet", m["steel"], (xr, y_out + side * 0.002, zc), 0.012, verts=8))
         for zr in [0.16 + k * 0.1 for k in range(5)] + [0.82 + k * 0.1 for k in range(5)]:
             for xr in (0.04, W - 0.04):
-                iron.append(dome("rivet", (xr, y_out + side * 0.002, zr), 0.012))
-    # Ручка-рычаг с накладкой с обеих сторон.
+                parts.append(dome("rivet", m["steel"], (xr, y_out + side * 0.002, zr), 0.012, verts=8))
+    # Ручка-рычаг с накладкой с обеих сторон, спереди — скважина.
     for side in (-1, 1):
         y = side * T / 2
-        iron.append(box("lockplate", 0.80, 0.90, min(y, y + side * 0.008), max(y, y + side * 0.008), 0.6, 0.84, bevel=0.004))
-        iron.append(cyl("hub", (0.85, y + side * 0.018, 0.76), 0.016, 0.022, verts=12))
-        iron.append(box("lever", 0.71, 0.86, min(y + side * 0.024, y + side * 0.036), max(y + side * 0.024, y + side * 0.036), 0.748, 0.772, bevel=0.004))
+        lo, hi = sorted((y, y + side * 0.008))
+        parts.append(box("lockplate", m["iron"], 0.80, 0.90, lo, hi, 0.6, 0.84, bevel=0.004))
+        parts.append(cyl("hub", m["iron"], (0.85, y + side * 0.018, 0.76), 0.016, 0.022, verts=14, bevel=0.002))
+        lo, hi = sorted((y + side * 0.024, y + side * 0.036))
+        parts.append(box("lever", m["iron"], 0.71, 0.86, lo, hi, 0.748, 0.772, bevel=0.004))
+        k0, k1 = sorted((y + side * 0.008, y + side * 0.0085))
+        parts.append(cyl("keyhole", m["hole"], (0.85, (k0 + k1) / 2, 0.665), 0.0075, k1 - k0, verts=12))
+        parts.append(box("keyslot", m["hole"], 0.846, 0.854, k0, k1, 0.63, 0.665))
     for zc in (0.2, 1.2):
-        iron.append(cyl("knuckle", (0.0, 0.0, zc), 0.024, 0.14, axis="Z", verts=12))
-    return body, iron
+        parts.append(cyl("knuckle", m["iron"], (0.0, 0.0, zc), 0.024, 0.14, axis="Z", verts=14, bevel=0.003))
+    return parts, m
 
 
 def stone_door():
-    body, iron = [], []
-    body.append(box("slab", 0.004, W - 0.004, -T / 2 + 0.01, T / 2 - 0.01, 0.0, H, bevel=0.012, seg=3))
+    m = {"stone": stone(), "iron": iron(), "hole": hole()}
+    parts = [box("slab", m["stone"], 0.004, W - 0.004, -T / 2 + 0.01, T / 2 - 0.01, 0.0, H, bevel=0.012, seg=3)]
     for side in (-1, 1):
         ys = sorted((side * (T / 2 - 0.012), side * (T / 2 + 0.006)))
         # Выпуклая рама и ромб посередине — резьба (скос меньше толщины, иначе она схлопнется).
-        body.append(box("frame_l", 0.06, 0.14, *ys, 0.06, H - 0.06, bevel=0.004))
-        body.append(box("frame_r", W - 0.14, W - 0.06, *ys, 0.06, H - 0.06, bevel=0.004))
-        body.append(box("frame_t", 0.142, W - 0.142, *ys, H - 0.14, H - 0.06, bevel=0.004))
-        body.append(box("frame_b", 0.142, W - 0.142, *ys, 0.06, 0.14, bevel=0.004))
-        d = box("diamond", -0.16, 0.16, *ys, -0.16, 0.16, bevel=0.004)
+        parts.append(box("frame_l", m["stone"], 0.06, 0.14, *ys, 0.06, H - 0.06, bevel=0.004))
+        parts.append(box("frame_r", m["stone"], W - 0.14, W - 0.06, *ys, 0.06, H - 0.06, bevel=0.004))
+        parts.append(box("frame_t", m["stone"], 0.142, W - 0.142, *ys, H - 0.14, H - 0.06, bevel=0.004))
+        parts.append(box("frame_b", m["stone"], 0.142, W - 0.142, *ys, 0.06, 0.14, bevel=0.004))
+        d = box("diamond", m["stone"], -0.16, 0.16, *ys, -0.16, 0.16, bevel=0.004)
         d.rotation_euler = (0, math.pi / 4, 0)
         d.location = (W / 2, d.location.y, H / 2 + 0.05)
         bpy.ops.object.select_all(action="DESELECT")
         d.select_set(True)
         bpy.context.view_layer.objects.active = d
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
-        body.append(d)
-    iron += ring_handle(0.84, 0.74, -1)
-    iron += ring_handle(0.84, 0.74, 1)
+        parts.append(d)
+    parts += ring_handle(m, 0.84, 0.74, -1)
+    parts += ring_handle(m, 0.84, 0.74, 1)
     for zc in (0.25, 1.15):
-        iron.append(cyl("pivot", (0.0, 0.0, zc), 0.026, 0.12, axis="Z", verts=12))
-    return body, iron
+        parts.append(cyl("pivot", m["iron"], (0.0, 0.0, zc), 0.026, 0.12, axis="Z", verts=14, bevel=0.003))
+    return parts, m
+
+
+# --- Развёртка, запекание, выгрузка -------------------------------------------------------------
+
+def unwrap(o):
+    bpy.ops.object.select_all(action="DESELECT")
+    o.select_set(True)
+    bpy.context.view_layer.objects.active = o
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.006)
+    # Острова — плотно по всей картинке, с поворотом.
+    bpy.ops.uv.pack_islands(rotate=True, margin=0.006)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def image(name, color):
+    img = bpy.data.images.new(name, TEX, TEX, alpha=False, float_buffer=not color)
+    img.colorspace_settings.name = "sRGB" if color else "Non-Color"
+    return img
+
+
+def bake(graphs, channel, img):
+    """Запечь канал всех материалов в `img`: цвет, шероховатость, металл, затенение — свечением,
+    нормали — как есть (с рельефом Bump)."""
+    for g in graphs:
+        tgt = getattr(g, "target", None) or g.node("ShaderNodeTexImage")
+        g.target = tgt
+        tgt.image = img
+        g.nt.nodes.active = tgt
+        for l in list(g.out.inputs["Surface"].links):
+            g.nt.links.remove(l)
+        if channel == "normal":
+            g.link(g.bsdf.outputs["BSDF"], g.out.inputs["Surface"])
+        else:
+            em = getattr(g, "emit", None) or g.node("ShaderNodeEmission")
+            g.emit = em
+            for l in list(em.inputs["Color"].links):
+                g.nt.links.remove(l)
+            g.put(em.inputs["Color"], g.ch[channel])
+            g.link(em.outputs["Emission"], g.out.inputs["Surface"])
+    s = bpy.context.scene
+    s.cycles.samples = SAMPLES
+    s.render.bake.margin = 6
+    s.render.bake.margin_type = "EXTEND"
+    if channel == "normal":
+        bpy.ops.object.bake(type="NORMAL", normal_space="TANGENT")
+    else:
+        bpy.ops.object.bake(type="EMIT")
+
+
+def pixels(img):
+    a = np.empty(TEX * TEX * 4, np.float32)
+    img.pixels.foreach_get(a)
+    return a.reshape(TEX, TEX, 4)
+
+
+def gltf_output(nt):
+    """Узел «glTF Material Output»: по нему выгрузка glTF берёт карту затенения."""
+    g = bpy.data.node_groups.get("glTF Material Output")
+    if g is None:
+        g = bpy.data.node_groups.new("glTF Material Output", "ShaderNodeTree")
+        g.interface.new_socket(name="Occlusion", in_out="INPUT", socket_type="NodeSocketFloat")
+    n = nt.nodes.new("ShaderNodeGroup")
+    n.node_tree = g
+    return n
+
+
+def bake_door(kind, door, graphs):
+    unwrap(door)
+    imgs = {"base": image(f"{kind}_base", True), "normal": image(f"{kind}_normal", False)}
+    for ch in ("rough", "metal", "ao"):
+        imgs[ch] = image(f"{kind}_{ch}", False)
+    for ch in ("base", "normal", "rough", "metal", "ao"):
+        bake(graphs, ch, imgs[ch])
+        print(f"DOOR {kind}: baked {ch}", flush=True)
+    # ORM: затенение, шероховатость, металл — в одну картинку, как в glTF.
+    orm = image(f"{kind}_orm", False)
+    o = np.stack([pixels(imgs["ao"])[..., 0], pixels(imgs["rough"])[..., 0], pixels(imgs["metal"])[..., 0], np.ones((TEX, TEX), np.float32)], -1)
+    orm.pixels.foreach_set(o.ravel())
+    orm.update()
+    if SHOTS:
+        for img in (imgs["base"], imgs["normal"], orm):
+            img.filepath_raw = os.path.join(SHOTS, f"door_{img.name}.png")
+            img.file_format = "PNG"
+            img.save()
+    # Готовый материал: три карты.
+    fm = bpy.data.materials.new(kind)
+    fm.use_nodes = True
+    nt = fm.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
+    tb = nt.nodes.new("ShaderNodeTexImage")
+    tb.image = imgs["base"]
+    nt.links.new(tb.outputs["Color"], bsdf.inputs["Base Color"])
+    tn = nt.nodes.new("ShaderNodeTexImage")
+    tn.image = imgs["normal"]
+    nm = nt.nodes.new("ShaderNodeNormalMap")
+    nt.links.new(tn.outputs["Color"], nm.inputs["Color"])
+    nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+    to = nt.nodes.new("ShaderNodeTexImage")
+    to.image = orm
+    sep = nt.nodes.new("ShaderNodeSeparateColor")
+    nt.links.new(to.outputs["Color"], sep.inputs["Color"])
+    nt.links.new(sep.outputs["Green"], bsdf.inputs["Roughness"])
+    nt.links.new(sep.outputs["Blue"], bsdf.inputs["Metallic"])
+    nt.links.new(sep.outputs["Red"], gltf_output(nt).inputs["Occlusion"])
+    door.data.materials.clear()
+    door.data.materials.append(fm)
+    for p in door.data.polygons:
+        p.material_index = 0
 
 
 def light_rig(s):
@@ -349,46 +690,37 @@ def light_rig(s):
     s.collection.objects.link(o)
 
 
-def shoot(s, kind, objs):
-    """Снимки створки спереди и сзади (Cycles, мало проходов)."""
+def shoot(s, kind):
+    """Снимки готовой створки: спереди, сзади и вблизи (Cycles с подавлением шума)."""
     light_rig(s)
     cam = bpy.data.cameras.new("cam")
     cam.lens = 50
     co = bpy.data.objects.new("cam", cam)
     s.collection.objects.link(co)
     s.camera = co
-    s.render.engine = "CYCLES"
-    s.cycles.samples = 24
+    s.cycles.samples = 48
+    s.cycles.use_denoising = True
     s.render.resolution_x, s.render.resolution_y = 520, 640
     s.render.film_transparent = False
-    for side, y in (("front", -1), ("back", 1)):
-        co.location = (W / 2 + 0.9 * y * 0.5, y * 3.4, H / 2 + 0.35)
-        aim = mathutils.Vector((W / 2, 0.0, H / 2)) - co.location
-        co.rotation_euler = aim.to_track_quat("-Z", "Y").to_euler()
+    for side, at, aim in (("front", (W / 2 - 0.45, -3.4, H / 2 + 0.35), (W / 2, 0.0, H / 2)), ("back", (W / 2 + 0.45, 3.4, H / 2 + 0.35), (W / 2, 0.0, H / 2)), ("close", (0.95, -0.75, 0.95), (0.62, 0.0, 0.7))):
+        co.location = at
+        co.rotation_euler = (mathutils.Vector(aim) - co.location).to_track_quat("-Z", "Y").to_euler()
         s.render.filepath = os.path.join(SHOTS, f"door_{kind}_{side}.png")
         bpy.ops.render.render(write_still=True)
 
 
 for kind, make in (("wood", wood_door), ("metal", metal_door), ("stone", stone_door)):
+    if ONLY and kind != ONLY:
+        continue
     s = reset()
-    body_parts, iron_parts = make()
-    body = join(body_parts, kind)
-    bake_body(body, kind)
-    iron = join(iron_parts, "iron")
-    iron.data.materials.clear()
-    iron.data.materials.append(iron_material())
-    for o in (body, iron):
-        bpy.ops.object.select_all(action="DESELECT")
-        o.select_set(True)
-        bpy.context.view_layer.objects.active = o
-        bpy.ops.object.shade_smooth_by_angle(angle=math.radians(35))
+    parts, mats = make()
+    door = join(parts, f"door_{kind}")
+    bake_door(kind, door, list(mats.values()))
     bpy.ops.object.select_all(action="DESELECT")
-    body.select_set(True)
-    iron.select_set(True)
+    door.select_set(True)
     path = os.path.join(OUT, f"door_{kind}.glb")
-    bpy.ops.export_scene.gltf(filepath=path, export_format="GLB", use_selection=True, export_apply=True, export_yup=True, export_image_format="AUTO", export_animations=False)
-    tris = sum(len(p.vertices) - 2 for o in (body, iron) for p in o.data.polygons)
-    print(f"DOOR {kind}: {path} {os.path.getsize(path)} bytes, ~{tris} triangles")
+    bpy.ops.export_scene.gltf(filepath=path, export_format="GLB", use_selection=True, export_apply=True, export_yup=True, export_image_format="WEBP", export_image_quality=100, export_animations=False)
+    tris = sum(len(p.vertices) - 2 for p in door.data.polygons)
+    print(f"DOOR {kind}: {path} {os.path.getsize(path)} bytes, ~{tris} triangles", flush=True)
     if SHOTS:
-        os.makedirs(SHOTS, exist_ok=True)
-        shoot(s, kind, (body, iron))
+        shoot(s, kind)

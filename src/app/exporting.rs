@@ -1162,10 +1162,11 @@ impl App {
             pics.insert(key, (export::webp_bytes(&rgba, 90.0), "image/webp"));
         }
         let mut scene = crate::scene3d::build(cells, &storeys);
-        // Створки дверей — модели Blender: их картинки (фактура в цвете двери) — по ключу.
+        // Створки дверей — модели Blender: их картинки (цвет в цвете двери, карты) — по ключу.
         for pic in &scene.pictures {
             if let Some(img) = crate::doors3d::picture(&pic.key) {
-                pics.insert(pic.key.clone(), (export::webp_bytes(&img, 90.0), "image/webp"));
+                let bytes = if crate::doors3d::is_map(&pic.key) { export::webp_lossless(&img) } else { export::webp_bytes(&img, 90.0) };
+                pics.insert(pic.key.clone(), (bytes, "image/webp"));
             }
         }
         let images = scene.pictures.iter().map(|pic| pics.remove(&pic.key).ok_or_else(|| format!("3D: нет картинки {}", pic.key))).collect::<Result<Vec<_>, _>>()?;

@@ -7,7 +7,8 @@
 //!
 //! Метку 3D Canvas читает у узла-сетки, а узел с одним куском three.js и делает сеткой, поэтому
 //! у створки и стекла кусок всегда один. Картинки — какими их дала выгрузка: JPEG, PNG или WebP
-//! (`EXT_texture_webp`, его three.js понимает).
+//! (`EXT_texture_webp`, его three.js понимает). У материала с картами (модели Blender) — ещё
+//! карта нормалей и ORM: затенение (R) и шероховатость с металлом (G, B) из одной картинки.
 
 use crate::scene3d::{Alpha, Look, Part, Scene3d};
 use serde_json::{Value, json};
@@ -86,17 +87,24 @@ pub fn write(scene: &Scene3d, images: &[(Vec<u8>, &str)], name: &str) -> Result<
     let mut texture_of = std::collections::HashMap::new();
     let mut materials = Vec::new();
     for m in &scene.materials {
+        // Текстура картинки `p` с повтором или без — одна на пару.
+        let mut texture = |p: usize| -> usize {
+            *texture_of.entry((p, m.repeat)).or_insert_with(|| {
+                let sampler = if m.repeat { 0 } else { 1 };
+                let source = if images[p].1 == "image/webp" { json!({"sampler": sampler, "extensions": {"EXT_texture_webp": {"source": p}}}) } else { json!({"sampler": sampler, "source": p}) };
+                textures.push(source);
+                textures.len() - 1
+            })
+        };
         let mut pbr = json!({"metallicFactor": 0.0, "roughnessFactor": 0.9});
+        let maps = m.maps.map(|mp| (texture(mp.normal), texture(mp.orm)));
+        if let Some((_, orm)) = maps {
+            // Шероховатость и металл — из карты (G, B) как есть.
+            pbr = json!({"metallicFactor": 1.0, "roughnessFactor": 1.0, "metallicRoughnessTexture": {"index": orm}});
+        }
         match m.look {
             Look::Picture(p) => {
-                let key = (p, m.repeat);
-                let t = *texture_of.entry(key).or_insert_with(|| {
-                    let sampler = if m.repeat { 0 } else { 1 };
-                    let source = if images[p].1 == "image/webp" { json!({"sampler": sampler, "extensions": {"EXT_texture_webp": {"source": p}}}) } else { json!({"sampler": sampler, "source": p}) };
-                    textures.push(source);
-                    textures.len() - 1
-                });
-                pbr["baseColorTexture"] = json!({"index": t});
+                pbr["baseColorTexture"] = json!({"index": texture(p)});
                 pbr["baseColorFactor"] = json!([1.0, 1.0, 1.0, m.opacity]);
             }
             Look::Color(c) => {
@@ -105,6 +113,10 @@ pub fn write(scene: &Scene3d, images: &[(Vec<u8>, &str)], name: &str) -> Result<
             }
         }
         let mut mat = json!({"pbrMetallicRoughness": pbr, "doubleSided": m.two_sided});
+        if let Some((normal, orm)) = maps {
+            mat["normalTexture"] = json!({"index": normal});
+            mat["occlusionTexture"] = json!({"index": orm});
+        }
         match m.alpha {
             Alpha::Opaque => mat["alphaMode"] = "OPAQUE".into(),
             Alpha::Mask => {
@@ -120,11 +132,24 @@ pub fn write(scene: &Scene3d, images: &[(Vec<u8>, &str)], name: &str) -> Result<
     let mut meshes = Vec::new();
     let mut nodes = Vec::new();
     for node in &scene.nodes {
+        // three.js раскладывает поворот узла в углы Эйлера XYZ: поворот вокруг вертикали больше
+        // чем на 90° выходит «180° по X и Z и меньше 90° по Y», и `burn-3d-fx`, прибавляя открытие
+        // к углу по Y, повернул бы такую створку зеркально — двойная раскрывалась бы в разные
+        // стороны. Такой створке — поворот на 180° меньше и сетка, сама повёрнутая на 180°.
+        let turn = node.part == Part::Door && node.yaw.cos() < 0.0;
+        let yaw = if turn { node.yaw - std::f32::consts::PI.copysign(node.yaw) } else { node.yaw };
         let mut prims = Vec::new();
         for (mat, mesh) in &node.prims {
             if mesh.idx.is_empty() {
                 continue;
             }
+            let turned;
+            let mesh = if turn {
+                turned = half_turn(mesh);
+                &turned
+            } else {
+                mesh
+            };
             let n = mesh.v.len();
             let (lo, hi) = mesh.v.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| ([0, 1, 2].map(|k| lo[k].min(v.p[k])), [0, 1, 2].map(|k| hi[k].max(v.p[k]))));
             let mut acc = |bin: &mut Bin, bytes: Vec<u8>, kind: &str, extra: Value| -> usize {
@@ -154,8 +179,8 @@ pub fn write(scene: &Scene3d, images: &[(Vec<u8>, &str)], name: &str) -> Result<
         if node.at != [0.0; 3] {
             n["translation"] = json!(node.at);
         }
-        if node.yaw != 0.0 {
-            let (s, c) = (node.yaw / 2.0).sin_cos();
+        if yaw != 0.0 {
+            let (s, c) = (yaw / 2.0).sin_cos();
             n["rotation"] = json!([0.0, s, 0.0, c]);
         }
         n["extras"] = extras(node);
@@ -216,6 +241,16 @@ pub fn write(scene: &Scene3d, images: &[(Vec<u8>, &str)], name: &str) -> Result<
     Ok(out)
 }
 
+/// Сетка, повёрнутая на 180° вокруг вертикали.
+fn half_turn(mesh: &crate::scene3d::Mesh) -> crate::scene3d::Mesh {
+    let mut m = mesh.clone();
+    for v in &mut m.v {
+        v.p = [-v.p[0], v.p[1], -v.p[2]];
+        v.n = [-v.n[0], v.n[1], -v.n[2]];
+    }
+    m
+}
+
 fn floats<const N: usize>(vals: impl Iterator<Item = [f32; N]>) -> Vec<u8> {
     vals.flat_map(|a| a.into_iter().flat_map(f32::to_le_bytes)).collect()
 }
@@ -232,6 +267,21 @@ mod tests {
         assert_eq!(&glb[16..20], b"JSON");
         assert_eq!(u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize, glb.len());
         serde_json::from_slice(&glb[20..20 + len]).unwrap()
+    }
+
+    fn sample_storey() -> Storey {
+        Storey {
+            floor: None,
+            walls: Vec::new(),
+            low: Vec::new(),
+            openings: Vec::new(),
+            gaps: Vec::new(),
+            look: WallLook { width: 0.25, strip: None, side: None, color: [80, 70, 60] },
+            ground: Default::default(),
+            roofs: Vec::new(),
+            cover: None,
+            caps: Vec::new(),
+        }
     }
 
     fn sample() -> Scene3d {
@@ -305,6 +355,62 @@ mod tests {
         let input = &doc["accessors"][anim["samplers"][0]["input"].as_u64().unwrap() as usize];
         assert_eq!((input["min"].clone(), input["max"].clone()), (json!([0.0]), json!([1.0])));
         assert!(doc["scenes"][0]["nodes"].as_array().unwrap().contains(&json!(node)));
+    }
+
+    #[test]
+    fn a_door_leaf_carries_its_normal_and_orm_maps() {
+        let s = sample();
+        let doc = json_of(&write(&s, &vec![(b"RIFF....WEBP".to_vec(), "image/webp"); s.pictures.len()], "test").unwrap());
+        let door = doc["nodes"].as_array().unwrap().iter().find(|n| n["extras"]["door"] == "wDoor").unwrap();
+        let prim = &doc["meshes"][door["mesh"].as_u64().unwrap() as usize]["primitives"][0];
+        let mat = &doc["materials"][prim["material"].as_u64().unwrap() as usize];
+        let source = |t: &Value| doc["textures"][t["index"].as_u64().unwrap() as usize]["extensions"]["EXT_texture_webp"]["source"].as_u64().unwrap() as usize;
+        let key = |t: &Value| s.pictures[source(t)].key.clone();
+        assert_eq!(key(&mat["normalTexture"]), "door3d:wood:normal");
+        // Затенение, шероховатость и металл — из одной картинки ORM, множители — единица.
+        assert_eq!(key(&mat["occlusionTexture"]), "door3d:wood:orm");
+        assert_eq!(key(&mat["pbrMetallicRoughness"]["metallicRoughnessTexture"]), "door3d:wood:orm");
+        assert_eq!((mat["pbrMetallicRoughness"]["metallicFactor"].as_f64(), mat["pbrMetallicRoughness"]["roughnessFactor"].as_f64()), (Some(1.0), Some(1.0)));
+        assert!(key(&mat["pbrMetallicRoughness"]["baseColorTexture"]).starts_with("door3d:wood:"));
+        // Стены — без карт, матовые.
+        let walls = doc["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "walls_1").unwrap();
+        let wm = &doc["materials"][doc["meshes"][walls["mesh"].as_u64().unwrap() as usize]["primitives"][0]["material"].as_u64().unwrap() as usize];
+        assert!(wm.get("normalTexture").is_none() && wm["pbrMetallicRoughness"]["metallicFactor"] == 0.0);
+    }
+
+    #[test]
+    fn a_leaf_turned_past_a_right_angle_is_written_so_its_euler_y_opens_it() {
+        // Двойная дверь вдоль x: вторая створка смотрит назад (поворот 180°).
+        let door = Opening { seg: ([0.0, 1.0], [2.0, 1.0]), kind: PortalKind::DoubleDoor, id: "w3".into(), art: None };
+        let st = Storey { openings: vec![door], walls: Vec::new(), ..sample_storey() };
+        let s = build([4.0, 4.0], &[st]);
+        let doc = json_of(&write(&s, &vec![(vec![0xFF, 0xD8, 0xFF], "image/jpeg"); s.pictures.len()], "test").unwrap());
+        let leaf = |id: &str| doc["nodes"].as_array().unwrap().iter().find(|n| n["extras"]["door"] == id).unwrap().clone();
+        let b = leaf("w3_b");
+        // Поворот в glb — в пределах ±90°: в углах Эйлера это чистый угол по Y.
+        let q = b["rotation"].as_array().map_or([0.0, 0.0, 0.0, 1.0], |q| [0, 1, 2, 3].map(|k| q[k].as_f64().unwrap() as f32));
+        let yaw = 2.0 * q[1].atan2(q[3]);
+        assert!(yaw.cos() >= 0.0, "{yaw}");
+        // А на месте створка та же: от петли (2, 1) к середине (1, 1).
+        let node = s.nodes.iter().find(|n| n.door.as_ref().is_some_and(|d| d.id == "w3_b")).unwrap();
+        let mesh = &doc["meshes"][b["mesh"].as_u64().unwrap() as usize]["primitives"][0];
+        let acc = &doc["accessors"][mesh["attributes"]["POSITION"].as_u64().unwrap() as usize];
+        let (lo, hi) = ([0, 1, 2].map(|k| acc["min"][k].as_f64().unwrap() as f32), [0, 1, 2].map(|k| acc["max"][k].as_f64().unwrap() as f32));
+        let (sn, cs) = yaw.sin_cos();
+        let world_x = |x: f32, z: f32| node.at[0] + cs * x + sn * z;
+        let xs = [world_x(lo[0], lo[2]), world_x(hi[0], hi[2]), world_x(lo[0], hi[2]), world_x(hi[0], lo[2])];
+        assert!(xs.iter().all(|&x| (0.95..=2.05).contains(&x)), "{xs:?}");
+        // Открытие — прибавка к углу по Y — у обеих в одну сторону: свободный край к z < 1.
+        for (id, n) in [("w3_a", leaf("w3_a")), ("w3_b", b.clone())] {
+            let q = n["rotation"].as_array().map_or([0.0, 0.0, 0.0, 1.0], |q| [0, 1, 2, 3].map(|k| q[k].as_f64().unwrap() as f32));
+            let y = 2.0 * q[1].atan2(q[3]) + n["extras"]["swing"].as_f64().unwrap() as f32;
+            let m = &doc["meshes"][n["mesh"].as_u64().unwrap() as usize]["primitives"][0];
+            let a = &doc["accessors"][m["attributes"]["POSITION"].as_u64().unwrap() as usize];
+            // Середина сетки по x (свободный край дальше от петли) — после поворота на y.
+            let mid = (a["min"][0].as_f64().unwrap() + a["max"][0].as_f64().unwrap()) as f32 / 2.0;
+            let z = n["translation"][2].as_f64().unwrap() as f32 - y.sin() * mid;
+            assert!(z < 0.7, "{id}: открывается к z < 1: {z}");
+        }
     }
 
     #[test]

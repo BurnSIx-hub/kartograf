@@ -1310,7 +1310,7 @@ impl Parts {
         }
         self.images.push(img);
         let look = crate::scene3d::Look::Picture(self.images.len() - 1);
-        self.materials.push(crate::scene3d::Material { look, alpha: crate::scene3d::Alpha::Mask, two_sided: true, repeat: false, opacity: 1.0 });
+        self.materials.push(crate::scene3d::Material { look, alpha: crate::scene3d::Alpha::Mask, two_sided: true, repeat: false, opacity: 1.0, maps: None });
         let v = |x: f32, z: f32| crate::scene3d::Vertex { p: [x, 0.0, z], n: [0.0, 1.0, 0.0], uv: [x + 0.5, z + 0.5] };
         let mesh = crate::scene3d::Mesh { v: vec![v(-0.5, -0.5), v(0.5, -0.5), v(0.5, 0.5), v(-0.5, 0.5)], idx: vec![0, 2, 1, 0, 3, 2] };
         self.template(vec![(self.materials.len() - 1, mesh)])

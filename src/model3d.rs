@@ -419,13 +419,42 @@ pub fn read_gltf(bytes: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model3d
             };
             let two_sided = mat_j.is_some_and(|mj| mj["doubleSided"].as_bool().unwrap_or(false));
             let opacity = if alpha == Alpha::Blend { factor[3] } else { 1.0 };
-            model.parts.push(Part3 { mesh: Mesh { v: std::mem::take(&mut v), idx }, material: Material { look, alpha, two_sided, repeat: true, opacity } });
+            model.parts.push(Part3 { mesh: Mesh { v: std::mem::take(&mut v), idx }, material: Material { look, alpha, two_sided, repeat: true, opacity, maps: None } });
         }
     }
     if model.parts.is_empty() {
         return Err("glTF: в сцене нет сеток".into());
     }
     Ok(model)
+}
+
+/// Карты своего `.glb` с картами PBR (створки дверей из Blender): нормали и ORM — затенение (R),
+/// шероховатость (G), металл (B), как в glTF. Берутся у первого материала с картой нормалей;
+/// затенение из отдельной картинки вписывается в R, без него R — 255.
+pub fn material_maps(bytes: &[u8]) -> Result<(image::RgbaImage, image::RgbaImage), String> {
+    let (json, bin) = split_glb(bytes)?;
+    let j: Value = serde_json::from_slice(json).map_err(|e| format!("glTF: {e}"))?;
+    let doc = Doc { j, bufs: vec![bin.map(<[u8]>::to_vec).unwrap_or_default()] };
+    let source = |info: &Value| -> Option<usize> {
+        let t = &doc.j["textures"][info["index"].as_u64()? as usize];
+        t["source"].as_u64().or_else(|| t["extensions"]["EXT_texture_webp"]["source"].as_u64()).map(|s| s as usize)
+    };
+    let m = doc.j["materials"].as_array().and_then(|ms| ms.iter().find(|m| m["normalTexture"].is_object())).ok_or("glTF: нет материала с картой нормалей")?;
+    let normal = doc.image(source(&m["normalTexture"]).ok_or("glTF: нет карты нормалей")?, None)?;
+    let mr = source(&m["pbrMetallicRoughness"]["metallicRoughnessTexture"]).ok_or("glTF: нет карты шероховатости")?;
+    let mut orm = doc.image(mr, None)?;
+    match source(&m["occlusionTexture"]) {
+        Some(o) if o != mr => {
+            let occ = doc.image(o, None)?;
+            let occ = if occ.dimensions() == orm.dimensions() { occ } else { image::imageops::resize(&occ, orm.width(), orm.height(), image::imageops::FilterType::Triangle) };
+            for (p, q) in orm.pixels_mut().zip(occ.pixels()) {
+                p[0] = q[0];
+            }
+        }
+        Some(_) => {}
+        None => orm.pixels_mut().for_each(|p| p[0] = 255),
+    }
+    Ok((normal, orm))
 }
 
 /// Исходная модель glTF — одним `.glb` в пространстве предмета, как есть: материалы со всеми
@@ -672,7 +701,7 @@ mod wow_side {
                 1 => Alpha::Mask,
                 _ => Alpha::Blend,
             };
-            let material = Material { look, alpha, two_sided: mat.is_some_and(|m| m.flags & 0x4 != 0), repeat: true, opacity: if blend == 2 { b.alpha.clamp(0.0, 1.0) } else { 1.0 } };
+            let material = Material { look, alpha, two_sided: mat.is_some_and(|m| m.flags & 0x4 != 0), repeat: true, opacity: if blend == 2 { b.alpha.clamp(0.0, 1.0) } else { 1.0 }, maps: None };
             let mut mesh = Mesh::default();
             let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for t in &b.triangles {
@@ -760,8 +789,8 @@ mod tests {
         let img = image::RgbaImage::from_fn(2, 2, |x, y| image::Rgba([(x * 200) as u8, (y * 200) as u8, 50, 255]));
         Model3d {
             parts: vec![
-                Part3 { mesh: top, material: Material { look: Look::Picture(0), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 } },
-                Part3 { mesh: side, material: Material { look: Look::Color([200, 40, 40]), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 } },
+                Part3 { mesh: top, material: Material { look: Look::Picture(0), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None } },
+                Part3 { mesh: side, material: Material { look: Look::Color([200, 40, 40]), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0, maps: None } },
             ],
             images: vec![img],
         }

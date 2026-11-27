@@ -35,6 +35,21 @@ const LINTEL_MAX: f32 = 2.5;
 const SIDE_PERIOD: f32 = 0.5;
 /// Створка открывается на четверть оборота.
 const SWING: f32 = std::f32::consts::FRAC_PI_2;
+/// Как висит створка: зазор у свободного края и отражена ли она по толщине.
+///
+/// У одиночной зазор — до косяка. Створки двойной сходятся посередине: край чуть за серединой, у
+/// модели свой край в 3–4 мм — шов в несколько миллиметров, и, открываясь в одну сторону, они
+/// друг друга не задевают. Вторая створка смотрит навстречу первой (повёрнута на 180°), и её лицо
+/// оказалось бы с другой стороны стены — она отражена по толщине: у двери одна лицевая сторона.
+#[derive(Clone, Copy)]
+struct Hang {
+    free: f32,
+    mirror: bool,
+}
+
+const SINGLE: Hang = Hang { free: 0.02, mirror: false };
+const LEFT: Hang = Hang { free: -0.002, mirror: false };
+const RIGHT: Hang = Hang { free: -0.002, mirror: true };
 /// Выше этого фишка не шагает сама (как в 3D Canvas: треть клетки): стенка помоста, обрыв.
 pub const STEP: f32 = 1.0 / 3.0;
 /// Стена на рельефе дробится на куски не длиннее этого: низ идёт по земле.
@@ -90,6 +105,16 @@ pub struct Material {
     /// Узор повторяется плиткой (стены); иначе картинка кладётся один раз (пол этажа).
     pub repeat: bool,
     pub opacity: f32,
+    /// Карты к картинке цвета (модели Blender): нормали и ORM — затенение, шероховатость, металл
+    /// в каналах R, G, B, как в glTF. Нет — матовое, без мелкого объёма.
+    pub maps: Option<Maps>,
+}
+
+/// Номера картинок карт в `Scene3d::pictures` (у окна 3D — его картинок).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Maps {
+    pub normal: usize,
+    pub orm: usize,
 }
 
 /// Порядок полей — как в буфере вершин окна 3D (`render3d`).
@@ -525,9 +550,9 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
         let floor_mat = match &st.floor {
             Some(p) => {
                 let look = Look::Picture(s.picture(p));
-                s.material(Material { look, alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: true, repeat: false, opacity: 1.0 })
+                s.material(Material { look, alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: true, repeat: false, opacity: 1.0, maps: None })
             }
-            None => s.material(Material { look: Look::Color([96, 90, 84]), alpha: Alpha::Opaque, two_sided: true, repeat: false, opacity: 1.0 }),
+            None => s.material(Material { look: Look::Color([96, 90, 84]), alpha: Alpha::Opaque, two_sided: true, repeat: false, opacity: 1.0, maps: None }),
         };
         // На рельефе пол — сетка высот (кручи — своей картинкой), выше первого этажа — плита
         // там, где пол есть, иначе плита во всю карту.
@@ -536,7 +561,7 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             (Some(f), _) => {
                 let cliff = st.ground.cliff.as_ref().map(|p| {
                     let pic = s.picture(p);
-                    let mat = s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 });
+                    let mat = s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0, maps: None });
                     (mat, p.size[0] as f32 / p.size[1].max(1) as f32)
                 });
                 let (gentle, steep) = field_mesh(f, size, y0, cliff.map(|c| c.1));
@@ -567,14 +592,14 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
         let wall_mat = match &look.strip {
             Some(p) => {
                 let pic = s.picture(p);
-                s.material(Material { look: Look::Picture(pic), alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: true, opacity: 1.0 })
+                s.material(Material { look: Look::Picture(pic), alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: true, opacity: 1.0, maps: None })
             }
-            None => s.material(Material { look: Look::Color(look.color), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 }),
+            None => s.material(Material { look: Look::Color(look.color), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None }),
         };
         let side_mat = match &look.side {
             Some(p) => {
                 let pic = s.picture(p);
-                s.material(Material { look: Look::Picture(pic), alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: true, opacity: 1.0 })
+                s.material(Material { look: Look::Picture(pic), alpha: if p.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: true, opacity: 1.0, maps: None })
             }
             None => wall_mat,
         };
@@ -594,8 +619,8 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
             }
         }
 
-        let wood = s.material(Material { look: Look::Color(WOOD), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 });
-        let glass = s.material(Material { look: Look::Color(GLASS_TINT), alpha: Alpha::Blend, two_sided: true, repeat: true, opacity: 0.3 });
+        let wood = s.material(Material { look: Look::Color(WOOD), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None });
+        let glass = s.material(Material { look: Look::Color(GLASS_TINT), alpha: Alpha::Blend, two_sided: true, repeat: true, opacity: 0.3, maps: None });
         for (i, o) in st.openings.iter().enumerate() {
             let (a, b) = o.seg;
             // Створка — на земле у петли.
@@ -604,21 +629,21 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
                 PortalKind::Door => {
                     extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
                     let look = Some(crate::doors3d::look_of(o.art.as_deref()));
-                    let node = leaf(&mut s, format!("door_{}_{}", k + 1, i + 1), k, (a, b), foot(a), DOOR, (wood, look), Door { id: o.id.clone(), swing: SWING });
+                    let node = leaf(&mut s, format!("door_{}_{}", k + 1, i + 1), k, (a, b), SINGLE, foot(a), DOOR, (wood, look), Door { id: o.id.clone(), swing: SWING });
                     s.nodes.push(node);
                 }
                 PortalKind::DoubleDoor => {
                     extrude(&mut walls, &fine(&[a, b]), half, y0 + DOOR, top, tiling, &base);
                     let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
                     let look = Some(crate::doors3d::look_of(o.art.as_deref()));
-                    let node = leaf(&mut s, format!("door_{}_{}a", k + 1, i + 1), k, (a, mid), foot(a), DOOR, (wood, look), Door { id: format!("{}_a", o.id), swing: SWING });
+                    let node = leaf(&mut s, format!("door_{}_{}a", k + 1, i + 1), k, (a, mid), LEFT, foot(a), DOOR, (wood, look), Door { id: format!("{}_a", o.id), swing: SWING });
                     s.nodes.push(node);
-                    let node = leaf(&mut s, format!("door_{}_{}b", k + 1, i + 1), k, (b, mid), foot(b), DOOR, (wood, look), Door { id: format!("{}_b", o.id), swing: -SWING });
+                    let node = leaf(&mut s, format!("door_{}_{}b", k + 1, i + 1), k, (b, mid), RIGHT, foot(b), DOOR, (wood, look), Door { id: format!("{}_b", o.id), swing: -SWING });
                     s.nodes.push(node);
                 }
                 // Тайный ход снаружи неотличим от стены: створка во всю высоту, из стены.
                 PortalKind::Secret => {
-                    let node = leaf(&mut s, format!("secret_{}_{}", k + 1, i + 1), k, (a, b), foot(a), STOREY, (side_mat, None), Door { id: o.id.clone(), swing: SWING });
+                    let node = leaf(&mut s, format!("secret_{}_{}", k + 1, i + 1), k, (a, b), SINGLE, foot(a), STOREY, (side_mat, None), Door { id: o.id.clone(), swing: SWING });
                     s.nodes.push(node);
                 }
                 PortalKind::Window => {
@@ -652,8 +677,8 @@ pub fn build(size: [f32; 2], storeys: &[Storey]) -> Scene3d {
 /// стороны: из-под свеса и из комнаты видна изнанка.
 fn roof_node(s: &mut Scene3d, k: usize, i: usize, r: &Roof3, y0: f32) -> Node {
     let pic = s.picture(&r.picture);
-    let cover = s.material(Material { look: Look::Picture(pic), alpha: if r.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: true, repeat: false, opacity: 1.0 });
-    let gable = s.material(Material { look: Look::Color(GABLE), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 });
+    let cover = s.material(Material { look: Look::Picture(pic), alpha: if r.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: true, repeat: false, opacity: 1.0, maps: None });
+    let gable = s.material(Material { look: Look::Color(GABLE), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0, maps: None });
     let prims = [(cover, r.cover.clone()), (gable, r.gables.clone())].into_iter().filter(|(_, m)| !m.idx.is_empty()).collect();
     Node { name: format!("roof_{}_{}", k + 1, i + 1), part: Part::Roof, storey: k, at: [0.0, y0, 0.0], yaw: 0.0, prims, door: None }
 }
@@ -807,16 +832,16 @@ fn blocks_node(s: &mut Scene3d, k: usize, blocks: &[Block], size: [f32; 2], y0: 
         let top_mat = match &b.skin {
             Some(sk) => {
                 let pic = s.picture(&sk.picture);
-                s.material(Material { look: Look::Picture(pic), alpha: if sk.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: false, opacity: 1.0 })
+                s.material(Material { look: Look::Picture(pic), alpha: if sk.picture.alpha { Alpha::Mask } else { Alpha::Opaque }, two_sided: false, repeat: false, opacity: 1.0, maps: None })
             }
             None => floor_mat,
         };
         let side_mat = match &b.face {
             Some(p) => {
                 let pic = s.picture(p);
-                s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 })
+                s.material(Material { look: Look::Picture(pic), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None })
             }
-            None => s.material(Material { look: Look::Color(b.side), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0 }),
+            None => s.material(Material { look: Look::Color(b.side), alpha: Alpha::Opaque, two_sided: false, repeat: true, opacity: 1.0, maps: None }),
         };
         let uv = |p: [f32; 2]| match &b.skin {
             Some(sk) => sk.uv(p),
@@ -895,25 +920,23 @@ pub(crate) fn tri(m: &mut Mesh, p: [[f32; 3]; 3], n: [f32; 3], uv: [[f32; 2]; 3]
     }
 }
 
-/// Створка от петли `hinge` к `to` на высоте `y0`, высотой `tall`: узел с началом на петле,
-/// сетка вдоль его оси x — так 3D Canvas поворачивает её вокруг петли.
+/// Створка от петли `hinge` до `to` высотой `tall` на земле `y0`, висящая по `hang`: узел с
+/// началом на петле, сетка вдоль его оси x — так её поворачивают вокруг петли. Модель двери
+/// ([`crate::doors3d`]) по виду `look`, растянутая по проёму; без вида (тайный ход) или без модели —
+/// доска толщиной [`LEAF`] материалом `mat` (она с обеих сторон одинакова).
 #[allow(clippy::too_many_arguments)]
-/// Створка от петли `hinge` до `to` высотой `tall` на земле `y0`: модель двери ([`crate::doors3d`])
-/// по виду `look`, растянутая по проёму; без вида (тайный ход) или без модели — доска толщиной
-/// [`LEAF`] материалом `mat`.
-fn leaf(s: &mut Scene3d, name: String, storey: usize, (hinge, to): Segment, y0: f32, tall: f32, (mat, look): (usize, Option<crate::doors3d::DoorLook>), door: Door) -> Node {
+fn leaf(s: &mut Scene3d, name: String, storey: usize, (hinge, to): Segment, hang: Hang, y0: f32, tall: f32, (mat, look): (usize, Option<crate::doors3d::DoorLook>), door: Door) -> Node {
     let (dx, dz) = (to[0] - hinge[0], to[1] - hinge[1]);
     let len = dx.hypot(dz).max(0.01);
-    if let Some(p) = look.and_then(|l| crate::doors3d::leaf_part(l, len, tall)) {
-        let (key, size) = p.picture;
-        let pic = s.picture(&Picture { key, size, alpha: false });
-        let material = s.material(Material { look: Look::Picture(pic), ..p.material });
+    if let Some(p) = look.and_then(|l| crate::doors3d::leaf_part(l, len, tall, hang.free, hang.mirror)) {
+        let [base, normal, orm] = p.pictures.map(|(key, size)| s.picture(&Picture { key, size, alpha: false }));
+        let material = s.material(Material { look: Look::Picture(base), maps: Some(Maps { normal, orm }), ..p.material });
         return Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(material, p.mesh)], door: Some(door) };
     }
     let mut m = Shell::default();
     let tiling = Tiling { top: 1.0, side_u: 1.0, side_v: 1.0 };
     // Чуть короче проёма и ниже притолоки: не трётся о косяк, когда поворачивается.
-    extrude(&mut m, &[[0.02, 0.0], [len - 0.02, 0.0]], LEAF / 2.0, 0.0, (tall - 0.02).into(), tiling, &|_| 0.0);
+    extrude(&mut m, &[[0.02, 0.0], [len - hang.free, 0.0]], LEAF / 2.0, 0.0, (tall - 0.02).into(), tiling, &|_| 0.0);
     Node { name, part: Part::Door, storey, at: [hinge[0], y0, hinge[1]], yaw: (-dz).atan2(dx), prims: vec![(mat, m.into_one())], door: Some(door) }
 }
 
@@ -1148,6 +1171,20 @@ mod tests {
         // Вторая смотрит навстречу первой и поворачивается в обратную сторону: обе — в одну сторону стены.
         assert!((leaves[1].yaw.abs() - std::f32::consts::PI).abs() < 1e-5);
         assert_eq!(leaves[0].door.as_ref().unwrap().swing, -leaves[1].door.as_ref().unwrap().swing);
+        // Закрытые створки сходятся посередине швом в несколько миллиметров, не заходя друг на друга.
+        let (a, b) = (placed(leaves[0]), placed(leaves[1]));
+        let seam = b.iter().map(|p| p[0]).fold(f32::MAX, f32::min) - a.iter().map(|p| p[0]).fold(f32::MIN, f32::max);
+        assert!(seam > 0.0005 && seam < 0.006, "шов {seam}");
+        // Открытые — обе по одну сторону стены (z < 1): поворот на `swing` вокруг петли.
+        let open = |n: &Node| {
+            let (s, c) = (n.yaw + n.door.as_ref().unwrap().swing).sin_cos();
+            n.prims.iter().flat_map(|(_, m)| m.v.iter()).map(|v| n.at[2] - s * v.p[0] + c * v.p[2]).sum::<f32>() / n.prims[0].1.v.len() as f32
+        };
+        assert!(open(leaves[0]) < 0.8 && open(leaves[1]) < 0.8, "{} {}", open(leaves[0]), open(leaves[1]));
+        // Лицом (петли, кольцо) — в одну сторону: середина сетки по толщине у обеих по одну сторону
+        // стены и на том же расстоянии.
+        let face = |pts: &[[f32; 3]]| pts.iter().map(|p| p[2] - 1.0).sum::<f32>() / pts.len() as f32;
+        assert!(face(&a).abs() > 1e-3 && (face(&a) - face(&b)).abs() < 1e-3, "{} {}", face(&a), face(&b));
     }
 
     #[test]

@@ -1812,7 +1812,7 @@ fn test_crate(dir: &std::path::Path) -> Result<(PathBuf, [f32; 2]), String> {
         mesh.v.extend(q.iter().map(|&p| Vertex { p, n, uv: [0.0, 0.0] }));
         mesh.idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    let material = Material { look: Look::Color([150, 100, 50]), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0 };
+    let material = Material { look: Look::Color([150, 100, 50]), alpha: Alpha::Opaque, two_sided: true, repeat: true, opacity: 1.0, maps: None };
     let m = crate::model3d::Model3d { parts: vec![crate::model3d::Part3 { mesh, material }], images: Vec::new() };
     let (img, cells) = crate::model3d::top_view(&m, 64.0)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;

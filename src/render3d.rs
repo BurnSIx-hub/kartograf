@@ -92,10 +92,17 @@ void main() {
 
 // Стена берёт свет, отступив по нормали: её сторона в комнате — свет комнаты, на улице —
 // улицы. Изнанка срезанной стены (видна сверху, когда стены по пояс) — тёмный срез.
+//
+// С картами (модели Blender): нормаль из карты в осях поверхности — оси по ходу UV из
+// производных (касательных у сеток нет; так же делает three.js), зелёный — вверх по картинке
+// Blender, то есть против v glTF. ORM: затенение, шероховатость, металл; блик — по солнцу.
 const FRAGMENT: &str = r#"#version 330 core
 uniform sampler2D u_tex;
 uniform sampler2D u_lit;
 uniform sampler2D u_glow;
+uniform sampler2D u_normal;
+uniform sampler2D u_orm;
+uniform int u_maps;
 uniform vec4 u_tint;
 uniform int u_mode;
 uniform vec4 u_light_rect;
@@ -121,6 +128,29 @@ void main() {
     vec2 uv = (p - u_light_rect.xy) / u_light_rect.zw;
     vec3 lit = texture(u_lit, uv).rgb;
     vec3 glow = texture(u_glow, uv).rgb;
+    if (u_maps == 1) {
+        vec3 m = texture(u_normal, v_uv).xyz * 2.0 - 1.0;
+        vec3 dp1 = dFdx(v_world);
+        vec3 dp2 = dFdy(v_world);
+        vec2 du1 = dFdx(v_uv);
+        vec2 du2 = dFdy(v_uv);
+        vec3 d2 = cross(dp2, n);
+        vec3 d1 = cross(n, dp1);
+        vec3 t = d2 * du1.x + d1 * du2.x;
+        vec3 b = d2 * du1.y + d1 * du2.y;
+        float k = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+        n = normalize(t * k * m.x - b * k * m.y + n * max(m.z, 0.05));
+        vec3 orm = texture(u_orm, v_uv).rgb;
+        float ndl = max(dot(n, u_sun), 0.0);
+        float shade = mix(1.0, orm.r, 0.85) * (0.62 + 0.38 * ndl) - 0.06 * (1.0 - abs(n.y));
+        vec3 h = normalize(u_sun + normalize(u_eye - v_world));
+        float rough = clamp(orm.g, 0.05, 1.0);
+        float sp = pow(max(dot(n, h), 0.0), mix(90.0, 6.0, rough)) * (1.0 - rough) * (1.0 - rough);
+        vec3 spec = mix(vec3(0.04), c.rgb, orm.b) * sp * 2.0 * ndl;
+        vec3 diff = c.rgb * (1.0 - 0.55 * orm.b);
+        f_color = vec4((diff * shade + spec) * lit + glow, u_mode == 2 ? c.a : 1.0);
+        return;
+    }
     float shade = 0.80 + 0.20 * max(dot(n, u_sun), 0.0) - 0.08 * (1.0 - abs(n.y));
     f_color = vec4(c.rgb * lit * shade + glow, u_mode == 2 ? c.a : 1.0);
 }
@@ -229,6 +259,9 @@ struct Uniforms {
     eye: Option<glow::UniformLocation>,
     cut: Option<glow::UniformLocation>,
     caps: Option<glow::UniformLocation>,
+    normal: Option<glow::UniformLocation>,
+    orm: Option<glow::UniformLocation>,
+    maps: Option<glow::UniformLocation>,
 }
 
 struct LightTex {
@@ -296,6 +329,9 @@ impl Gpu {
                 eye: at("u_eye"),
                 cut: at("u_cut"),
                 caps: at("u_caps"),
+                normal: at("u_normal"),
+                orm: at("u_orm"),
+                maps: at("u_maps"),
             };
             let aniso = gl.supported_extensions().iter().any(|e| e.ends_with("texture_filter_anisotropic"));
             let sampler = |wrap: u32, mips: bool| -> Result<glow::Sampler, String> {
@@ -405,7 +441,7 @@ impl Gpu {
             }
             self.materials = up.materials;
             // Фишка — своим материалом в конце списка.
-            self.materials.push(Material { look: Look::Color([255, 255, 255]), alpha: Alpha::Opaque, two_sided: false, repeat: false, opacity: 1.0 });
+            self.materials.push(Material { look: Look::Color([255, 255, 255]), alpha: Alpha::Opaque, two_sided: false, repeat: false, opacity: 1.0, maps: None });
             self.pawn = vec![Self::part(gl, self.materials.len() - 1, &up.pawn)?];
             Ok(())
         }
@@ -427,6 +463,9 @@ impl Gpu {
             for mut m in add.materials {
                 if let Look::Picture(i) = m.look {
                     m.look = Look::Picture(tex0 + i);
+                }
+                if let Some(mp) = &mut m.maps {
+                    (mp.normal, mp.orm) = (tex0 + mp.normal, tex0 + mp.orm);
                 }
                 self.materials.push(m);
             }
@@ -549,9 +588,18 @@ impl Gpu {
                     Look::Color(c) => (self.white, c.map(|v| v as f32 / 255.0)),
                 };
                 let rgb = tint.unwrap_or(rgb);
+                let sampler = if m.repeat { self.repeat } else { self.clamp };
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.bind_sampler(0, Some(if m.repeat { self.repeat } else { self.clamp }));
+                gl.bind_sampler(0, Some(sampler));
+                let maps = m.maps.and_then(|mp| Some((*self.textures.get(mp.normal)?, *self.textures.get(mp.orm)?)));
+                gl.uniform_1_i32(self.u.maps.as_ref(), maps.is_some() as i32);
+                let (normal, orm) = maps.unwrap_or((self.white, self.white));
+                for (unit, t) in [(3, normal), (4, orm)] {
+                    gl.active_texture(glow::TEXTURE0 + unit);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    gl.bind_sampler(unit, Some(sampler));
+                }
                 gl.uniform_4_f32(self.u.tint.as_ref(), rgb[0], rgb[1], rgb[2], m.opacity);
                 gl.uniform_1_i32(self.u.mode.as_ref(), match m.alpha {
                     Alpha::Opaque => 0,
@@ -590,6 +638,8 @@ impl Gpu {
             gl.uniform_1_i32(self.u.tex.as_ref(), 0);
             gl.uniform_1_i32(self.u.lit.as_ref(), 1);
             gl.uniform_1_i32(self.u.glow.as_ref(), 2);
+            gl.uniform_1_i32(self.u.normal.as_ref(), 3);
+            gl.uniform_1_i32(self.u.orm.as_ref(), 4);
             gl.bind_sampler(1, Some(self.linear));
             gl.bind_sampler(2, Some(self.linear));
             for item in &frame.items {
@@ -614,7 +664,7 @@ impl Gpu {
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::POLYGON_OFFSET_FILL);
             gl.bind_vertex_array(None);
-            for unit in 0..3 {
+            for unit in 0..5 {
                 gl.bind_sampler(unit, None);
             }
             gl.active_texture(glow::TEXTURE0);
