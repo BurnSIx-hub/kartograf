@@ -1233,7 +1233,7 @@ const look = { el: null, on: false, hover: null, move: null, down: null, ray: nu
 
 function lookApi() {
   const api = game.burnCinema?.inspect;
-  return api && LOOK_API.every((k) => typeof api[k] === "function") ? api : null;
+  return api && (api.apiVersion ?? 0) >= 1 && LOOK_API.every((k) => typeof api[k] === "function") ? api : null;
 }
 
 /** Футы над нулём сцены → высота 3D Canvas. */
@@ -1311,8 +1311,10 @@ function lookAt(ev) {
     const mesh = lookModel(region);
     const hit = mesh && ray.intersectObject(mesh, true)[0];
     if (!hit || hit.distance > near + 1e-3 || (best && hit.distance >= best.distance)) continue;
-    const zone = api.zoneOf(region);
-    if (zone) best = { zone, distance: hit.distance, point: { x: hit.point.x * L.factor, y: hit.point.z * L.factor } };
+    // С точкой 🔥 Cinema проверит и туман: игрок не осмотрит предмет, которого не видит.
+    const point = { x: hit.point.x * L.factor, y: hit.point.z * L.factor };
+    const zone = api.zoneOf(region, { point });
+    if (zone) best = { zone, distance: hit.distance, point };
   }
   if (best) return best;
   if (!floor?.point) return null;
